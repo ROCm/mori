@@ -1,10 +1,6 @@
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""CPU lifecycle checks for the real native L1 allocation helper.
-
-Torch and allocation RPCs are controlled boundaries, never alternate helper
-implementations. The last tests exercise the real native client/server fence.
-"""
+"""Native allocation lifecycle with fake Torch/RPC boundaries and real RPC fences."""
 
 import contextlib
 import gc
@@ -97,27 +93,16 @@ def runtime(monkeypatch):
     return SimpleNamespace(calls=calls, torch=torch)
 
 
-class Client:
-    def __init__(self, calls):
-        self.calls = calls
-        self.fail_attach = self.fail_bind = False
-
-    def attach(self, *args, **kwargs):
-        self.calls.append(("attach", args, kwargs))
-        if self.fail_attach:
-            raise RuntimeError("Attach response lost after server accepted")
-
-    def bind_layout(self, *args):
-        self.calls.append(("bind", args))
-        if self.fail_bind:
-            raise RuntimeError("BindLayout response lost")
-
-    def detach(self, pool_id):
-        self.calls.append(("detach", pool_id))
+def unconfirmed(*args, **kwargs):
+    raise RuntimeError("operation was not confirmed")
 
 
 def allocate(helper, runtime):
-    client = Client(runtime.calls)
+    client = SimpleNamespace(
+        attach=lambda *args, **kwargs: runtime.calls.append(("attach", args, kwargs)),
+        bind_layout=lambda *args: runtime.calls.append(("bind", args)),
+        detach=lambda pool_id: runtime.calls.append(("detach", pool_id)),
+    )
     owner = helper.NativeL1Memory(client, "pool", "model-format")
     arena = owner.allocate(1024, "cuda")
     return client, owner, arena
@@ -154,12 +139,12 @@ def test_final_arena_zeroed_in_place_and_registered_after_sync(helper, runtime):
     assert allocator() is not None  # The returned arena still owns its allocator.
 
 
-@pytest.mark.parametrize("failure", ["fail_attach", "fail_bind"])
+@pytest.mark.parametrize("operation", ["attach", "bind_layout"])
 def test_uncertain_registration_retains_owner_without_caller_refs(
-    helper, runtime, failure
+    helper, runtime, operation
 ):
     client, owner, arena = allocate(helper, runtime)
-    setattr(client, failure, True)
+    setattr(client, operation, unconfirmed)
     with pytest.raises(
         helper.L1MemoryInDoubtError, match="registration was not confirmed"
     ):
@@ -183,12 +168,9 @@ def test_failed_close_retains_owner_until_confirmed_retry(
     client, owner, arena = allocate(helper, runtime)
     owner.bind_layout(arena, 4, [(0, 32)])
 
-    def fail(_):
-        raise RuntimeError(f"{operation} was not confirmed")
-
     target = client if operation == "detach" else runtime.torch.cuda
     with monkeypatch.context() as fault:
-        fault.setattr(target, operation, fail)
+        fault.setattr(target, operation, unconfirmed)
         with pytest.raises(helper.L1MemoryInDoubtError, match="safe close"):
             owner.close()
         assert helper._LIVE_NATIVE_L1_MEMORY[id(owner)] is owner

@@ -90,7 +90,6 @@ class LoopPeer final : public PeerApi {
     last = request;
     auto result = owner->AcquireRead(request);
     if (lose_acquire) result.status = Status::Error("injected lost Acquire reply");
-    if (corrupt && !result.regions.empty()) result.regions[0].offset = UINT64_MAX;
     if (on_acquire) on_acquire(result);
     return result;
   }
@@ -101,7 +100,7 @@ class LoopPeer final : public PeerApi {
   }
   PoolManager* owner;
   int acquires = 0, releases = 0;
-  bool lose_acquire = false, lose_release = false, corrupt = false;
+  bool lose_acquire = false, lose_release = false;
   PeerReadRequest last;
   std::function<void()> on_probe;
   std::function<void(PeerReadResult&)> on_acquire;
@@ -216,11 +215,18 @@ TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
     std::reverse(keys.begin(), keys.end());
     std::reverse(src_slots.begin(), src_slots.end());
   }
-  const bool malformed = mode == "WrongUnit" || mode == "OutOfRange";
+  if (mode == "RepeatedSource") {
+    std::fill(keys.begin(), keys.end(), keys.front());
+    std::fill(src_slots.begin(), src_slots.end(), src_slots.front());
+  }
+  const bool malformed = mode == "WrongUnit" || mode == "OutOfRange" ||
+                         mode == "HandleIndex" || mode == "Descriptor";
   if (malformed) {
     peer->on_acquire = [&](PeerReadResult& read) {
       if (mode == "WrongUnit") ++read.regions.back().bytes;
-      else read.regions.back().offset = UINT64_MAX;
+      if (mode == "OutOfRange") read.regions.back().offset = UINT64_MAX;
+      if (mode == "HandleIndex") read.regions.back().handle_index = read.handles.size();
+      if (mode == "Descriptor") read.handles.back()[0] = '!';
     };
   }
   auto expected = *directory;
@@ -238,6 +244,7 @@ TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
     }
   }
   const auto result = dest->Fetch("dst", keys, options);
+  EXPECT_TRUE(result.status.ok);
   EXPECT_EQ(result.copied_slots, malformed ? 0u : keys.size());
   EXPECT_EQ(result.copied_bytes, bytes);
   size_t runs = keys.size();
@@ -247,15 +254,17 @@ TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
   EXPECT_EQ(dest_api->last_fragments.size(), runs * layout.regions.size());
   EXPECT_EQ(*directory, expected);  // Full destination, guards and source bytes.
   EXPECT_EQ(peer->releases, 1);
+  EXPECT_EQ(dest_api->imports.load() - dest_api->unimports.load(), 1);  // Own arena remains mapped.
   for (size_t k = 0; k < keys.size(); ++k) {
-    EXPECT_TRUE(source->Apply(owners[k], {{OpKind::kPublish, src_slots[k], keys[k]}}).ok);
+    EXPECT_TRUE(source->Apply(owners[k], {{OpKind::kPublish, src_slots[k], keys[k] + "-changed"}}).ok);
     EXPECT_TRUE(dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[k], ""}}).ok);
   }
 }
 INSTANTIATE_TEST_SUITE_P(Layouts, L1PeerRunTest,
                         ::testing::Values("Contiguous", "Unaligned", "ReversedDestination",
                                           "GappedDestination", "ReversedSource", "DifferentHandle",
-                                          "WrongUnit", "OutOfRange"),
+                                          "RepeatedSource",
+                                          "WrongUnit", "OutOfRange", "HandleIndex", "Descriptor"),
                         [](const auto& info) { return info.param; });
 
 TEST_F(L1PeerTest, SourceRequiresCommitAndMatchingGroupAndLayout) {
@@ -273,7 +282,9 @@ TEST_F(L1PeerTest, RepeatedAcquireAndReleaseAreIdempotentAndPinsPreventReuse) {
   auto slots = Publish(*source, "src", {"a"});
   auto first = source->AcquireRead(Read());
   ASSERT_EQ(first.available, 1u);
-  EXPECT_EQ(source->AcquireRead(Read()).regions.size(), first.regions.size());
+  auto replay = source->AcquireRead(Read());
+  EXPECT_EQ(replay.regions.size(), first.regions.size());
+  EXPECT_EQ(replay.handles, first.handles);
   EXPECT_FALSE(source->Apply("src", {{OpKind::kPublish, slots[0], "changed"}}).ok);
   EXPECT_FALSE(source->ReleaseRead("op", source->Incarnation(), false).ok);
   EXPECT_FALSE(source->Apply("src", {{OpKind::kPublish, slots[0], "changed"}}).ok);
@@ -281,6 +292,11 @@ TEST_F(L1PeerTest, RepeatedAcquireAndReleaseAreIdempotentAndPinsPreventReuse) {
   EXPECT_TRUE(source->ReleaseRead("op", source->Incarnation(), true).ok);
   EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, slots[0], "changed"}}).ok);
   EXPECT_FALSE(source->AcquireRead(Read()).status.ok);
+  ASSERT_TRUE(source->Detach("src").ok);
+  // Both snapshots own their descriptors after the grant and source pool are gone.
+  EXPECT_EQ(first.handles, (std::vector<std::string>{handles["src"]}));
+  EXPECT_EQ(replay.handles, first.handles);
+  for (const auto& region : replay.regions) EXPECT_EQ(region.handle_index, 0u);
 }
 
 TEST_F(L1PeerTest, PeerReadPinsProtectTheUpstreamKeptEvictionList) {
@@ -337,17 +353,6 @@ TEST_F(L1PeerTest, CachedSourceIsNotEvictedUntilItsPeerGrantIsReleased) {
   auto reused = allocation.get();
   EXPECT_EQ(reused.slots, (std::vector<uint32_t>{0}));
   EXPECT_EQ(reused.evicted_keys, (std::vector<std::string>{"a"}));
-}
-
-TEST_F(L1PeerTest, RepeatedSourceKeyCanFillDistinctDestinationsAndUnpinCompletely) {
-  Publish(*source, "src", {"a"});
-  auto options = Destinations(2);
-  auto result = dest->Fetch("dst", {"a", "a"}, options);
-  EXPECT_TRUE(result.status.ok);
-  EXPECT_EQ(result.copied_slots, 2u);
-  EXPECT_EQ(dest_api->last_fragments.size(), 4u);
-  for (uint32_t slot : options.dst_slots) EXPECT_TRUE(Equals("dst", slot, 11));
-  EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
 }
 
 TEST_F(L1PeerTest, RejectsDuplicateDestinationBeforeAcquire) {
@@ -420,7 +425,6 @@ TEST_P(L1PeerFailureTest, ConfirmedFailureReleasesPinsAndWritersForRetry) {
   Publish(*source, "src", {"a"});
   auto options = Destinations(1);
   dest_api->fail_import = fault == "Import";
-  peer->corrupt = fault == "Descriptor";
   peer->lose_acquire = fault == "AcquireReply";
   dest_api->outcome = {fault != "DrainedCopy", true, "injected drained failure"};
   EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 0u);
@@ -428,13 +432,13 @@ TEST_P(L1PeerFailureTest, ConfirmedFailureReleasesPinsAndWritersForRetry) {
   EXPECT_EQ(peer->releases, 1);
   EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
   ASSERT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "a"}}).ok);
-  dest_api->fail_import = peer->corrupt = peer->lose_acquire = false;
+  dest_api->fail_import = peer->lose_acquire = false;
   dest_api->outcome = {true, true, {}};
   EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 1u);
   EXPECT_EQ(peer->releases, 2);
 }
 INSTANTIATE_TEST_SUITE_P(Failures, L1PeerFailureTest,
-                        ::testing::Values("Import", "Descriptor", "AcquireReply", "DrainedCopy"),
+                        ::testing::Values("Import", "AcquireReply", "DrainedCopy"),
                         [](const auto& info) { return info.param; });
 
 TEST_F(L1PeerTest, LostReleaseRetainsSourceButConfirmedDestinationIsUsable) {

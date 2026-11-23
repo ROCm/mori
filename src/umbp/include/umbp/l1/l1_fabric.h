@@ -37,6 +37,7 @@ namespace mori::umbp::l1 {
 bool ExportFabricMemory(int device, void* ptr, uint64_t bytes, ExportedMemory* exported,
                         std::string* error);
 bool IsFabricHandle(const std::string& handle);
+bool GetFabricViewBytes(const std::string& handle, uint64_t* bytes, std::string* error);
 bool ValidateFabricRange(const std::string& handle, uint64_t offset, uint64_t bytes,
                          std::string* error);
 

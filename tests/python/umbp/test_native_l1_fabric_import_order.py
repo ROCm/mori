@@ -1,15 +1,11 @@
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Real FABRIC export alongside installed MORI-IO, in both import orders.
+"""Exercise both native L1/MORI-IO import orders in isolated GPU processes."""
 
-Each order runs in a fresh process: an ABI regression may abort native code and
-must not kill the pytest coordinator. No model, RPC service, or peer is needed.
-The model's installed MORI-IO can be older than the tested L1 extension.
-"""
-
+import importlib
 import importlib.util
-import json
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -17,42 +13,9 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(scope="module")
-def fabric_gpu():
-    if importlib.util.find_spec("mori_umbp_l1") is None:
-        pytest.skip("native L1 extension is not installed")
-    if (
-        importlib.util.find_spec("torch") is None
-        or importlib.util.find_spec("mori") is None
-    ):
-        pytest.skip("Torch and the installed MORI allocator are required")
-    # Keep even capability probing out of the pytest process's GPU context.
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import json, torch; from pathlib import Path; "
-                "print(json.dumps(dict(gpu=torch.cuda.is_available(), "
-                "active=any(p.read_text().strip() in ('active','ready') "
-                "for p in Path('/sys/bus/pci/devices').glob('*/ualink/accel_state')))))"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert probe.returncode == 0, probe.stdout + probe.stderr
-    capabilities = json.loads(probe.stdout.strip().splitlines()[-1])
-    if not capabilities["gpu"]:
-        pytest.skip("no visible GPU")
-    if not capabilities["active"]:
-        pytest.skip("no active UALink domain reported by sysfs")
-
-
 @pytest.mark.parametrize("order", ["native_first", "io_first"])
-def test_fabric_export_survives_installed_io_import_order(fabric_gpu, order):
+def test_fabric_export_survives_installed_io_import_order(order):
+    # An ABI regression may abort; even capability probing stays in the child.
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), "--child", order],
         capture_output=True,
@@ -61,6 +24,8 @@ def test_fabric_export_survives_installed_io_import_order(fabric_gpu, order):
         timeout=90,
         check=False,
     )
+    if result.returncode == 77:
+        pytest.skip(result.stdout.strip())
     assert result.returncode == 0, (
         f"FABRIC export child {order} exited {result.returncode}; "
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -69,26 +34,34 @@ def test_fabric_export_survives_installed_io_import_order(fabric_gpu, order):
 
 
 def _child(order):
-    import struct
-
-    # The order is the regression trigger. In particular, importing the native
-    # extension earlier in a fixture would mask io_first's symbol interposition.
-    if order == "native_first":
-        native = importlib.import_module("mori_umbp_l1")
-        make_fabric_mem_pool = importlib.import_module("mori.io").make_fabric_mem_pool
-    elif order == "io_first":
-        make_fabric_mem_pool = importlib.import_module("mori.io").make_fabric_mem_pool
-        native = importlib.import_module("mori_umbp_l1")
-    else:
+    if order not in ("native_first", "io_first"):
         raise ValueError(order)
+    for name in ("torch", "mori", "mori_umbp_l1"):
+        if importlib.util.find_spec(name) is None:
+            print(f"{name} is not installed")
+            return 77
 
+    if not any(
+        p.read_text().strip() in ("active", "ready")
+        for p in Path("/sys/bus/pci/devices").glob("*/ualink/accel_state")
+    ):
+        print("an active UALink domain is required")
+        return 77
+
+    # Do not import either module before this point: ordering triggers the bug.
+    names = ("mori_umbp_l1", "mori.io")
+    if order == "io_first":
+        names = tuple(reversed(names))
+    modules = {name: importlib.import_module(name) for name in names}
+    native = modules["mori_umbp_l1"]
     import torch
-    from mori.io.fabric_allocator import _mori_io_lib_path
 
+    if not torch.cuda.is_available():
+        print("no visible GPU")
+        return 77
     assert native.NATIVE_L1_FABRIC_VERSION == 1
     torch.cuda.set_device(0)
-    print(f"{order}: native={native.__file__}, io={_mori_io_lib_path()}", flush=True)
-    pool = make_fabric_mem_pool()
+    pool = modules["mori.io"].make_fabric_mem_pool()
     nbytes = 4 << 20
     with torch.cuda.use_mem_pool(pool):
         arena = torch.empty(nbytes, dtype=torch.uint8, device="cuda:0")
@@ -103,7 +76,7 @@ def _child(order):
     assert arena.data_ptr() == before
     assert int(torch.count_nonzero(arena != 37).item()) == 0
     torch.cuda.synchronize()
-    # No Attach was sent, so there can be no peer access to this allocation.
+    # No Attach was sent, so no peer can still access this allocation.
     del arena
     torch.cuda.synchronize()
     del pool
@@ -113,4 +86,4 @@ def _child(order):
 if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] != "--child":
         raise SystemExit("use pytest, or --child native_first|io_first")
-    _child(sys.argv[2])
+    raise SystemExit(_child(sys.argv[2]))

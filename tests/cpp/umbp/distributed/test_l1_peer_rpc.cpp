@@ -7,13 +7,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -68,10 +67,7 @@ class ControlledPeer final : public pb::UMBPL1Pool::Service {
   std::atomic<bool> compact_requested{false};
   std::atomic<int> releases{0};
 
-  void Unblock() {
-    blocked = Block::kNone;
-    wake_.notify_all();
-  }
+  void Unblock() { blocked = Block::kNone; }
   grpc::Status PeerProbe(grpc::ServerContext* context, const pb::PeerProbeRequest* request,
                          pb::PeerProbeResponse* response) override {
     if (!Wait(context, Block::kProbe)) return Cancelled();
@@ -100,7 +96,7 @@ class ControlledPeer final : public pb::UMBPL1Pool::Service {
     response->set_available(result.available);
     for (const auto& region : result.regions) {
       auto* out = response->add_regions();
-      out->set_handle(region.handle);
+      out->set_handle(result.handles[region.handle_index]);
       out->set_offset(region.offset);
       out->set_bytes(region.bytes);
     }
@@ -121,16 +117,13 @@ class ControlledPeer final : public pb::UMBPL1Pool::Service {
 
  private:
   bool Wait(grpc::ServerContext* context, Block point) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (blocked == point && !context->IsCancelled()) wake_.wait_for(lock, 10ms);
+    while (blocked == point && !context->IsCancelled()) std::this_thread::sleep_for(10ms);
     return !context->IsCancelled();
   }
   static grpc::Status Cancelled() {
     return {grpc::StatusCode::CANCELLED, "injected delayed peer control RPC"};
   }
   PoolManager* owner_;
-  std::mutex mutex_;
-  std::condition_variable wake_;
 };
 
 class PeerServer {
@@ -231,16 +224,30 @@ TEST_F(L1PeerRpcTest, ReleaseTimeoutDoesNotUnpinAndConfirmedRetryIsIdempotent) {
   CheckReadTimeout(ControlledPeer::Block::kReleaseRequest);
 }
 
-TEST_F(L1PeerRpcTest, NewClientAcceptsLegacyInlineReply) {
+TEST_F(L1PeerRpcTest, NewClientInternsLegacyAndDuplicateDictionaryHandles) {
   ControlledPeer service(owner.get());  // Ignores compact_handles, as an older server does.
   PeerServer server(service);
-  const PeerReadRequest request{"legacy", owner->Incarnation(), "g", {"a"}, {16}};
-  const auto read = server.peer->AcquireRead(request);
-  ASSERT_TRUE(read.status.ok);
-  ASSERT_EQ(read.regions.size(), 1u);
-  EXPECT_TRUE(service.compact_requested.load());
-  EXPECT_EQ(read.regions[0].handle, RpcDescriptor());
-  EXPECT_TRUE(server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true).ok);
+  for (int encoding : {0, 1, 2}) {  // Legacy inline, duplicate dictionary, mixed references.
+    service.rewrite = [encoding](pb::AcquireReadResponse* response) {
+      if (encoding == 0) return;
+      for (int i = 0; i < response->regions_size(); ++i) {
+        if (encoding == 2 && i == 0) continue;
+        auto* region = response->mutable_regions(i);
+        response->add_handles(region->handle());
+        region->clear_handle();
+        region->set_handle_index(response->handles_size());
+      }
+    };
+    const PeerReadRequest request{std::to_string(encoding), owner->Incarnation(), "g",
+                                  {"a", "a"}, {16}};
+    const auto read = server.peer->AcquireRead(request);
+    ASSERT_TRUE(read.status.ok);
+    ASSERT_EQ(read.regions.size(), 2u);
+    EXPECT_TRUE(service.compact_requested.load());
+    EXPECT_EQ(read.handles, (std::vector<std::string>{RpcDescriptor()}));
+    for (const auto& region : read.regions) EXPECT_EQ(region.handle_index, 0u);
+    EXPECT_TRUE(server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true).ok);
+  }
 }
 
 class L1PeerWireTest : public ::testing::TestWithParam<std::tuple<uint32_t, uint32_t, uint32_t>> {};
@@ -303,8 +310,9 @@ TEST_P(L1PeerWireTest, CompactAndLegacyRepliesPreserveRegionsAndTheSameGrant) {
   const auto decoded = server.peer->AcquireRead(read);
   ASSERT_TRUE(decoded.status.ok);
   ASSERT_EQ(decoded.regions.size(), slots * regions);
+  EXPECT_EQ(decoded.handles, handles);
   for (uint32_t i = 0; i < slots * regions; ++i) {
-    EXPECT_EQ(decoded.regions[i].handle, handles[(i / regions) % pools]);
+    EXPECT_EQ(decoded.regions[i].handle_index, (i / regions) % pools);
     EXPECT_EQ(decoded.regions[i].offset, layout.regions[i % regions].offset +
                                             (i / regions) * read.unit_bytes[i % regions]);
     EXPECT_EQ(decoded.regions[i].bytes, read.unit_bytes[i % regions]);

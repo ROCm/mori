@@ -453,11 +453,18 @@ bool IsFabricHandle(const std::string& handle) {
   return handle.size() >= kMagicBytes && handle.compare(0, kMagicBytes, kMagic, kMagicBytes) == 0;
 }
 
-bool ValidateFabricRange(const std::string& handle, uint64_t offset, uint64_t bytes,
-                         std::string* error) {
+bool GetFabricViewBytes(const std::string& handle, uint64_t* bytes, std::string* error) {
   Descriptor descriptor;
   if (!Decode(handle, &descriptor, error)) return false;
-  if (bytes == 0 || offset > descriptor.bytes || bytes > descriptor.bytes - offset) {
+  *bytes = descriptor.bytes;
+  return true;
+}
+
+bool ValidateFabricRange(const std::string& handle, uint64_t offset, uint64_t bytes,
+                         std::string* error) {
+  uint64_t view_bytes = 0;
+  if (!GetFabricViewBytes(handle, &view_bytes, error)) return false;
+  if (bytes == 0 || offset > view_bytes || bytes > view_bytes - offset) {
     *error = "native L1 pool range exceeds the exported FABRIC view";
     return false;
   }

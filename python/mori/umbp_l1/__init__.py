@@ -19,13 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Client-owned native HBM for UMBP L1 sharing, without offload tiers.
-
-This module does not load Torch, the native extension, or the IO allocator at
-import time. Allocation returns the final tensor used by the caller; there is
-no KV staging allocation. A caller must stop issuing GPU work before ``close``
-and retain its ``NativeL1Memory`` while the tensor or derived views are in use.
-"""
+"""Client-owned final KV HBM; Torch and native libraries load only when needed."""
 
 from __future__ import annotations
 
@@ -38,10 +32,8 @@ class L1MemoryInDoubtError(RuntimeError):
     """Memory could still be accessed; its owner must not free or reuse it."""
 
 
-# A lost Attach/Detach response must not let Python free exported HBM. Retain
-# the owner before the first RPC and remove it only after confirmed Detach.
-# This cannot protect against process exit or a killed owner: peers must be
-# drained/stopped before terminating an owner whose close did not succeed.
+# Retain before Attach until confirmed Detach. This cannot protect HBM after
+# process exit: drain peers before terminating an owner whose close failed.
 _LIVE_NATIVE_L1_MEMORY: dict[int, NativeL1Memory] = {}
 
 
@@ -66,17 +58,12 @@ def require_native_l1_support(module=None):
 
 
 class NativeL1Memory:
-    """One FABRIC allocation registered with one native L1 client.
+    """One zeroed FABRIC arena; allocation and Attach are each attempted once.
 
-    ``allocate`` returns zero-initialized byte storage. ``bind_layout`` adopts
-    that same storage; ``regions`` is a sequence of ``(offset, unit_bytes)``
-    pairs, with ``num_slots`` consecutive units in each region. The caller
-    owns layout semantics, local write fencing, and scheduling of slots.
-
-    Allocation and the Attach attempt are each allowed once. After any Attach
-    attempt, successful ``close`` through this same client is required before
-    releasing exported memory. There is deliberately no destructor that frees
-    it on an RPC failure, and no timeout-based permission to reuse it.
+    Retain this helper while any tensor/view is in use. The caller owns layout,
+    slot scheduling and write fencing, and must stop GPU work before close.
+    Any Attach attempt requires confirmed close before releasing memory;
+    neither timeout nor destruction permits freeing an uncertain allocation.
     """
 
     def __init__(self, client, pool_id: str, group: str):
@@ -138,17 +125,14 @@ class NativeL1Memory:
                 self._arena = torch.empty(
                     nbytes, dtype=torch.uint8, device=owner_device
                 )
-                # Keep the allocator if the original Tensor outlives this
-                # helper after Detach. Callers still retain the helper for
-                # the lifetime of any derived views, as required above.
+                # Keep the allocator if the original tensor outlives this owner.
                 self._arena._mori_native_l1_mem_pool = self._mem_pool
-                # hipMemset is unsupported on some FABRIC VMM runtimes. An
-                # in-place ATen kernel zeroes the final HBM without staging.
+                # Some FABRIC runtimes lack hipMemset; zero in place with ATen.
                 torch.bitwise_and(self._arena, 0, out=self._arena)
             return self._arena
 
     def bind_layout(self, buf, num_slots: int, regions) -> None:
-        """Export and adopt the original allocation, then bind its layout."""
+        """Bind (offset, unit_bytes) regions, each containing num_slots units."""
         with self._lock:
             if self._closing or self._closed:
                 raise RuntimeError("Native L1 memory is closing or closed")
@@ -180,8 +164,7 @@ class NativeL1Memory:
 
             import torch
 
-            # Subsequent owner writes are fenced by the caller's Commit
-            # protocol. The allocation itself must be initialized first.
+            # Initialize before Attach; the caller fences later writes via Commit.
             torch.cuda.synchronize(self._device)
             handle = self._module.export_fabric_memory(
                 buf.data_ptr(), buf.numel(), self._device.index
@@ -207,12 +190,10 @@ class NativeL1Memory:
                 ) from exc
 
     def close(self) -> None:
-        """Drain local work and require a confirmed, incarnation-fenced Detach.
+        """Require incarnation-fenced Detach after stopping writers/Commit reporter.
 
-        The caller must first stop local writers and its Commit reporter. A
-        failed close keeps the allocation alive and can be retried through
-        this same owner. Success is idempotent and preserves local Tensor and
-        allocator references; neither allocation nor binding can be repeated.
+        Failure retains memory and permits retry. Success is idempotent and
+        preserves tensor/allocator references, but never permits reallocation.
         """
         with self._lock:
             if self._closed:

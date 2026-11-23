@@ -196,7 +196,7 @@ struct PeerReadRequest {
   std::vector<uint64_t> unit_bytes;
 };
 struct PeerReadRegion {
-  std::string handle;
+  uint32_t handle_index = 0;  // Zero-based index into PeerReadResult::handles.
   uint64_t offset = 0;
   uint64_t bytes = 0;
 };
@@ -205,6 +205,8 @@ struct PeerReadResult {
   std::string incarnation;
   uint32_t available = 0;
   std::vector<PeerReadRegion> regions;
+  // Own the descriptors: a returned/replayed result can outlive its read grant.
+  std::vector<std::string> handles;
 };
 class PeerApi {
  public:

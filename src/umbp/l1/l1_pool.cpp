@@ -939,10 +939,6 @@ FetchResult PoolManager::FetchLocal(const std::string& pool_id,
     return result;
   }
   const bool into = !options.dst_slots.empty();
-  if (into && options.dst_slots.size() < keys.size()) {
-    result.status = Status::Error("fetch into pool " + pool_id + ": fewer slots than keys");
-    return result;
-  }
   // Retain the allocation and its layout through the settle wait as well as
   // the unlocked copy, including calls with only local hits or no copy steps.
   ++pool->busy;
@@ -1009,18 +1005,7 @@ FetchResult PoolManager::FetchLocal(const std::string& pool_id,
       result.slots.push_back(local->second);
       continue;
     }
-    const Holder* source = nullptr;
-    auto holders = group.holders.find(key);
-    if (holders != group.holders.end()) {
-      for (const Holder& h : holders->second) {
-        // Not this pool, and not a slot its owner may still be writing.
-        if (h.pool != pool && !h.pool->quarantined && h.pool->slots[h.slot].writers == 0 &&
-            Readable(*h.pool, h.pool->slots[h.slot])) {
-          source = &h;
-          break;
-        }
-      }
-    }
+    const Holder* source = source_of(key);
     if (source == nullptr) break;
     uint32_t dst = 0;
     if (!TakeFreeLocked(pool, &dst, &result.evicted_keys, /*settled_only=*/true)) break;
@@ -1320,13 +1305,17 @@ PeerReadResult PoolManager::AcquireRead(const PeerReadRequest& request) {
   }
   // Lookup and pin occur under the same mutex; Probe was only a hint. Pool
   // replacement/rebinding waits on busy, so this grant needs no cached locator.
+  std::unordered_map<std::string, uint32_t> handles;
+  result.regions.reserve(request.keys.size() * request.unit_bytes.size());
   for (const std::string& key : request.keys) {
     const Holder* source = PeerSourceLocked(request.group, key);
     if (source == nullptr) break;
     const Pool& p = *source->pool;
+    const auto [handle, added] = handles.try_emplace(p.external_handle, result.handles.size());
+    if (added) result.handles.push_back(p.external_handle);
     for (const Region& r : p.layout.regions) {
       result.regions.push_back(PeerReadRegion{
-          p.external_handle, p.external_offset + r.offset + uint64_t{source->slot} * r.unit_bytes,
+          handle->second, p.external_offset + r.offset + uint64_t{source->slot} * r.unit_bytes,
           r.unit_bytes});
     }
     ++source->pool->slots[source->slot].pins;
@@ -1472,7 +1461,11 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   if (valid) {
     // Descriptor imports are reused within this call only. Mapping a descriptor
     // creates an address view, not a payload allocation/copy or a staging pool.
-    std::unordered_map<std::string, void*> bases;
+    struct View {
+      void* base = nullptr;
+      uint64_t bytes = 0;
+    };
+    std::vector<View> views(read.handles.size());
     // Build runs per layout region before the backend checks and plans copies.
     // Every original range is still validated; never merge descriptor views.
     for (size_t r = 0; valid && r < units.size(); ++r) {
@@ -1480,32 +1473,40 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       uint32_t previous_dst = 0;
       for (size_t k = 0; k < read.available; ++k) {
         const PeerReadRegion& region = read.regions[k * units.size() + r];
-        if (region.bytes != units[r] ||
-            !ValidateFabricRange(region.handle, region.offset, region.bytes, &error)) {
+        if (region.handle_index >= views.size() || region.bytes != units[r]) {
           valid = false;
           break;
         }
-        auto entry = bases.find(region.handle);
-        if (entry == bases.end()) {
-          void* base = nullptr;
+        View& view = views[region.handle_index];
+        const std::string& handle = read.handles[region.handle_index];
+        // Decode once per descriptor for range checks, not once per region.
+        if (view.bytes == 0 && !GetFabricViewBytes(handle, &view.bytes, &error)) {
+          valid = false;
+          break;
+        }
+        if (region.offset > view.bytes || region.bytes > view.bytes - region.offset) {
+          error = "native L1 pool range exceeds the exported FABRIC view";
+          valid = false;
+          break;
+        }
+        if (view.base == nullptr) {
           void* mapped = nullptr;
-          if (!api_->Import(pool->device, region.handle, 0, &base, &mapped, &error)) {
+          if (!api_->Import(pool->device, handle, 0, &view.base, &mapped, &error)) {
             valid = false;
             break;
           }
           mappings.push_back(mapped);
-          entry = bases.emplace(region.handle, base).first;
         }
         const uint32_t dst = options.dst_slots[leading + k];
         const Region& layout = pool->layout.regions[r];
-        if (previous && previous->handle == region.handle &&
+        if (previous && previous->handle_index == region.handle_index &&
             previous->offset + previous->bytes == region.offset &&
             uint64_t{previous_dst} + 1 == dst) {
           fragments.back().bytes += region.bytes;
         } else {
           fragments.push_back(MemoryApi::Fragment{
               static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
-              static_cast<const char*>(entry->second) + region.offset, region.bytes, pool->device});
+              static_cast<const char*>(view.base) + region.offset, region.bytes, pool->device});
         }
         previous = &region;
         previous_dst = dst;
