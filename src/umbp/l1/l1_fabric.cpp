@@ -357,7 +357,8 @@ class FabricMemoryApi final : public MemoryApi {
     // These are host-side address/length metadata, passed as kernel arguments.
     // No allocation here holds any KV payload; the only payload addresses are
     // the imported source allocation and the caller's final destination slots.
-    auto plan = fabric::PlanCopy(std::move(segments), 32, true, true);
+    // Match the MORI-IO multi-segment copy budget; 32 blocks underfill 455 GPUs.
+    auto plan = fabric::PlanCopy(std::move(segments), 1536, true, true);
     if (!plan.error.empty()) return Failed(plan.error);
     bool submitted = false;
     for (auto& dispatch : plan.dispatches) {

@@ -117,3 +117,20 @@ normal Detach before services stopped.
 An earlier 2026-11-22 run also covered slot reuse and a ten-minute bidirectional
 soak. These are bounded workload and coordinated-shutdown results, not full
 model quality, saturated throughput, crash recovery or other topologies.
+
+## Copy bandwidth tuning
+
+The multi-region copy budget now matches MORI-IO's 1536 blocks; the single-region
+path is unchanged. On g13-12 ↔ g13-10, three uninstrumented AB/BA/AB rounds using
+the V4.1 16-region layout (128 keys / 24,412,160 bytes) improved all 60 paired
+large-request Fetch windows: dense +6–22%, fragmented +13–42%. Each GPU had one
+outstanding Fetch; these are repeated-address payload rates, not wire bandwidth
+or model throughput. Small requests had mixed changes, including regressions;
+longer windows did not show a consistent backend slowdown. No general
+no-regression claim is made.
+
+The tuning passed 57 C++ tests, the copy planner, KEEP_COPIES peer coverage and
+180 GPU correctness cases, including all 32 directed paths, the ATOM adapter,
+unaligned chunk tails and slot reuse. The model validation above predates this
+budget-only change. Profiling after tuning puts AcquireRead metadata/RPC at
+47–57% of large-request handler time; repeated descriptors are the next target.
