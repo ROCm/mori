@@ -616,6 +616,9 @@ __device__ inline static void waitStoresComplete() {
 // store of its flags, which has already written back L2 and waited for this wave's stores, so
 // for PSD only the wait is left: a second write-back costs a round trip per post and orders
 // nothing more. The other providers' WQE stores are plain, so they keep the fence.
+// This relies on every PSD post cco issues being a WRITE/inline/atomic WQE, whose flags store is
+// system scope (ionic_device_primitives.hpp). IonicPostSend's flags store is only agent scope: a
+// cco PSD SEND would need the full fence back.
 template <core::ProviderType PrvdType>
 __device__ inline static void fenceAfterWqes() {
   if constexpr (PrvdType == core::ProviderType::PSD) {

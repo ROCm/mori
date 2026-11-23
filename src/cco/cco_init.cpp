@@ -827,7 +827,17 @@ int ccoCommDestroy(ccoComm* comm) {
 /*                              ccoMemAlloc                                */
 /* ========================================================================== */
 
-int ccoWindowUncached() { return CcoWindowAllocType() != hipMemAllocationTypePinned ? 1 : 0; }
+// ROCm before 7.14 accepts hipMemAllocationTypeUncached for a VMM allocation but still places it in
+// the coarse-grained (cached) pool, so the request alone does not make the window uncached.
+static bool CcoRuntimeHonoursUncachedVmm() {
+  int version = 0;
+  return hipRuntimeGetVersion(&version) == hipSuccess && version >= 71400000;
+}
+
+int ccoWindowUncached() {
+  return CcoWindowAllocType() != hipMemAllocationTypePinned && CcoRuntimeHonoursUncachedVmm() ? 1
+                                                                                              : 0;
+}
 
 int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   if (outPtr == nullptr) {

@@ -309,10 +309,11 @@ MORI_JIT_API int mori_jit_plan_launch(void* plan, const void* argBuf, int argSiz
 
 // Launch several plans that share one argument buffer, in order, with a single
 // crossing of this ABI. The EP internode sequence is N kernels (2 for dispatch,
-// 4 for combine) over one EpInterNodeCcoArgs -- all eight passes publish the same
-// args schema -- so the caller fills the struct once and hands the whole run
-// here. That collapses N ctypes crossings and N Python arg-marshals into one; the
-// N hipModuleLaunchKernel calls still happen, one per plan, on the same stream.
+// 3 for combine, or 2 when CombineSync is skipped) over one EpInterNodeCcoArgs --
+// all seven passes publish the same args schema -- so the caller fills the struct
+// once and hands the whole run here. That collapses N ctypes crossings and N
+// Python arg-marshals into one; the N hipModuleLaunchKernel calls still happen,
+// one per plan, on the same stream.
 // On failure the plan index is folded into the error so a fault is attributable.
 MORI_JIT_API int mori_jit_plan_launch_multi(void* const* plans, int nplans, const void* argBuf,
                                             int argSize, void* stream) {

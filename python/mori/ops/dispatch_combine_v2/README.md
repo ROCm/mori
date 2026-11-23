@@ -180,7 +180,7 @@ the **hip** backend implements it.
 |---|---|---|
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
 | `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch. `low_latency` `True` / `False` sets it to `"v2_ll"` / `"v2"` ([Low latency](#low-latency)) |
-| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against the `max_num_inp_token_across_ranks` the dispatch is given (its combine reuses it): `<=` runs `v2_ll`; `>`, or a dispatch without it, runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
+| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against the `max_num_inp_token_across_ranks` the dispatch is given (its combine reuses it): `<=` runs `v2_ll`; `>`, or a dispatch without it, runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 The crossover is one number for every shape: for fp8 dispatch, hidden 3584, top-16 at EP32 on MI355X, `v2_ll` stays faster above 512 tokens (dispatch + combine at 1024 tokens: about 880 µs against 1024 µs for `v2`), so a caller of such a shape names `v2_ll` or raises the crossover |
 | `num_qp_per_pe` | `8` | QPs **allocated** per connected peer, fixed for the DevComm's lifetime; at most 64. Unused by intranode kernels |
 | `active_qps` | `None` | Pin the **active** count -- how many of the allocated QPs a kernel sends on -- for every bucket and both phases. `None`: the tuning table's count, else `min(2, num_qp_per_pe)` |
 | `active_qp_counts` | `None` | Extra counts, e.g. `(1, 2, 4, 8)`, compiled for every bucket geometry so `op.set_active_qps()` can switch to them |
@@ -441,6 +441,18 @@ tools/run_internode_test.sh --rank 0 --master-addr <ip> --ifname <nic> \
 Set `MORI_RDMA_TC` / `MORI_RDMA_SL` to match the fabric's RoCE class; unset, every
 transfer goes out on SL 1 / DSCP 0. `tools/env_setup.sh` derives both from
 `ROCE_DSCP`/`ROCE_PRIO`.
+
+`MORI_EP_DISABLE_RDMA_ATOMICS` (set, and not `0`/`false`/`off`/`no`) builds the
+`v2` and `v2_ll` plans without RDMA atomics: the chunk flags, the flags of a
+`v2_ll` chunk's later pieces (one per drained QP) and the combine barrier marks
+become RDMA WRITEs. Use it where RDMA atomics into GPU memory fail or are slow.
+Every rank must set it alike; when torch.distributed's default group is exactly
+the op's ranks, construction checks it, and the drained QP count, across ranks.
+
+A combine whose input is `combine_in_view()` and that folds no weights skips the
+CombineSync pass: the input already is the staging area. `--combine-zero-copy`
+feeds the test's and the bench's combines through `combine_in_view()`; the test
+alternates rounds with and without weights, so both launch paths run.
 
 ## Design notes (intranode kernels)
 

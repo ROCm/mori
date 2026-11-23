@@ -57,6 +57,11 @@ _U64 = 8
 _F32 = 4
 
 
+# A dispatch chunk is one warp's tokens: warpSize, 64, or 32 on gfx125x. Per-chunk regions count
+# chunks with the smaller, so they fit either wave size.
+CHUNK_TOKENS_MIN = 32
+
+
 def internode_regions(cfg):
     """``[(name, nbytes)]`` for :class:`SymmArena`, in v1's allocation order.
 
@@ -150,7 +155,8 @@ def internode_regions(cfg):
             "inter_node_chunk_flag",
             n_nodes
             * max(
-                max_tokens_to_send_per_rank, 4 * -(-max_tokens_to_send_per_rank // 64)
+                max_tokens_to_send_per_rank,
+                4 * -(-max_tokens_to_send_per_rank // CHUNK_TOKENS_MIN),
             )
             * _U64,
         ),

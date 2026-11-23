@@ -98,7 +98,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // Only the ordinary Combine pass reads it; keeping it false elsewhere lets the
   // other passes share one compiled module across load-first and plain buckets.
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
-  cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics;
+  // Only the passes with cross-node traffic read it; the local ones (copystaging, combinesync,
+  // combineall) then share one module between atomic and atomic-free ops.
+  cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics && DescriptorFor(kind).takesComm;
   // Dispatch passes only, so the other passes keep one module with and without it.
   cfg.kernelCfg.moeSort = request.moeSort && (kind == EpInterNodeKernel::Dispatch ||
                                               kind == EpInterNodeKernel::DispatchLL);

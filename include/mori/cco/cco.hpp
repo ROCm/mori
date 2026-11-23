@@ -958,8 +958,9 @@ int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
 int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
-// 1 if ccoMemAlloc / ccoWindowRegister memory is allocated uncached (the default; see
-// CCO_UNCACHED_WINDOW), so device stores to it bypass L2; 0 if it falls back to pinned memory.
+// 1 if ccoMemAlloc / ccoWindowRegister memory is uncached (the default; see CCO_UNCACHED_WINDOW),
+// so device stores to it bypass L2; 0 if it falls back to pinned memory, or if the HIP runtime
+// (before ROCm 7.14) places uncached VMM allocations in the cached pool regardless.
 int ccoWindowUncached();
 int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a

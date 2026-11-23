@@ -29,9 +29,10 @@
 //   2. EP internode v1 dispatch + combine, ported from
 //      src/ops/dispatch_combine/internode_v1.cpp.
 //
-// Part 2 is mechanical: the algorithm, the block specialisation, the chunk-flag
-// protocol and the proxy-PE topology are unchanged from v1; only the transport
-// calls and the threaded-down `const ccoDevComm& comm` differ.
+// Part 2 started as a mechanical port and has since diverged from v1: the
+// atomic-free signalling (chunk flags and per-QP pieces written by RDMA WRITE),
+// the per-warp receive, the parallel relays and barrier posts, and the batched
+// relay gather are v2-only. The proxy-PE topology is still v1's.
 //
 // mori/shmem is deliberately not included. It reaches its endpoints through a
 // device global that the host fills on every hipModuleLoad, and a JIT module
@@ -748,8 +749,9 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
   }
 }
 
-// v2_ll intra-node blocks wait for this rank's RDMA posts, which their XGMI stores would slow;
-// bounded (50 us), so a grid that is not fully resident cannot deadlock on it.
+// Atomic-free v2_ll intra-node blocks wait for this rank's RDMA posts, which their XGMI stores
+// would slow; bounded (50 us at a 100 MHz wall clock), so a grid that is not fully resident cannot
+// deadlock on it.
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void WaitLLPostsIssued(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
@@ -1429,8 +1431,9 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
 
   // Senders take slots with atomics on the destination's dispTokOffset, so once every local PE
   // is done a PE's own counter is its received total. A warp's slot atomics have returned and
-  // its forwarded stores complete here, before its block's one arrival; completed means visible
-  // at the peer because the window is uncached.
+  // its forwarded stores complete here, before its block's one arrival. Completed means visible
+  // at the peer on an uncached window; on a cached one (CCO_UNCACHED_WINDOW=0, or a runtime that
+  // ignores the uncached type) this relies on drained XGMI peer stores being visible, as main did.
   EpInterNodeWaitStores();
   __syncthreads();
   // moeSort: the received rows in the last block, -1 in the others, and the finalize's tables.
@@ -1599,7 +1602,8 @@ __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
       internode::DispatchInterNodeLLRecv<kConfig, T>(args);
     }
   } else {
-    internode::WaitLLPostsIssued<kConfig, T>(args);
+    // Measured only atomic-free on AINIC; the atomic path keeps main's order.
+    if constexpr (kConfig.noRdmaAtomics) internode::WaitLLPostsIssued<kConfig, T>(args);
     internode::DispatchIntraNode<kConfig, T>(args);
     if constexpr (kConfig.moeSort) {
       if (args.sortZeroRowBytes > 0) internode::MoeSortZeroRows<kConfig, T>(args);
@@ -1646,7 +1650,8 @@ namespace combine_impl {
 // case (1, 2, 4, 6, 8, 10), core::WarpAccum issues AccumNum loads before
 // accumulating, and wider loads put more bytes in flight. Other topk (e.g. 9,
 // 16) go through WarpAccumDynamic, which loads 16-byte vectors one source at a
-// time. The ordinary path has a separate 4-byte load-first policy below.
+// time, in the intra-node gather; the relays use CombineGatherRelay below for
+// every topk. The ordinary path has a separate 4-byte load-first policy below.
 //
 // Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
@@ -2139,9 +2144,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       int startTokenIdx = k * warpSize;
       uint64_t thisChunkTokenNum = chunkFlag[node * maxChunkNum + k];
       thisChunkTokenNum -= (thisChunkTokenNum > 0) ? 1 : 0;
-      // Padding (past the chunk's tokens, or the flag already cleared) neither gathers nor
-      // counts: every real item reads the flag before its own increment, so all of them
-      // compute the same completion target.
+      // Padding (past the chunk's tokens) neither gathers nor counts: every real item reads the
+      // flag before its own increment, so all of them compute the same completion target. The
+      // flags are cleared only after every item has read them (end of this pass).
       if ((tokenId - startTokenIdx) >= thisChunkTokenNum) continue;
       int inTokenPartId = i % warpsPerToken;
       size_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
