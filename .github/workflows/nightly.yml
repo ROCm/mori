@@ -508,7 +508,9 @@ jobs:
     env:
       CT: ${{ matrix.ct }}
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
-      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      # Multiplexed for the same reason as ci.yml's internode-env: node2's sshd can
+      # deny a new connection, so only the first one, retried below, is checked.
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=/tmp/mori-ci-ssh-%C -o ControlPersist=30m
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
@@ -575,6 +577,15 @@ jobs:
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Open SSH connection to node2
+        run: |
+          for i in 1 2 3 4 5; do
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST true && exit 0
+            echo "ssh to node2 failed (attempt $i/5), retrying in 10s"
+            sleep 10
+          done
+          exit 1
 
       - name: Start container on node2
         run: |
@@ -834,6 +845,65 @@ jobs:
               --cmd test --kernel-type async_ll \
               --quant-type none --dtype bf16 --max-tokens $TOKENS
             wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      # The EPv2 (cco) internode path from the wheel, with ci_cco.yml's
+      # cco-internode-test cases. That job runs only when a change touches EPv2;
+      # this catches what reaches it through shmem, RDMA or cco.
+      - name: MORI-EP internode CCO kernel test
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          ENTRY=tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
+          PORT=29240
+          for CASE in "v2 128" "v2 4096" "v2_ll 128" "auto 128" \
+                      "v2 4096 -- --active-qp-counts 1,2,4,8" \
+                      "v2_ll 128 -- --active-qp-counts 1,2,4,8"; do
+            set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
+            echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS $EXTRA port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --entry $ENTRY
+              --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16
+              --max-tokens $TOKENS --num-qp 8 $EXTRA
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            NODE2_PID=$!
+            $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --entry $ENTRY \
+              --cmd test --kernel-type $KERNEL --quant-type none --dtype bf16 \
+              --max-tokens $TOKENS --num-qp 8 $EXTRA
+            # With a pid: bare `wait` returns 0 whatever node2 did.
+            wait "$NODE2_PID"
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-EP internode CCO kernel bench and stress
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          ENTRY=tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
+          PORT=29260
+          for ARGS in "bench --kernel-type v2 --max-tokens 128" \
+                      "bench --kernel-type v2 --max-tokens 4096" \
+                      "stress --rounds 2000 --kernel-type auto --max-tokens 4096"; do
+            echo "=== cco $ARGS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --entry $ENTRY
+              --cmd $ARGS --dtype bf16 --num-qp 8
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            NODE2_PID=$!
+            $CT exec -e MORI_INTERNODE_TIMEOUT=900 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --entry $ENTRY \
+              --cmd $ARGS --dtype bf16 --num-qp 8
+            wait "$NODE2_PID"
             sleep 1
             PORT=$((PORT + 1))
           done
