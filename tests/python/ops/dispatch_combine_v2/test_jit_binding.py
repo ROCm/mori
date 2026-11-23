@@ -1167,6 +1167,32 @@ def test_local_plans_refuse_what_they_cannot_hold(name, kw):
         _local(name).describe(**dict(_LOCAL_KW, **kw))
 
 
+def test_the_hip_gate_takes_the_local_limits_from_the_plans():
+    # The gate keeps no copy of EpLocalCfgIsValid: it asks the plans, and
+    # reports their reason.
+    from types import SimpleNamespace
+
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    refusal = EpDispatchCombineOpHip._local_refusal
+    ok = dict(
+        world_size=2,
+        max_num_inp_token_per_rank=64,
+        num_experts_per_rank=4,
+        num_experts_per_token=4,
+        hidden_dim=1024,
+        dispatch_dtype=torch.bfloat16,
+    )
+    assert refusal(SimpleNamespace(**ok), *cb.LOCAL_PLANS) is None
+    for kw in (
+        dict(num_experts_per_token=65),
+        dict(num_experts_per_rank=8193),
+        dict(hidden_dim=1023),
+    ):
+        why = refusal(SimpleNamespace(**dict(ok, **kw)), *cb.LOCAL_PLANS)
+        assert why and "inconsistent config" in why, (kw, why)
+
+
 def _count(idx, rank, epr, rows):
     ids = idx[:rows].flatten().long() - rank * epr
     ids = ids[(ids >= 0) & (ids < epr)]

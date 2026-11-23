@@ -39,7 +39,11 @@ import torch
 import torch.distributed as dist
 
 import mori.cco as cco
-from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2 import (
+    EpDispatchCombineConfig,
+    EpDispatchCombineOp,
+    EpDispatchRoutingHandle,
+)
 
 HIDDEN = int(os.environ.get("HIDDEN", 2048))
 TOPK = int(os.environ.get("TOPK", 4))
@@ -182,6 +186,20 @@ def run_backend(name, comm, rank, world, d):
             checks["replay_refuses_another_token_count"] = False
         except ValueError:
             checks["replay_refuses_another_token_count"] = True
+        # A handle rebuilt from tensors() without its token count is refused; the
+        # replays below use one rebuilt with the count.
+        try:
+            op.dispatch(
+                d["x_c"],
+                d["w_c"],
+                None,
+                d["idx_a"],
+                routing=EpDispatchRoutingHandle.from_tensors(ha.tensors()),
+            )
+            checks["replay_refuses_countless_handle"] = False
+        except ValueError:
+            checks["replay_refuses_countless_handle"] = True
+        ha = EpDispatchRoutingHandle.from_tensors(ha.tensors(), M)
         # Replay the OLDER handle with a new payload: same routing, new tokens.
         recv_c, n_c, _ = dispatch(d["x_c"], d["w_c"], d["idx_a"], routing=ha)
         checks["older_handle_replay_count"] = n_c == n_a

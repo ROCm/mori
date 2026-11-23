@@ -98,7 +98,8 @@ _skip_fp4 = pytest.mark.skipif(not _IS_GFX950, reason="fp4 is gfx950-only")
 def _required_tags(env):
     """The OP lines a case must print, so a check its knobs turn on cannot drop out
     silently (several are gated on the op's capabilities)."""
-    hip = env.get("MORI_V2_KERNEL_BACKEND") == "hip"
+    default = "hip" if _IS_GFX125X else "flydsl"
+    hip = env.get("MORI_V2_KERNEL_BACKEND", default) == "hip"
     tags = set()
     if not (hip and _IS_GFX125X):  # gfx125x HIP has no local_expert_count
         tags.add("OP-LEC")

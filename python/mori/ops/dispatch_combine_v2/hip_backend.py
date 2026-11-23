@@ -1318,16 +1318,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             elif cfg.is_scatter:
                 bad.append("enable_std_moe with combine_mode='scatter' (gather only)")
-            elif not self._local_shape_ok(cfg, rows=True):
-                bad.append(
-                    "enable_std_moe with top-k > 64, > 8192 experts a rank or a hidden "
-                    "that is not whole 16 B rows (the convert kernels' limits)"
-                )
             elif cb.local_plan("ep_convert_dispatch") is None:
                 bad.append(
                     "enable_std_moe (libmori_ops_v2.so predates the StdMoE kernels; "
                     "rebuild it)"
                 )
+            elif why := self._local_refusal(
+                cfg, "ep_convert_dispatch", "ep_convert_combine"
+            ):
+                bad.append(f"enable_std_moe: {why}")
         # The kernel walks the source scale rows with the PADDED dword stride, so
         # a caller row that is not itself a whole number of dwords would be read
         # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg
@@ -2232,19 +2231,36 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     @staticmethod
-    def _local_shape_ok(cfg, rows=False):
-        """EpLocalCfgIsValid's limits on gfx942/gfx950 (wave64): one lane per top-k
-        slot, the count's LDS histogram of 8192 experts, and for the converts bf16
-        rows in whole 16 B."""
-        ok = cfg.num_experts_per_token <= 64 and cfg.num_experts_per_rank <= 8192
-        return ok and (not rows or cfg.hidden_dim % 8 == 0)
+    def _local_refusal(cfg, *names):
+        """Why the local plans `names` cannot be built for cfg, or None. Asks the
+        plans themselves (describe() runs EpLocalCfgIsValid and compiles nothing),
+        so the limits live in C++ only. The shape is what _local_kernels builds;
+        the grid and recv size do not bear on validity here."""
+        shape = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=0,
+            block_num=1,
+            warp_per_block=8,
+        )
+        for name in names:
+            rows = {}
+            if name != "ep_local_expert_count":
+                rows = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.dispatch_dtype)
+            try:
+                cb.local_plan(name).describe(**shape, **rows)
+            except RuntimeError as e:
+                return str(e)
+        return None
 
     def _local_kernels(self, cfg):
         """local_expert_count and the StdMoE converts: gfx942/gfx950 intranode."""
         if self._is1250 or cb.local_plan("ep_local_expert_count") is None:
             return {}
         # Past the local kernels' limits the op serves dispatch and combine only.
-        if not self._local_shape_ok(cfg):
+        if self._local_refusal(cfg, "ep_local_expert_count"):
             return {}
         self._alloc_local_buffers(cfg)
         arena = self.arena

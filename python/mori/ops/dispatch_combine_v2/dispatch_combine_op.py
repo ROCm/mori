@@ -887,7 +887,7 @@ class EpDispatchRoutingHandle:
         inter_node_disp_send_map,
         total_recv_token_num,
         disp_tok_id_to_src_tok_id_local=None,
-        cur_rank_num_token=0,
+        cur_rank_num_token=None,
         *,
         reverse_src_view=None,
         reverse_encode=None,
@@ -899,7 +899,9 @@ class EpDispatchRoutingHandle:
         self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
-        self.cur_rank_num_token = cur_rank_num_token
+        # None = not recorded: combine then picks as for 0, and replay refuses.
+        self.count_known = cur_rank_num_token is not None
+        self.cur_rank_num_token = cur_rank_num_token or 0
         self.max_num_inp_token_across_ranks = max_num_inp_token_across_ranks
         # Either an already-materialized reverse map (from_tensors round-trip) or
         # a live arena view to clone on first access (dispatch()).
@@ -928,8 +930,14 @@ class EpDispatchRoutingHandle:
 
     @classmethod
     def from_tensors(
-        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=_UNKNOWN_PEAK
+        cls,
+        tensors,
+        cur_rank_num_token=None,
+        max_num_inp_token_across_ranks=_UNKNOWN_PEAK,
     ):
+        """Rebuild a handle from tensors(). Pass cur_rank_num_token (the token count
+        of the dispatch that made the tensors) to replay it: replay walks that many
+        rows of the dest map, so it refuses a handle without one."""
         return cls(
             *tensors,
             cur_rank_num_token=cur_rank_num_token,
@@ -1487,10 +1495,18 @@ class EpDispatchCombineOp:
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
         # Replay reads n * topk entries of the handle's dest map, and only the handle's
-        # own tokens were written. 0 = not recorded (from_tensors without a count).
-        ct = 0 if routing is None else routing.cur_rank_num_token
-        if ct and n != ct:
-            raise ValueError(f"routing replay needs the handle's {ct} tokens, got {n}")
+        # own tokens were written.
+        if routing is not None:
+            if not getattr(routing, "count_known", True):
+                raise ValueError(
+                    "routing replay needs the handle's token count: rebuild it with "
+                    "EpDispatchRoutingHandle.from_tensors(..., cur_rank_num_token=n)"
+                )
+            ct = routing.cur_rank_num_token
+            if n != ct:
+                raise ValueError(
+                    f"routing replay needs the handle's {ct} tokens, got {n}"
+                )
         peak = max_num_inp_token_across_ranks
         if peak is not None and not n <= peak <= cap:
             raise ValueError(
