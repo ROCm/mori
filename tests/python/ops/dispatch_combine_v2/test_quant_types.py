@@ -253,7 +253,10 @@ def test_scatter_rows_serve_every_format(monkeypatch, name, model, scatter):
     )
     if name != "none" or scatter:
         for edge, block, warp in tc._SCATTER_COMBINE_TABLE[model][8, 7168, 8, None]:
-            assert tc.pick_bucket(got["schedule"], edge or 1 << 20)[3:5] == (block, warp)
+            assert tc.pick_bucket(got["schedule"], edge or 1 << 20)[3:5] == (
+                block,
+                warp,
+            )
     else:  # the gather keeps its own rows
         scat = tc.lookup(8, 7168, 8, dtype="bf16", experts_per_rank=32, scatter=True)
         assert got["schedule"] != scat["schedule"]

@@ -468,7 +468,10 @@ def _run(d, comm):
                 w_k = wts[:ct].float().cpu()
                 if cap is not None:
                     keep = torch.tensor(
-                        [[p >= 0 and p in reach[t] for p in pes[t].tolist()] for t in range(ct)],
+                        [
+                            [p >= 0 and p in reach[t] for p in pes[t].tolist()]
+                            for t in range(ct)
+                        ],
                         dtype=torch.bool,
                     ).view(ct, K)
                     w_k = torch.where(keep, w_k, torch.zeros_like(w_k))
