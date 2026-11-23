@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 // CPU-only tests of the production peer state machine. The injected backend
 // uses host bytes; descriptor parsing, slot ownership and peer grants are real.
@@ -64,8 +85,7 @@ class TestMemory final : public MemoryApi {
     last_fragments = fragments;
     if (on_copy) on_copy();
     if (!outcome.ok) return outcome;
-    for (const auto& fragment : fragments)
-      std::memcpy(fragment.dst, fragment.src, fragment.bytes);
+    for (const auto& fragment : fragments) std::memcpy(fragment.dst, fragment.src, fragment.bytes);
     return outcome;
   }
   std::atomic<int> imports{0}, unimports{0}, copies{0};
@@ -73,6 +93,7 @@ class TestMemory final : public MemoryApi {
   CopyOutcome outcome{true, true, {}};
   std::vector<Fragment> last_fragments;
   std::function<void()> on_copy;
+
  private:
   std::shared_ptr<Directory> directory_;
 };
@@ -130,7 +151,8 @@ class L1PeerTest : public ::testing::Test {
   void Fill(const std::string& id, uint32_t slot, unsigned char value) {
     auto& bytes = directory->at(handles[id]);
     for (const auto& region : layout.regions)
-      std::memset(bytes.data() + region.offset + slot * region.unit_bytes, value, region.unit_bytes);
+      std::memset(bytes.data() + region.offset + slot * region.unit_bytes, value,
+                  region.unit_bytes);
   }
   bool Equals(const std::string& id, uint32_t slot, unsigned char value) {
     const auto& bytes = directory->at(handles[id]);
@@ -219,8 +241,8 @@ TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
     std::fill(keys.begin(), keys.end(), keys.front());
     std::fill(src_slots.begin(), src_slots.end(), src_slots.front());
   }
-  const bool malformed = mode == "WrongUnit" || mode == "OutOfRange" ||
-                         mode == "HandleIndex" || mode == "Descriptor";
+  const bool malformed =
+      mode == "WrongUnit" || mode == "OutOfRange" || mode == "HandleIndex" || mode == "Descriptor";
   if (malformed) {
     peer->on_acquire = [&](PeerReadResult& read) {
       if (mode == "WrongUnit") ++read.regions.back().bytes;
@@ -256,16 +278,92 @@ TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
   EXPECT_EQ(peer->releases, 1);
   EXPECT_EQ(dest_api->imports.load() - dest_api->unimports.load(), 1);  // Own arena remains mapped.
   for (size_t k = 0; k < keys.size(); ++k) {
-    EXPECT_TRUE(source->Apply(owners[k], {{OpKind::kPublish, src_slots[k], keys[k] + "-changed"}}).ok);
+    EXPECT_TRUE(
+        source->Apply(owners[k], {{OpKind::kPublish, src_slots[k], keys[k] + "-changed"}}).ok);
     EXPECT_TRUE(dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[k], ""}}).ok);
   }
 }
 INSTANTIATE_TEST_SUITE_P(Layouts, L1PeerRunTest,
-                        ::testing::Values("Contiguous", "Unaligned", "ReversedDestination",
-                                          "GappedDestination", "ReversedSource", "DifferentHandle",
-                                          "RepeatedSource",
-                                          "WrongUnit", "OutOfRange", "HandleIndex", "Descriptor"),
-                        [](const auto& info) { return info.param; });
+                         ::testing::Values("Contiguous", "Unaligned", "ReversedDestination",
+                                           "GappedDestination", "ReversedSource", "DifferentHandle",
+                                           "RepeatedSource", "WrongUnit", "OutOfRange",
+                                           "HandleIndex", "Descriptor"),
+                         [](const auto& info) { return info.param; });
+
+TEST_F(L1PeerTest, PrefixLongerThanOneReadIsFetchedWindowByWindow) {
+  // 300 keys: two whole 128-key reads and a third of 44, each its own grant.
+  constexpr uint32_t n = 300;
+  const Layout layout{n, {{0, 16}, {uint64_t{n} * 16, 4}}};
+  const uint64_t bytes = uint64_t{n} * 20;
+  auto attach = [&](PoolManager& manager, const std::string& id, unsigned char token) {
+    handles[id] = Descriptor(token, bytes);
+    (*directory)[handles[id]] = std::vector<unsigned char>(bytes, 0xDA);
+    ASSERT_TRUE(manager.Attach(id, "long", token, bytes, {handles[id], 0, "hip_fabric"}).status.ok);
+    ASSERT_TRUE(manager.BindLayout(id, layout).ok);
+    ASSERT_EQ(manager.Open(id).num_slots, n);
+  };
+  attach(*source, "lsrc", 3);
+  attach(*dest, "ldst", 4);
+  std::vector<std::string> keys;
+  for (uint32_t i = 0; i < n; ++i) keys.push_back("k" + std::to_string(i));
+  auto value = [](uint32_t i) { return static_cast<unsigned char>(1 + i % 200); };
+  auto src_slots = source->Allocate("lsrc", n).slots;
+  ASSERT_EQ(src_slots.size(), n);
+  auto& src_bytes = directory->at(handles["lsrc"]);
+  for (uint32_t i = 0; i < n; ++i) {
+    std::memset(src_bytes.data() + src_slots[i] * 16, value(i), 16);
+    std::memset(src_bytes.data() + n * 16 + src_slots[i] * 4, value(i), 4);
+    ASSERT_TRUE(source->Apply("lsrc", {{OpKind::kPublish, src_slots[i], keys[i]}}).ok);
+  }
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(dest->Fetch("ldst", keys, probe).available, n);
+  FetchOptions options;
+  options.dst_slots = dest->Allocate("ldst", n).slots;
+  ASSERT_EQ(options.dst_slots.size(), n);
+  auto result = dest->Fetch("ldst", keys, options);
+  EXPECT_TRUE(result.status.ok);
+  EXPECT_EQ(result.slots, options.dst_slots);
+  EXPECT_EQ(result.copied_bytes, bytes);
+  EXPECT_EQ(peer->acquires, 3);
+  EXPECT_EQ(peer->releases, 3);
+  const auto& dst_bytes = directory->at(handles["ldst"]);
+  for (uint32_t i : {0u, 127u, 128u, 255u, 256u, 299u}) {
+    EXPECT_EQ(dst_bytes[options.dst_slots[i] * 16], value(i)) << i;
+    EXPECT_EQ(dst_bytes[n * 16 + options.dst_slots[i] * 4], value(i)) << i;
+  }
+}
+
+TEST_F(L1PeerTest, WindowedFetchStopsAtTheFirstKeyThePeerLacks) {
+  // 200 keys published, then a hole: the second window brings 72 and nothing after it is asked for.
+  constexpr uint32_t n = 300;
+  const Layout layout{n, {{0, 16}, {uint64_t{n} * 16, 4}}};
+  const uint64_t bytes = uint64_t{n} * 20;
+  auto attach = [&](PoolManager& manager, const std::string& id, unsigned char token) {
+    handles[id] = Descriptor(token, bytes);
+    (*directory)[handles[id]] = std::vector<unsigned char>(bytes, 0xDA);
+    ASSERT_TRUE(manager.Attach(id, "long", token, bytes, {handles[id], 0, "hip_fabric"}).status.ok);
+    ASSERT_TRUE(manager.BindLayout(id, layout).ok);
+    ASSERT_EQ(manager.Open(id).num_slots, n);
+  };
+  attach(*source, "lsrc", 3);
+  attach(*dest, "ldst", 4);
+  std::vector<std::string> keys;
+  for (uint32_t i = 0; i < n; ++i) keys.push_back("k" + std::to_string(i));
+  auto src_slots = source->Allocate("lsrc", n).slots;
+  ASSERT_EQ(src_slots.size(), n);
+  for (uint32_t i = 0; i < n; ++i) {
+    if (i == 200) continue;
+    ASSERT_TRUE(source->Apply("lsrc", {{OpKind::kPublish, src_slots[i], keys[i]}}).ok);
+  }
+  FetchOptions options;
+  options.dst_slots = dest->Allocate("ldst", n).slots;
+  auto result = dest->Fetch("ldst", keys, options);
+  EXPECT_TRUE(result.status.ok);
+  EXPECT_EQ(result.slots.size(), 200u);
+  EXPECT_EQ(peer->acquires, 2);
+  EXPECT_EQ(peer->releases, 2);
+}
 
 TEST_F(L1PeerTest, SourceRequiresCommitAndMatchingGroupAndLayout) {
   Publish(*source, "src", {"a"}, 7);
@@ -302,16 +400,15 @@ TEST_F(L1PeerTest, RepeatedAcquireAndReleaseAreIdempotentAndPinsPreventReuse) {
 TEST_F(L1PeerTest, PeerReadPinsProtectTheUpstreamKeptEvictionList) {
   source->SetEvictionPolicy(1);
   const auto slots = Publish(*source, "src", {"a", "b", "c", "d", "e", "f", "g", "h"});
-  for (uint32_t slot : slots)
-    ASSERT_TRUE(source->Apply("src", {{OpKind::kRelease, slot, ""}}).ok);
+  for (uint32_t slot : slots) ASSERT_TRUE(source->Apply("src", {{OpKind::kRelease, slot, ""}}).ok);
   // With no spare copies, eviction moves the cached slots to `kept` first.
   ASSERT_EQ(source->Allocate("src", 1).slots, (std::vector<uint32_t>{slots[0]}));
   auto request = Read("kept");
   request.keys = {"b"};
   ASSERT_EQ(source->AcquireRead(request).available, 1u);
   const auto granted = source->Allocate("src", kSlots - 1).slots;
-  EXPECT_EQ(granted, (std::vector<uint32_t>{slots[2], slots[3], slots[4], slots[5], slots[6],
-                                         slots[7]}));
+  EXPECT_EQ(granted,
+            (std::vector<uint32_t>{slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]}));
   EXPECT_TRUE(Equals("src", slots[1], 12));
   ASSERT_TRUE(source->ReleaseRead("kept", source->Incarnation(), true).ok);
   EXPECT_EQ(source->Allocate("src", 1).slots, (std::vector<uint32_t>{slots[1]}));
@@ -382,7 +479,10 @@ TEST_F(L1PeerTest, DestinationCannotBeReusedWhileCopyIsRunning) {
   auto options = Destinations(1);
   std::promise<void> started, finish;
   auto gate = finish.get_future().share();
-  dest_api->on_copy = [&] { started.set_value(); gate.wait(); };
+  dest_api->on_copy = [&] {
+    started.set_value();
+    gate.wait();
+  };
   auto result = std::async(std::launch::async, [&] { return dest->Fetch("dst", {"a"}, options); });
   started.get_future().wait();
   EXPECT_FALSE(dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[0], ""}}).ok);
@@ -438,8 +538,8 @@ TEST_P(L1PeerFailureTest, ConfirmedFailureReleasesPinsAndWritersForRetry) {
   EXPECT_EQ(peer->releases, 2);
 }
 INSTANTIATE_TEST_SUITE_P(Failures, L1PeerFailureTest,
-                        ::testing::Values("Import", "AcquireReply", "DrainedCopy"),
-                        [](const auto& info) { return info.param; });
+                         ::testing::Values("Import", "AcquireReply", "DrainedCopy"),
+                         [](const auto& info) { return info.param; });
 
 TEST_F(L1PeerTest, LostReleaseRetainsSourceButConfirmedDestinationIsUsable) {
   Publish(*source, "src", {"a"});
@@ -455,18 +555,19 @@ TEST_F(L1PeerTest, LostReleaseRetainsSourceButConfirmedDestinationIsUsable) {
 TEST_F(L1PeerTest, UnknownCompletionRetainsMappingsPinsAndQuarantinesDestination) {
   // Isolate the intentional retention in a child: no normal teardown is safe
   // without external drain proof, and no GPU is involved in this injection.
-  EXPECT_EXIT(( [&] {
-    Publish(*source, "src", {"a"});
-    auto options = Destinations(1);
-    dest_api->outcome = {false, false, "injected unknown completion"};
-    auto result = dest->Fetch("dst", {"a"}, options);
-    bool ok = !result.status.ok && result.completion_unknown && peer->releases == 0 &&
-              dest_api->unimports == 0 && !dest->Detach("dst").ok &&
-              !dest->Allocate("dst", 1).status.ok &&
-              !dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[0], ""}}).ok &&
-              !source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok;
-    _exit(ok ? 0 : 1);
-  }() ), ::testing::ExitedWithCode(0), "");
+  EXPECT_EXIT(([&] {
+                Publish(*source, "src", {"a"});
+                auto options = Destinations(1);
+                dest_api->outcome = {false, false, "injected unknown completion"};
+                auto result = dest->Fetch("dst", {"a"}, options);
+                bool ok = !result.status.ok && result.completion_unknown && peer->releases == 0 &&
+                          dest_api->unimports == 0 && !dest->Detach("dst").ok &&
+                          !dest->Allocate("dst", 1).status.ok &&
+                          !dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[0], ""}}).ok &&
+                          !source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok;
+                _exit(ok ? 0 : 1);
+              }()),
+              ::testing::ExitedWithCode(0), "");
 }
 
 }  // namespace

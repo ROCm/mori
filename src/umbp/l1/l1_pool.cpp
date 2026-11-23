@@ -1434,164 +1434,165 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     finish();
     return result;
   }
-  const size_t count = std::min(kPeerKeys, keys.size() - leading);
-  std::vector<std::string> suffix(keys.begin() + leading, keys.begin() + leading + count);
-  if (!ValidPeerShape(suffix, units)) {
-    finish();
-    return result;
-  }
-  // Use one peer per suffix. No metadata cache: resolve and pin again for every
-  // Fetch, preserving owner-local timestamp semantics across different hosts.
-  std::shared_ptr<PeerApi> chosen;
-  PeerProbeResult best;
-  for (const auto& peer : peers) {
-    PeerProbeResult probe = peer->Probe(group, suffix, units);
-    if (probe.status.ok && !probe.incarnation.empty() && probe.available <= count &&
-        probe.available > best.available) {
-      chosen = peer;
-      best = std::move(probe);
+  // One read carries at most kPeerKeys keys (the bound on a grant's pins and on
+  // the reply). A prefix longer than that is read window by window, each window
+  // probed, pinned, copied and released on its own, until a peer has less than a
+  // whole window: a 100k-token prefix is ~800 blocks, and stopping after the
+  // first window would leave the engine recomputing all but its first 128.
+  while (leading < keys.size()) {
+    const size_t count = std::min(kPeerKeys, keys.size() - leading);
+    std::vector<std::string> suffix(keys.begin() + leading, keys.begin() + leading + count);
+    if (!ValidPeerShape(suffix, units)) break;
+    // Use one peer per window. No metadata cache: resolve and pin again for every
+    // window, preserving owner-local timestamp semantics across different hosts.
+    std::shared_ptr<PeerApi> chosen;
+    PeerProbeResult best;
+    for (const auto& peer : peers) {
+      PeerProbeResult probe = peer->Probe(group, suffix, units);
+      if (probe.status.ok && !probe.incarnation.empty() && probe.available <= count &&
+          probe.available > best.available) {
+        chosen = peer;
+        best = std::move(probe);
+      }
     }
-  }
-  if (!chosen) {
-    finish();
-    return result;
-  }
-  if (options.probe_only) {
-    result.available += best.available;
-    finish();
-    return result;
-  }
-  lock.lock();
-  size_t reserved = 0;
-  for (; reserved < best.available; ++reserved) {
-    const uint32_t id = options.dst_slots[leading + reserved];
-    if (id >= pool->slots.size() || pool->slots[id].state != SlotState::kHeld ||
-        pool->slots[id].has_key || pool->slots[id].writers != 0 || pool->slots[id].pins != 0 ||
-        !Fillable(*pool, pool->slots[id]))
-      break;
-    ++pool->slots[id].writers;
-  }
-  const std::string operation = incarnation_ + std::to_string(++next_read_);
-  lock.unlock();
-  if (reserved == 0) {
-    finish();
-    return result;
-  }
-  suffix.resize(reserved);
-  PeerReadRequest request{operation, best.incarnation, group, suffix, units};
-  PeerReadResult read = chosen->AcquireRead(request);
-  std::vector<void*> mappings;
-  std::vector<MemoryApi::Fragment> fragments;
-  std::string error;
-  bool valid = read.status.ok && read.incarnation == best.incarnation &&
-               read.available <= reserved && read.regions.size() == read.available * units.size();
-  uint64_t bytes = 0;
-  if (valid) {
-    // Descriptor imports are reused within this call only. Mapping a descriptor
-    // creates an address view, not a payload allocation/copy or a staging pool.
-    struct View {
-      void* base = nullptr;
-      uint64_t bytes = 0;
-    };
-    std::vector<View> views(read.handles.size());
-    // Build runs per layout region before the backend checks and plans copies.
-    // Every original range is still validated; never merge descriptor views.
-    for (size_t r = 0; valid && r < units.size(); ++r) {
-      const PeerReadRegion* previous = nullptr;
-      uint32_t previous_dst = 0;
-      for (size_t k = 0; k < read.available; ++k) {
-        const PeerReadRegion& region = read.regions[k * units.size() + r];
-        if (region.handle_index >= views.size() || region.bytes != units[r]) {
-          valid = false;
-          break;
-        }
-        View& view = views[region.handle_index];
-        const std::string& handle = read.handles[region.handle_index];
-        // Ask once per descriptor for range checks, not once per region.
-        if (view.bytes == 0 && !api_->PeerViewBytes(handle, &view.bytes, &error)) {
-          valid = false;
-          break;
-        }
-        if (region.offset > view.bytes || region.bytes > view.bytes - region.offset) {
-          error = "native L1 pool range exceeds the peer's exported view";
-          valid = false;
-          break;
-        }
-        if (view.base == nullptr) {
-          void* mapped = nullptr;
-          if (!api_->Import(pool->device, handle, 0, &view.base, &mapped, &error)) {
+    if (!chosen) break;
+    if (options.probe_only) {
+      result.available += best.available;
+      leading += best.available;
+      if (best.available < count) break;
+      continue;
+    }
+    lock.lock();
+    size_t reserved = 0;
+    for (; reserved < best.available; ++reserved) {
+      const uint32_t id = options.dst_slots[leading + reserved];
+      if (id >= pool->slots.size() || pool->slots[id].state != SlotState::kHeld ||
+          pool->slots[id].has_key || pool->slots[id].writers != 0 || pool->slots[id].pins != 0 ||
+          !Fillable(*pool, pool->slots[id]))
+        break;
+      ++pool->slots[id].writers;
+    }
+    const std::string operation = incarnation_ + std::to_string(++next_read_);
+    lock.unlock();
+    if (reserved == 0) break;
+    suffix.resize(reserved);
+    PeerReadRequest request{operation, best.incarnation, group, suffix, units};
+    PeerReadResult read = chosen->AcquireRead(request);
+    std::vector<void*> mappings;
+    std::vector<MemoryApi::Fragment> fragments;
+    std::string error;
+    bool valid = read.status.ok && read.incarnation == best.incarnation &&
+                 read.available <= reserved && read.regions.size() == read.available * units.size();
+    uint64_t bytes = 0;
+    if (valid) {
+      // Descriptor imports are reused within this call only. Mapping a descriptor
+      // creates an address view, not a payload allocation/copy or a staging pool.
+      struct View {
+        void* base = nullptr;
+        uint64_t bytes = 0;
+      };
+      std::vector<View> views(read.handles.size());
+      // Build runs per layout region before the backend checks and plans copies.
+      // Every original range is still validated; never merge descriptor views.
+      for (size_t r = 0; valid && r < units.size(); ++r) {
+        const PeerReadRegion* previous = nullptr;
+        uint32_t previous_dst = 0;
+        for (size_t k = 0; k < read.available; ++k) {
+          const PeerReadRegion& region = read.regions[k * units.size() + r];
+          if (region.handle_index >= views.size() || region.bytes != units[r]) {
             valid = false;
             break;
           }
-          mappings.push_back(mapped);
+          View& view = views[region.handle_index];
+          const std::string& handle = read.handles[region.handle_index];
+          // Ask once per descriptor for range checks, not once per region.
+          if (view.bytes == 0 && !api_->PeerViewBytes(handle, &view.bytes, &error)) {
+            valid = false;
+            break;
+          }
+          if (region.offset > view.bytes || region.bytes > view.bytes - region.offset) {
+            error = "native L1 pool range exceeds the peer's exported view";
+            valid = false;
+            break;
+          }
+          if (view.base == nullptr) {
+            void* mapped = nullptr;
+            if (!api_->Import(pool->device, handle, 0, &view.base, &mapped, &error)) {
+              valid = false;
+              break;
+            }
+            mappings.push_back(mapped);
+          }
+          const uint32_t dst = options.dst_slots[leading + k];
+          const Region& layout = pool->layout.regions[r];
+          if (previous && previous->handle_index == region.handle_index &&
+              previous->offset + previous->bytes == region.offset &&
+              uint64_t{previous_dst} + 1 == dst) {
+            fragments.back().bytes += region.bytes;
+          } else {
+            fragments.push_back(MemoryApi::Fragment{
+                static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
+                static_cast<const char*>(view.base) + region.offset, region.bytes, pool->device});
+          }
+          previous = &region;
+          previous_dst = dst;
+          bytes += region.bytes;
         }
-        const uint32_t dst = options.dst_slots[leading + k];
-        const Region& layout = pool->layout.regions[r];
-        if (previous && previous->handle_index == region.handle_index &&
-            previous->offset + previous->bytes == region.offset &&
-            uint64_t{previous_dst} + 1 == dst) {
-          fragments.back().bytes += region.bytes;
-        } else {
-          fragments.push_back(MemoryApi::Fragment{
-              static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
-              static_cast<const char*>(view.base) + region.offset, region.bytes, pool->device});
-        }
-        previous = &region;
-        previous_dst = dst;
-        bytes += region.bytes;
       }
     }
-  }
-  const auto started = std::chrono::steady_clock::now();
-  CopyOutcome outcome{false, true, "remote read unavailable: " + error};
-  if (valid) {
-    try {
-      outcome = api_->CopyBatchTracked(pool->device, fragments);
-    } catch (const std::exception& e) {
-      outcome = {false, false, e.what()};
-    } catch (...) {
-      outcome = {false, false, "copy backend threw without a completion proof"};
+    const auto started = std::chrono::steady_clock::now();
+    CopyOutcome outcome{false, true, "remote read unavailable: " + error};
+    if (valid) {
+      try {
+        outcome = api_->CopyBatchTracked(pool->device, fragments);
+      } catch (const std::exception& e) {
+        outcome = {false, false, e.what()};
+      } catch (...) {
+        outcome = {false, false, "copy backend threw without a completion proof"};
+      }
     }
-  }
-  const auto micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                std::chrono::steady_clock::now() - started)
-                                                .count());
-  if (!outcome.drained) {
+    const auto micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - started)
+                                                  .count());
+    if (!outcome.drained) {
+      lock.lock();
+      pool->quarantined = true;
+      result.status = Status::Error("FABRIC copy completion unknown: " + outcome.error);
+      result.completion_unknown = true;
+      result.slots.clear();
+      // Keep the remote source pin, mappings, destination writers and busy guard.
+      // No fallback or recomputation into these destinations is permitted.
+      idle_.notify_all();
+      return result;
+    }
+    for (void* mapped : mappings) api_->Unimport(pool->device, mapped);
+    // Even a lost Acquire reply can have pinned an owner slot. No submission or
+    // confirmed drain makes a release safe; owner tombstones fence delayed RPCs.
+    Status release = chosen->ReleaseRead(operation, best.incarnation, true);
+    if (!release.ok) {
+      MORI_UMBP_WARN(
+          "[L1Peer] release unconfirmed operation={} owner={} error={}; source stays pinned",
+          operation, best.incarnation, release.error);
+    }
     lock.lock();
-    pool->quarantined = true;
-    result.status = Status::Error("FABRIC copy completion unknown: " + outcome.error);
-    result.completion_unknown = true;
-    result.slots.clear();
-    // Keep the remote source pin, mappings, destination writers and busy guard.
-    // No fallback or recomputation into these destinations is permitted.
-    idle_.notify_all();
-    return result;
+    for (size_t i = 0; i < reserved; ++i) --pool->slots[options.dst_slots[leading + i]].writers;
+    if (outcome.ok) {
+      for (size_t i = 0; i < read.available; ++i)
+        result.slots.push_back(options.dst_slots[leading + i]);
+      result.copied_slots += read.available;
+      result.copied_bytes += bytes;
+      result.copy_micros += micros;
+      pool->fetched_in_slots += read.available;
+      pool->fetched_in_bytes += bytes;
+      pool->copy_micros += micros;
+      MORI_UMBP_INFO("[L1Peer] {} read completed pool={} owner={} operation={} slots={} bytes={}",
+                     api_->PeerKind(), pool_id, best.incarnation, operation, read.available, bytes);
+    }
+    lock.unlock();
+    if (!outcome.ok || read.available < count) break;
+    leading += read.available;
   }
-  for (void* mapped : mappings) api_->Unimport(pool->device, mapped);
-  // Even a lost Acquire reply can have pinned an owner slot. No submission or
-  // confirmed drain makes a release safe; owner tombstones fence delayed RPCs.
-  Status release = chosen->ReleaseRead(operation, best.incarnation, true);
-  if (!release.ok) {
-    MORI_UMBP_WARN(
-        "[L1Peer] release unconfirmed operation={} owner={} error={}; source stays pinned",
-        operation, best.incarnation, release.error);
-  }
-  lock.lock();
-  for (size_t i = 0; i < reserved; ++i) --pool->slots[options.dst_slots[leading + i]].writers;
-  if (outcome.ok) {
-    for (size_t i = 0; i < read.available; ++i)
-      result.slots.push_back(options.dst_slots[leading + i]);
-    result.copied_slots += read.available;
-    result.copied_bytes += bytes;
-    result.copy_micros += micros;
-    pool->fetched_in_slots += read.available;
-    pool->fetched_in_bytes += bytes;
-    pool->copy_micros += micros;
-    MORI_UMBP_INFO("[L1Peer] {} read completed pool={} owner={} operation={} slots={} bytes={}",
-                   api_->PeerKind(), pool_id, best.incarnation, operation, read.available, bytes);
-  }
-  --pool->busy;
-  idle_.notify_all();
+  finish();
   return result;
 }
 
