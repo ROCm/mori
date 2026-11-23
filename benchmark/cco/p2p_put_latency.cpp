@@ -240,6 +240,11 @@ int main(int argc, char** argv) {
   }
 
   PerfArgs& args = ctx.args;
+  if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
+    if (ctx.my_pe == 0) std::fprintf(stderr, "-s lane is for cco_p2p_put_bw -t proxy\n");
+    PerfFinalize(&ctx);
+    return 1;
+  }
   const int my_pe = ctx.my_pe;
 
   if (args.transport == Transport::kProxy && args.put_scope != PutScope::kWarp &&

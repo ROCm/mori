@@ -210,6 +210,8 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
       hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid,
                          block, 0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
+    case PutScope::kLane:  // proxy put_bw only, rejected in main
+      break;
   }
 }
 
@@ -226,6 +228,11 @@ int main(int argc, char** argv) {
   }
 
   PerfArgs& args = ctx.args;
+  if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
+    if (ctx.my_pe == 0) std::fprintf(stderr, "-s lane is for cco_p2p_put_bw -t proxy\n");
+    PerfFinalize(&ctx);
+    return 1;
+  }
   const int my_pe = ctx.my_pe;
   if (args.transport == Transport::kProxy) {
     if (my_pe == 0) std::fprintf(stderr, "-t proxy: ccoProxy has no get\n");

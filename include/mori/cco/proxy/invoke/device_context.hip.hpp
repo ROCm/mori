@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include "internal/serializer.hip.hpp"
 #include "mori/cco/proxy/queue/queue.hpp"
@@ -107,6 +108,22 @@ class DeviceContext {
         internal::ArgumentSerializer<Args...>::serialize(payload.bytes, args...);
         return queue.push_lane_masked(payload, arg_bytes, callback_id, active);
       }
+    }
+
+    // Invoke a callback from each executing lane, from any subset of the
+    // wavefront (divergent code, a single lane): MPSC only, through
+    // push_active_lanes(). Each lane passes its own callback_id and sends
+    // the first `arg_bytes` bytes of `args`, which must be the callback's
+    // argument size: a callback taking a struct whose prefix is another
+    // callback's argument can share one payload type, e.g. a larger
+    // descriptor that starts with a smaller one. The callbacks run in lane
+    // order. Always returns true.
+    template <typename T>
+    __device__ bool invoke_active_lanes(uint8_t callback_id, const T& args, uint32_t arg_bytes) {
+      static_assert(std::is_trivially_copyable_v<T>, "invoke arguments are copied bytewise");
+      static_assert(sizeof(T) <= mori::cco::proxy::queue::kMaxMessageBytes,
+                    "invoke arguments exceed mori::cco::proxy::queue::kMaxMessageBytes");
+      return queue.push_active_lanes(args, arg_bytes, callback_id);
     }
   };
 

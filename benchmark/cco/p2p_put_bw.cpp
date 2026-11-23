@@ -117,8 +117,9 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 // iteration, then a flush waits until its puts completed (remote ack) -- the
 // counterpart of ibgda's trailing flush. SPSC: wavefront w of block b owns
 // queue b * wavefronts per block + w, or block b owns queue b with
-// ccoCoopBlock; MPSC: the block's wavefronts share queue b.
-template <typename Q, typename Coop>
+// ccoCoopBlock; MPSC: the block's wavefronts share queue b. ccoCoopThread
+// (MPSC only) and ccoCoopLaneMasked give every thread its own put.
+template <typename Q, typename Coop, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
   Coop coop;
@@ -135,17 +136,19 @@ __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
   const size_t off_bytes = base * sizeof(double);
   const size_t bytes = per_unit * sizeof(double);
 
-  constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
+  constexpr bool kPerThread =
+      std::is_same_v<Coop, ccoCoopLaneMasked> || std::is_same_v<Coop, ccoCoopThread>;
   const int wave = __builtin_amdgcn_wavefrontsize();
   const int waves = (blockDim.x * blockDim.y * blockDim.z + wave - 1) / wave;
   const int spscQueue = std::is_same_v<Coop, ccoCoopBlock> ? bid : bid * waves + tid / wave;
   ccoProxy<Q> proxy{devComm, ccoProxy<Q>::kSpsc ? spscQueue : bid};
   for (int i = 0; i < iter; i++) {
-    proxy.put(peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
-              reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
+    proxy.template put<CCO_TEAM_WORLD, ThreadMode>(
+        peer, reinterpret_cast<ccoWindow_t>(recvWin), off_bytes,
+        reinterpret_cast<ccoWindow_t>(sendWin), off_bytes, bytes, ccoGda_NoSignal{}, coop);
   }
-  if constexpr (kLaneMasked) {
-    proxy.flush();  // one flush for the wavefront
+  if constexpr (kPerThread) {
+    proxy.flush(ccoCoopWarp{});  // one flush for the wavefront
   } else {
     proxy.flush(coop);
   }
@@ -157,9 +160,19 @@ static void launch_proxy(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
   if (scope == PutScope::kWarp) {
     hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopWarp>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
-  } else if (scope == PutScope::kThread) {
+  } else if (scope == PutScope::kLane) {
     hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopLaneMasked>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
+  } else if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) {
+    if constexpr (!ccoProxy<Q>::kSpsc) {  // checked in main: SPSC has no ccoCoopThread
+      if (scope == PutScope::kThread) {
+        hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopThread>), grid, block, 0, 0, sendWin, recvWin,
+                           len_doubles, devComm, count);
+      } else {
+        hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopThread, ccoGdaThreadAggregate>), grid, block, 0,
+                           0, sendWin, recvWin, len_doubles, devComm, count);
+      }
+    }
   } else {
     hipLaunchKernelGGL((proxy_put_bw<Q, ccoCoopBlock>), grid, block, 0, 0, sendWin, recvWin,
                        len_doubles, devComm, count);
@@ -280,6 +293,8 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
       hipLaunchKernelGGL((ibgda_put_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid,
                          block, 0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
+    case PutScope::kLane:  // proxy only, rejected in main
+      break;
   }
 }
 
@@ -298,14 +313,21 @@ int main(int argc, char** argv) {
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const bool proxy = args.transport == Transport::kProxy;
-  // -s thread: ccoCoopLaneMasked, which issues from whole wavefronts (a KIWI
-  // push is wavefront-collective).
-  if (proxy && (args.put_scope == PutScope::kThreadAgg ||
-                (args.put_scope == PutScope::kThread &&
-                 args.threads_per_block % ctx.device_warp_size != 0))) {
-    if (my_pe == 0) {
-      std::fprintf(stderr, "-t proxy needs -s thread|warp|block (thread: -T whole wavefronts)\n");
-    }
+  // -s lane (ccoCoopLaneMasked) issues from whole wavefronts; -s thread and
+  // thread_agg (ccoCoopThread) need MPSC queues.
+  const bool threadScope =
+      args.put_scope == PutScope::kThread || args.put_scope == PutScope::kThreadAgg;
+  const char* scopeError = nullptr;
+  if (!proxy && args.put_scope == PutScope::kLane) {
+    scopeError = "-s lane is ccoProxy's: use it with -t proxy";
+  } else if (proxy && args.put_scope == PutScope::kLane &&
+             args.threads_per_block % ctx.device_warp_size != 0) {
+    scopeError = "-t proxy -s lane needs -T whole wavefronts";
+  } else if (proxy && threadScope && !args.proxy_mpsc) {
+    scopeError = "-t proxy -s thread|thread_agg needs -q mpsc (or -s lane for SPSC queues)";
+  }
+  if (scopeError != nullptr) {
+    if (my_pe == 0) std::fprintf(stderr, "%s\n", scopeError);
     PerfFinalize(&ctx);
     return 1;
   }

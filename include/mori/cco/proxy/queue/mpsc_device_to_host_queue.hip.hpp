@@ -167,17 +167,47 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
     template <typename T>
     __device__ bool push_lane_masked(const T& message, uint32_t bytes, uint32_t metadata,
                                      bool active) {
+      return push_own_messages</*kFullWave=*/true>(message, bytes, metadata, active);
+    }
+
+    /**
+     * @brief Every executing lane pushes its own `message`, from any subset
+     *        of the wavefront
+     *
+     * push_lane_masked() with the lanes that execute the call as the active
+     * ones, so it may be called from divergent code (a branch, a single
+     * lane): the first executing lane claims the lines of all of them with
+     * one fetch-add and waits for credit, then each executing lane stores
+     * its own message, in lane order. Lanes on the two sides of a branch,
+     * which the compiler treats as concurrent threads, claim disjoint lines
+     * through the device-memory atomic; nothing else of the handle needs to
+     * agree across lanes. Always returns true.
+     */
+    template <typename T>
+    __device__ bool push_active_lanes(const T& message, uint32_t bytes, uint32_t metadata) {
+      return push_own_messages</*kFullWave=*/false>(message, bytes, metadata, true);
+    }
+
+   private:
+    // push_lane_masked() (kFullWave: all 64 lanes, lane 0 claims) and
+    // push_active_lanes() (the executing lanes, the first of them claims).
+    template <bool kFullWave, typename T>
+    __device__ bool push_own_messages(const T& message, uint32_t bytes, uint32_t metadata,
+                                      bool active) {
 #ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
       __builtin_trap();
       return false;
 #else
-      detail::assert_full_wave();
+      if constexpr (kFullWave) detail::assert_full_wave();
       const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, active, log2_capacity);
       if (c.total == 0) {
         return true;  // no active lane: claim nothing
       }
+      // broadcast_lane0() reads the first executing lane: lane 0 in a full wavefront.
+      uint32_t leader = 0;
+      if constexpr (!kFullWave) leader = __builtin_ctzll(__builtin_amdgcn_read_exec());
       uint64_t base = 0;
-      if (__lane_id() == 0) {
+      if (__lane_id() == leader) {
         base = __hip_atomic_fetch_add(producer_index, c.total, __ATOMIC_RELAXED,
                                       __HIP_MEMORY_SCOPE_AGENT);
       }
@@ -186,7 +216,7 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
       const uint64_t cap = uint64_t{1} << log2_capacity;
       if (base + c.total - consumer_index_cached > cap) {
         uint64_t fresh = 0;
-        if (__lane_id() == 0) {
+        if (__lane_id() == leader) {
           // The chunk stores below depend on this loop's exit.
           while (base + c.total - (fresh = detail::load_published(consumer_index)) > cap) {
             __builtin_amdgcn_s_sleep(1);

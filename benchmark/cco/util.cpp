@@ -55,8 +55,10 @@ void PrintUsage(const char* program) {
                "  -T threads     threads per block\n"
                "                 for sdma bw, -c/-T set the number of issue units\n"
                "                 (grid x units-per-block); omit both for one block\n"
-               "  -s scope       thread | warp | block | thread_agg (default block)\n"
+               "  -s scope       thread | warp | block | thread_agg | lane (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
+               "                 proxy: thread and thread_agg need -q mpsc; lane =\n"
+               "                 ccoCoopLaneMasked (put_bw only)\n"
                "  -C comp        SDMA latency completion: quiet | signal (default quiet)\n"
                "                 quiet  = quietQueue(), engine read pointer drain\n"
                "                 signal = put carries a local-signal ATOMIC, then\n"
@@ -71,7 +73,7 @@ void PrintUsage(const char* program) {
                "  -Q threads     proxy: host proxy threads (default 4)\n"
                "  -K qps         proxy: RC QPs per (proxy thread, peer) (default 4)\n"
                "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
-               "                 per wavefront with -s warp|thread) | mpsc (one queue per\n"
+               "                 per wavefront with -s warp|lane) | mpsc (one queue per\n"
                "                 block)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
@@ -183,6 +185,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->put_scope = PutScope::kBlock;
         } else if (std::strcmp(optarg, "thread_agg") == 0) {
           out_args->put_scope = PutScope::kThreadAgg;
+        } else if (std::strcmp(optarg, "lane") == 0) {
+          out_args->put_scope = PutScope::kLane;
         } else {
           return 1;
         }

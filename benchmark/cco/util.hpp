@@ -44,7 +44,9 @@ namespace mori::cco::benchmark {
 // Cooperation granularity of the kernel transfer loop / RDMA op.
 // kThreadAgg: thread scope with ccoGdaThreadAggregate (same-peer lanes post as one
 // batch instead of per-peer grouping). Bandwidth kernels only; latency uses thread.
-enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
+// kLane: ccoProxy's ccoCoopLaneMasked, per-thread puts pushed by whole
+// wavefronts (proxy put_bw only).
+enum class PutScope { kThread, kWarp, kBlock, kThreadAgg, kLane };
 
 // How an SDMA op waits for local completion (latency kernels). Named after the
 // API the kernel calls; both give the same sender-side guarantee at different cost.
@@ -130,10 +132,10 @@ struct PerfArgs {
 };
 
 // SPSC proxy queues needed so that every issuing wavefront owns one: per block,
-// its wavefronts with warp or thread scope (a thread-scope wavefront pushes its
+// its wavefronts with warp or lane scope (a lane-scope wavefront pushes its
 // lanes' puts together), else 1; times blocks.
 inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
-  return scope == PutScope::kWarp || scope == PutScope::kThread
+  return scope == PutScope::kWarp || scope == PutScope::kLane
              ? (threads_per_block + warp_size - 1) / warp_size
              : 1;
 }
@@ -212,6 +214,8 @@ inline const char* ScopeToChar(PutScope scope) {
       return "block";
     case PutScope::kThreadAgg:
       return "thread_agg";
+    case PutScope::kLane:
+      return "lane";
   }
   return "none";
 }
@@ -243,7 +247,7 @@ inline bool size_ok(PutScope scope, std::size_t size_bytes, int nblocks, int thr
     return false;
   }
   const std::size_t per_block = len / static_cast<std::size_t>(nblocks);
-  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) {
+  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg || scope == PutScope::kLane) {
     return per_block % static_cast<std::size_t>(threads_per_block) == 0;
   }
   if (scope == PutScope::kWarp) {
