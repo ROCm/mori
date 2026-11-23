@@ -632,9 +632,8 @@ hipError_t CollectivesFacade::launchPermute(const PermuteGroup& g, bool isAsync)
   // the gate. Else fall to push.
   const uintptr_t bits =
       reinterpret_cast<uintptr_t>(tuple.send[0]) | reinterpret_cast<uintptr_t>(tuple.recv[0]);
-  if (tuple.n == 1 &&
-      resolveCopyMode(tuple.bytes[0], kAutoPullMaxBytesPermute) == RsMode::kPull &&
-      PullCopy16Aligned(bits)) {
+  if (resolveCopyMode(tuple.bytes[0], kAutoPullMaxBytesPermute) == RsMode::kPull &&
+      PullCopy16Aligned(bits) && tuple.n == 1) {
     constexpr int kPullThreads = 256;
     // A send-only rank copies nothing: one block runs the handshake.
     const int blocks =

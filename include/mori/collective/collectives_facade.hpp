@@ -570,7 +570,7 @@ class CollectivesFacade {
            state_(state), myPe_(myPe), nPes_(nPes), peBase_(peBase),
            logS_(logS), mode_(mode), devComm_(state.devComm),
            barrierCtr_(state.commCtl +
-                       (static_cast<size_t>(peBase) * kCCLMaxPeers + nPes - 1) * kCommCtlWords),
+                       (peBase * kCCLMaxPeers + nPes - 1) * kCommCtlWords),
            arrived_(barrierCtr_ + kCCLMaxPeers) {
     devComm_.sdma.deviceHandles += peBase;
   }
