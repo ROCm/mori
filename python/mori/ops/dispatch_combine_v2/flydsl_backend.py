@@ -28,6 +28,7 @@ device tensors surfaced to the caller via from_gpu_ptr.
 import torch
 
 import flydsl.expr as fx
+from mori.jit.core import _target_arch
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
@@ -49,12 +50,20 @@ from .dispatch_combine_op import (  # noqa: F401
     EpDispatchRoutingHandle,
     KernelSet,
 )
+from .quant_types import is_gfx125x_arch
 from .symm_arena import SymmArena  # noqa: F401
 
 
 class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     """FlyDSL-kernel EP op. The full v2 feature set: gather + scatter combine,
     fp8/fp4, quant, StdMoE, per-token scales, routing replay."""
+
+    @classmethod
+    def _quant_formats(cls, arch):
+        # The scatter combine's fp8 codec is wave64-only.
+        if is_gfx125x_arch(arch):
+            return ()
+        return ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """This backend has no cross-node path.
@@ -69,13 +78,23 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
             )
-        if cfg.quant_type in _FP4_QUANT_TYPES:
+        refused = self._quant_refusal(cfg, _target_arch())
+        if refused:
+            return refused
+        # The fp8 codec reads and writes bf16 rows.
+        if cfg.fp8_blockwise and cfg.combine_dtype != torch.bfloat16:
             return (
-                f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
-                "pass kernel_backend='hip'",
+                f"quant_type={cfg.quant_type!r} with combine dtype {cfg.combine_dtype} "
+                "(bf16 only)",
             )
-        # The config lets an asymmetric dtype through with fp8_blockwise for the
-        # hip push combine; this backend's fp8_blockwise scatter has no such path.
+        # The fp8 codec quantizes a token in 128-element chunks, one per wave load.
+        if cfg.fp8_blockwise and cfg.hidden_dim % 128:
+            return (
+                f"quant_type={cfg.quant_type!r} needs hidden_dim % 128 == 0 on the "
+                f"flydsl backend, got hidden_dim={cfg.hidden_dim}",
+            )
+        # The config lets an asymmetric dtype through with a quantized combine
+        # for the hip push combine; this backend's quantized scatter has no such path.
         if cfg.is_asymmetric_dtype and cfg.quant_type != "none":
             return (
                 f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "
@@ -148,7 +167,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 regions.append(
                     (
                         "comb_scales",
-                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_dim * 4,
+                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_bytes,
                     )
                 )
         # Gate FIRST, as the hip backend does: rejecting after taking the
@@ -260,7 +279,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                         arena.offset("comb_scales") if cfg.fp8_blockwise else 0
                     ),
                     fp8_blockwise=cfg.fp8_blockwise,
-                    scale_dim=cfg.combine_scale_dim,
+                    quant_group=cfg.quant_group,
                 )
                 for (b, w) in combine_specs
             }

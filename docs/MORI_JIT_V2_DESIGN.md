@@ -319,8 +319,9 @@ kernel 内还是 host 侧）、`self_resets_counters`、`capabilities` / `unsupp
 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
-bf16/fp32（§3.7），其余一概不接：scatter、量化（`quant_type`，与直接传已量化载荷是两回事）、
-StdMoE、per-token scales、routing replay、`local_expert_count`。能力门在**构造期**跑、且在分配 arena
+bf16/fp32（§3.7）；带 `quant_type` 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
+本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
+`local_expert_count`。能力门在**构造期**跑、且在分配 arena
 之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。
 
@@ -357,8 +358,8 @@ HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 b
 `KernelConfig`。
 单机的查表在构造 `EpDispatchCombineConfig` 时完成，`resolve_schedule()` 只把得到的 `cfg.schedule`
 转成 `ScheduleEntry`。只有 `cfg.kernel_backend`、`MORI_V2_KERNEL_BACKEND` 或架构默认值解析为 `hip`
-时才查 HIP 的表：`quant_type="none"` 时先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，再没有
-就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
+时才查 HIP 的表：先查 `IntraNodeV2` 表（量化时不用它的 combine 行，gfx125x 上量化时 dispatch 行也不用），
+某相没有规则时回退到 Python 表，再没有就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
 解析：在 gfx942/gfx950 上既不设 `kernel_backend` 也不设 `MORI_V2_KERNEL_BACKEND` 就直接实例化
 `EpDispatchCombineOpHip`，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 `cfg.schedule` 或任一
 block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
@@ -517,7 +518,7 @@ gfx125x 的 TDM body（`ep_intranode_1250x.hpp`）同样是从 v1 机械移植�
 `_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。
 
-**HIP 后端未实现**（由能力门在构造期拒绝）：scatter combine、`quant_type` 量化、StdMoE、per-token
+**HIP 后端未实现**（由能力门在构造期拒绝）：非量化 scatter combine、StdMoE、per-token
 scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。注意 fp8/fp4 **dispatch**
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
 

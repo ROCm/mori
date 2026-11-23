@@ -68,6 +68,26 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
+  if (kind == EpKernelKind::Combine && req.combineScatterQGroup != 0) {
+    if (arch.rfind("gfx125", 0) == 0 || req.dtype != EpDType::Bf16 ||
+        (req.combineScatterQGroup != 32 && req.combineScatterQGroup != 128) || req.combineFp4 ||
+        req.combineFp8 || req.combineBf16Push || req.ll128 || req.ll128CombineOnly ||
+        req.cardCombine) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterQGroup is the gfx942/gfx950 quantized scatter combine: 32 or "
+          "128, "
+          "a bf16 combine, and no push, ll128 or card combine beside it");
+    }
+    c.combineScatterQGroup = req.combineScatterQGroup;
+    if (req.combineScatterFp4 && arch.rfind("gfx950", 0) != 0) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterFp4 needs gfx950, the arch with the e2m1 conversions");
+    }
+    c.combineScatterFp4 = req.combineScatterFp4;
+  } else if (kind == EpKernelKind::Combine && req.combineScatterFp4) {
+    throw std::runtime_error("mori v2 ep: combineScatterFp4 needs combineScatterQGroup");
+  }
+
   // Defaults for the bare C++ caller only -- the Python path uses the tuning
   // table (hip_tuning_configs) and never sees these. Split by kernel because
   // dispatch is copy-bound and wants warps while combine's reduction saturates
@@ -298,11 +318,20 @@ std::string EpCombineInfo(const EpCfg& c) {
          EpKv("pushLandRows", EpCombinePushLandRows(c)) +
          EpKv("pushLandOff", EpCombinePushLandOff(c));
   }
+  if (EpCombineScatter(c)) {
+    s +=
+        EpKv("scatterRowBytes", EpScatterRowBytes(c)) + EpKv("scatterLandOff", EpScatterLandOff(c));
+  }
   return s + EpRegionInfo(c, EpKernelKind::Combine);
 }
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineScatterQGroup) {
+    const bool g32 = cfg.combineScatterQGroup == 32;
+    if (cfg.combineScatterFp4) return EpEntryName(cfg, g32 ? "combine_fp4x32" : "combine_fp4x128");
+    return EpEntryName(cfg, g32 ? "combine_fp8x32" : "combine_fp8x128");
+  }
   if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
   if (cfg.combineBf16Push) return EpEntryName(cfg, "combine_bf16p");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
@@ -318,7 +347,9 @@ std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
     throw std::runtime_error(
         "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
-  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg),
+                        EpCombineScatter(cfg) ? "EpCombineScatterBody" : "EpCombineBody",
+                        "EpCombine1250xBody");
 }
 
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }

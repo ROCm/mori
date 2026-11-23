@@ -257,6 +257,10 @@ struct EpCfg {
   // elements. Exclusive with combineFp4 (MakeEpCfg).
   bool combineFp8 = false;
   bool combineBf16Push = false;
+  // gfx942/gfx950 scatter combine with an fp8 wire: elements per scale, 32 (E8M0)
+  // or 128 (f32); 0 = off. Each sender quantizes into the origin's landing row.
+  int combineScatterQGroup = 0;
+  bool combineScatterFp4 = false;  // e2m1 instead of fp8 on that wire (gfx950)
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -287,6 +291,8 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(combineBf16Push);
+  MORI_FIELD(combineScatterQGroup);
+  MORI_FIELD(combineScatterFp4);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -299,7 +305,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 25, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 27, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -568,7 +574,26 @@ constexpr size_t EpRegionOutWtsBytes(const EpCfg& c) { return EpRegionOutIdxByte
 constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpTokenBytes(c);
 }
+// The scatter combine's layout in outTok, after the pull rows: one row per (source
+// rank, origin token) holding the fp8 / e2m1 payload, its scales (an E8M0 byte a
+// 32-element group, or an f32 a 128-element block) and the token's topk weights,
+// padded to 128 B.
+constexpr bool EpCombineScatter(const EpCfg& c) { return c.combineScatterQGroup != 0; }
+constexpr int EpScatterScaleBytes(const EpCfg& c) {
+  return c.combineScatterQGroup == 32 ? c.hiddenDim / 32 : c.hiddenDim / 128 * 4;
+}
+constexpr int EpScatterPayloadBytes(const EpCfg& c) {
+  return c.combineScatterFp4 ? c.hiddenDim / 2 : c.hiddenDim;
+}
+constexpr int EpScatterRowBytes(const EpCfg& c) {
+  return (int)EpAlignUp128((size_t)EpScatterPayloadBytes(c) + EpScatterScaleBytes(c) +
+                           4 * c.numExpertPerToken);
+}
+constexpr size_t EpScatterLandOff(const EpCfg& c) { return EpAlignUp128(EpCombinePushLandOff(c)); }
+
 constexpr size_t EpRegionOutTokBytes(const EpCfg& c) {
+  if (EpCombineScatter(c))
+    return EpScatterLandOff(c) + (size_t)c.worldSize * c.maxTokPerRank * EpScatterRowBytes(c);
   if (c.ll128 || c.ll128CombineOnly)
     return EpCombinePushLandOff(c) + (size_t)EpCombinePushLandRows(c) * EpLl128LandRowBytes(c);
   if (!EpCombinePush(c) && !c.combineBf16Push) return EpCombinePushLandOff(c);
@@ -674,7 +699,14 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
          (!c.cardDedup || EpCardDedupOk(c)) && (c.cardDedup || c.cardPullBlocks == 0) &&
          (!c.cardFwdMark || (c.cardDedup && c.cardPullBlocks == 0)) &&
-         (!c.cardCombine || c.cardDedup || EpCardCombineOk(c));
+         (!c.cardCombine || c.cardDedup || EpCardCombineOk(c)) &&
+         // The scatter combine quantizes whole 128-element blocks with 8 lanes a 64-wide
+         // wave, and is the portable body's: no push, ll128 or card mode beside it.
+         (EpCombineScatter(c) || !c.combineScatterFp4) &&
+         (!EpCombineScatter(c) ||
+          ((c.combineScatterQGroup == 32 || c.combineScatterQGroup == 128) &&
+           c.hiddenDim % 128 == 0 && c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
+           !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
 }
 
 }  // namespace v2

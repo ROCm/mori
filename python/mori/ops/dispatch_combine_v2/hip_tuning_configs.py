@@ -41,6 +41,8 @@ from typing import NamedTuple
 
 from mori.ops import utils as _gpu
 
+from .quant_types import is_gfx125x_arch, resolve_quant_type
+
 logger = logging.getLogger(__name__)
 
 # Models with no table of their own that reuse a tuned sibling's key.
@@ -348,7 +350,7 @@ _COMBINE_TABLE: dict = {
 }
 
 _COMBINE_PUSH_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): ((None, 32, 16),),
         },
@@ -416,7 +418,7 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp4_blockwise_fp32": {
+    "fp4_blockwise_1x128": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
         },
@@ -430,7 +432,7 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): ((None, 32, 16),),
         },
@@ -477,7 +479,7 @@ _BF16_PUSH_TABLE: dict = {
 }
 
 _LL128_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
                 "fp4": dict(max_tok=128, dispatch=(32, 16), combine=(32, 8))
@@ -498,7 +500,7 @@ _LL128_TABLE: dict = {
             },
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
         "gfx1250/96cu": {
             (8, 7168, 6, None): {
                 "fp8": dict(max_tok=64, dispatch=(32, 16), combine=(32, 8))
@@ -576,6 +578,33 @@ _CAPPED_COMBINE_TABLE: dict = {
 
 _CAPPED_COMBINE_PUSH_TABLE: dict = {}
 
+# The quantized scatter combine off gfx125x, every format: device -> shape -> buckets.
+_SCATTER_COMBINE_TABLE: dict = {
+    # MI300X EP8, 2026-11-16, dispatch 64x16, min of 2 rounds, fp8 1x128 combine us (1x32
+    # within 2% at every point):
+    #   T     64x8   128x4  160x4  256x4  160x8  256x8
+    #   32    27.4   28.3   30.0   37.5   39.0   53.2
+    #   128   58.0   56.1   55.5   59.7   62.1   72.9
+    #   512  135.7  129.9  125.5  122.8  124.0  135.6
+    #   1024 233.9  223.6  210.5  198.2  201.7  211.6
+    #   2048 441.1  417.4  386.9  359.7  360.2  371.9
+    #   4096 892.2  836.4  763.4  690.4  684.5  692.0
+    "mi300x": {
+        (8, 7168, 8, None): ((32, 64, 8), (128, 160, 4), (None, 256, 4)),
+    },
+    # MI355X EP8, 2026-11-16, dispatch 64x16, min of 2 rounds on a shared node, 1x128
+    # combine us, fp8 | fp4:
+    #   T     64x8   160x4  256x4  128x8  256x8 |  64x8  160x4  256x4  128x8  256x8
+    #   32    24.0   26.5   32.9   30.5   44.9  |  23.2   25.6   31.2   29.2   44.5
+    #   128   49.3   46.5   49.8   47.8   59.0  |  43.0   40.0   41.6   39.8   51.3
+    #   512  119.5  102.7   96.7   96.7  103.6  | 112.5   92.5   75.4   76.2   79.8
+    #   1024 210.3  172.9  157.4  159.0  157.2  | 200.3  157.1  117.3  121.2  113.8
+    #   4096 845.3  653.0  547.8  564.8  502.1  | 800.3  603.5  399.9  426.8  333.2
+    "mi355x": {
+        (8, 7168, 8, None): ((32, 64, 8), (128, 160, 4), (512, 256, 4), (None, 256, 8)),
+    },
+}
+
 
 def tuning_profile(profile=None, default="peak"):
     """``profile``, else MORI_EP_TUNING_PROFILE, else ``default``."""
@@ -624,6 +653,13 @@ def _capped(phase, own, peak, shape, key, default_warp):
     return tuple(rows)
 
 
+def _resolve_quant(quant_type, devs):
+    """The explicit name of `quant_type`; fp8_blockwise / fp4_blockwise take the
+    group of the device the tables are read for."""
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
+    return resolve_quant_type(quant_type, gfx125x)
+
+
 def ll128(
     world_size,
     hidden_dim,
@@ -634,6 +670,7 @@ def ll128(
     quant_type="none",
 ):
     devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
     if devs[0] == "gfx1250-strict":
         return None  # LL128's polls miss peer writes on these parts; use the schedule
     per_device = _LL128_TABLE.get(quant_type, {})
@@ -758,7 +795,8 @@ def resolve_schedule(
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
-    rules when quant_type is "none", else the Python table's; an explicit
+    rules (its dispatch rules unless the op is quantized on gfx125x, its combine
+    rules only for an unquantized combine), else the Python table's; an explicit
     cfg.schedule is taken as given, and pinned or untuned geometry is one bucket.
     Inter names each bucket of internode_schedule() with its kernel family; tuned
     grids are clamped to ``cu_count``, the backend's own CU count. Loading and
@@ -945,7 +983,8 @@ def lookup(
     ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
     half; ``quant_type`` picks the combine half. Each half is built independently,
     so either can be re-tuned without touching the other: its IntraNodeV2 table
-    rules when it has any (``quant_type="none"`` only), else the Python table's,
+    rules when it has any (not for a quantized combine half, nor a quantized
+    dispatch half on gfx125x), else the Python table's,
     else the HIP single-shot default. A shape with neither half tuned gets the
     default and no schedule.
 
@@ -960,6 +999,7 @@ def lookup(
     profile = tuning_profile(profile)
     base = _hip_default()
     devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
     shape = (world_size, hidden_dim, topk, experts_per_rank)
     wire = _DISPATCH_DTYPE_ALIAS.get(dtype, dtype)
     disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)
@@ -969,7 +1009,8 @@ def lookup(
     capped_disp = _first_bucket(_CAPPED_DISPATCH_TABLE, devs, *shape)
     if capped_disp is not None:
         capped_disp = capped_disp.get(wire) or capped_disp.get(None)
-    # Combine: the quant type's push rows, else the gather rows; a capped row comes from
+    # Combine: the quant type's push rows (gfx125x) or scatter rows (elsewhere), else the
+    # gather rows; a capped row comes from
     # the same table as the peak row it stands for, or from its own push table.
     comb = capped_comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
@@ -977,13 +1018,18 @@ def lookup(
         capped_comb = _first_bucket(
             _CAPPED_COMBINE_PUSH_TABLE.get(quant_type, {}), devs, *shape
         )
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
+    if comb is None and quant_type != "none" and not gfx125x:
+        comb = _first_bucket(_SCATTER_COMBINE_TABLE, devs, *shape)
     if comb is None:
         comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
         if capped_comb is None:
             capped_comb = _first_bucket(_CAPPED_COMBINE_TABLE, devs, *shape)
     if dispatch_dtype is None:
         dispatch_dtype, combine_dtype = _wire_dtypes(wire)
-    if dispatch_dtype is not None and quant_type == "none":
+    # The IntraNodeV2 tables time the gather combine, so a quantized combine keeps
+    # their dispatch half only; gfx125x's quantized ops keep the Python tables.
+    if dispatch_dtype is not None and (quant_type == "none" or not gfx125x):
         table_disp, table_comb = intranode_buckets(
             world_size,
             hidden_dim,
@@ -993,7 +1039,8 @@ def lookup(
             experts_per_rank=experts_per_rank,
         )
         disp = table_disp or disp
-        comb = table_comb or comb
+        if quant_type == "none":
+            comb = table_comb or comb
     if profile == "capped":
         disp = _capped(
             "dispatch", capped_disp, disp, shape, wire, base["warp_num_per_block"]
