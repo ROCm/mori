@@ -425,7 +425,7 @@ void SimBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
 }
 
 void SimBackend::DeregisterRemoteEngine(const EngineDesc& rdesc) {
-  // In-flight transfers keep their Peer alive, as RDMA QPs outlive the engine registration.
+  // In-flight transfers keep their Peer alive and finish; sessions to it report dead.
   std::lock_guard<std::mutex> lock(peersMu_);
   peers_.erase(rdesc.key);
 }

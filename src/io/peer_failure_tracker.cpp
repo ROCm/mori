@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <algorithm>
 #include <utility>
 
 #include "mori/io/peer_failure.hpp"
@@ -35,6 +36,22 @@ void PeerFailureTracker::RegisterQp(const QpKey& qp, std::string remoteEngineKey
 void PeerFailureTracker::ForgetQp(const QpKey& qp) {
   std::lock_guard<std::mutex> lock(mu_);
   qpOwners_.erase(qp);
+}
+
+void PeerFailureTracker::ReleaseQp(const QpKey& qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = qpOwners_.find(qp);
+  if (it != qpOwners_.end()) {
+    const void* cq = it->second.cqHandle;
+    qpOwners_.erase(it);
+    // The CQ goes with the last QP on it, and a new CQ can be allocated at its address.
+    const bool cqInUse = std::any_of(qpOwners_.begin(), qpOwners_.end(), [&](const auto& owner) {
+      return owner.second.cqHandle == cq && owner.first.deviceName == qp.deviceName;
+    });
+    if (cq != nullptr && !cqInUse) failedCqs_.erase(CqKey{qp.deviceName, cq});
+  }
+  failedQps_.erase(qp);
+  erroredQps_.erase(qp);
 }
 
 void PeerFailureTracker::Enqueue(PeerFailureEvent event) {
@@ -96,6 +113,17 @@ bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
   *out = std::move(pending_.front());
   pending_.pop_front();
   return true;
+}
+
+size_t PeerFailureTracker::DropPending(const std::string& remoteEngineKey) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const size_t before = pending_.size();
+  pending_.erase(std::remove_if(pending_.begin(), pending_.end(),
+                                [&](const PeerFailureEvent& event) {
+                                  return event.remoteEngineKey == remoteEngineKey;
+                                }),
+                 pending_.end());
+  return before - pending_.size();
 }
 
 bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {

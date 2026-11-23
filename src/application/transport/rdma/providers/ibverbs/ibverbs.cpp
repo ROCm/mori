@@ -267,6 +267,8 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     endpoint.atomicIbuf.lkey = ibufMr->lkey;
     endpoint.atomicIbuf.rkey = ibufMr->rkey;
     endpoint.atomicIbuf.nslots = ibufSlots;
+    std::lock_guard<std::mutex> lock(poolMu);
+    atomicIbufs[endpoint.handle.qpn] = {ibufAddr, ibufMr};
   }
 
   {
@@ -420,7 +422,9 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
         ibv_reg_mr(pd, rbuf, kRecvBufSz, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (rmr) {
       std::lock_guard<std::mutex> lock(poolMu);
-      proxyRecvInfo[local.qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount)};
+      proxyRecvInfo[local.qpn] = {rbuf, rmr->lkey, static_cast<uint32_t>(kRecvCount), rmr};
+    } else {
+      free(rbuf);
     }
   }
 }
@@ -442,6 +446,18 @@ bool IBVerbsDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) no
       int ret = ibv_destroy_qp(qpIt->second);
       if (ret == 0) {
         qpPool.erase(qpIt);
+        auto recvIt = proxyRecvInfo.find(ep.handle.qpn);
+        if (recvIt != proxyRecvInfo.end()) {
+          ibv_dereg_mr(recvIt->second.mr);
+          free(recvIt->second.buf);
+          proxyRecvInfo.erase(recvIt);
+        }
+        auto ibufIt = atomicIbufs.find(ep.handle.qpn);
+        if (ibufIt != atomicIbufs.end()) {
+          ibv_dereg_mr(ibufIt->second.second);
+          free(ibufIt->second.first);
+          atomicIbufs.erase(ibufIt);
+        }
       } else {
         int err = ret > 0 ? ret : errno;
         if (err == 0) err = EIO;

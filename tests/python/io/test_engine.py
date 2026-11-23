@@ -645,6 +645,109 @@ def test_failed_qp_replacements_back_off():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_deregister_remote_engine_tears_down_its_sessions():
+    """A session to a deregistered engine is dead and fails at once; registering the
+    engine again gives sessions on new QPs."""
+    initiator, target = create_connected_engine_pair(
+        "dereg_sessions", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 4096)
+    )
+    size = initiator_tensor.numel()
+    sess = initiator.create_session(initiator_mem, target_mem)
+    status = sess.write(0, 0, size, initiator.allocate_transfer_uid())
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+
+    target_desc = target.get_engine_desc()
+    initiator.deregister_remote_engine(target_desc)
+    assert not sess.alive()
+    status = sess.write(0, 0, size, initiator.allocate_transfer_uid())
+    wait_status(status)
+    assert status.Failed()
+
+    initiator.register_remote_engine(target_desc)
+    target_tensor.zero_()
+    torch.cuda.synchronize()
+    new_sess = initiator.create_session(initiator_mem, target_mem)
+    assert new_sess.alive()
+    status = new_sess.write(0, 0, size, initiator.allocate_transfer_uid())
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_deregister_drops_the_engines_queued_peer_failures():
+    """Each QP to a dead peer queues its own failure. Once the peer is deregistered they
+    describe connections that are gone, and a caller that reconnects on a failure must
+    not take them for failures of the new connection."""
+    initiator, target = create_connected_engine_pair(
+        "dereg_failures", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 4096)
+    )
+    sess = initiator.create_session(initiator_mem, target_mem)
+    target_desc = target.get_engine_desc()
+    del target
+    gc.collect()
+
+    # The failure is reported before the transfer's status turns failed.
+    status = sess.batch_write([0, 2048], [0, 2048], [2048, 2048], 1)
+    wait_status(status)
+    assert status.Failed()
+    initiator.deregister_remote_engine(target_desc)
+    assert initiator.pop_peer_failure() is None
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_engine_replaced_under_the_same_key_gets_the_writes():
+    """A restarted peer comes back under the same key and numbers its memory as before.
+    Once the old engine is deregistered and the new one registered, writes reach the
+    new engine, not the old one's cached QPs and memory region. The old engine stays
+    up, so a misrouted write would succeed: only the buffers tell."""
+    initiator, old_target = create_connected_engine_pair(
+        "dereg_replace", qp_per_transfer=2, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, old_tensor, initiator_mem, old_mem = alloc_and_register_mem(
+        (initiator, old_target), (1, 4096)
+    )
+    size = initiator_tensor.numel()
+    status = initiator.write(
+        initiator_mem, 0, old_mem, 0, size, initiator.allocate_transfer_uid()
+    )
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+
+    old_desc = old_target.get_engine_desc()
+    new_target = IOEngine(
+        key=old_desc.key, config=IOEngineConfig(host="127.0.0.1", port=0)
+    )
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        new_target.create_backend(
+            BackendType.RDMA, RdmaBackendConfig(qp_per_transfer=2)
+        )
+    new_tensor = torch.zeros_like(old_tensor)
+    new_mem = new_target.register_torch_tensor(new_tensor)
+    assert new_mem.id == old_mem.id
+
+    initiator.deregister_remote_engine(old_desc)
+    initiator.register_remote_engine(new_target.get_engine_desc())
+    old_tensor.zero_()
+    initiator_tensor.random_(1, 256)
+    torch.cuda.synchronize()
+    status = initiator.write(
+        initiator_mem, 0, new_mem, 0, size, initiator.allocate_transfer_uid()
+    )
+    wait_status(status)
+    assert status.Succeeded(), status.Message()
+    assert not old_tensor.any(), "the write landed in the old engine's buffer"
+    assert torch.equal(initiator_tensor.cpu(), new_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_successful_writes_always_have_inbound_notification_under_pressure():
     """Regression for notify all-or-none behavior.
 

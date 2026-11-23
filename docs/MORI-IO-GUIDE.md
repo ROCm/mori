@@ -90,7 +90,7 @@ from mori.io import (
 | `create_backend(type, config)` | Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode) |
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
-| `deregister_remote_engine(desc)` | Deregister a remote engine |
+| `deregister_remote_engine(desc)` | Deregister a remote engine. Over RDMA this tears down every QP to it: transfers still in flight fail, sessions to it report `alive()` False and fail new transfers, and each QP is freed once no session holds it. To reconnect, for example after the peer restarted or a QP failed, register the engine again and create new sessions; they get new QPs. A connection the engine asks for while the deregistration runs is refused, and one already being accepted is torn down with the rest. Its failures still queued for `pop_peer_failure()` are dropped, as they describe connections that are gone. A QP that cannot be moved to the error state keeps its transfers running to completion and is retried by the next deregistration. The peer is not told: its own QPs to this engine fail on their next transfer. The call blocks while connection builds to the engine finish and its QPs are destroyed, tens of milliseconds on ionic, and releases the GIL meanwhile |
 | `register_memory(ptr, size, device_id, mem_loc)` | Register memory by raw pointer |
 | `register_torch_tensor(tensor)` | Register a PyTorch tensor |
 | `deregister_memory(mem_desc)` | Deregister memory |
