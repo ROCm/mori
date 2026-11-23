@@ -69,6 +69,46 @@ struct PeerFailureEvent {
   std::string detail;
 };
 
+// Outcome of IOEngine::FenceRemoteEngine: whether a peer can still write into
+// this engine's registered memory. A WRITE target never learns that a transfer
+// was abandoned, so the only way to make its buffers safe to reuse is to cut the
+// peer's queue pairs on the receiving side.
+struct FenceResult {
+  // False when no backend could revoke the peer's access. Nothing was fenced.
+  bool supported{false};
+  // Connections to the peer that were taken out of service.
+  int endpointsFenced{0};
+  // Connections that could not be taken out of service. While any remain, the peer
+  // can still write, so the caller must not hand its buffers to anyone else.
+  int endpointsFailed{0};
+  // Local transfers toward the peer that were failed because their QP was cut.
+  int transfersFailed{0};
+  // Whether this engine knows the key: it holds or once held a connection with the peer,
+  // or has the peer registered. A key it does not know is most likely not the peer's,
+  // which then is not fenced at all.
+  bool peerKnown{false};
+  std::string message;
+
+  // True only when the peer provably can no longer write into this engine. Fencing a
+  // known peer this engine has no connection to is ok: there is nothing to cut. A key it
+  // does not know is not ok, though it is still fenced. A known key can still be the
+  // wrong peer's, e.g. another rank's: a caller that cannot rule that out must also
+  // expect endpointsFenced > 0.
+  bool Ok() const { return supported && peerKnown && endpointsFailed == 0; }
+};
+
+// Fence result for a backend that has a path from `remote` into this engine and no way
+// to cut it: reported as one failed endpoint, so the combined result is not ok.
+inline FenceResult UncutPath(const std::string& remote, const std::string& transport,
+                             const std::string& why) {
+  FenceResult result;
+  result.supported = true;
+  result.endpointsFailed = 1;
+  result.peerKnown = true;
+  result.message = "peer " + remote + " can still write over " + transport + ": " + why;
+  return result;
+}
+
 // Which resource a failure invalidates; each covers a different set of sessions.
 enum class FailureScope : uint32_t {
   kQp = 0,
@@ -115,6 +155,10 @@ class PeerFailureTracker {
   // Drops a QP association. Any recorded failure for it is retained, so a
   // pending event stays drainable after the endpoint is gone.
   void ForgetQp(const QpKey& qp);
+  // For a QP that was destroyed after it failed: drops it with what was recorded against
+  // it, and against its CQ once no other QP uses that CQ, so a new QP given its number is
+  // not condemned. Pending events stay drainable.
+  void ReleaseQp(const QpKey& qp);
 
   // Records a failure, or clears one on recovery. Repeats fold into the first.
   void Report(const PeerFailureReport& report);
