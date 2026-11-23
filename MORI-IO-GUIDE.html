@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-IO Introduction &mdash; MORI development (4f5ebf8c) documentation</title>
+  <title>MORI-IO Introduction &mdash; MORI development (6c2f7f50) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=015641dd"></script>
+      <script src="_static/documentation_options.js?v=7980c026"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -303,6 +303,12 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">deregister_remote_engine(desc)</span></code></p></td>
 <td><p>Deregister a remote engine</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fence_remote_engine(engine_key)</span></code></p></td>
+<td><p>Cut a peer off from this engine’s memory so buffers it was writing into can be reused. Returns a <code class="docutils literal notranslate"><span class="pre">FenceResult</span></code>; only trust it when <code class="docutils literal notranslate"><span class="pre">ok</span></code> is set (<code class="docutils literal notranslate"><span class="pre">endpoints_failed</span> <span class="pre">==</span> <span class="pre">0</span></code>, and <code class="docutils literal notranslate"><span class="pre">peer_known</span></code>: this engine had a connection with the key or has it registered, so a mistyped key is not ok). A known key can still be another peer’s; a caller that cannot rule that out should also expect <code class="docutils literal notranslate"><span class="pre">endpoints_fenced</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>. Only RDMA connections can be cut: once XGMI, fabric or OFI could have handed a peer access to this engine’s memory (a mapping, an import or a key, which outlive deregistration), the fence reports that path as a failed endpoint, so <code class="docutils literal notranslate"><span class="pre">ok</span></code> stays false. The peer stays fenced (refused in both directions) until <code class="docutils literal notranslate"><span class="pre">unfence_remote_engine</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unfence_remote_engine(engine_key)</span></code></p></td>
+<td><p>Let a fenced peer connect again; returns whether it was fenced. Call once nothing the peer still has in flight can reach buffers that were handed out. Does no network I/O: the peer is told in the background (best effort) and reconnects on its next transfer</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">register_memory(ptr,</span> <span class="pre">size,</span> <span class="pre">device_id,</span> <span class="pre">mem_loc)</span></code></p></td>
 <td><p>Register memory by raw pointer</p></td>
 </tr>
@@ -466,10 +472,13 @@ in logs; when another backend is selected, an INFO log gives the Fabric reason a
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_PORT_DOWN_FAIL_FAST</span></code></p></td>
 <td><p>Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_FENCE_RELEASE_DELAY_MS</span></code></p></td>
+<td><p>The connections a fence cut (QPs, CQs, notification buffers) and the sessions it evicted are kept while the peer is fenced, so their QP numbers cannot go to new QPs, and destroyed this long after the peer is unfenced (default <code class="docutils literal notranslate"><span class="pre">10000</span></code>). The fence already stops every new use of them; the delay covers a notification send that passed admission just before the fence, the poll loop’s last pass, a caller returning from a session it took before the fence, and a write of the peer still retrying on its side of a cut QP, so keep it above the peer’s transport retry budget (<code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_TIMEOUT</span></code>, <code class="docutils literal notranslate"><span class="pre">MORI_IO_QP_RETRY_CNT</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
 <td><p>Auto-bind to a free port</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
 <td><p>MORI-IO loads libibverbs dynamically at runtime (<code class="docutils literal notranslate"><span class="pre">dlopen</span></code> of <code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code>) rather than linking it. To use an out-of-tree libibverbs, put its directory on <code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code>.</p></td>
 </tr>
 </tbody>
