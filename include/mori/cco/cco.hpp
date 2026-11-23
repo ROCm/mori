@@ -1075,8 +1075,8 @@ int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perR
                   ccoComm** comm);
 // Destroy every DevComm first. A DevComm with ccoProxy queues left alive is
 // warned about and its proxy engine stopped here; its other device resources
-// stay allocated until ccoDevCommDestroy(nullptr, &devComm), the only call that
-// may still take it.
+// stay allocated until ccoDevCommDestroy(nullptr, &devComm), the only valid
+// call on it after this.
 int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──

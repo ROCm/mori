@@ -1938,8 +1938,10 @@ __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBa
 // destructor) then an agent-scope release (e.g. a flag store) in the old owner,
 // and an agent-scope acquire of it before the new owner constructs its
 // ccoProxy (__syncthreads() suffices within one block). Across kernel launches
-// stream order is enough; concurrent kernels need different SPSC queues. A
-// handle that never pushes saves nothing, so readers may share a queue index.
+// stream order is enough; concurrent kernels need different SPSC queues. If
+// you only call readSignal, waitSignal, resetSignal or failed on a handle, you
+// may construct it with any queue index, even one another wavefront is pushing
+// to.
 //
 // Usage errors trap instead of corrupting a queue or faulting: an empty pool,
 // an SPSC queueIndex out of range, a push from a partial wavefront and (builds
