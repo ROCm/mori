@@ -1325,7 +1325,7 @@ PeerReadResult PoolManager::AcquireRead(const PeerReadRequest& request) {
     if (source == nullptr) break;
     const Pool& p = *source->pool;
     for (const Region& r : p.layout.regions) {
-      grant.result.regions.push_back(PeerReadRegion{
+      result.regions.push_back(PeerReadRegion{
           p.external_handle, p.external_offset + r.offset + uint64_t{source->slot} * r.unit_bytes,
           r.unit_bytes});
     }
@@ -1334,7 +1334,6 @@ PeerReadResult PoolManager::AcquireRead(const PeerReadRequest& request) {
     grant.sources.push_back(*source);
     ++result.available;
   }
-  result.regions = std::move(grant.result.regions);
   grant.result = result;
   read_grants_.emplace(request.operation_id, std::move(grant));
   return result;

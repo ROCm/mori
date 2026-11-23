@@ -333,27 +333,30 @@ TEST_F(L1PeerTest, DestinationWaitsForPreviousOwnerCommit) {
   EXPECT_EQ(result.get().copied_slots, 1u);
 }
 
-TEST_F(L1PeerTest, ImportFailureOrMalformedReplyUnpinsSourceAndReleasesWriter) {
+class L1PeerFailureTest : public L1PeerTest, public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(L1PeerFailureTest, ConfirmedFailureReleasesPinsAndWritersForRetry) {
+  const auto& fault = GetParam();
+  SCOPED_TRACE(fault);
   Publish(*source, "src", {"a"});
   auto options = Destinations(1);
-  dest_api->fail_import = true;
+  dest_api->fail_import = fault == "Import";
+  peer->corrupt = fault == "Descriptor";
+  peer->lose_acquire = fault == "AcquireReply";
+  dest_api->outcome = {fault != "DrainedCopy", true, "injected drained failure"};
   EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 0u);
-  dest_api->fail_import = false;
-  peer->corrupt = true;
-  EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 0u);
-  peer->corrupt = false;
-  EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 1u);
-  EXPECT_EQ(peer->releases, 3);
-  EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
-}
-
-TEST_F(L1PeerTest, LostAcquireReplyStillReleasesTheOwnerGrant) {
-  Publish(*source, "src", {"a"});
-  peer->lose_acquire = true;
-  EXPECT_EQ(dest->Fetch("dst", {"a"}, Destinations(1)).copied_slots, 0u);
+  EXPECT_TRUE(Equals("dst", options.dst_slots[0], 0xDA));
   EXPECT_EQ(peer->releases, 1);
   EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
+  ASSERT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "a"}}).ok);
+  dest_api->fail_import = peer->corrupt = peer->lose_acquire = false;
+  dest_api->outcome = {true, true, {}};
+  EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 1u);
+  EXPECT_EQ(peer->releases, 2);
 }
+INSTANTIATE_TEST_SUITE_P(Failures, L1PeerFailureTest,
+                        ::testing::Values("Import", "Descriptor", "AcquireReply", "DrainedCopy"),
+                        [](const auto& info) { return info.param; });
 
 TEST_F(L1PeerTest, LostReleaseRetainsSourceButConfirmedDestinationIsUsable) {
   Publish(*source, "src", {"a"});
@@ -364,16 +367,6 @@ TEST_F(L1PeerTest, LostReleaseRetainsSourceButConfirmedDestinationIsUsable) {
   EXPECT_FALSE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
   EXPECT_TRUE(dest->Apply("dst", {{OpKind::kPublish, options.dst_slots[0], "a"}}).ok);
   EXPECT_TRUE(source->ReleaseRead(peer->last.operation_id, source->Incarnation(), true).ok);
-}
-
-TEST_F(L1PeerTest, DrainedCopyFailureAllowsSafeRetry) {
-  Publish(*source, "src", {"a"});
-  auto options = Destinations(1);
-  dest_api->outcome = {false, true, "injected failed but drained copy"};
-  EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 0u);
-  EXPECT_TRUE(Equals("dst", options.dst_slots[0], 0xDA));
-  dest_api->outcome = {true, true, {}};
-  EXPECT_EQ(dest->Fetch("dst", {"a"}, options).copied_slots, 1u);
 }
 
 TEST_F(L1PeerTest, UnknownCompletionRetainsMappingsPinsAndQuarantinesDestination) {

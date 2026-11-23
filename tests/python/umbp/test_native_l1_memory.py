@@ -13,7 +13,7 @@ import sys
 import uuid
 import weakref
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,18 +33,13 @@ def helper():
 def runtime(monkeypatch):
     calls = []
 
-    class Device:
-        def __init__(self, value, index=None):
-            if isinstance(value, Device):
-                self.type, self.index = value.type, value.index
-            else:
-                parts = str(value).split(":")
-                self.type = parts[0]
-                self.index = (
-                    index
-                    if index is not None
-                    else int(parts[1]) if len(parts) == 2 else None
-                )
+    def device(value, index=None):
+        if isinstance(value, SimpleNamespace):
+            return value
+        kind, _, ordinal = str(value).partition(":")
+        if index is None and ordinal:
+            index = int(ordinal)
+        return SimpleNamespace(type=kind, index=index)
 
     class Tensor:
         def __init__(self, count, device):
@@ -59,11 +54,6 @@ def runtime(monkeypatch):
 
     class MemPool:
         pass
-
-    @contextlib.contextmanager
-    def scope(kind, value):
-        calls.append((kind, id(value) if kind == "allocator" else value))
-        yield
 
     def empty(nbytes, *, dtype, device):
         calls.append(("empty", nbytes))
@@ -82,35 +72,35 @@ def runtime(monkeypatch):
         calls.append(("export", ptr, nbytes, device))
         return b"fake-export-descriptor"
 
-    torch = ModuleType("torch")
-    torch.device, torch.uint8, torch.empty, torch.bitwise_and = (
-        Device,
-        "uint8",
-        empty,
-        zero,
+    torch = SimpleNamespace(
+        device=device,
+        uint8="uint8",
+        empty=empty,
+        bitwise_and=zero,
+        cuda=SimpleNamespace(
+            device=contextlib.nullcontext,
+            use_mem_pool=contextlib.nullcontext,
+            current_device=lambda: 1,
+            device_count=lambda: 4,
+            synchronize=synchronize,
+        ),
     )
-    torch.cuda = SimpleNamespace(
-        device=lambda d: scope("device", d.index),
-        use_mem_pool=lambda p: scope("allocator", p),
-        current_device=lambda: 1,
-        device_count=lambda: 4,
-        synchronize=synchronize,
-    )
-    io = ModuleType("mori.io")
-    io.make_fabric_mem_pool = MemPool
-    native = ModuleType("mori_umbp_l1")
-    native.NATIVE_L1_FABRIC_VERSION = 1
-    native.export_fabric_memory = export
     monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "mori.io", io)
-    monkeypatch.setitem(sys.modules, "mori_umbp_l1", native)
-    return SimpleNamespace(calls=calls, torch=torch, native=native, Tensor=Tensor)
+    monkeypatch.setitem(
+        sys.modules, "mori.io", SimpleNamespace(make_fabric_mem_pool=MemPool)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mori_umbp_l1",
+        SimpleNamespace(NATIVE_L1_FABRIC_VERSION=1, export_fabric_memory=export),
+    )
+    return SimpleNamespace(calls=calls, torch=torch)
 
 
 class Client:
     def __init__(self, calls):
         self.calls = calls
-        self.fail_attach = self.fail_bind = self.fail_detach = False
+        self.fail_attach = self.fail_bind = False
 
     def attach(self, *args, **kwargs):
         self.calls.append(("attach", args, kwargs))
@@ -124,8 +114,6 @@ class Client:
 
     def detach(self, pool_id):
         self.calls.append(("detach", pool_id))
-        if self.fail_detach:
-            raise RuntimeError("detach: owner incarnation mismatch")
 
 
 def allocate(helper, runtime):
@@ -180,11 +168,7 @@ def test_uncertain_registration_retains_owner_without_caller_refs(
     allocator_ref = weakref.ref(arena._mori_native_l1_mem_pool)
     del owner, arena
     gc.collect()
-    assert (
-        owner_ref() is not None
-        and arena_ref() is not None
-        and allocator_ref() is not None
-    )
+    assert all(ref() is not None for ref in (owner_ref, arena_ref, allocator_ref))
     with pytest.raises(RuntimeError, match="already attempted"):
         owner_ref().bind_layout(arena_ref(), 4, [(0, 32)])
     owner_ref().close()
@@ -192,36 +176,30 @@ def test_uncertain_registration_retains_owner_without_caller_refs(
     assert owner_ref() is None and arena_ref() is None and allocator_ref() is None
 
 
-def test_failed_incarnation_fence_retains_until_confirmed_detach(helper, runtime):
+@pytest.mark.parametrize("operation", ["detach", "synchronize"])
+def test_failed_close_retains_owner_until_confirmed_retry(
+    helper, runtime, monkeypatch, operation
+):
     client, owner, arena = allocate(helper, runtime)
-    owner.bind_layout(arena, 4, [(0, 32)])
-    client.fail_detach = True
-    with pytest.raises(
-        helper.L1MemoryInDoubtError, match="safe close was not confirmed"
-    ):
-        owner.close()
-    assert helper._LIVE_NATIVE_L1_MEMORY[id(owner)] is owner
-    with pytest.raises(RuntimeError, match="closing or closed"):
-        owner.allocate(32, 0)
-    with pytest.raises(RuntimeError, match="closing or closed"):
-        owner.bind_layout(arena, 4, [(0, 32)])
-    client.fail_detach = False
-    owner.close()
-    assert id(owner) not in helper._LIVE_NATIVE_L1_MEMORY
-
-
-def test_failed_owner_gpu_drain_does_not_send_detach(helper, runtime, monkeypatch):
-    _, owner, arena = allocate(helper, runtime)
     owner.bind_layout(arena, 4, [(0, 32)])
 
     def fail(_):
-        raise RuntimeError("GPU work completion unknown")
+        raise RuntimeError(f"{operation} was not confirmed")
 
-    monkeypatch.setattr(runtime.torch.cuda, "synchronize", fail)
-    with pytest.raises(helper.L1MemoryInDoubtError):
-        owner.close()
-    assert not any(c[0] == "detach" for c in runtime.calls)
-    assert helper._LIVE_NATIVE_L1_MEMORY[id(owner)] is owner
+    target = client if operation == "detach" else runtime.torch.cuda
+    with monkeypatch.context() as fault:
+        fault.setattr(target, operation, fail)
+        with pytest.raises(helper.L1MemoryInDoubtError, match="safe close"):
+            owner.close()
+        assert helper._LIVE_NATIVE_L1_MEMORY[id(owner)] is owner
+        with pytest.raises(RuntimeError, match="closing or closed"):
+            owner.allocate(32, 0)
+        with pytest.raises(RuntimeError, match="closing or closed"):
+            owner.bind_layout(arena, 4, [(0, 32)])
+        if operation == "synchronize":
+            assert not any(c[0] == "detach" for c in runtime.calls)
+    owner.close()
+    assert id(owner) not in helper._LIVE_NATIVE_L1_MEMORY
 
 
 @pytest.mark.parametrize(
@@ -236,7 +214,7 @@ def test_invalid_layout_cannot_publish_descriptor(helper, runtime, regions):
     owner.close()
 
 
-def test_native_failed_fabric_attach_fences_detach_without_incarnation(tmp_path):
+def test_native_failed_fabric_attach_fences_detach_without_incarnation():
     native = pytest.importorskip("mori_umbp_l1")
     address = f"unix:///tmp/l1_attach_{uuid.uuid4().hex}.sock"
     server = native.HostTestServer(address)
@@ -250,7 +228,7 @@ def test_native_failed_fabric_attach_fences_detach_without_incarnation(tmp_path)
         client.detach("owner")
 
 
-def test_native_old_owner_cannot_detach_replacement_server(tmp_path):
+def test_native_old_owner_cannot_detach_replacement_server():
     native = pytest.importorskip("mori_umbp_l1")
     address = f"unix:///tmp/l1_epoch_{uuid.uuid4().hex}.sock"
     server = native.HostTestServer(address)

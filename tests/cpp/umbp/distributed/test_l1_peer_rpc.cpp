@@ -150,8 +150,7 @@ class PeerServer {
 class L1PeerRpcTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    memory = std::make_shared<RpcMemory>();
-    owner = std::make_unique<PoolManager>(memory);
+    owner = std::make_unique<PoolManager>(std::make_shared<RpcMemory>());
     Attach(*owner, "source");
     ASSERT_EQ(owner->Allocate("source", 1).slots, (std::vector<uint32_t>{0}));
     ASSERT_TRUE(owner->Apply("source", {{OpKind::kPublish, 0, "a"}}).ok);
@@ -160,10 +159,31 @@ class L1PeerRpcTest : public ::testing::Test {
     ASSERT_TRUE(manager.Attach(id, "g", 0, 16, {RpcDescriptor(), 0, "hip_fabric"}).status.ok);
     ASSERT_TRUE(manager.BindLayout(id, Layout{1, {{0, 16}}}).ok);
   }
-  PeerReadRequest Read(const std::string& operation = "rpc-read") {
-    return {operation, owner->Incarnation(), "g", {"a"}, {16}};
+  void CheckReadTimeout(ControlledPeer::Block point) {
+    ControlledPeer service(owner.get());
+    PeerServer server(service);
+    const PeerReadRequest request{"rpc-read", owner->Incarnation(), "g", {"a"}, {16}};
+    auto release = [&] {
+      return server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true);
+    };
+    const bool acquire = point == ControlledPeer::Block::kAcquireReply;
+    SCOPED_TRACE(acquire ? "lost Acquire reply" : "lost Release request");
+    if (!acquire) ASSERT_TRUE(server.peer->AcquireRead(request).status.ok);
+    service.blocked = point;
+    auto pending = std::async(std::launch::async, [&] {
+      return acquire ? server.peer->AcquireRead(request).status : release();
+    });
+    const bool bounded = pending.wait_for(4s) == std::future_status::ready;
+    if (!bounded) service.Unblock();  // Bound failures of the old 120-second deadline too.
+    EXPECT_FALSE(pending.get().ok);
+    EXPECT_TRUE(bounded);
+    EXPECT_FALSE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
+    service.Unblock();
+    ASSERT_TRUE(release().ok);
+    EXPECT_TRUE(release().ok);
+    EXPECT_TRUE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
+    EXPECT_FALSE(server.peer->AcquireRead(request).status.ok);
   }
-  std::shared_ptr<RpcMemory> memory;
   std::unique_ptr<PoolManager> owner;
 };
 
@@ -189,45 +209,11 @@ TEST_F(L1PeerRpcTest, SlowProbeLeavesTimeForAHealthyPeer) {
 }
 
 TEST_F(L1PeerRpcTest, LostAcquireReplyKeepsSourcePinnedUntilConfirmedRelease) {
-  ControlledPeer service(owner.get());
-  service.blocked = ControlledPeer::Block::kAcquireReply;
-  PeerServer server(service);
-  const auto request = Read();
-  auto pending = std::async(std::launch::async, [&] { return server.peer->AcquireRead(request); });
-  const bool bounded = pending.wait_for(4s) == std::future_status::ready;
-  service.Unblock();
-  const auto read = pending.get();
-  EXPECT_TRUE(bounded);
-  EXPECT_FALSE(read.status.ok) << "delayed reply should expire before the parent Fetch";
-  EXPECT_FALSE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
-  ASSERT_TRUE(server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true).ok);
-  EXPECT_TRUE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
-  EXPECT_FALSE(server.peer->AcquireRead(request).status.ok);
+  CheckReadTimeout(ControlledPeer::Block::kAcquireReply);
 }
 
 TEST_F(L1PeerRpcTest, ReleaseTimeoutDoesNotUnpinAndConfirmedRetryIsIdempotent) {
-  ControlledPeer service(owner.get());
-  PeerServer server(service);
-  const auto request = Read();
-  ASSERT_TRUE(server.peer->AcquireRead(request).status.ok);
-  service.blocked = ControlledPeer::Block::kReleaseRequest;
-  auto pending = std::async(std::launch::async, [&] {
-    return server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true);
-  });
-  const bool bounded = pending.wait_for(4s) == std::future_status::ready;
-  // Wait for the cancellation-observing handler before enabling the retry.
-  const auto released = [&] {
-    if (!bounded) service.Unblock();
-    return pending.get();
-  }();
-  EXPECT_TRUE(bounded);
-  EXPECT_FALSE(released.ok);
-  EXPECT_FALSE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
-  service.Unblock();
-  ASSERT_TRUE(server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true).ok);
-  EXPECT_TRUE(server.peer->ReleaseRead(request.operation_id, request.expected_incarnation, true).ok);
-  EXPECT_TRUE(owner->Apply("source", {{OpKind::kPublish, 0, "replacement"}}).ok);
-  EXPECT_FALSE(server.peer->AcquireRead(request).status.ok);
+  CheckReadTimeout(ControlledPeer::Block::kReleaseRequest);
 }
 }  // namespace
 }  // namespace mori::umbp::l1

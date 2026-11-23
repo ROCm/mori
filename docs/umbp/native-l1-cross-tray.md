@@ -1,169 +1,119 @@
 # Native L1 sharing across trays
 
-Based on [PR #1045](https://github.com/ROCm/mori/pull/1045) at
-`82996281c5800ec63541cff7c793e7f86fc9907c` (open on 2026-11-23).
-This opt-in extension is required in addition to #1045 for cross-tray sharing. It uses
-the FABRIC mapping/copy approach referenced by PR #1024 and
-`feat/umbp-ualink-kv-sharing`, without merging their general pool/tier stacks.
-
-## Scope and data path
+This opt-in extension builds on [PR #1045](https://github.com/ROCm/mori/pull/1045)
+at `82996281c5800ec63541cff7c793e7f86fc9907c` (open on 2026-11-23).
+It uses the FABRIC mapping/copy approach from PR #1024 and the KV-sharing branch:
 
 ```text
-ATOM owner native KV HBM → imported FABRIC view → copy kernel → ATOM consumer native KV slots
+ATOM owner KV HBM → imported FABRIC view → copy kernel → ATOM consumer KV slots
 ```
 
-The consumer reserves its final slots first. A local L1 service probes static
-peers, acquires a read grant that pins the owner's current source slots, imports
-their FABRIC descriptors, and copies directly into those destinations. Only
-address/length metadata travels over gRPC. There is no KV payload staging,
-separate KV allocation, DRAM/SSD tier, master, or PoolClient routing.
+The consumer reserves its final slots, acquires a peer read grant that pins the
+source, and copies directly into those slots. gRPC carries metadata only. There
+is no staging allocation, DRAM/SSD tier, master, or PoolClient routing.
+Local sharing is checked first; each Fetch can extend that continuous prefix with
+up to 128 keys from one peer. Limits are eight peers and 64 layout regions;
+copies and FABRIC mapping operations are currently serialized.
 
-Local sharing remains first in lookup order. The initial remote path selects one
-peer for up to 128 following keys per Fetch; it can return a shorter continuous
-prefix. Up to eight peers and 64 layout regions are supported. Copies and FABRIC
-mapping operations are serialized in this first version. This is a correctness
-implementation, with no throughput claim.
+## Deployment
 
-## Integration
+Both trays require HIP FABRIC GPUs in the **same active vPOD/fabric domain**,
+reachable L1 endpoints, and this matching MORI Python package/native extension.
+The worker also needs the regular MORI-IO allocator and PyTorch MemPool support.
+The extension exposes `NATIVE_L1_FABRIC_VERSION=1`; #1045 alone lacks these APIs.
+The service is pure L1 and does not require the standalone tier server.
 
-Both trays need supported HIP FABRIC GPUs in the **same active vPOD/fabric domain**,
-the matching native L1 Python module, a compiled FABRIC copy kernel, and reachable
-L1 gRPC endpoints. Separate networked machines without this fabric connectivity
-are insufficient. No third coordination machine is required.
-
-Build/install this MORI checkout in the normal supported ROCm build environment.
-The service uses `mori_umbp_l1`/`umbp_l1`; its runtime does not need the standalone
-tier server. Install the matching MORI Python package on ATOM workers for the
-lightweight `mori.umbp_l1.NativeL1Memory` client helper. Allocation also needs the
-regular MORI IO allocator library and PyTorch MemPool support. Building the L1
-extension alone does not install the Python helper or allocator.
-
-For a configured ROCm build, enable `BUILD_IO`, `BUILD_UMBP` and
-`BUILD_UMBP_L1_PYTHON`, and explicitly set `GPU_TARGETS` (`gfx1250` on 455), then build:
+In a configured ROCm build, enable `BUILD_IO`, `BUILD_UMBP` and
+`BUILD_UMBP_L1_PYTHON`, and set `GPU_TARGETS` (`gfx1250` on 455):
 
 ```bash
 cmake --build /path/to/build --target mori_umbp_l1 mori_fabric_copy_kernel
-```
-
-The explicit kernel target produces `/path/to/build/lib/fabric_copy.hsaco`.
-
-The separate `mori_umbp_l1` extension must also be on the worker/service Python
-path. With CMake's default output directories it is under `build/src/umbp`:
-
-```bash
 export PYTHONPATH="/path/to/build/src/umbp${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-Use the actual extension output directory if the build overrides it. The new
-`mori.umbp_l1` Python package is included by the normal MORI package discovery;
-it does not import `mori.umbp` or load the general tier stack.
+The kernel is `/path/to/build/lib/fabric_copy.hsaco`. Adjust the extension path
+if CMake output directories differ. Install the matching Python package as well:
+building the extension does not install `mori.umbp_l1.NativeL1Memory` or the allocator.
 
-Start one service per tray (replace peer addresses and the kernel path):
+Start one service per tray with reciprocal peers:
 
 ```bash
 # Tray A
 python tools/umbp_l1_fabric_server.py --listen 0.0.0.0:29620 \
-  --peer TRAY_B_IP:29620 --kernel /path/to/fabric_copy.hsaco
-
+  --peer TRAY_B_IP:29620 --kernel /path/to/build/lib/fabric_copy.hsaco
 # Tray B
 python tools/umbp_l1_fabric_server.py --listen 0.0.0.0:29620 \
-  --peer TRAY_A_IP:29620 --kernel /path/to/fabric_copy.hsaco
+  --peer TRAY_A_IP:29620 --kernel /path/to/build/lib/fabric_copy.hsaco
 ```
 
-This control service uses existing insecure gRPC, so its endpoints are intended
-for the trusted cluster network. FABRIC mode requires the kernel; it never falls
-back to HIP memcpy or staging. Device ordinals and visibility must match between
-each ATOM worker and its local L1 service.
+Use a trusted cluster network for the insecure gRPC endpoints. GPU ordinals and
+visibility must match between workers and their local service. FABRIC mode
+requires the kernel and never falls back to HIP memcpy or staging.
 
-The companion ATOM cross-tray adapter is based on
-[PR #3482](https://github.com/ROCm/ATOM/pull/3482) at
-`db27ec2198711f2d77dafff8ed0d5621af59d9fb` (open on 2026-11-23).
-Install this MORI Python helper and native extension together before enabling
-the adapter; #1045 alone does not provide its FABRIC APIs. Configure `umbp_pool` with
+The companion ATOM adapter builds on [PR #3482](https://github.com/ROCm/ATOM/pull/3482)
+at `db27ec2198711f2d77dafff8ed0d5621af59d9fb`. Configure `umbp_pool` with
 `transport: "fabric"`, `address: "127.0.0.1:29620"`, a unique `node_id` per tray,
-and a common explicit `group`. Each engine on a tray needs a distinct namespace.
-The group must identify identical model revision, KV/hash conventions,
-block size, layer/shard layout and speculative configuration; equal region sizes
-alone do not establish semantic compatibility. Existing IPC mode stays the default.
+and a common explicit `group`; each engine on a tray needs a distinct namespace.
+Group members must match model revision, KV/hash conventions, block size,
+layer/shard layout and speculative configuration. Equal region sizes are not
+enough. Local deployments retain the default IPC mode.
 
-UMBP's `NativeL1Memory` helper runs inside the ATOM worker. It allocates the final
-KV arena with `make_fabric_mem_pool`, initializes it with an in-place GPU kernel,
-and manages descriptor export, Attach/BindLayout, and safe Detach. The helper
-owns the tensor and allocator references; it does not create a second arena or
-stage KV bytes. Other allocations keep their usual allocator. Imports of Torch,
-the native extension and the IO allocator are deferred until the relevant API
-is used. The native module exposes `NATIVE_L1_FABRIC_VERSION=1` for compatibility
-checks.
-
-ATOM's existing memory provider delegates to these client-side operations:
+The helper runs inside the worker, allocates and zeroes the final KV arena, and
+owns its allocator, descriptor, registration and Detach lifecycle. ATOM supplies
+layout and write progress. Keep the helper alive while any arena view is in use:
 
 ```python
 from mori.umbp_l1 import NativeL1Memory
 
 memory = NativeL1Memory(client, pool_id, group)
-arena = memory.allocate(nbytes, device)  # the final KV tensor
+arena = memory.allocate(nbytes, device)
 memory.bind_layout(arena, num_slots, regions)  # byte offset/unit size pairs
-# Use the arena; publish/commit through the existing L1 client.
-# After stopping local admission/writes, confirm peer drain before releasing views:
+# Use the arena and publish/commit through the existing L1 client.
+# Stop admission/writes and confirm peer drain before releasing views.
 memory.close()
 ```
 
-Keep `memory` alive while the tensor or derived views are in use. The ATOM
-connector still supplies KV layout and owner write progress and prevents slot
-reuse when Fetch completion is unknown. FABRIC handles and allocator lifetime
-are encapsulated by UMBP; model and attention code use the existing provider
-interface.
+## Completion and shutdown
 
-## Lifetime and failure behavior
+AcquireRead resolves and pins current source slots; owner Commit establishes
+write completion. Destination writers prevent overlapping Fetch/publication.
+ReleaseRead unpins only after confirmed copy completion or no submitted work.
+Incarnation and operation IDs fence stale or duplicated requests.
 
-Probe is a hint; AcquireRead atomically resolves and pins current source slots.
-Local owner Commit timestamps establish readiness. Destination writer counts
-prevent overlapping Fetch and publication; source pins prevent eviction/reuse.
-ReleaseRead only permits unpinning after confirmed copy completion or confirmed
-absence of submitted work. Owner incarnation and operation IDs fence stale and
-duplicated control messages, including a delayed Acquire after Release.
+Unknown completion retains mappings, pins and destinations and quarantines the
+pool. ATOM stops serving on a FABRIC Fetch exception. The helper retains arena
+and allocator references before Attach and requires Detach confirmation from
+that same service incarnation. A busy-pool lifecycle wait is bounded to two
+seconds; failure raises without releasing memory. Propagate failed `close()`;
+keep owners and services alive until peer drain and Detach are confirmed.
+A timeout never authorizes memory reuse; Python references cannot protect HBM
+after process exit.
 
-Unknown completion keeps mappings, source pins and destination slots, and
-quarantines the destination pool. The client exposes `FetchInDoubtError`; ATOM
-treats any FABRIC Fetch exception conservatively and stops serving while retaining
-its allocation. A timeout never authorizes reuse or fallback into affected slots.
-Detach requires acknowledgement from the same service incarnation as Attach.
-Lifecycle RPCs wait at most two seconds for a busy pool, then return an error
-without releasing memory. Stop admission and drain peers before shutdown.
-The UMBP helper retains the tensor and MemPool before the first Attach RPC; a
-lost Attach reply cannot drop that retention. An unconfirmed `close()` raises
-`L1MemoryInDoubtError` and retains the allocation. Callers must propagate this
-failure instead of continuing normal memory teardown.
+There is no automatic recovery, Release retry or receipt reclamation. Each
+service retains at most 65,536 receipts/tombstones per lifetime; plan a coordinated
+drain/restart before exhaustion. Lost Release may leave source slots pinned.
+`UMBP_L1_KEEP_COPIES` remains local to each PoolManager, with pins/writers also
+protecting its kept list; it does not maintain a global cross-tray copy count.
+Remote copies are logged as `[L1Peer] fabric completed` and counted at destination;
+source `served_out_slots` counts local copies only.
 
-This version has no automatic recovery, release retry, or receipt garbage
-collection. Each service allows 65,536 operation receipts/tombstones per lifetime;
-exhaustion rejects new grants until a coordinated drain/restart. A lost Release
-may leave source slots pinned. Forced owner/service termination requires
-coordinated peer teardown; retaining Python references cannot preserve memory
-after process exit. Source `served_out_slots` counts local copies only; completed
-remote copies are logged as `[L1Peer] fabric completed` and counted at destination.
+## Validation scope
 
-The upstream `UMBP_L1_KEEP_COPIES` policy is preserved. Remote read pins and
-destination writers also protect slots in its kept list. Its copy count remains
-local to a `PoolManager`; it does not guarantee a global number of copies across trays.
+The 2026-11-23 current-source run on g13-12 ↔ g13-10 passed a fresh native
+extension/gfx1250 kernel build, 57 C++ pool/peer/RPC tests, copy planner,
+19 peer tests with `KEEP_COPIES=1`, 12 Python helper tests and 134 companion
+ATOM tests (one intentional native fault-injection skip).
 
-## Validation status
+Real GPU checks passed both import orders, all 32 directed device paths
+(160 cases: bytes/guards/final pointer, prefix cap, pending writes and ATOM
+adapter), and 16 GPU Event/Commit cases on four bidirectional device pairs.
+DeepSeek-V4.1-Flash Fetch-off/on runs on the same consumer matched inputs,
+complete output text and token counts for all 64 requests per arm including
+warmup. Each of the 16 measured remote hits copied 96 slots / 18,309,120 bytes;
+true misses and local-hot requests had no remote copy. Each node used attention
+DP4/TP1 and MoE EP4, without cross-node TP. All three model instances confirmed
+normal Detach before services stopped.
 
-The earlier implementation (MORI base `b946dd65`, ATOM base `bd897325f`) passed
-two-tray validation on g13-12 and g13-10 on 2026-11-22: all 32 directed GPU paths,
-real GPU Event/Commit ordering, slot reuse, and a ten-minute bidirectional soak.
-DeepSeek-V4.1-Flash Fetch-off/on comparisons matched inputs, output text and token
-counts for 64 requests per arm including warmup; the 16 measured remote-hit
-requests each confirmed actual KV copying. Attention used DP4/TP1 per node and
-MoE EP4; this was not cross-node tensor parallelism.
-
-The 2026-11-23 dependency alignment rebuilt the native extension and gfx1250
-kernel. CPU regressions passed: 56 C++ pool/peer/RPC tests, the copy planner,
-12 Python helper tests, and 128 companion ATOM tests (one intentional skip).
-All 18 peer tests also passed with `UMBP_L1_KEEP_COPIES=1`, including a new
-kept-list/read-pin regression. CPU import-order and ELF symbol-isolation checks
-passed. GPU import-order tests were skipped in the CPU-only environment.
-
-The updated PR heads have not been retested with GPUs or model inference. Earlier
-results cover bounded workloads and coordinated shutdown, not full model quality,
-saturated throughput, crash recovery, or topologies beyond the two tested trays.
+An earlier 2026-11-22 run also covered slot reuse and a ten-minute bidirectional
+soak. These are bounded workload and coordinated-shutdown results, not full
+model quality, saturated throughput, crash recovery or other topologies.
