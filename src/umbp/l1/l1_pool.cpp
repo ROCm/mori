@@ -1473,30 +1473,44 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     // Descriptor imports are reused within this call only. Mapping a descriptor
     // creates an address view, not a payload allocation/copy or a staging pool.
     std::unordered_map<std::string, void*> bases;
-    for (size_t i = 0; i < read.regions.size(); ++i) {
-      const PeerReadRegion& region = read.regions[i];
-      if (region.bytes != units[i % units.size()] ||
-          !ValidateFabricRange(region.handle, region.offset, region.bytes, &error)) {
-        valid = false;
-        break;
-      }
-      auto entry = bases.find(region.handle);
-      if (entry == bases.end()) {
-        void* base = nullptr;
-        void* mapped = nullptr;
-        if (!api_->Import(pool->device, region.handle, 0, &base, &mapped, &error)) {
+    // Build runs per layout region before the backend checks and plans copies.
+    // Every original range is still validated; never merge descriptor views.
+    for (size_t r = 0; valid && r < units.size(); ++r) {
+      const PeerReadRegion* previous = nullptr;
+      uint32_t previous_dst = 0;
+      for (size_t k = 0; k < read.available; ++k) {
+        const PeerReadRegion& region = read.regions[k * units.size() + r];
+        if (region.bytes != units[r] ||
+            !ValidateFabricRange(region.handle, region.offset, region.bytes, &error)) {
           valid = false;
           break;
         }
-        mappings.push_back(mapped);
-        entry = bases.emplace(region.handle, base).first;
+        auto entry = bases.find(region.handle);
+        if (entry == bases.end()) {
+          void* base = nullptr;
+          void* mapped = nullptr;
+          if (!api_->Import(pool->device, region.handle, 0, &base, &mapped, &error)) {
+            valid = false;
+            break;
+          }
+          mappings.push_back(mapped);
+          entry = bases.emplace(region.handle, base).first;
+        }
+        const uint32_t dst = options.dst_slots[leading + k];
+        const Region& layout = pool->layout.regions[r];
+        if (previous && previous->handle == region.handle &&
+            previous->offset + previous->bytes == region.offset &&
+            uint64_t{previous_dst} + 1 == dst) {
+          fragments.back().bytes += region.bytes;
+        } else {
+          fragments.push_back(MemoryApi::Fragment{
+              static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
+              static_cast<const char*>(entry->second) + region.offset, region.bytes, pool->device});
+        }
+        previous = &region;
+        previous_dst = dst;
+        bytes += region.bytes;
       }
-      const uint32_t dst = options.dst_slots[leading + i / units.size()];
-      const Region& layout = pool->layout.regions[i % units.size()];
-      fragments.push_back(MemoryApi::Fragment{
-          static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
-          static_cast<const char*>(entry->second) + region.offset, region.bytes, pool->device});
-      bytes += region.bytes;
     }
   }
   const auto started = std::chrono::steady_clock::now();

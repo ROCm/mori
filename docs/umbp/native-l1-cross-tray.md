@@ -1,7 +1,9 @@
 # Native L1 sharing across trays
 
 This opt-in extension builds on [PR #1045](https://github.com/ROCm/mori/pull/1045)
-at `82996281c5800ec63541cff7c793e7f86fc9907c` (open on 2026-11-23).
+at `fb01cb16bdbdcfb21ebedbda4c89fb226cd82161` (open on 2026-11-23).
+The base was rebased from `82996281`; its L1 changes and this PR's implementation
+are unchanged. Validation revisions below identify the original tested commits.
 It uses the FABRIC mapping/copy approach from PR #1024 and the KV-sharing branch:
 
 ```text
@@ -99,7 +101,7 @@ source `served_out_slots` counts local copies only.
 
 ## Validation scope
 
-The 2026-11-23 current-source run on g13-12 ↔ g13-10 passed a fresh native
+The 2026-11-23 run at MORI `965a6061` on g13-12 ↔ g13-10 passed a fresh native
 extension/gfx1250 kernel build, 57 C++ pool/peer/RPC tests, copy planner,
 19 peer tests with `KEEP_COPIES=1`, 12 Python helper tests and 134 companion
 ATOM tests (one intentional native fault-injection skip).
@@ -133,4 +135,28 @@ The tuning passed 57 C++ tests, the copy planner, KEEP_COPIES peer coverage and
 180 GPU correctness cases, including all 32 directed paths, the ATOM adapter,
 unaligned chunk tails and slot reuse. The model validation above predates this
 budget-only change. Profiling after tuning puts AcquireRead metadata/RPC at
-47–57% of large-request handler time; repeated descriptors are the next target.
+47–57% of large-request handler time.
+
+AcquireRead now negotiates a per-response dictionary of full descriptors;
+new and old services retain the inline-handle fallback. For the V4.1 layout,
+an offline protobuf fixture reduces a 128-key response from about 332 KB to
+25 KB. The receiver also coalesces contiguous source/destination runs within
+each layout region before backend validation and copy planning: dense 128-key
+requests become 16 fragments instead of 2048. Each original range remains
+validated; descriptor identity, pin/writer protection and allocation-level
+alias checks are preserved. No mapping cache or staging buffer is added.
+
+Three rotated baseline/dictionary/combined rounds (540,000 timed Fetches) on
+the same trays improved all 60 large-request windows versus `be244261`.
+Single-worker dense rates rose from 15.6–17.0 to 25.5–26.0 GiB/s; fragmented
+rates rose from 15.1–15.7 to 21.3–21.9 GiB/s. Four-pair bidirectional rates
+improved about 25%/30% per worker. Coalescing adds 9–20% for single-worker dense
+requests over dictionary-only, but its additional concurrent gain is mixed,
+with small p99 regressions versus dictionary-only. Tiny requests also fluctuate;
+three longer reverse windows changed −0.18%/+5.13%/−2.53%. These are bounded
+repeated-address Fetch results, not a universal no-regression claim.
+
+The combined extension passed 74 C++ tests, the planner and 27 KEEP_COPIES
+peer tests, all 32 directed GPU paths, tails/slot reuse, the real ATOM adapter,
+16 Event/Commit cases and bidirectional mixed-version service checks. ATOM and
+the copy kernel are unchanged; the model run above predates these optimizations.

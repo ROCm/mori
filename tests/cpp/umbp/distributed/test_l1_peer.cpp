@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -60,6 +61,7 @@ class TestMemory final : public MemoryApi {
   bool Synchronize(int, std::string*) override { return true; }
   CopyOutcome CopyBatchTracked(int, const std::vector<Fragment>& fragments) override {
     ++copies;
+    last_fragments = fragments;
     if (on_copy) on_copy();
     if (!outcome.ok) return outcome;
     for (const auto& fragment : fragments)
@@ -69,6 +71,7 @@ class TestMemory final : public MemoryApi {
   std::atomic<int> imports{0}, unimports{0}, copies{0};
   bool fail_import = false;
   CopyOutcome outcome{true, true, {}};
+  std::vector<Fragment> last_fragments;
   std::function<void()> on_copy;
  private:
   std::shared_ptr<Directory> directory_;
@@ -88,6 +91,7 @@ class LoopPeer final : public PeerApi {
     auto result = owner->AcquireRead(request);
     if (lose_acquire) result.status = Status::Error("injected lost Acquire reply");
     if (corrupt && !result.regions.empty()) result.regions[0].offset = UINT64_MAX;
+    if (on_acquire) on_acquire(result);
     return result;
   }
   Status ReleaseRead(const std::string& op, const std::string& incarnation, bool drained) override {
@@ -100,6 +104,7 @@ class LoopPeer final : public PeerApi {
   bool lose_acquire = false, lose_release = false, corrupt = false;
   PeerReadRequest last;
   std::function<void()> on_probe;
+  std::function<void(PeerReadResult&)> on_acquire;
 };
 
 class L1PeerTest : public ::testing::Test {
@@ -120,17 +125,17 @@ class L1PeerTest : public ::testing::Test {
     handles[id] = Descriptor(token, kBytes);
     (*directory)[handles[id]] = std::vector<unsigned char>(kBytes, 0xDA);
     ASSERT_TRUE(manager.Attach(id, group, token, kBytes, {handles[id], 0, "hip_fabric"}).status.ok);
-    ASSERT_TRUE(manager.BindLayout(id, kLayout).ok);
+    ASSERT_TRUE(manager.BindLayout(id, layout).ok);
     ASSERT_EQ(manager.Open(id).num_slots, kSlots);
   }
   void Fill(const std::string& id, uint32_t slot, unsigned char value) {
     auto& bytes = directory->at(handles[id]);
-    for (const auto& region : kLayout.regions)
+    for (const auto& region : layout.regions)
       std::memset(bytes.data() + region.offset + slot * region.unit_bytes, value, region.unit_bytes);
   }
   bool Equals(const std::string& id, uint32_t slot, unsigned char value) {
     const auto& bytes = directory->at(handles[id]);
-    for (const auto& region : kLayout.regions)
+    for (const auto& region : layout.regions)
       for (uint64_t i = 0; i < region.unit_bytes; ++i)
         if (bytes[region.offset + slot * region.unit_bytes + i] != value) return false;
     return true;
@@ -155,6 +160,7 @@ class L1PeerTest : public ::testing::Test {
     return {operation, source->Incarnation(), "g", {"a"}, {16, 4}};
   }
   std::shared_ptr<Directory> directory;
+  Layout layout = kLayout;
   std::map<std::string, std::string> handles;
   std::shared_ptr<TestMemory> source_api, dest_api;
   std::unique_ptr<PoolManager> source, dest;
@@ -179,6 +185,78 @@ TEST_F(L1PeerTest, CopiesOnlyTheLeadingRemotePrefixIntoFinalSlots) {
   EXPECT_TRUE(dest->Apply("dst", {{OpKind::kPublish, options.dst_slots[0], "a"}}).ok);
   EXPECT_EQ(dest->Probe("g", {"a"}, {16, 4}).available, 1u);
 }
+
+class L1PeerRunTest : public L1PeerTest, public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(L1PeerRunTest, CoalescesOnlyValidatedContiguousRangesInOneDescriptor) {
+  const auto& mode = GetParam();
+  if (mode == "Unaligned") {
+    layout = {kSlots, {{1, 13}, {112, 3}}};
+    ASSERT_TRUE(source->BindLayout("src", layout).ok);
+    ASSERT_TRUE(dest->BindLayout("dst", layout).ok);
+  }
+  std::vector<std::string> keys{"a", "b", "c", "d"}, owners(4, "src");
+  std::vector<uint32_t> src_slots;
+  if (mode == "DifferentHandle") {
+    Attach(*source, "src2", 3);
+    ASSERT_EQ(source->Allocate("src2", 2).slots.size(), 2u);
+    src_slots = Publish(*source, "src", {"a", "b"});
+    const auto more = Publish(*source, "src2", {"c", "d"});
+    src_slots.insert(src_slots.end(), more.begin(), more.end());
+    owners[2] = owners[3] = "src2";
+  } else {
+    src_slots = Publish(*source, "src", keys);
+  }
+  auto options = Destinations(kSlots);
+  options.dst_slots.resize(keys.size());
+  if (mode == "ReversedDestination")
+    std::reverse(options.dst_slots.begin(), options.dst_slots.end());
+  if (mode == "GappedDestination") options.dst_slots = {0, 2, 4, 6};
+  if (mode == "ReversedSource") {
+    std::reverse(keys.begin(), keys.end());
+    std::reverse(src_slots.begin(), src_slots.end());
+  }
+  const bool malformed = mode == "WrongUnit" || mode == "OutOfRange";
+  if (malformed) {
+    peer->on_acquire = [&](PeerReadResult& read) {
+      if (mode == "WrongUnit") ++read.regions.back().bytes;
+      else read.regions.back().offset = UINT64_MAX;
+    };
+  }
+  auto expected = *directory;
+  uint64_t bytes = 0;
+  if (!malformed) {
+    for (size_t k = 0; k < keys.size(); ++k) {
+      for (const auto& region : layout.regions) {
+        std::memcpy(expected[handles["dst"]].data() + region.offset +
+                        options.dst_slots[k] * region.unit_bytes,
+                    directory->at(handles[owners[k]]).data() + region.offset +
+                        src_slots[k] * region.unit_bytes,
+                    region.unit_bytes);
+        bytes += region.unit_bytes;
+      }
+    }
+  }
+  const auto result = dest->Fetch("dst", keys, options);
+  EXPECT_EQ(result.copied_slots, malformed ? 0u : keys.size());
+  EXPECT_EQ(result.copied_bytes, bytes);
+  size_t runs = keys.size();
+  if (mode == "Contiguous" || mode == "Unaligned") runs = 1;
+  if (mode == "DifferentHandle") runs = 2;
+  if (malformed) runs = 0;
+  EXPECT_EQ(dest_api->last_fragments.size(), runs * layout.regions.size());
+  EXPECT_EQ(*directory, expected);  // Full destination, guards and source bytes.
+  EXPECT_EQ(peer->releases, 1);
+  for (size_t k = 0; k < keys.size(); ++k) {
+    EXPECT_TRUE(source->Apply(owners[k], {{OpKind::kPublish, src_slots[k], keys[k]}}).ok);
+    EXPECT_TRUE(dest->Apply("dst", {{OpKind::kRelease, options.dst_slots[k], ""}}).ok);
+  }
+}
+INSTANTIATE_TEST_SUITE_P(Layouts, L1PeerRunTest,
+                        ::testing::Values("Contiguous", "Unaligned", "ReversedDestination",
+                                          "GappedDestination", "ReversedSource", "DifferentHandle",
+                                          "WrongUnit", "OutOfRange"),
+                        [](const auto& info) { return info.param; });
 
 TEST_F(L1PeerTest, SourceRequiresCommitAndMatchingGroupAndLayout) {
   Publish(*source, "src", {"a"}, 7);
@@ -267,6 +345,7 @@ TEST_F(L1PeerTest, RepeatedSourceKeyCanFillDistinctDestinationsAndUnpinCompletel
   auto result = dest->Fetch("dst", {"a", "a"}, options);
   EXPECT_TRUE(result.status.ok);
   EXPECT_EQ(result.copied_slots, 2u);
+  EXPECT_EQ(dest_api->last_fragments.size(), 4u);
   for (uint32_t slot : options.dst_slots) EXPECT_TRUE(Equals("dst", slot, 11));
   EXPECT_TRUE(source->Apply("src", {{OpKind::kPublish, 0, "changed"}}).ok);
 }

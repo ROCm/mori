@@ -209,6 +209,8 @@ message AcquireReadRequest {
   string group = 3;
   repeated bytes keys = 4;
   repeated uint64 unit_bytes = 5 [packed = true];
+  // Opt in to the response handle dictionary; older clients get inline handles.
+  bool compact_handles = 6;
 }
 
 message PeerReadRegion {
@@ -216,6 +218,9 @@ message PeerReadRegion {
   bytes handle = 1;
   uint64 offset = 2;
   uint64 bytes = 3;
+  // 1-based index into AcquireReadResponse.handles; 0 means inline handle.
+  // An indexed region must leave handle empty.
+  uint32 handle_index = 4;
 }
 
 message AcquireReadResponse {
@@ -225,6 +230,8 @@ message AcquireReadResponse {
   uint32 available = 4;
   // Key-major, then region-major; exactly available * unit_bytes.size().
   repeated PeerReadRegion regions = 5;
+  // Full opaque descriptors, deduplicated within this response only.
+  repeated bytes handles = 6;
 }
 
 message ReleaseReadRequest {

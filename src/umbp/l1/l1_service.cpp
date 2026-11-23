@@ -172,9 +172,17 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     SetStatus(result.status, response);
     response->set_incarnation(result.incarnation);
     response->set_available(result.available);
+    std::unordered_map<std::string, uint32_t> handles;
+    response->mutable_regions()->Reserve(result.regions.size());
     for (const PeerReadRegion& region : result.regions) {
       pb::PeerReadRegion* out = response->add_regions();
-      out->set_handle(region.handle);
+      if (request->compact_handles()) {
+        const auto [entry, added] = handles.try_emplace(region.handle, handles.size() + 1);
+        if (added) response->add_handles(region.handle);
+        out->set_handle_index(entry->second);
+      } else {
+        out->set_handle(region.handle);
+      }
       out->set_offset(region.offset);
       out->set_bytes(region.bytes);
     }
@@ -274,6 +282,7 @@ class L1Peer final : public PeerApi {
     request.set_operation_id(read.operation_id);
     request.set_expected_incarnation(read.expected_incarnation);
     request.set_group(read.group);
+    request.set_compact_handles(true);
     for (const std::string& key : read.keys) request.add_keys(key);
     for (uint64_t bytes : read.unit_bytes) request.add_unit_bytes(bytes);
     pb::AcquireReadResponse response;
@@ -283,9 +292,21 @@ class L1Peer final : public PeerApi {
     result.status = FromResponse(stub_->AcquireRead(&context, request, &response), response);
     result.incarnation = response.incarnation();
     result.available = response.available();
+    if (!result.status.ok) return result;
+    for (const std::string& handle : response.handles()) {
+      if (handle.empty())
+        return {Status::Error("native L1 read has an empty handle dictionary entry"),
+                result.incarnation};
+    }
     result.regions.reserve(response.regions_size());
     for (const pb::PeerReadRegion& region : response.regions()) {
-      result.regions.push_back(PeerReadRegion{region.handle(), region.offset(), region.bytes()});
+      const uint32_t index = region.handle_index();
+      if (index > static_cast<uint32_t>(response.handles_size()) ||
+          (index != 0 && !region.handle().empty()) || (index == 0 && region.handle().empty())) {
+        return {Status::Error("native L1 read has an invalid handle reference"), result.incarnation};
+      }
+      const std::string& handle = index ? response.handles(index - 1) : region.handle();
+      result.regions.push_back(PeerReadRegion{handle, region.offset(), region.bytes()});
     }
     return result;
   }
