@@ -32,6 +32,8 @@ namespace mori::umbp::standalone {
 
 constexpr uint32_t kFdRegistrationMagic = 0x554d4250;  // "UMBP"
 constexpr uint32_t kFdRegistrationVersion = 1;
+constexpr uint32_t kProcessWatchVersion = 2;
+constexpr uint32_t kWatchedFdRegistrationVersion = 3;
 constexpr size_t kClientIdBytes = 64;
 
 struct FdRegistrationMessage {
@@ -49,7 +51,8 @@ std::string DefaultStandaloneAddress();
 bool EnsureParentDirectory(const std::string& path, std::string* error = nullptr);
 
 int SendFdRegistration(const std::string& socket_path, int fd, const std::string& client_id,
-                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error);
+                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error,
+                       uint32_t version = kFdRegistrationVersion);
 int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::string* error);
 
 bool SendStatus(int socket_fd, int32_t status, std::string* error = nullptr);

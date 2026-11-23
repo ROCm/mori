@@ -161,7 +161,8 @@ bool EnsureParentDirectory(const std::string& path, std::string* error) {
 }
 
 int SendFdRegistration(const std::string& socket_path, int fd, const std::string& client_id,
-                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error) {
+                       uintptr_t worker_base, size_t size, int timeout_ms, std::string* error,
+                       uint32_t version) {
   if (client_id.empty() || client_id.size() >= kClientIdBytes) {
     SetError(error, "client_id is empty or too long");
     return -1;
@@ -190,6 +191,7 @@ int SendFdRegistration(const std::string& socket_path, int fd, const std::string
   }
 
   FdRegistrationMessage msg;
+  msg.version = version;
   std::strncpy(msg.client_id, client_id.c_str(), sizeof(msg.client_id) - 1);
   msg.worker_base = static_cast<uint64_t>(worker_base);
   msg.size = static_cast<uint64_t>(size);
@@ -249,7 +251,7 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
 
   ssize_t received = 0;
   while (true) {
-    received = recvmsg(socket_fd, &hdr, 0);
+    received = recvmsg(socket_fd, &hdr, MSG_CMSG_CLOEXEC);
     if (received < 0 && errno == EINTR) continue;
     break;
   }
@@ -276,8 +278,12 @@ int RecvFdRegistration(int socket_fd, FdRegistrationMessage* message, std::strin
   }
   int received_fd = -1;
   std::memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
-  if (message->magic != kFdRegistrationMagic || message->version != kFdRegistrationVersion ||
-      message->client_id[kClientIdBytes - 1] != '\0' || message->size == 0) {
+  const bool process_watch = message->version == kProcessWatchVersion;
+  const bool memory = message->version == kFdRegistrationVersion ||
+                      message->version == kWatchedFdRegistrationVersion;
+  if (message->magic != kFdRegistrationMagic || (!process_watch && !memory) ||
+      message->client_id[0] == '\0' || message->client_id[kClientIdBytes - 1] != '\0' ||
+      (process_watch ? (message->size != 0 || message->worker_base != 0) : message->size == 0)) {
     close(received_fd);
     SetError(error, "invalid fd registration payload");
     return -1;

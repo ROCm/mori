@@ -25,9 +25,11 @@
 #include "umbp/standalone/standalone_server.h"
 
 #include <grpcpp/grpcpp.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -38,6 +40,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -562,6 +565,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     chmod(grpc_path.c_str(), 0600);
+    process_thread_ = std::thread([this]() { ReapExitedProcesses(); });
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
     if (concurrent_backend_) {
       MORI_UMBP_INFO(
@@ -586,12 +590,19 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (!shutdown_.compare_exchange_strong(expected, true)) return;
 
     StopFdListener();
+    process_cv_.notify_all();
+    if (process_thread_.joinable()) process_thread_.join();
     // Reported here as well as periodically: a run that stops between two
     // round numbers would otherwise take its last, most-settled window of
     // measurements with it.
     key_handle_stats_.Report();
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
+    }
+    {
+      std::lock_guard<std::mutex> lock(external_identity_lifecycle_mu_);
+      for (const auto& [id, fd] : process_fds_) close(fd);
+      process_fds_.clear();
     }
     UnregisterAllExternalIdentities();
     {
@@ -615,6 +626,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // extra ssd.enabled veto here would keep refusing a backend that can.
     response->set_supports_ranged_io(client_->SupportsRangedIO());
     response->set_simulation(backend_config_.sim.enabled);
+    response->set_supports_process_watch(true);
     return grpc::Status::OK;
   }
 
@@ -991,6 +1003,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return grpc::Status::OK;
     }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    if (request->require_process_watch() && !ProcessIsAlive(request->client_id())) {
+      SetBool(response, false, "client process is not registered or has exited");
+      return grpc::Status::OK;
+    }
     memory_importer_->Register(*this, *request, response);
     if (response->ok() && !EnsureExternalIdentity(*request)) {
       MORI_UMBP_WARN(
@@ -1007,6 +1023,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
     RemoveExternalIdentity(request->client_id());
     UnmapClient(request->client_id());
+    RemoveProcessWatch(request->client_id());
     return grpc::Status::OK;
   }
 
@@ -1314,8 +1331,77 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return;
     }
 
-    int32_t status = RegisterFd(fd, msg) ? 0 : -1;
+    std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+    int32_t status = -1;
+    if (msg.version == kProcessWatchVersion) {
+      status = RegisterProcessWatch(fd, msg.client_id) ? 0 : -1;
+    } else if (msg.version == kWatchedFdRegistrationVersion && !ProcessIsAlive(msg.client_id)) {
+      close(fd);
+    } else {
+      status = RegisterFd(fd, msg) ? 0 : -1;
+    }
     SendStatus(client_fd, status);
+  }
+
+  // pidfds name a process generation even across sibling PID namespaces.
+  // The lifecycle lock serializes this table, registration and deregistration.
+  static bool PidfdIsAlive(int fd) {
+    pollfd event{fd, POLLIN, 0};
+    int result;
+    do {
+      result = poll(&event, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
+  }
+
+  bool ProcessIsAlive(const std::string& id) {
+    auto it = process_fds_.find(id);
+    return it != process_fds_.end() && PidfdIsAlive(it->second);
+  }
+
+  bool RegisterProcessWatch(int fd, const std::string& id) {
+    // Signal 0 validates the fd type without delivering a signal. EINVAL is
+    // expected across sibling PID namespaces; EPERM is possible across UIDs.
+    const int result = static_cast<int>(syscall(SYS_pidfd_send_signal, fd, 0, nullptr, 0));
+    const bool valid = result == 0 || errno == EINVAL || errno == EPERM;
+    if (!valid || !PidfdIsAlive(fd)) {
+      close(fd);
+      return false;
+    }
+    auto [it, inserted] = process_fds_.emplace(id, fd);
+    if (!inserted) close(fd);
+    return PidfdIsAlive(it->second);
+  }
+
+  void RemoveProcessWatch(const std::string& id) {
+    auto it = process_fds_.find(id);
+    if (it == process_fds_.end()) return;
+    close(it->second);
+    process_fds_.erase(it);
+  }
+
+  void ReapExitedProcesses() {
+    std::unique_lock<std::mutex> lock(external_identity_lifecycle_mu_);
+    while (!shutdown_.load()) {
+      process_cv_.wait_for(lock, std::chrono::milliseconds(100),
+                           [this]() { return shutdown_.load(); });
+      if (shutdown_.load()) break;
+      for (auto it = process_fds_.begin(); it != process_fds_.end();) {
+        pollfd event{it->second, POLLIN, 0};
+        if (poll(&event, 1, 0) <= 0 || !(event.revents & (POLLIN | POLLHUP))) {
+          ++it;
+          continue;
+        }
+        const std::string id = it->first;
+        // Remove address resolution first. ReleaseRegisteredMemory then waits
+        // for every admitted backend call using client_mu_ before unmapping.
+        RemoveExternalIdentity(id);
+        UnmapClient(id);
+        close(it->second);
+        it = process_fds_.erase(it);
+        MORI_UMBP_INFO("[StandaloneServer] reclaimed exited client_id={}", id);
+      }
+    }
   }
 
   bool RegisterFd(int fd, const FdRegistrationMessage& msg) {
@@ -1793,6 +1879,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::map<std::string, std::vector<RegisteredMemory>> memory_;
   std::map<IpcKey, IpcMapping> ipc_maps_;
   std::mutex external_identity_lifecycle_mu_;
+  std::map<std::string, int> process_fds_;
+  std::condition_variable process_cv_;
+  std::thread process_thread_;
   std::mutex external_identity_mu_;
   std::map<std::string, std::shared_ptr<ExternalKvIdentityClient>> external_identities_;
 

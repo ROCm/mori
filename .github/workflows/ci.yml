@@ -784,7 +784,7 @@ jobs:
           $CT exec -e MORI_UMBP_LOG_LEVEL=warn $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE/build
             timeout 300 ctest --output-on-failure \
-              -R '^(umbp_|test_dummy_ssd_tier|test_ssd_tier)'
+              -R '^(umbp_|test_dummy_ssd_tier|test_ssd_tier|test_standalone_shm_ipc$)'
           "
 
       # Five client primitives -- put / get / exists / put_ranges / get_ranges
