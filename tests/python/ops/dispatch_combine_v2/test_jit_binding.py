@@ -279,6 +279,34 @@ def test_describe_rejects_what_the_constructor_rejects():
         cb.EpDispatchPlan.describe(hidden_dim=7)
 
 
+def _device_arch():
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def _built_for(plan):
+    """The arch a plan compiled for: its cache directory is <root>/<arch>_<nic>[_ccqe]/<entry>."""
+    return plan.info["cacheDir"].split("/")[-2].split("_", 1)[0]
+
+
+def test_describe_arch_applies_to_that_call_only():
+    # Every arch, one after another, then a plan with none: each arch= is gone
+    # when its call returns, so the plan is built for the device.
+    for arch in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        cb.EpDispatchPlan.describe(arch=arch, **_SMALL)
+    p = cb.EpDispatchPlan(**_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
+def test_create_for_another_arch_fails_before_compiling():
+    other = "gfx950" if _device_arch() == "gfx942" else "gfx942"
+    with pytest.raises(RuntimeError, match=f"building for {other} \\(set by arch=\\)"):
+        cb.EpDispatchPlan(arch=other, **_SMALL)
+    p = cb.EpDispatchPlan(arch=_device_arch(), **_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
 def test_every_arena_region_is_reported_in_args_order():
     stems = [
         n[3].lower() + n[4:]
@@ -977,3 +1005,43 @@ def test_a_group_compares_defaults_by_the_address_launch_writes(launched, stages
     cb.plan_api.make_launch_group([a, b])
     for p in (a, b, other):
         p.close()
+
+
+_SCATTER_KW = dict(
+    world_size=8,
+    hidden_dim=7168,
+    max_tok_per_rank=128,
+    max_recv=1024,
+    num_expert_per_token=8,
+)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+def test_scatter_combine_lands_one_quantized_row_per_source_token(group, fp4):
+    from mori.jit.core import _target_arch
+
+    arch = _target_arch()
+    kw = dict(_SCATTER_KW, combine_scatter_q_group=group, combine_scatter_fp4=fp4)
+    if arch.startswith("gfx125") or (fp4 and not arch.startswith("gfx950")):
+        with pytest.raises(RuntimeError, match="combineScatter"):
+            cb.EpCombinePlan.describe(**kw)
+        return
+    info = cb.EpCombinePlan.describe(**kw)
+    payload = 7168 // 2 if fp4 else 7168
+    scales = 7168 // 32 if group == 32 else 7168 // 128 * 4
+    assert info["scatterRowBytes"] == _up128(payload + scales + 4 * 8)
+    # every (source rank, source token) pair has its own landing row
+    assert info["region.outTok"] == info["scatterLandOff"] + 8 * 128 * (
+        info["scatterRowBytes"]
+    )
+    assert (info["combineScatterQGroup"], info["combineScatterFp4"]) == (group, fp4)
+
+
+def test_scatter_combine_refuses_a_push_beside_it():
+    with pytest.raises(RuntimeError, match="combineScatter"):
+        cb.EpCombinePlan.describe(
+            **_SCATTER_KW, combine_scatter_q_group=128, combine_bf16_push=True
+        )
+    with pytest.raises(RuntimeError, match="needs combineScatterQGroup"):
+        cb.EpCombinePlan.describe(**_SCATTER_KW, combine_scatter_fp4=True)

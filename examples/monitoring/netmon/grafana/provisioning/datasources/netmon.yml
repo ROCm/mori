@@ -1,0 +1,13 @@
+# VictoriaMetrics as a Prometheus-type data source (MetricsQL is a PromQL superset).
+apiVersion: 1
+
+datasources:
+  - name: netmon-vm
+    uid: netmon-vm
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:${NETMON_VM_PORT}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 1ms

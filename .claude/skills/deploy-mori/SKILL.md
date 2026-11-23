@@ -726,7 +726,7 @@ Some machines are configured in ways that make MORI slow without anything being 
 with MORI. The **`known-issues`** skill collects them, with detection commands and fixes.
 
 Worth a look on any newly deployed box, and mandatory reading before debugging a
-performance problem that only shows up on one machine. The most common one:
+performance problem that only shows up on one machine. The most common:
 
 - **HIP VMM peer traffic silently falls off XGMI** on kernels built without
   `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` (stock Ubuntu 22.04 GA 5.15).
@@ -739,6 +739,16 @@ performance problem that only shows up on one machine. The most common one:
 
   Both must print `=y`. In a container without the config, see Step 8 above. Details:
   `.claude/skills/known-issues/SKILL.md`.
+
+- **amdgpu miscounts VRAM registered with a NIC** (MoRI-IO, UMBP): after registration,
+  allocations and kernel loads fail with OOM although VRAM is free. Every public
+  amdgpu-dkms release is affected, and 30.x and 31.10 – 31.60 behave differently. Check
+  `cat /sys/module/amdgpu/version` against Issue 4 of the same skill.
+
+- **AINIC firmware mishandles retransmitted RDMA READs** (MoRI-IO, UMBP): on 1.117.5 builds
+  after a-45, reads fail with flush errors and no root cause, or succeed with data missing
+  or landing late. Check `cat /sys/class/infiniband/*/fw_ver` against Issue 5 of the same
+  skill; `MORI_IO_QP_MAX_RD_ATOMIC=1` avoids it.
 
 ---
 

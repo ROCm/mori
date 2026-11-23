@@ -29,10 +29,12 @@ from .dispatch_combine_op import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
     EpDispatchRoutingHandle,
+    supported_quant_types,
 )
 
 __all__ = [
     "EpDispatchCombineConfig",
     "EpDispatchCombineOp",
     "EpDispatchRoutingHandle",
+    "supported_quant_types",
 ]

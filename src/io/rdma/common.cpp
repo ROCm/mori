@@ -34,9 +34,13 @@
 #include <ctime>
 #include <limits>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <string>
 #include <thread>
 #include <utility>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/verbs_ops.hpp"
@@ -721,6 +725,53 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus,
   return {StatusCode::IN_PROGRESS, ""};
 }
 
+namespace {
+
+// When a READ is retransmitted while its QP keeps several in flight, AMD Pollara (AINIC)
+// 1.117.5 firmware after a-45 can report it complete before all of its data is written, or
+// move the QP to the error state without failing a work request. Seen on 1.117.5-a-77 and
+// 1.117.5-a-196, not on 1.117.5-a-45; until a build with the fix is known, every later
+// 1.117.5 build counts (Known Issues in docs/MORI-IO-GUIDE.md).
+bool HasAinicReadIssue(const application::IonicFwVersion& fw) {
+  const auto& [major, minor, patch, build] = fw;
+  return major == 1 && minor == 117 && patch == 5 && build > 45;
+}
+
+// Once per process, at the first READ: reports it going over such firmware with more than
+// one READ in flight per QP. At error level, the default, because the failures it warns of
+// can be silent.
+void WarnOnceIfAinicReadIssue(const EpPairVec& eps) {
+  static std::once_flag once;
+  std::call_once(once, [&eps] {
+    // The ionic driver rounds max_rd_atomic down to 2^k - 1, so 2 also means one.
+    std::optional<uint8_t> rdAtomic = application::ReadIoQpMaxRdAtomicEnv();
+    if (rdAtomic.has_value() && rdAtomic.value() < 3) return;
+    std::set<std::string> affected;
+    for (const EpPair& ep : eps) {
+      const ibv_qp* qp = ep.local.ibvHandle.qp;
+      if (qp == nullptr || qp->context == nullptr) continue;
+      const char* dev = qp->context->device->name;
+      std::optional<application::IonicFwVersion> fw = application::ReadIonicFwVersion(dev);
+      if (!fw.has_value() || !HasAinicReadIssue(*fw)) continue;
+      const auto& [major, minor, patch, build] = *fw;
+      affected.insert(std::string(dev) + " " + std::to_string(major) + "." + std::to_string(minor) +
+                      "." + std::to_string(patch) + "-a-" + std::to_string(build));
+    }
+    if (affected.empty()) return;
+    std::string list;
+    for (const std::string& a : affected) list += (list.empty() ? "" : ", ") + a;
+    MORI_IO_ERROR(
+        "Known issue: RDMA READ over AINIC firmware {}: a READ retransmitted while its QP keeps "
+        "several in flight can complete before all of its data is written, or fail the QP with "
+        "only flush errors (seen on 1.117.5-a-77 and 1.117.5-a-196). Set "
+        "MORI_IO_QP_MAX_RD_ATOMIC=1 to keep one READ in flight per QP; see Known Issues in "
+        "docs/MORI-IO-GUIDE.md",
+        list);
+  });
+}
+
+}  // namespace
+
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
                              const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
@@ -729,6 +780,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
                              TransferUniqueId id, bool isRead, int postBatchSize,
                              const RdmaTransferControl& control) {
   MORI_IO_FUNCTION_TIMER;
+  if (isRead) WarnOnceIfAinicReadIssue(eps);
   // ADDITIVE (MORI_ROCTX=1): brackets host submission for this generic RDMA I/O
   // batch; both reads and writes route here.
   // bytes= carries the whole-call payload (sum of the per-request sizes).

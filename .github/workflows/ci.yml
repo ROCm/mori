@@ -11,23 +11,6 @@ on:
     # act through ci-rerun.yml, which re-runs this workflow when one is added.
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
-    inputs:
-      run_umbp_single_node_hicache:
-        type: boolean
-        default: false
-        description: Run UMBP single-node hicache smoke test
-      sglang_repo:
-        type: string
-        default: "sgl-project/sglang"
-        description: owner/repo to checkout for SGLang
-      sglang_ref:
-        type: string
-        default: "main"
-        description: branch, tag, or SHA for SGLang checkout
-      enable_dp:
-        type: boolean
-        default: false
-        description: Enable DP/EP modes when launching the hicache test
 permissions:
   contents: read
 
@@ -844,7 +827,8 @@ jobs:
     name: mori internode test (${{ matrix.platform }})
     # Not on build: that runs on another runner, and this job builds mori itself.
     needs: scope
-    if: needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
+    # Off: MI355X-AINIC, this job's only runner, is down.
+    if: false && needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -1498,68 +1482,6 @@ jobs:
     env: *internode-env
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps: *internode-steps
-
-  umbp-single-node-hicache:
-    name: mori umbp single-node hicache smoke test
-    needs: build
-    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache
-    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
-    timeout-minutes: 180
-    steps:
-      - name: Fix workspace permissions
-        run: |
-          WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
-            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
-              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
-          fi
-
-      - name: Checkout MoRI
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-          # A re-run (run_attempt > 1) checks out the PR merged with the current
-          # main; otherwise it would reuse the merge commit of the first attempt.
-          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
-
-      - name: Checkout SGLang
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.sglang_repo }}
-          ref: ${{ inputs.sglang_ref }}
-          path: sglang
-          fetch-depth: 1
-
-      - name: Ensure hicache script is executable
-        run: chmod +x src/umbp/scripts/run_umbp_single_node_hicache.sh
-
-      - name: Run hicache smoke test
-        env:
-          SGLANG_REPO: ${{ github.workspace }}/sglang
-          MORI_REPO: ${{ github.workspace }}
-          RESULTS_DIR: ${{ github.workspace }}/umbp_single_node_results
-          USE_DUMMY_WEIGHTS: "true"
-          RUN_GSM8K: "false"
-          MODEL_PATH: ${{ github.workspace }}/umbp_dummy_model
-          ENABLE_DP: ${{ inputs.enable_dp }}
-          START_UMBP_MASTER: "false"
-        run: |
-          set -euo pipefail
-          mkdir -p "$RESULTS_DIR"
-          ./src/umbp/scripts/run_umbp_single_node_hicache.sh
-
-      - name: Upload hicache artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: umbp-single-node-hicache-${{ github.run_id }}
-          path: |
-            ${{ github.workspace }}/umbp_single_node_results
-          if-no-files-found: warn
-
-      - name: Cleanup hicache container
-        if: always()
-        run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
 
   cco:
     name: CCO

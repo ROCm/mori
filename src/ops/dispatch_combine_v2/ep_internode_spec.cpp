@@ -357,7 +357,7 @@ mori::ops::v2::EpInterNodeCfg EpInterNodeCfgFromFields(const mori::jit::v2::Fiel
     using mori::jit::v2::WireAssign;
     if (fields.Has(name)) WireAssign(slot, fields.Get(name, 0));
   });
-  return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, request, kind);
+  return MakeEpInterNodeCfg(mori::jit::v2::ActiveArch(), request, kind);
 }
 
 // No C++-side AOT: a precompiled entry only helps if it renders the Cfg a live

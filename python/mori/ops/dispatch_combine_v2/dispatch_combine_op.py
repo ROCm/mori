@@ -61,6 +61,16 @@ import torch
 from mori.tensor_utils import from_gpu_ptr
 from mori.jit.config import detect_wave_size
 
+from .quant_types import (
+    QUANT_TYPES,
+    is_gfx125x,
+    is_gfx125x_arch,
+    names_for,
+    quant_element,
+    quant_group,
+    resolve_quant_type,
+)
+
 logger = logging.getLogger(__name__)
 
 WAVE = detect_wave_size()
@@ -79,11 +89,11 @@ def _default_backend() -> str:
     return "hip" if gfx125x else "flydsl"
 
 
-_FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
+_QUANT_TYPES = QUANT_TYPES
+_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
 # The quant types the hip backend runs as its gfx125x push combine: the sender
 # quantizes into the destination's landing rows and the destination reduces them.
-_PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
-_QUANT_TYPES = ("none", "fp8_blockwise") + _FP4_QUANT_TYPES
+_PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise_1x32",)
 # Removed quant types and their replacement, named in the error.
 _REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
 
@@ -119,7 +129,9 @@ class EpDispatchCombineConfig:
     scale_type_size: int = 0
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
-    # none | fp8_blockwise | fp4_blockwise | fp4_blockwise_fp32
+    # Combine wire quant: "none", an explicit fp{8,4}_blockwise_1x{32,128}, or
+    # fp8_blockwise / fp4_blockwise for the arch's default group (see
+    # quant_types.py). Holds the explicit name after construction.
     quant_type: str = "none"
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
@@ -365,10 +377,7 @@ class EpDispatchCombineConfig:
                 f"quant_type {self.quant_type!r} was removed; use "
                 f"{_REMOVED_QUANT_TYPES[self.quant_type]!r}"
             )
-        if self.quant_type not in _QUANT_TYPES:
-            raise ValueError(
-                f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
-            )
+        self.quant_type = resolve_quant_type(self.quant_type, is_gfx125x())
         if self.is_internode and self.max_num_inp_token_per_rank % WAVE:
             # The internode send buffer is addressed as
             # pe * max_num_inp_token_per_rank + slot, but slots are handed out in
@@ -441,16 +450,11 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
-            push = self.quant_type in _PUSH_QUANT_TYPES
-            if (
-                (self.combine_mode != "gather" and not push)
-                or (self.quant_type != "none" and not push)
-                or self.enable_std_moe
-            ):
+            quant = self.quant_type != "none"
+            if (self.combine_mode != "gather" and not quant) or self.enable_std_moe:
                 raise ValueError(
-                    "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    f"quant_type=none (or one of {_PUSH_QUANT_TYPES}), "
-                    "enable_std_moe=False"
+                    "combine_data_type (asymmetric dtype) requires combine_mode=gather "
+                    "or a quantized combine, and enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.
@@ -575,6 +579,7 @@ class EpDispatchCombineConfig:
                     self.hidden_dim,
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
+                    quant=self.quant_type != "none",
                 )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
@@ -628,13 +633,31 @@ class EpDispatchCombineConfig:
         return self.combine_mode == "scatter"
 
     @property
+    def quant_element(self):
+        """ "fp8" / "fp4" on a quantized combine wire, else None."""
+        return quant_element(self.quant_type)
+
+    @property
+    def quant_group(self):
+        """Elements per combine scale (32 or 128), 0 when unquantized."""
+        return quant_group(self.quant_type)
+
+    @property
     def fp8_blockwise(self):
-        return self.quant_type == "fp8_blockwise"
+        """An fp8 combine wire, whatever its group."""
+        return self.quant_element == "fp8"
 
     @property
     def combine_scale_dim(self):
-        """Per-token block count for fp8_blockwise combine (block_elems=128)."""
-        return self.hidden_dim // 128 if self.fp8_blockwise else 0
+        """Per-token scale count of the fp8 combine wire."""
+        return self.hidden_dim // self.quant_group if self.fp8_blockwise else 0
+
+    @property
+    def combine_scale_bytes(self):
+        """Per-token scale bytes of the fp8 combine wire: one E8M0 byte per 1x32
+        group, one f32 per 1x128 block, rounded up to a dword."""
+        size = 1 if self.quant_group == 32 else 4
+        return (self.combine_scale_dim * size + 3) // 4 * 4
 
     @property
     def wire_elem_size(self):
@@ -874,6 +897,27 @@ class EpDispatchRoutingHandle:
         )
 
 
+def supported_quant_types(backend=None, arch=None) -> dict[str, str]:
+    """The quant_type names `backend` serves intranode on `arch`, each mapped to
+    the explicit format it resolves to there. Any other name is refused when the
+    op is built. Defaults: this machine's arch, and the backend an op would pick
+    (MORI_V2_KERNEL_BACKEND, else hip on gfx125x and flydsl elsewhere). Shape
+    limits (a hidden size, a combine dtype) are checked at construction only.
+    """
+    if arch is None:
+        from mori.jit.core import _target_arch
+
+        arch = _target_arch()
+    gfx125x = is_gfx125x_arch(arch)
+    name = (
+        backend
+        or os.environ.get("MORI_V2_KERNEL_BACKEND")
+        or ("hip" if gfx125x else "flydsl")
+    )
+    cls = EpDispatchCombineOp._resolve_backend(name)
+    return names_for(cls._quant_formats(arch), gfx125x)
+
+
 class EpDispatchCombineOp:
     """Base + backend selector. Instantiating this picks a subclass."""
 
@@ -982,6 +1026,22 @@ class EpDispatchCombineOp:
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
+
+    @classmethod
+    def _quant_formats(cls, arch: str) -> tuple[str, ...]:
+        """Explicit quant types this backend's intranode combine serves on `arch`."""
+        return ()
+
+    @classmethod
+    def _quant_refusal(cls, cfg, arch: str) -> tuple[str, ...]:
+        """Why `cfg.quant_type` is refused on `arch`; empty if it is served."""
+        formats = cls._quant_formats(arch)
+        if cfg.quant_type == "none" or cfg.quant_type in formats:
+            return ()
+        return (
+            f"quant_type={cfg.quant_type!r} on {arch or 'this GPU'} (the "
+            f"{cls.backend_name} backend serves {', '.join(formats) or 'none'})",
+        )
 
     def _set_segment_stride(self, stride, num_tokens):
         """Record this round's segment stride (None or 0 = compact). Only the
@@ -1119,7 +1179,9 @@ class EpDispatchCombineOp:
     @staticmethod
     def _specs_from(cfg):
         """The (block, warp) variants to build, de-duplicated from the schedule."""
-        if cfg.schedule and not cfg.is_scatter:
+        # A plain scatter keeps one combine geometry; the gather's buckets are not
+        # tuned for it. A quantized one takes the buckets lookup(quant=True) gave.
+        if cfg.schedule and (not cfg.is_scatter or cfg.quant_type != "none"):
             disp = sorted({(db, dw) for (_, db, dw, _, _) in cfg.schedule})
             comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
         elif cfg.schedule:

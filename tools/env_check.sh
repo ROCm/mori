@@ -8,6 +8,8 @@
 # backend (MORI_ENABLE_HOST_PROXY=1) does cross-node RDMA without IBGDA, so an
 # old firmware still runs; only IBGDA needs the minimum.
 #   - AINIC     : >= 1.117.5-a-45 is solid. The 1.117.1 major does NOT support IBGDA.
+#                 1.117.5 builds after a-45 can mishandle retransmitted RDMA READs
+#                 (seen on a-77 and a-196; Known Issues in docs/MORI-IO-GUIDE.md).
 #   - Broadcom  : solid on 237.1.137.x (official release) and 235.2.86.x
 #                 (customer-specific build). Known bad: 231.x and 232.x are too
 #                 old for IBGDA.
@@ -1277,7 +1279,9 @@ version_ge() {
 #   below the required minimum for cross-node IBGDA. It is a warning, not a
 #   failure: IBGDA needs the minimum, but the host-proxy backend
 #   (MORI_ENABLE_HOST_PROXY=1) does cross-node RDMA without IBGDA, so an old
-#   firmware still runs. An *undetectable* version also warns.
+#   firmware still runs. An *undetectable* version also warns. So does a 1.117.5
+#   build after a-45, which can mishandle retransmitted RDMA READs (Known Issues in
+#   docs/MORI-IO-GUIDE.md; MORI-IO avoids it with MORI_IO_QP_MAX_RD_ATOMIC=1).
 check_ainic_version_recommendation() {
     local ver="$1"
     [[ -n "$ver" ]] || { log_warn "cannot verify AINIC firmware version against requirement (empty)"; return; }
@@ -1290,6 +1294,9 @@ check_ainic_version_recommendation() {
         log_ok "AINIC firmware $ver meets the required minimum (>= $AINIC_MIN_VER) for cross-node IBGDA"
     else
         log_warn "AINIC firmware $ver is below the minimum (>= $AINIC_MIN_VER) for cross-node IBGDA — upgrade for IBGDA, or use MORI_ENABLE_HOST_PROXY=1"
+    fi
+    if [[ "$ver" =~ ^1\.117\.5-a-?([0-9]+)$ ]] && (( 10#${BASH_REMATCH[1]} > 45 )); then
+        log_warn "AINIC firmware $ver can mishandle retransmitted RDMA READs (seen on 1.117.5-a-77 and a-196): MORI-IO transfers may fail with flush errors or return incomplete data — set MORI_IO_QP_MAX_RD_ATOMIC=1 (Known Issues in docs/MORI-IO-GUIDE.md)"
     fi
 }
 
