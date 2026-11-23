@@ -99,6 +99,22 @@ jobs:
           ls -l /dev/kfd /dev/dri 2>&1 | head -12 || true
           amd-smi list 2>&1 | head -40 || true
 
+      # The lane tests GPU-to-GPU transfers. On a host with one GPU the XGMI
+      # cases would skip and pass, so stop here, before anything is installed.
+      - name: Check for two GPUs
+        run: |
+          n=0
+          for dev in /sys/class/drm/card[0-9]*/device; do
+            case "$(basename "$(dirname "$dev")")" in *-*) continue ;; esac
+            [ "$(cat "$dev/vendor" 2>/dev/null)" = 0x1002 ] || continue
+            n=$((n + 1))
+            echo "AMD GPU $n: $(basename "$(readlink -f "$dev")") device=$(cat "$dev/device")"
+          done
+          if [ "$n" -lt 2 ]; then
+            echo "::error::$(hostname) has $n AMD GPU(s); this lane needs 2 to test GPU-to-GPU transfers"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -151,6 +167,14 @@ jobs:
           echo "ROCM_PATH=$rocm" >> $GITHUB_ENV
           echo "CMAKE_PREFIX_PATH=$rocm" >> $GITHUB_ENV
           echo "ROCM_LIB_DIRS=$rocm/lib:$rocm/llvm/lib" >> $GITHUB_ENV
+
+          # The count that matters is what the ROCm runtime can use.
+          n=$($py -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null | tail -1)
+          echo "GPUs usable by ROCm: ${n:-0}"
+          if [ "${n:-0}" -lt 2 ]; then
+            echo "::error::ROCm sees ${n:-0} GPU(s) on $(hostname); this lane needs 2"
+            exit 1
+          fi
 
       - name: Unpack system headers
         id: sysroot
@@ -294,9 +318,6 @@ jobs:
         if: ${{ !cancelled() && steps.sysroot.outcome == 'success' }}
         run: |
           MORI_GPU_ARCHS=$GFX python -m pip install .
-          # Without both GPUs the XGMI tests below would skip and the step would
-          # pass without testing anything.
-          python -c 'import torch; n = torch.cuda.device_count(); assert n >= 2, f"{n} GPU(s) visible, need 2"'
 
       - name: MORI-IO Python (XGMI and simulated backends)
         id: python
