@@ -70,6 +70,7 @@ from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
+    CHUNK_TOKENS_MIN,
     asyncll_regions,
     asyncll_seg_layout,
     asyncll_seg_words,
@@ -78,6 +79,35 @@ from .internode_regions import (
 from .symm_arena import SymmArena
 
 logger = logging.getLogger(__name__)
+
+
+def _check_ranks_agree(cfg, **settings):
+    """Raise when ranks disagree on op-wide settings their kernels must share.
+
+    The dispatch piece count and the combine barrier slots follow
+    MORI_EP_DISABLE_RDMA_ATOMICS and the drained QP count; a rank that differs
+    reads a piece before it lands or waits on the wrong slot. Checked through
+    torch.distributed when its default group is exactly this op's ranks;
+    skipped otherwise.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if dist.get_world_size() != cfg.world_size:
+        return
+    mine = tuple(sorted(settings.items()))
+    gathered = [None] * cfg.world_size
+    dist.all_gather_object(gathered, mine)
+    differ = {rank: dict(g) for rank, g in enumerate(gathered) if g != mine}
+    if differ:
+        raise ValueError(
+            f"mori ep v2: ranks disagree on {dict(mine)} (this rank "
+            f"{dist.get_rank()}); differing ranks: {differ}. Set "
+            "MORI_EP_DISABLE_RDMA_ATOMICS, the tuning table, active_qp_counts and "
+            "MORI_EP_*_GEOM the same on every rank."
+        )
+
 
 # segment_error_flags() bits.
 SEGMENT_ERR_OVERFLOW = 1
@@ -873,12 +903,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Counts completions. NOT the local half of the symmetric chunk-flag
         # region despite the name: that one is written by dispatch and read+
         # cleared by combine, which enumerates its work from dispatch's leftovers.
-        # The v2_ll combine counts one piece per QP of each 64-token chunk.
+        # The v2_ll combine counts one piece per QP of each chunk (one warp's tokens).
         self.inter_chunk_flag_combine = torch.zeros(
             n_nodes
             * max(
                 max_tokens_per_rank * 2,
-                -(-max_tokens_per_rank // 64) * cfg.num_qp_per_pe,
+                -(-max_tokens_per_rank // CHUNK_TOKENS_MIN) * cfg.num_qp_per_pe,
             ),
             **i32,
         )
@@ -1952,6 +1982,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ]
             + list(self._selectable_active_qps)
         )
+        _check_ranks_agree(
+            cfg,
+            no_rdma_atomics=bool(getattr(self, "_no_rdma_atomics", False)),
+            num_qp_to_drain=num_qp_to_drain,
+        )
         plans = {}
         kernels = {"dispatch": {}, "combine": {}}
         for phase, dtype in (
@@ -2437,8 +2472,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         the ones compiled for every bucket geometry. Rank-local: ranks, and the
         dispatch and combine of one pair, may use different counts, because a
         combine's barrier contribution does not depend on it (see
-        kCombineBarrierMarkerTotal). A captured graph keeps the plans it was
-        captured with.
+        kCombineBarrierMarkerTotal). What must match across ranks is the op's
+        drained count (the largest selectable one), which the atomic-free
+        dispatch pieces and barrier slots follow; it is fixed when the op is
+        built. A captured graph keeps the plans it was captured with.
         """
         if not self.cfg.is_internode:
             raise ValueError("active_qps requires the internode HIP backend")

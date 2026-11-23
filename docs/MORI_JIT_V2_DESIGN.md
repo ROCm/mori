@@ -416,7 +416,7 @@ mori_jit_precompile / mori_jit_registered_plans / mori_jit_last_error
 
 `_launch_multi` 是批量发射：N 个共享同一 args 布局的 plan，填一次参数结构、穿一次 ABI，
 然后按序发射（C++ 侧就是对同一个 `argBuf` 循环 `vt->launch`，不认识任何具体 kernel）。
-EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 4 个，本来要穿 6 次。
+EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 3 个(zero-copy 且不折叠 weights 时跳过 CombineSync,只剩 2 个),本来要穿 5 次。
 
 Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 handle 数组挪到构建期**，
 发射路径只剩填参数和那一次 ABI 调用。「共享同一 args 布局」按完整的

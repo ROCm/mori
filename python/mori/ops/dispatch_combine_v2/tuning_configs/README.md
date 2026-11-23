@@ -17,8 +17,8 @@ e.g. gfx942_mi308x_InterNodeV2_ep16.csv
 | `kernel_type` | Path | `internode_kernel` |
 | --- | --- | --- |
 | `IntraNodeV2` | single node (EP8) | — |
-| `InterNodeV2` | two nodes (EP16), ordinary kernels | `v2` |
-| `InterNodeV2LL` | two nodes (EP16), low-latency kernels | `v2_ll` |
+| `InterNodeV2` | several nodes (EP16, EP32), ordinary kernels | `v2` |
+| `InterNodeV2LL` | several nodes (EP16, EP32), low-latency kernels | `v2_ll` |
 
 Each row is one rule: the launch geometry for one shape, phase and token
 ceiling.
@@ -167,7 +167,8 @@ Where it is on today (it is off everywhere else):
 | MI300X (gfx942, 304) | 256/8, 256/6, 384/6; 264/9 intra; 272/9 inter; 896/16 intra and inter | 7168, plus 6144 for 256/8 and 5120 for 384/6; only 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 at hidden 7168 |
 
 - Each GPU model has three tables: IntraNodeV2 (EP8), InterNodeV2 (EP16) and
-  InterNodeV2LL (EP16).
+  InterNodeV2LL (EP16). MI355X also has InterNodeV2 and InterNodeV2LL tables at
+  EP32, for 896/16 only.
 - Every shape in a table has both phases.
 - Not every shape is in every table, and not every dtype is in every shape.
   See the files.
@@ -175,6 +176,12 @@ Where it is on today (it is off everywhere else):
   4–32 for inter-node 256/8, 272/9, 896/16, and 384/6 at hidden 5120. The
   MI300X IntraNodeV2 table also has ceilings of 16, 32, 8192 and 16384 for every
   shape.
+
+The MI355X EP32 tables were tuned atomic-free (`MORI_EP_DISABLE_RDMA_ATOMICS=1`)
+on AINIC. A rule has no signalling-mode selector, so they also apply with RDMA
+atomics, and to MI350X through the model alias. Their bf16 dispatch has a single
+v2_ll rule, at 128 tokens; buckets clamp in both directions, so that geometry
+serves bf16 dispatch at every token count.
 
 The model behind each shape:
 
@@ -185,7 +192,7 @@ The model behind each shape:
 | GLM-5, GLM-5.3 | 256/8 | 6144 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X, MI300X: EP8 and EP16 |
-| Kimi K3 | 896/16 | 3584 | MI308X, MI355X: EP16; MI300X: EP8 and EP16 |
+| Kimi K3 | 896/16 | 3584 | MI308X: EP16; MI355X: EP16 and EP32; MI300X: EP8 and EP16 |
 | none known | 256/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; bf16 dispatch only, except MI300X EP8, which also has fp8_e4m3_fnuz |
 
 A shape without rows runs on the default geometry. For example:
