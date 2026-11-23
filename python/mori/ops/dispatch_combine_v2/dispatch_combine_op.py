@@ -79,14 +79,34 @@ WAVE = detect_wave_size()
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
 
-def _default_backend() -> str:
+def _gfx125x() -> bool:
     try:
         from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
 
-        gfx125x = _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
     except Exception:
-        gfx125x = False
-    return "hip" if gfx125x else "flydsl"
+        return False
+
+
+def _default_backend() -> str:
+    return "hip" if _gfx125x() else "flydsl"
+
+
+# The LDS a gfx125x dispatch block can give its token-row slabs: ep_cfg.hpp's
+# Ep1250xLdsBytes less EpDispatch1250xStaticLdsBytes.
+_DISPATCH_SLAB_LDS_1250 = 327680 - 4096
+
+
+def _dispatch_warp_cap(token_nbytes: int) -> int:
+    """Most warps, a power of two, a gfx125x dispatch block holds for this token row.
+
+    Each warp stages a whole row in LDS; more warps than fit launch and never run.
+    The same bound as MakeEpCfg, which halves its default of 16 until the slabs fit.
+    """
+    cap = 1
+    while cap * 2 * token_nbytes <= _DISPATCH_SLAB_LDS_1250:
+        cap *= 2
+    return cap
 
 
 _QUANT_TYPES = QUANT_TYPES
@@ -540,6 +560,13 @@ class EpDispatchCombineConfig:
             if self.combine_rdma_block_num is None:
                 self.combine_rdma_block_num = 64
             return
+        # The gfx125x dispatch stages a token row a warp in LDS, so the warps a block
+        # holds depend on the row (_dispatch_warp_cap) -- MakeEpCfg bounds its own
+        # default the same way. The tables cannot do this themselves: they are keyed
+        # by the transported dtype, which calls fp32 "bf16", and not by what a row
+        # takes. Every warp count below is one we pick, a tuned row or a single-shot
+        # default; one the caller pinned is left alone.
+        warp_cap = _dispatch_warp_cap(self.token_nbytes) if _gfx125x() else None
         if not pinned:
             backend = (
                 self.kernel_backend
@@ -583,6 +610,13 @@ class EpDispatchCombineConfig:
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
+            if warp_cap is not None:
+                self.warp_num_per_block = min(self.warp_num_per_block, warp_cap)
+                if self.schedule:
+                    self.schedule = tuple(
+                        (edge, db, min(dw, warp_cap), cbn, cw)
+                        for edge, db, dw, cbn, cw in self.schedule
+                    )
         else:
             # explicit geometry: fill any unset field with the single-shot default
             if self.dispatch_block_num is None:
@@ -590,7 +624,8 @@ class EpDispatchCombineConfig:
             if self.combine_block_num is None:
                 self.combine_block_num = 80
             if self.warp_num_per_block is None:
-                self.warp_num_per_block = 16
+                # Unset beside a field that was pinned: still ours to choose.
+                self.warp_num_per_block = 16 if warp_cap is None else min(16, warp_cap)
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
 
