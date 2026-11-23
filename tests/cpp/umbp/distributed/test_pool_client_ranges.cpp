@@ -251,7 +251,8 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, size_t dram_capacity,
                                          std::vector<char>& get_scratch,
                                          std::vector<char>& put_scratch,
-                                         bool locality_prefetch = true) {
+                                         bool locality_prefetch = true,
+                                         bool remote_single_flight = true) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -276,6 +277,7 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
+    cfg.remote_single_flight = remote_single_flight;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
@@ -1703,4 +1705,134 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
 }
 
 }  // namespace
+// ---- remote single-flight --------------------------------------------------
+
+namespace {
+
+std::vector<char> SingleFlightObject(size_t salt) {
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) {
+    object[i] = static_cast<char>((i * 89 + salt * 151 + 7) & 0xff);
+  }
+  return object;
+}
+
+// Whole-object read of `keys` into `out` as quarter spans, the shape a reader
+// that restores every layer at once sends.
+std::vector<bool> ReadWholeObjects(PoolClient* client, const std::vector<std::string>& keys,
+                                   std::vector<std::vector<char>>* out) {
+  constexpr size_t kQuarter = kObjectSize / 4;
+  std::vector<std::vector<void*>> ptrs(keys.size());
+  std::vector<std::vector<size_t>> sizes(keys.size()), offsets(keys.size());
+  for (size_t k = 0; k < keys.size(); ++k) {
+    for (size_t q = 0; q < 4; ++q) {
+      ptrs[k].push_back((*out)[k].data() + q * kQuarter);
+      sizes[k].push_back(kQuarter);
+      offsets[k].push_back(q * kQuarter);
+    }
+  }
+  return client->BatchGetRanges(keys, ptrs, sizes, offsets);
+}
+
+}  // namespace
+
+// Eight readers of the same remote keys at once -- every TP rank of an engine
+// restoring one TP-replicated prefix through a node-shared server.  Each key
+// must cross the wire once: one leader per key, nobody re-pulling after the
+// wait, and every reader still gets the right bytes.
+TEST_F(PoolClientRangesTest, ConcurrentWholeObjectReadersPullEachRemoteKeyOnce) {
+  constexpr size_t kKeys = 4;  // 8 pages of the caller's 16: every leader gets a slot
+  constexpr size_t kReaders = 8;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("single-flight-" + std::to_string(k));
+    objects.push_back(SingleFlightObject(k));
+    SeedRemoteObject(keys.back(), objects.back());
+  }
+
+  std::atomic<size_t> ready{0};
+  std::atomic<size_t> bad{0};
+  std::vector<std::thread> readers;
+  for (size_t r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      std::vector<std::vector<char>> out(kKeys, std::vector<char>(kObjectSize, 0));
+      ready.fetch_add(1);
+      while (ready.load() < kReaders) std::this_thread::yield();
+      const auto got = ReadWholeObjects(caller_.get(), keys, &out);
+      for (size_t k = 0; k < kKeys; ++k) {
+        if (!got[k] || out[k] != objects[k]) bad.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : readers) t.join();
+
+  EXPECT_EQ(bad.load(), 0u);
+  const SingleFlightActivity stats = caller_->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead, kKeys) << "one pull per key";
+  EXPECT_EQ(stats.refetched, 0u) << "a reader that waited pulled the key again";
+  EXPECT_EQ(stats.timed_out, 0u);
+  // Readers that arrived after a commit hit phase 1 and never got this far.
+  EXPECT_EQ(stats.served_local, stats.joined + stats.already_local);
+  for (const auto& key : keys) EXPECT_TRUE(LocallyResident(caller_.get(), key));
+}
+
+// The same key twice in one call: the second entry follows the first's pull
+// rather than allocating a second slot for it.
+TEST_F(PoolClientRangesTest, SameRemoteKeyTwiceInOneCallIsPulledOnce) {
+  const std::string key = "single-flight-twice";
+  const std::vector<char> object = SingleFlightObject(99);
+  SeedRemoteObject(key, object);
+
+  std::vector<std::vector<char>> out(2, std::vector<char>(kObjectSize, 0));
+  const auto got = ReadWholeObjects(caller_.get(), {key, key}, &out);
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_TRUE(got[0]);
+  EXPECT_TRUE(got[1]);
+  EXPECT_EQ(out[0], object);
+  EXPECT_EQ(out[1], object);
+
+  const SingleFlightActivity stats = caller_->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead, 1u);
+  EXPECT_EQ(stats.joined, 1u);
+  EXPECT_EQ(stats.served_local, 1u);
+  EXPECT_EQ(stats.refetched, 0u);
+}
+
+// Off means off: concurrent readers still get their bytes, and nothing is
+// claimed, joined or counted.
+TEST_F(PoolClientRangesTest, RemoteSingleFlightOffLeavesReadsAlone) {
+  std::vector<char> off_get(kScratchSize), off_put(kScratchSize);
+  auto off = MakeClient("ranges-single-flight-off", kCallerCapacity, off_get, off_put,
+                        /*locality_prefetch=*/true, /*remote_single_flight=*/false);
+  const std::string key = "single-flight-off";
+  const std::vector<char> object = SingleFlightObject(7);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  off->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(off.get(), key));
+
+  constexpr size_t kReaders = 4;
+  std::atomic<size_t> ready{0};
+  std::atomic<size_t> bad{0};
+  std::vector<std::thread> readers;
+  for (size_t r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      std::vector<std::vector<char>> out(1, std::vector<char>(kObjectSize, 0));
+      ready.fetch_add(1);
+      while (ready.load() < kReaders) std::this_thread::yield();
+      const auto got = ReadWholeObjects(off.get(), {key}, &out);
+      if (!got[0] || out[0] != object) bad.fetch_add(1);
+    });
+  }
+  for (auto& t : readers) t.join();
+
+  EXPECT_EQ(bad.load(), 0u);
+  const SingleFlightActivity stats = off->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead + stats.joined + stats.already_local + stats.served_local + stats.refetched +
+                stats.timed_out,
+            0u);
+  off->Shutdown();
+}
+
 }  // namespace mori::umbp

@@ -94,7 +94,6 @@ _KERNEL_TYPE_NAMES = frozenset(
 # (fp4_blockwise reached dispatch_combine.py but never the enum branch here).
 _QUANT_ENUM_TO_CONFIG_STR = {
     "None_": "none",
-    "Fp8DirectCast": "fp8_direct_cast",
     "Fp8BlockwiseQuant": "fp8_blockwise",
     "Fp4BlockwiseQuant": "fp4_blockwise",
 }

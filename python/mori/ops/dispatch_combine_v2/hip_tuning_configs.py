@@ -32,6 +32,7 @@ from __future__ import annotations
 import csv
 import functools
 import io
+import logging
 import numbers
 import os
 import tempfile
@@ -39,6 +40,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from mori.ops import utils as _gpu
+
+from .quant_types import is_gfx125x_arch, resolve_quant_type
+
+logger = logging.getLogger(__name__)
 
 # Models with no table of their own that reuse a tuned sibling's key.
 _MODEL_ALIAS = {"mi350x": "mi355x"}  # same die / CU count
@@ -78,7 +83,8 @@ def _device_keys():
     rev = _gpu.asic_revision()
     if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
         return ("gfx1250-strict", "gfx1250")
-    return (key,)
+    cu = _gpu.cu_count()
+    return (f"{key}/{cu}cu", key) if cu else (key,)
 
 
 def _first_bucket(table, devs, *shape):
@@ -174,6 +180,25 @@ _DISPATCH_TABLE: dict = {
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+        },
+        # hidden 5120 (DeepSeek-V4.1-Flash), topk 6, 96 experts a rank. Swept 64-256 blocks x
+        # 4-16 warps for each dispatch dtype. Graph us, median of 3 rounds, these rows against
+        # 128x8 for bf16 and the 64x16 default for fp8 / fp4:
+        #   ct     bf16 128x8   rows   fp8 64x16   rows   fp4 64x16   rows
+        #   64          24.8    18.8        24.8   19.4        25.8   19.4
+        #   512         27.2    26.2        26.3   23.4        32.1   22.0
+        #   2048        55.9    52.9        46.7   37.5        45.5   29.6
+        #   8192       169.0   165.2       107.8  100.9       100.1   69.2
+        #   16384      321.8   308.8       197.9  195.9       180.4  132.6
+        (4, 5120, 6, 96): {
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
+        },
+        # Its 128-expert topk-3 draft MoE (32 experts a rank) takes the same rows: at 2048 tokens
+        # bf16 / fp8 / fp4 run 43.0 / 31.6 / 26.1 against 47.1 / 42.5 / 41.2.
+        (4, 5120, 3, 32): {
+            None: ((256, 64, 4), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "bf16": ((256, 64, 4), (512, 128, 4), (2048, 256, 4), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
@@ -278,6 +303,11 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((256, 32, 8), (512, 32, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): {
+            None: ((None, 32, 16),),
+        },
+    },
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
@@ -288,6 +318,9 @@ _DISPATCH_TABLE: dict = {
 # been tuned per bucket in its IntraNodeV2 table. On gfx1250, 128x4 never wins and
 # 256x8 collapses 2x at 16384.
 _COMBINE_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((None, 32, 8),),
+    },
     "gfx1250": {
         # topk 9 = 8 routed + 1 shared.
         (4, 7168, 9, None): (
@@ -297,6 +330,16 @@ _COMBINE_TABLE: dict = {
             (1024, 256, 8),
             (None, 192, 8),
         ),
+        # hidden 5120: 64x8 up to 128 tokens, then 128x8; topk 3 moves to 256x4 past 512 tokens,
+        # where it leads the 128-block grids by 4-10% up to 4096 (128x16 is 6% ahead at 8192).
+        # Graph us, median of 3 rounds, topk 6 | topk 3:
+        #   ct     64x8  128x8 128x16  256x4 |  64x8  128x8 128x16  256x4
+        #   128    13.6   15.0   15.2   14.9 |  13.0   13.9   14.5   13.8
+        #   512    24.4   21.4   20.9   21.2 |  23.0   19.5   18.9   19.4
+        #   2048   65.5   49.1   50.7   48.5 |  54.7   42.8   40.5   39.1
+        #   8192  228.8  163.8  189.7  165.5 | 172.1  131.0  124.4  131.5
+        (4, 5120, 6, 96): ((128, 64, 8), (None, 128, 8)),
+        (4, 5120, 3, 32): ((128, 64, 8), (512, 128, 8), (None, 256, 4)),
     },
     # The gfx1250-strict parts, as their dispatch rows.
     "gfx1250-strict": {
@@ -307,7 +350,10 @@ _COMBINE_TABLE: dict = {
 }
 
 _COMBINE_PUSH_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
             # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
@@ -372,7 +418,7 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp4_blockwise_fp32": {
+    "fp4_blockwise_1x128": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
         },
@@ -386,7 +432,10 @@ _COMBINE_PUSH_TABLE: dict = {
             ),
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): ((None, 32, 16),),
+        },
         "gfx1250": {
             # 128x16 is ahead of 64x16 from 512 to 1536 tokens a rank (-3.6, -7.0, -14.6 at topk 6).
             # It stays ahead of 128x24 through 2048 at topk 6 (-3.5) but only through 1792 at topk 9
@@ -424,10 +473,18 @@ _BF16_PUSH_TABLE: dict = {
         (4, 7168, 6, None): ((128, 64, 8), (512, 64, 16), (None, 64, 24)),
         (8, 7168, 6, None): ((192, 64, 8), (512, 64, 16), (None, 64, 24)),
     },
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): ((128, 32, 8), (None, 32, 16)),
+    },
 }
 
 _LL128_TABLE: dict = {
-    "fp4_blockwise": {
+    "fp4_blockwise_1x32": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
@@ -443,7 +500,12 @@ _LL128_TABLE: dict = {
             },
         },
     },
-    "fp8_blockwise": {
+    "fp8_blockwise_1x32": {
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=64, dispatch=(32, 16), combine=(32, 8))
+            },
+        },
         "gfx1250": {
             (4, 7168, 6, None): {
                 "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))
@@ -474,8 +536,128 @@ _LL128_TABLE: dict = {
                 "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
             },
         },
+        "gfx1250/96cu": {
+            (8, 7168, 6, None): {
+                "bf16": dict(max_tok=63, dispatch=(32, 16), combine=(32, 16)),
+            },
+        },
     },
 }
+
+
+# Tuning profiles. "peak" is the tables above. "capped" keeps every grid at or under
+# _CAPPED_BLOCKS, for an op that shares the GPU with the expert GEMMs: a capped lookup takes
+# the shape's _CAPPED_* rows, else its peak rows with each wider bucket on 64 blocks of the
+# larger of its warp count and the default's (16 dispatch, 8 combine). The _CAPPED_* tables
+# hold only the rows that differ.
+PROFILES = ("peak", "capped")
+_CAPPED_BLOCKS = 64
+
+_CAPPED_DISPATCH_TABLE: dict = {
+    "gfx1250": {
+        # hidden 5120, both DeepSeek-V4.1-Flash MoEs, every dispatch dtype. Graph us, one
+        # run, topk 6 bf16 / fp8 / fp4:
+        #   ct     64x4   64x8  64x16 |  64x4   64x8  64x16 |  64x4   64x8  64x16
+        #   256    21.8   24.3   25.6 |  20.7   22.0   24.3 |  20.3   20.4   32.6
+        #   1024   42.5   39.4   39.9 |  40.9   32.7   33.5 |  42.8   32.5   32.5
+        #   2048   70.5   59.6   59.3 |  72.0   46.8   45.2 |  73.7   44.6   43.6
+        #   8192  233.5  184.5  170.6 | 253.6  142.3  107.8 | 236.8  130.0   99.6
+        (4, 5120, 6, 96): {None: ((256, 64, 4), (1024, 64, 8), (None, 64, 16))},
+        (4, 5120, 3, 32): {None: ((256, 64, 4), (1024, 64, 8), (None, 64, 16))},
+    },
+}
+
+_CAPPED_COMBINE_TABLE: dict = {
+    "gfx1250": {
+        # hidden 5120: 64x16 past 128 tokens (topk 6: 16.2 / 36.7 / 197.4 at 256 / 1024 /
+        # 8192 against 16.6 / 38.0 / 228.6 for 64x8; topk 3 the same way).
+        (4, 5120, 6, 96): ((128, 64, 8), (None, 64, 16)),
+        (4, 5120, 3, 32): ((128, 64, 8), (None, 64, 16)),
+    },
+}
+
+_CAPPED_COMBINE_PUSH_TABLE: dict = {}
+
+# The quantized scatter combine off gfx125x, every format: device -> shape -> buckets.
+_SCATTER_COMBINE_TABLE: dict = {
+    # MI300X EP8, 2026-11-16, dispatch 64x16, min of 2 rounds, fp8 1x128 combine us (1x32
+    # within 2% at every point):
+    #   T     64x8   128x4  160x4  256x4  160x8  256x8
+    #   32    27.4   28.3   30.0   37.5   39.0   53.2
+    #   128   58.0   56.1   55.5   59.7   62.1   72.9
+    #   512  135.7  129.9  125.5  122.8  124.0  135.6
+    #   1024 233.9  223.6  210.5  198.2  201.7  211.6
+    #   2048 441.1  417.4  386.9  359.7  360.2  371.9
+    #   4096 892.2  836.4  763.4  690.4  684.5  692.0
+    "mi300x": {
+        (8, 7168, 8, None): ((32, 64, 8), (128, 160, 4), (None, 256, 4)),
+    },
+    # MI355X EP8, 2026-11-16, dispatch 64x16, min of 2 rounds on a shared node, 1x128
+    # combine us, fp8 | fp4:
+    #   T     64x8   160x4  256x4  128x8  256x8 |  64x8  160x4  256x4  128x8  256x8
+    #   32    24.0   26.5   32.9   30.5   44.9  |  23.2   25.6   31.2   29.2   44.5
+    #   128   49.3   46.5   49.8   47.8   59.0  |  43.0   40.0   41.6   39.8   51.3
+    #   512  119.5  102.7   96.7   96.7  103.6  | 112.5   92.5   75.4   76.2   79.8
+    #   1024 210.3  172.9  157.4  159.0  157.2  | 200.3  157.1  117.3  121.2  113.8
+    #   4096 845.3  653.0  547.8  564.8  502.1  | 800.3  603.5  399.9  426.8  333.2
+    "mi355x": {
+        (8, 7168, 8, None): ((32, 64, 8), (128, 160, 4), (512, 256, 4), (None, 256, 8)),
+    },
+}
+
+
+def tuning_profile(profile=None, default="peak"):
+    """``profile``, else MORI_EP_TUNING_PROFILE, else ``default``."""
+    profile = profile or os.environ.get("MORI_EP_TUNING_PROFILE") or default
+    if profile not in PROFILES:
+        raise ValueError(f"tuning profile {profile!r}: want one of {PROFILES}")
+    return profile
+
+
+def default_profile():
+    """The op's default: capped on gfx125x parts, peak elsewhere."""
+    return "capped" if "gfx1250" in _device_keys() else "peak"
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_no_capped_rows(phase, shape, key) -> None:
+    logger.warning(
+        "no capped %s rows for EP%d hidden %d topk %d (experts per rank %s, %s); its peak "
+        "buckets wider than %d blocks run the default geometry",
+        phase,
+        *shape,
+        key,
+        _CAPPED_BLOCKS,
+    )
+
+
+def _capped(phase, own, peak, shape, key, default_warp):
+    """A capped phase: its own rows, else the peak rows with every bucket wider than
+    _CAPPED_BLOCKS put on _CAPPED_BLOCKS blocks of max(its warps, ``default_warp``).
+    Keeping the warp count keeps the bucket's LDS, so the geometry stays launchable."""
+    if own is not None:
+        return own
+    if peak is None or all(row[1] <= _CAPPED_BLOCKS for row in peak):
+        return peak
+    _warn_no_capped_rows(phase, shape, key)
+    rows = []
+    for edge, block, warp in peak:
+        if block <= _CAPPED_BLOCKS:
+            geom = (block, warp)
+        else:
+            geom = (_CAPPED_BLOCKS, max(warp, default_warp))
+        if rows and rows[-1][1:] == geom:
+            rows[-1] = (edge, *geom)
+        else:
+            rows.append((edge, *geom))
+    return tuple(rows)
+
+
+def _resolve_quant(quant_type, devs):
+    """The explicit name of `quant_type`; fp8_blockwise / fp4_blockwise take the
+    group of the device the tables are read for."""
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
+    return resolve_quant_type(quant_type, gfx125x)
 
 
 def ll128(
@@ -487,11 +669,19 @@ def ll128(
     experts_per_rank=None,
     quant_type="none",
 ):
-    if _device_keys()[0] == "gfx1250-strict":
+    devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
+    if devs[0] == "gfx1250-strict":
         return None  # LL128's polls miss peer writes on these parts; use the schedule
-    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
-    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
-    plan = entry.get(dtype) if entry else None
+    per_device = _LL128_TABLE.get(quant_type, {})
+    plan = None
+    for key in devs:
+        entry = _bucket_key(
+            per_device.get(key, {}), world_size, hidden_dim, topk, experts_per_rank
+        )
+        plan = entry.get(dtype) if entry else None
+        if plan is not None:
+            break
     if plan is None:
         return None
     if max_tok <= plan["max_tok"]:
@@ -506,12 +696,27 @@ def ll128(
 
 
 def bf16_push(world_size, hidden_dim, topk, experts_per_rank=None):
-    return _bucket_key(
-        _BF16_PUSH_TABLE.get(_device_keys()[0], {}),
-        world_size,
-        hidden_dim,
-        topk,
-        experts_per_rank,
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _BF16_PUSH_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
+    )
+
+
+_CARD_TABLE: dict = {
+    "gfx1250/96cu": {
+        (8, 7168, 6, None): dict(pull_blocks=8, pull_launch_max=256),
+    },
+}
+
+
+def card(world_size, hidden_dim, topk, experts_per_rank=None):
+    devs = _device_keys()
+    if devs[0] == "gfx1250-strict":
+        return None
+    return _first_bucket(
+        _CARD_TABLE, devs, world_size, hidden_dim, topk, experts_per_rank
     )
 
 
@@ -584,11 +789,14 @@ class ScheduleEntry(NamedTuple):
     combine: KernelConfig
 
 
-def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+def resolve_schedule(
+    cfg, cu_count=None, kernel_family=None
+) -> tuple[ScheduleEntry, ...]:
     """The HIP V2 schedule consumed by both construction and token selection.
 
     Intra adapts the schedule Config resolved: per phase, the IntraNodeV2 table's
-    rules when quant_type is "none", else the Python table's; an explicit
+    rules (its dispatch rules unless the op is quantized on gfx125x, its combine
+    rules only for an unquantized combine), else the Python table's; an explicit
     cfg.schedule is taken as given, and pinned or untuned geometry is one bucket.
     Inter names each bucket of internode_schedule() with its kernel family; tuned
     grids are clamped to ``cu_count``, the backend's own CU count. Loading and
@@ -617,11 +825,10 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
             for ceiling, db, dw, cb, cw in rows
         )
 
-    geometries = internode_schedule(cfg, cu_count=cu_count)
-    ceilings = [row[0] for row in geometries]
+    family = kernel_family or internode_kernel_family(cfg)
+    geometries = internode_schedule(cfg, cu_count=cu_count, kernel_family=family)
     entries = []
     for ceiling, dispatch, combine, load_first in geometries:
-        family = internode_kernel_family(cfg, _probe(ceiling, ceilings))
         entries.append(
             ScheduleEntry(
                 ceiling,
@@ -645,6 +852,28 @@ def resolve_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
     return tuple(entries)
 
 
+def resolve_ll_schedule(cfg, cu_count=None) -> tuple[ScheduleEntry, ...]:
+    """The v2_ll schedule an internode "auto" op runs for calls whose
+    max_num_inp_token_across_ranks is at most internode_auto_ll_max_tokens.
+
+    resolve_schedule() for kernel_family="v2_ll", up to and including the first
+    bucket whose ceiling reaches the crossover, which internode_schedule() makes
+    a bucket edge. Empty for every other op; resolve_schedule() alone serves it.
+    """
+    if (
+        getattr(cfg, "async_ll", False)
+        or not cfg.is_internode
+        or cfg.internode_kernel != "auto"
+    ):
+        return ()
+    rows = []
+    for row in resolve_schedule(cfg, cu_count=cu_count, kernel_family="v2_ll"):
+        rows.append(row)
+        if row.max_tokens is None or row.max_tokens >= cfg.internode_auto_ll_max_tokens:
+            break
+    return tuple(rows)
+
+
 def describe_schedule(cfg, schedule) -> str:
     """Multi-line summary of a resolved schedule and the table files looked up for
     its shape (found or missing)."""
@@ -663,6 +892,11 @@ def describe_schedule(cfg, schedule) -> str:
         f"HIP V2 schedule: {_gpu.arch_name()}/{_gpu.detect_model()} "
         f"ep{cfg.world_size} expert{num_experts} top{cfg.num_experts_per_token} "
         f"hidden{cfg.hidden_dim} dispatch={cfg.dispatch_dtype} combine={cfg.combine_dtype}"
+        + (
+            f" profile={cfg.tuning_profile}"
+            if getattr(cfg, "tuning_profile", None)
+            else ""
+        )
     ]
     if cfg.is_internode:
         families = [_V2_KERNEL_TYPES[f] for f in internode_kernel_families(cfg)]
@@ -742,36 +976,60 @@ def lookup(
     quant_type="none",
     dispatch_dtype=None,
     combine_dtype=None,
+    profile=None,
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
     ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
     half; ``quant_type`` picks the combine half. Each half is built independently,
     so either can be re-tuned without touching the other: its IntraNodeV2 table
-    rules when it has any (``quant_type="none"`` only), else the Python table's,
+    rules when it has any (not for a quantized combine half, nor a quantized
+    dispatch half on gfx125x), else the Python table's,
     else the HIP single-shot default. A shape with neither half tuned gets the
     default and no schedule.
 
     The table is matched with the legs' torch dtypes; a caller that passes only
     ``dtype`` gets the ones it names (_wire_dtypes), so both ways of calling read
     the same rules.
+
+    ``profile`` ("peak" / "capped", see PROFILES) defaults to MORI_EP_TUNING_PROFILE,
+    else "peak": these are the tuned tables, and the op layer picks the deployment
+    profile (default_profile()).
     """
+    profile = tuning_profile(profile)
     base = _hip_default()
     devs = _device_keys()
+    quant_type = _resolve_quant(quant_type, devs)
     shape = (world_size, hidden_dim, topk, experts_per_rank)
     wire = _DISPATCH_DTYPE_ALIAS.get(dtype, dtype)
     disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)
     if disp is not None:
         # None is the "every dtype measured the same" key; an exact dtype overrides it.
         disp = disp.get(wire) or disp.get(None)
-    comb = None
+    capped_disp = _first_bucket(_CAPPED_DISPATCH_TABLE, devs, *shape)
+    if capped_disp is not None:
+        capped_disp = capped_disp.get(wire) or capped_disp.get(None)
+    # Combine: the quant type's push rows (gfx125x) or scatter rows (elsewhere), else the
+    # gather rows; a capped row comes from
+    # the same table as the peak row it stands for, or from its own push table.
+    comb = capped_comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
+        capped_comb = _first_bucket(
+            _CAPPED_COMBINE_PUSH_TABLE.get(quant_type, {}), devs, *shape
+        )
+    gfx125x = bool(devs[0]) and is_gfx125x_arch(devs[0])
+    if comb is None and quant_type != "none" and not gfx125x:
+        comb = _first_bucket(_SCATTER_COMBINE_TABLE, devs, *shape)
     if comb is None:
         comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
+        if capped_comb is None:
+            capped_comb = _first_bucket(_CAPPED_COMBINE_TABLE, devs, *shape)
     if dispatch_dtype is None:
         dispatch_dtype, combine_dtype = _wire_dtypes(wire)
-    if dispatch_dtype is not None and quant_type == "none":
+    # The IntraNodeV2 tables time the gather combine, so a quantized combine keeps
+    # their dispatch half only; gfx125x's quantized ops keep the Python tables.
+    if dispatch_dtype is not None and (quant_type == "none" or not gfx125x):
         table_disp, table_comb = intranode_buckets(
             world_size,
             hidden_dim,
@@ -781,7 +1039,20 @@ def lookup(
             experts_per_rank=experts_per_rank,
         )
         disp = table_disp or disp
-        comb = table_comb or comb
+        if quant_type == "none":
+            comb = table_comb or comb
+    if profile == "capped":
+        disp = _capped(
+            "dispatch", capped_disp, disp, shape, wire, base["warp_num_per_block"]
+        )
+        comb = _capped(
+            "combine",
+            capped_comb,
+            comb,
+            shape,
+            quant_type,
+            base["combine_warp_num_per_block"],
+        )
     if disp is None and comb is None:
         return _gpu.fit_blocks_to_cus(base)
     disp = disp or ((None, base["dispatch_block_num"], base["warp_num_per_block"]),)
@@ -807,11 +1078,13 @@ _INTERNODE_GEOMETRY_FIELDS = (
 )
 
 
-def internode_kernel_family(cfg, num_tokens):
-    """Resolve auto using live tokens, independently of the declared capacity."""
+def internode_kernel_family(cfg, *, max_tokens=None):
+    """Resolve auto from the call's max token count across ranks; v2 without one."""
     if cfg.internode_kernel != "auto":
         return cfg.internode_kernel
-    return "v2_ll" if num_tokens <= cfg.internode_auto_ll_max_tokens else "v2"
+    if max_tokens is not None and max_tokens <= cfg.internode_auto_ll_max_tokens:
+        return "v2_ll"
+    return "v2"
 
 
 def internode_kernel_families(cfg):
@@ -870,7 +1143,7 @@ def _geometry_from_env(name, cfg):
     return geometry
 
 
-def internode_schedule(cfg, cu_count=None):
+def internode_schedule(cfg, cu_count=None, kernel_family=None):
     """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
     combine load-first).
 
@@ -898,8 +1171,9 @@ def internode_schedule(cfg, cu_count=None):
         fitted = tuple(fit_internode_geometry(g) for g in overrides)
         return [(ceiling, *fitted, False) for ceiling in _ceilings(extra=crossover)]
 
-    tables = {
-        family: internode_buckets(
+    family = kernel_family or internode_kernel_family(cfg)
+    table = (
+        internode_buckets(
             cfg.world_size,
             cfg.hidden_dim,
             cfg.num_experts_per_token,
@@ -910,16 +1184,14 @@ def internode_schedule(cfg, cu_count=None):
             cu_count=cu_count,
         )
         or []
-        for family in internode_kernel_families(cfg)
-    }
-    ceilings = _ceilings(*tables.values(), extra=crossover)
+    )
+    ceilings = _ceilings(table, extra=crossover)
 
     pinned = getattr(cfg, "_pinned_geometry", frozenset())
-    rows, families = [], []
+    rows = []
     for ceiling in ceilings:
         probe = _probe(ceiling, ceilings)
-        family = internode_kernel_family(cfg, probe)
-        tuned = pick_bucket(tables[family], probe)
+        tuned = pick_bucket(table, probe)
         geometries = []
         for index, (fields, fallback) in enumerate(
             zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
@@ -947,14 +1219,11 @@ def internode_schedule(cfg, cu_count=None):
             bool(tuned and tuned[3]) and family == "v2" and overrides[1] is None
         )
         row = (ceiling, *geometries, load_first)
-        # Equal neighbours of one family share a bucket. A family boundary
-        # stays an edge even between equal geometries, so each bucket's family
-        # follows from its ceiling alone (resolve_schedule).
-        if rows and rows[-1][1:] == row[1:] and families[-1] == family:
+        # Equal neighbours share a bucket.
+        if rows and rows[-1][1:] == row[1:]:
             rows[-1] = row
         else:
             rows.append(row)
-            families.append(family)
     return rows
 
 

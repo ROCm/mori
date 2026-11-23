@@ -1,0 +1,87 @@
+name: netmon unit tests
+
+# The unit tests of tools/netmon (ainic-netmon): the C++ collector tests and the Python
+# report / importer / dashboard tests; and of tools/xgmi_netmon (xgmi-netmon): the C++ tests.
+# They need no GPU and no NIC, so they run on a hosted runner, apart from the GPU lanes of
+# ci.yml: the mori build compiles both tools (BUILD_NETMON, BUILD_XGMI_NETMON) but leaves their
+# tests out.
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/netmon/**
+      - tools/xgmi_netmon/**
+      # test_import.py checks the dashboards here against their generator
+      - examples/monitoring/netmon/**
+      - .github/workflows/netmon.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - tools/netmon/**
+      - tools/xgmi_netmon/**
+      - examples/monitoring/netmon/**
+      - .github/workflows/netmon.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netmon-unit-test:
+    name: netmon unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # numpy is all the report tests need (plotly only draws the HTML report).
+      - name: Install numpy
+        run: python -m pip install numpy
+
+      # Standalone build, as in tools/netmon/README.md: tests on, -Werror on.
+      - name: Configure
+        run: >
+          cmake -S tools/netmon -B build-netmon -DCMAKE_BUILD_TYPE=Release
+          -DPython3_EXECUTABLE="$(which python)"
+
+      # CMake leaves the Python tests out without an error when it finds no Python with
+      # numpy: make sure both suites are there before running them.
+      - name: Check that both test suites are registered
+        run: |
+          ctest --test-dir build-netmon -N | tee tests.txt
+          grep -q 'netmon_tests$' tests.txt
+          grep -q 'netmon_report_tests$' tests.txt
+
+      - name: Build
+        run: cmake --build build-netmon -j "$(nproc)"
+
+      - name: Run unit tests
+        run: ctest --test-dir build-netmon --output-on-failure --no-tests=error
+
+  xgmi-netmon-unit-test:
+    name: xgmi-netmon unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Standalone build, as in tools/xgmi_netmon/README.md: tests on, -Werror on. The tests use
+      # the gpu_metrics captures in tests/fixtures, so they need no GPU.
+      - name: Build
+        run: |
+          cmake -S tools/xgmi_netmon -B build-xgmi -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-xgmi -j "$(nproc)"
+
+      - name: Run unit tests
+        run: ctest --test-dir build-xgmi --output-on-failure --no-tests=error

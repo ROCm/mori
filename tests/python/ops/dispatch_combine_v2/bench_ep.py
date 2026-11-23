@@ -62,6 +62,7 @@ import torch.distributed as dist
 
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x, resolve_quant_type
 
 import _data
 import _report
@@ -104,22 +105,33 @@ ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
-PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
-if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32", "fp8_blockwise"):
-    raise ValueError(
-        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32|fp8_blockwise"
-    )
-_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise"
+# COMB_MODE=push is the quantized combine: gfx125x's push, or the gfx942/gfx950
+# scatter. Only the push has a check here; test_op.py checks the scatter.
+_GFX125X = is_gfx125x()
+PUSH_QUANT = resolve_quant_type(
+    os.environ.get("PUSH_QUANT") or "fp4_blockwise", gfx125x=_GFX125X
+)
+_PUSH_FP8 = PUSH_QUANT.startswith("fp8")
 PUSH_QRULE = os.environ.get("PUSH_QRULE")
 if not PUSH_QRULE:
-    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_fp32" else "mx"
-if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and PUSH_QRULE != "mx"):
+    PUSH_QRULE = "blk" if PUSH_QUANT.endswith("_1x128") else "mx"
+if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and _GFX125X and PUSH_QRULE != "mx"):
     raise ValueError(
         f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk (mx only for {PUSH_QUANT})"
     )
 _PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
-_PUSH_WIRE = ((HIDDEN if _PUSH_FP8 else HIDDEN // 2) + HIDDEN // 32 + 127) // 128 * 128
+_PUSH_WIRE = (
+    (
+        (HIDDEN if _PUSH_FP8 else HIDDEN // 2)
+        + (HIDDEN // 32 if _PUSH_QGROUP == 32 else HIDDEN // 128 * 4)
+        + 127
+    )
+    // 128
+    * 128
+)
 CHECK = int(os.environ.get("CHECK", 1))
+if COMB_MODE == "push" and not _GFX125X:
+    CHECK = 0
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
@@ -581,7 +593,8 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -620,7 +633,7 @@ def main():
         if push_checked:
             ok = check_push_quant(out, ct) == 0
             for k in range(1, CHECK_REPEAT + 1):
-                *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 assert int(total_t.cpu().item()) == total, (
                     int(total_t.cpu().item()),
@@ -649,7 +662,7 @@ def main():
                 flush=True,
             )
         if land is not None:
-            *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+            *_, total_t, r = op.dispatch(i_, w_, s_, x_, **route)
             lockstep()
             assert int(total_t.cpu().item()) == total, (
                 int(total_t.cpu().item()),
@@ -1044,6 +1057,7 @@ def main():
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
         s_ = scales[:ct] if SCALE_DIM else None
+        route = dict(return_routing=True, max_num_inp_token_across_ranks=ct)
         for name, op in ops.items():
             points += 1
             total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
@@ -1060,7 +1074,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -1069,7 +1083,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, **route)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -1080,7 +1094,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, **route)
                 held[0] = r
 
             def eager_legs():

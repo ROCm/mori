@@ -186,6 +186,34 @@ TEST(Geometry, CombineSharedMemCoversOnePointerArrayPerWarp) {
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8);
 }
 
+TEST(Geometry, WorkgroupLdsOverTheLimitIsRefused) {
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 0, 327680, 327680));
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 48, 327680, 0));  // limit unknown
+  try {
+    CheckWorkgroupLds("k", 48, 327680, 327680);
+    FAIL() << "48 B over the limit was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("48 B static + 327680 B dynamic"), std::string::npos)
+        << e.what();
+  }
+}
+
+TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
+  EpCfg c;
+  c.worldSize = 4;
+  c.numExpertPerToken = 6;
+  c.waveSize = 32;
+  c.warpPerBlock = 16;
+  // 5120 used to take the metadata slab too: 16 x 2 x 10240 B, all of the LDS.
+  const std::pair<int, int> want[] = {
+      {4096, 262144}, {5120, 163840}, {6144, 196608}, {7168, 229376}};
+  for (const auto& [hidden, bytes] : want) {
+    c.hiddenDim = hidden;
+    EXPECT_EQ(EpDispatch1250xLdsBytes(c), bytes) << hidden;
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+}
+
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EpCfg ok;
   EXPECT_TRUE(EpCfgIsValid(ok));
@@ -815,6 +843,64 @@ TEST(Describe, FailsWhereCreateWould) {
   // The push combine is gfx125x only; RenderSource rejects it, compiled or not.
   ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
   EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
+}
+
+// --------------------------------------------------------------------------
+// arch= retargets one plan call and is gone when it returns.
+// --------------------------------------------------------------------------
+
+extern "C" const char* mori_jit_plan_describe(const char*, const char*, const char* const*,
+                                              const long long*, int);
+
+namespace {
+std::string CacheDirNow() {
+  return Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;", {});
+}
+}  // namespace
+
+TEST(Arch, ScopedArchRetargetsOnlyItsScope) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  const std::string base = CacheDirNow();
+  {
+    ScopedArch scope("gfx1250");
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+    EXPECT_EQ(ActiveArchSource(), "arch=");
+    EXPECT_NE(CacheDirNow().find("/gfx1250_mlx5/"), std::string::npos);
+    {
+      ScopedArch keep(nullptr);
+      EXPECT_EQ(ActiveArch(), "gfx1250");
+    }
+    {
+      ScopedArch inner("gfx942");
+      EXPECT_EQ(ActiveArch(), "gfx942");
+    }
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+  }
+  EXPECT_EQ(ActiveArch(), "gfx950");
+  EXPECT_EQ(CacheDirNow(), base);
+}
+
+TEST(Arch, ScopedArchIsThreadLocal) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  ScopedArch scope("gfx1250");
+  std::string seen;
+  std::thread([&seen] { seen = ActiveArch(); }).join();
+  EXPECT_EQ(seen, "gfx950");
+}
+
+TEST(Arch, DescribeArchDoesNotOutliveTheCall) {
+  // Two arch= in a row used to throw "toolchain already resolved", and the first
+  // one stuck: every later plan in the process compiled for it.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  const char* text = mori_jit_plan_describe("ep_dispatch", "gfx942", nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_EQ(ParseInfo(text)["stagingBytes"], "0");
+  ASSERT_NE(mori_jit_plan_describe("ep_dispatch", "gfx950", nullptr, nullptr, 0), nullptr)
+      << PlanError();
+  EXPECT_EQ(ActiveArch(), "gfx1250");
+  text = mori_jit_plan_describe("ep_dispatch", nullptr, nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_NE(ParseInfo(text)["stagingBytes"], "0");
 }
 
 // --------------------------------------------------------------------------

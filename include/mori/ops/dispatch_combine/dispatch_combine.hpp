@@ -61,7 +61,8 @@ enum KernelType {
   AsyncLL = 4,
   IntraNodeLL = 5
 };
-enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
+// Value 1 is unused; keep the remaining values stable across the pybind/JIT boundary.
+enum class QuantType { None = 0, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
 
 // Blockwise combine quant types share the same staging/scale layout (per-block float scales);
 // they differ only in the transported element codec: FP8 = 1 byte/elem, FP4 (E2M1) = 0.5 byte/elem
@@ -200,9 +201,11 @@ struct EpDispatchCombineConfig {
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).
   inline __host__ __device__ size_t HiddenDimSz() const { return (size_t)hiddenDim; }
 
+  // Padded to 16 B so every staging slot starts on a vector boundary.
   inline __host__ __device__ size_t XferBytesPerToken(size_t tokenTypeSize) const {
-    return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
-           ScaleBytes();
+    size_t bytes = HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
+                   ScaleBytes();
+    return (bytes + 15) & ~size_t{15};
   }
   inline __host__ __device__ size_t MaxXferBytesPerToken() const {
     return XferBytesPerToken(maxTokenTypeSize);

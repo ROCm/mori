@@ -3,84 +3,136 @@ MORI Documentation
 
 **MORI** (**Mo**\dular **R**\DMA **I**\nterface) is a bottom-up, modular, and composable framework for building high-performance communication applications with a strong focus on RDMA + GPU integration.
 
+New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quickstart`.
+
+.. image:: mori_arch_20260422_v1.jpg
+   :alt: MORI architecture
+
 .. toctree::
-   :maxdepth: 2
+   :hidden:
    :caption: Getting Started
 
    installation
    quickstart
-   ep_backends
 
 .. toctree::
-   :maxdepth: 2
-   :caption: User Guides
+   :hidden:
+   :caption: MORI-EP
 
-   MORI-EP-GUIDE
-   MORI-SHMEM-GUIDE
-   MORI-CCO-GUIDE
-   MORI-CCO-FUSED-OPS-GUIDE
-   MORI-IR-GUIDE
-   MORI-IO-GUIDE
-   MORI-UMBP-SINGLE-NODE-GUIDE
-   umbp-simulation
-   umbp-calibration
-   PROFILER
+   User guide <MORI-EP-GUIDE>
+   Choosing an API and backend <ep_backends>
+   Benchmark <MORI-EP-BENCHMARK>
+   V1 vs V2 inter-node performance <EPv2_PERF>
+   RDMA bandwidth in the kernels <rdma_bandwidth_utilization>
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Benchmarks
+   :hidden:
+   :caption: MORI-FUSED
 
-   MORI-EP-BENCHMARK
-   EPv2_PERF
-   MORI-IO-BENCHMARK
-   MORI-UMBP-PD-BENCHMARK
-   UMBP-TIER-MANAGEMENT-BENCHMARK
-   rdma_bandwidth_utilization
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Developer Guides
-
-   MORI_IR_INTEGRATION
-   MORI_JIT_ARCHITECTURE
-   MORI_JIT_V2_DESIGN
+   Overview <MORI-CCO-FUSED-OPS-GUIDE>
+   GEMM + all-reduce <fused-gemm-ar>
+   GEMM + reduce-scatter <fused-gemm-rs>
+   GEMM + all-to-all <fused-gemm-a2a>
+   GEMM + all-gather <fused-gemm-ag>
+   All-gather + GEMM <fused-ag-gemm>
+   All-to-all + GEMM <fused-a2a-gemm>
+   Tests and benchmarks <fused-tests-and-benchmarks>
 
 .. toctree::
-   :maxdepth: 2
+   :hidden:
+   :caption: MORI-SHMEM
+
+   SHMEM guide <MORI-SHMEM-GUIDE>
+
+.. toctree::
+   :hidden:
+   :caption: MORI-CCO
+
+   CCO guide <MORI-CCO-GUIDE>
+   Device API for FlyDSL and Triton <cco-device-api>
+   Examples <cco-examples>
+   Benchmarks <cco-benchmarks>
+
+.. toctree::
+   :hidden:
+   :caption: MORI-IO
+
+   IO guide <MORI-IO-GUIDE>
+   Benchmark <MORI-IO-BENCHMARK>
+
+.. toctree::
+   :hidden:
+   :caption: MORI-UMBP
+
+   Overview <umbp-overview>
+   Configuration and environment variables <umbp-configuration>
+   Pure-SSD mode and multi-drive tiers <umbp-pure-ssd-mode>
+   NUMA placement for a DRAM tier <umbp-numa-tier-placement>
+   KV indexer export <umbp-kv-indexer-export>
+   Monitoring <umbp-monitoring>
+   PD disaggregation benchmark <MORI-UMBP-PD-BENCHMARK>
+   Tier-management benchmark <UMBP-TIER-MANAGEMENT-BENCHMARK>
+   Simulation <umbp-simulation>
+   Calibration <umbp-calibration>
+
+.. toctree::
+   :hidden:
+   :caption: Tools
+
+   MORI-VIZ kernel profiler <PROFILER>
+
+.. toctree::
+   :hidden:
    :caption: API Reference
 
-   api/communication
-   api/profiler
-   api/umbp
+   Communication APIs <api/communication>
+   Profiler API <api/profiler>
+   UMBP master client <api/umbp>
+
+.. toctree::
+   :hidden:
+   :caption: Developer Guides
+
+   JIT compilation framework <MORI_JIT_ARCHITECTURE>
+   JIT v2 (in Chinese) <MORI_JIT_V2_DESIGN>
+   UMBP single-node smoke test <MORI-UMBP-SINGLE-NODE-GUIDE>
 
 Components
 ----------
 
 .. list-table::
    :header-rows: 1
-   :widths: 20 80
+   :widths: 15 45 40
 
    * - Component
-     - Description
+     - What it is
+     - Start here
    * - **MORI-EP**
      - Intra and inter-node dispatch/combine kernels for MoE Expert Parallelism
-   * - **MORI-IO**
-     - Point-to-point communication library for KVCache transfer via RDMA/XGMI
-   * - **MORI-CCL**
-     - Collective communication, including SDMA implementations; availability depends on the installed bindings
+     - :doc:`MORI-EP-GUIDE` (EPv1 on MORI-SHMEM, EPv2 on MORI-CCO, and how to choose), then :doc:`ep_backends`
+   * - **MORI-FUSED**
+     - GEMMs fused with the all-reduce, reduce-scatter, all-to-all or all-gather next to them, overlapping the transfer with the GEMM over the SDMA copy engines; built on MORI-CCO
+     - :doc:`MORI-CCO-FUSED-OPS-GUIDE`
    * - **MORI-SHMEM**
      - OpenSHMEM-style symmetric memory APIs for GPU memory and RDMA
+     - :doc:`MORI-SHMEM-GUIDE`
    * - **MORI-CCO**
-     - Collective Communication Object: explicit-handle GPU communication (LSA / GDA / SDMA)
+     - Next-Generation Collective Communication Object for GPUs: symmetric memory, natively designed for compute-communication fusion (LSA / GDA / SDMA)
+     - :doc:`MORI-CCO-GUIDE`
+   * - **MORI-IO**
+     - Point-to-point communication library for KVCache transfer via RDMA/XGMI
+     - :doc:`MORI-IO-GUIDE`
    * - **MORI-UMBP**
      - Unified memory and bandwidth pool with tiered storage and distributed KV access
+     - :doc:`umbp-overview`
    * - **MORI-VIZ**
      - Warp-level kernel profiler with Perfetto integration
+     - :doc:`PROFILER`
 
 Supported Hardware
 ------------------
 
-**GPUs:** MI308X, MI300X, MI325X, MI355X (MI450X under development)
+**GPUs:** MI308X, MI300X, MI325X, MI355X
 
 **NICs:** AMD Pollara (AINIC), Mellanox ConnectX-7, Broadcom Thor2 (Volcano under development)
 

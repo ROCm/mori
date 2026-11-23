@@ -138,15 +138,19 @@ jobs:
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
-          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch. The
-          # tables load from the installed package, so a build that ships no tables,
-          # or a table that fails to parse, fails here.
+          # CU fit, the per-target macro guard, the FlyDSL schedules' bounds, the AsyncLL
+          # defaults per arch, the peak / capped tuning profiles, and the combine quant
+          # type names. The tables load from the installed package, so a build that
+          # ships no tables, or a table that fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
               tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py \
-              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
+              tests/python/ops/dispatch_combine_v2/test_tuning_configs.py \
+              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py \
+              tests/python/ops/dispatch_combine_v2/test_tuning_profile.py \
+              tests/python/ops/dispatch_combine_v2/test_quant_types.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         if: contains(fromJSON(inputs.groups), 'cco')
@@ -405,15 +409,20 @@ jobs:
           #
           # This runner has no gfx1250, so what actually runs here is the portable
           # body -- the one that cannot be exercised by hand on the TDM boxes.
+          #
+          # Each dispatch dtype also feeds the HIP quantized scatter combine (the
+          # a4w4 serving shape: fp4/fp8 dispatch, bf16 expert output, quantized wire).
           for disp in fp8 fp4; do
+          for comb in gather:none scatter:fp8_blockwise_1x128 scatter:fp4_blockwise_1x32; do
             $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=224 -e HIDDEN=7168 \
-              -e DISP=$disp $CONTAINER bash -c "\
+              -e DISP=$disp -e COMBINE=${comb%%:*} -e QUANT=${comb#*:} $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
               out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asym_dtype.py 2>&1) || \
                 { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
               case \"\$out\" in *FAIL*) exit 1;; esac; \
               case \"\$out\" in *ASYM-SCALES*) ;; *) echo 'no ASYM-SCALES line: scales never ran'; exit 1;; esac" || exit 1
+          done
           done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
@@ -604,7 +613,8 @@ jobs:
     # passed in as part of the CCO unit test: on MI355X-AINIC-PIT-G17,
     # test_asyncll's back_to_back check fails. The other EPv2 steps run in
     # cco-unit-test.
-    if: contains(fromJSON(inputs.groups), 'epv2')
+    # Off: MI355X-AINIC, this job's only runner, is down.
+    if: false && contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -676,7 +686,8 @@ jobs:
     name: CCO internode test (${{ matrix.platform }})
     # Needs no other job: cco-unit-test runs on another runner, and this runner
     # runs one job at a time, so it never overlaps the other jobs on node1.
-    if: contains(fromJSON(inputs.groups), 'epv2')
+    # Off: MI355X-AINIC, this job's only runner, is down.
+    if: false && contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -818,6 +829,7 @@ jobs:
           # shared barrier from their own combine kernel code. Every case
           # allocates the op's default 8 QPs, so no table's count is clamped.
           for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
+                      "auto 128 --num-qp 8" \
                       "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
                       "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"

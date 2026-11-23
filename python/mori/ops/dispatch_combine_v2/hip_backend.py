@@ -54,6 +54,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import functools
 import logging
 import os
@@ -66,10 +67,23 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import asyncll_regions, internode_regions
+from .quant_types import is_gfx125x_arch, resolve_quant_type
+from .internode_regions import (
+    asyncll_regions,
+    asyncll_seg_layout,
+    asyncll_seg_words,
+    internode_regions,
+)
 from .symm_arena import SymmArena
 
 logger = logging.getLogger(__name__)
+
+# segment_error_flags() bits.
+SEGMENT_ERR_OVERFLOW = 1
+SEGMENT_ERR_MISMATCH = 2
+# EpInterNodeArgs.segStride bit 63: the op has the segmented layout, so compact
+# rounds on it still exchange the mode word (asyncll::kSegCapableBit).
+SEG_CAPABLE_BIT = 1 << 63
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
@@ -86,6 +100,7 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "fwdMap": "fwd_map",
 }
 
 _LL_REGIONS = dict(
@@ -291,20 +306,32 @@ def _combine_info_cached(fields: tuple) -> dict:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
+PUSH_QGROUP = {
+    "fp4_blockwise_1x32": 32,
+    "fp4_blockwise_1x128": 128,
+    "fp8_blockwise_1x32": 32,
+}
 # The combine request fields each push quant type turns on.
 _PUSH_REQUEST = {
-    "fp4_blockwise": (("combine_fp4", 1),),
-    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
-    "fp8_blockwise": (("combine_fp8", 1),),
+    "fp4_blockwise_1x32": (("combine_fp4", 1),),
+    "fp4_blockwise_1x128": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise_1x32": (("combine_fp8", 1),),
 }
+
+
+def _push_quant(name):
+    """The explicit push quant type `name` means; the push combine is gfx125x."""
+    return resolve_quant_type(name, gfx125x=True)
 
 
 def push_wire_nbytes(cfg) -> int:
     """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
     plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
     cfg.quant_type; the push combine, and so this, is gfx125x only."""
-    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    fields = (
+        ("hidden_dim", int(cfg.hidden_dim)),
+        *_PUSH_REQUEST[_push_quant(cfg.quant_type)],
+    )
     return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
@@ -317,9 +344,55 @@ def push_land_rows(cfg) -> int:
         ("world_size", int(cfg.world_size)),
         ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
         ("num_expert_per_token", int(cfg.num_experts_per_token)),
-        *_PUSH_REQUEST["fp4_blockwise"],
+        *_PUSH_REQUEST["fp4_blockwise_1x32"],
     )
     return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
+
+
+_CARD_COMBINE_ROWS_MAX = 2048
+
+
+_CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
+# The gfx942/gfx950 scatter combine's wires (combine_scatter_q_group); e2m1 needs gfx950.
+_SCATTER_QUANT_TYPES = ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
+_SCATTER_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
+
+
+def _card_layout(cfg):
+    if (
+        cfg.is_internode
+        or cfg.async_ll
+        or cfg.combine_dtype is not torch.bfloat16
+        or not cfg.schedule
+    ):
+        return None
+    shape = (cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
+    epr = cfg.num_experts_per_rank
+    rows = cfg.effective_max_recv
+    if cfg.quant_type == "none":
+        if (
+            cfg.dispatch_dtype is not torch.bfloat16
+            or os.environ.get("MORI_EP_BF16_PUSH", "1") == "0"
+        ):
+            return None
+        push = tuning.bf16_push(*shape, experts_per_rank=epr)
+        if push is None or any(
+            b and -(-rows // b) > _CARD_COMBINE_ROWS_MAX for _, b, _ in push
+        ):
+            return None
+    elif cfg.quant_type in _CARD_QUANT_TYPES:
+        if not (
+            cfg.dispatch_dtype is torch.bfloat16
+            or cfg.dispatch_dtype in _FP8_TUNING_DTYPES
+            or cfg.is_fp4
+        ) or any(
+            cw != 16 or -(-rows // cb) > _CARD_COMBINE_ROWS_MAX
+            for _, _, _, cb, cw in cfg.schedule
+        ):
+            return None
+    else:
+        return None
+    return tuning.card(*shape, experts_per_rank=epr)
 
 
 def ll128_layout(cfg):
@@ -391,19 +464,36 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # them per call -- torch.as_tensor + view showed up in the host profile at
         # ~27us a round, on a path where the host already paces the GPU.
         self._views = {}
+        # This round's segmented stride, 0 for the compact layout (see
+        # _set_segment_stride). Combine and the views follow the last dispatch.
+        self._seg_stride = 0
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
-        self._is1250 = _arch.split(":")[0].startswith("gfx125")
+        self._is1250 = is_gfx125x_arch(_arch)
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
-        lay = ll128_layout(cfg) if self._is1250 else None
+        lay = (
+            ll128_layout(cfg) if self._is1250 and cfg.low_latency is not False else None
+        )
         split = lay is not None and lay["max_tok"] < cfg.max_num_inp_token_per_rank
         self._ll128_geom = None if split else lay
         self._ll128_split = lay if split else None
         self._ll_recv_cap = cfg.world_size * lay["max_tok"] if split else 0
         self._ll_last = False
+        card = _card_layout(cfg) if self._is1250 else None
+        self._ll128_dedup = card is not None
+        self._card = card if self._ll128_geom is None else None
+
+        # "auto" resolves before the gate and the arena, from the config alone,
+        # so every rank reaches the same answer; the regions depend on it.
+        if cfg.async_ll_recv_layout == "auto":
+            supported = not self._asyncll_segmented_unsupported(cfg)
+            cfg = dataclasses.replace(
+                cfg, async_ll_recv_layout="segmented" if supported else "compact"
+            )
+            self.cfg = cfg
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -411,6 +501,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        if lay is None and not cfg.is_internode and not cfg.async_ll:
+            self._warn_unused_low_latency()
         # Active QP counts set_active_qps() may switch to. Each is compiled for
         # every bucket geometry, so a switch never compiles at launch.
         self._selectable_active_qps = tuple(cfg.active_qp_counts or ())
@@ -428,15 +520,31 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._schedule = tuning.resolve_schedule(
             cfg, cu_count=self._multi_processor_count
         )
+        self._ll_schedule = tuning.resolve_ll_schedule(
+            cfg, cu_count=self._multi_processor_count
+        )
+        rows = self._schedule + self._ll_schedule
         if cfg.rank == 0 and not cfg.async_ll and logger.isEnabledFor(logging.INFO):
-            logger.info("%s", tuning.describe_schedule(cfg, self._schedule))
-        self._dispatch_specs = tuple(
-            dict.fromkeys(row.dispatch for row in self._schedule)
-        )
-        self._combine_specs = tuple(
-            dict.fromkeys(row.combine for row in self._schedule)
-        )
+            logger.info("%s", tuning.describe_schedule(cfg, rows))
+        self._dispatch_specs = tuple(dict.fromkeys(row.dispatch for row in rows))
+        self._combine_specs = tuple(dict.fromkeys(row.combine for row in rows))
+        if self._card is not None and any(
+            spec.warp_per_block <= 8
+            or spec.warp_per_block < cfg.world_size
+            or spec.block_num + self._card["pull_blocks"] > self._multi_processor_count
+            or (
+                cfg.is_fp4
+                and (cfg.world_size <= 4 or spec.warp_per_block == cfg.world_size)
+            )
+            for spec in self._dispatch_specs
+        ):
+            self._card = None
         self._bf16_push = self._bf16_push_layout(cfg)
+        self._card_quant = (
+            self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES
+        )
+        if self._bf16_push is None and not self._card_quant:
+            self._card = None
         self._push_specs = tuple(
             dict.fromkeys(
                 tuning.KernelConfig("intra", b, w) for _, b, w in self._bf16_push or ()
@@ -483,12 +591,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             raise ValueError(f"MORI_EP_BF16_PUSH must be '0' or '1', got {flag!r}")
         if flag == "0":
             return None
-        return tuning.bf16_push(
+        lay = tuning.bf16_push(
             cfg.world_size,
             cfg.hidden_dim,
             cfg.num_experts_per_token,
             experts_per_rank=cfg.num_experts_per_rank,
         )
+        if lay is not None and self._card is not None:
+            lay = tuple((mx, b, 16) for mx, b, _ in lay)
+        return lay
+
+    def _push_card(self):
+        return {} if self._card is None else dict(card_combine=True)
 
     def _build(self, cfg, comm):
         dev = self.dev
@@ -877,13 +991,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return (
             tuple(
                 cb.EpDispatchPlan.describe(
-                    **disp,
+                    **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
-                for cap in self._dispatch_caps(cfg, spec)
+                for cap, blocks in self._dispatch_variants(cfg, spec)
             ),
             tuple(
                 cb.EpCombinePlan.describe(
@@ -896,6 +1010,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             + tuple(
                 cb.EpCombinePlan.describe(
                     **comb,
+                    **self._push_card(),
                     combine_bf16_push=True,
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
@@ -1028,6 +1143,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "it and every AsyncLL transfer would be a no-op (or use "
                 "async_ll_transport='lsa', which needs no engine)"
             )
+        if cfg.async_ll_segmented:
+            bad.extend(self._asyncll_segmented_unsupported(cfg))
         return tuple(bad)
 
     def _plan_requests(self, cfg):
@@ -1052,19 +1169,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # rejects a Cfg whose row is not a whole number of them.
             scale_bytes=self._scale_i32(cfg) * 4,
         )
+        if self._card is not None:
+            disp["card_dedup"] = True
+            disp["card_combine"] = True
+            if self._card["pull_blocks"]:
+                disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb["combine_fp8"] = True
+        if self._is1250:
+            for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
+                comb[field] = bool(on)
+        elif cfg.quant_type != "none":
+            comb["combine_scatter_q_group"] = cfg.quant_group
+            if cfg.quant_element == "fp4":
+                comb["combine_scatter_fp4"] = True
+        if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
+            comb["card_combine"] = True
         geom = self._ll128_geom
         if geom is not None and "dispatch" in geom:
             disp.update(
                 ll128=True,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
+                ll128_dedup=self._ll128_dedup,
             )
             comb["ll128"] = True
         elif geom is not None:
@@ -1083,14 +1209,64 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dict(
                 disp,
                 **ll,
+                card_dedup=False,
+                card_pull_blocks=0,
+                card_combine=False,
+                ll128_dedup=self._ll128_dedup,
                 combine_fp4=comb.get("combine_fp4", False),
                 combine_fp8=comb.get("combine_fp8", False),
                 call_tok_max=n,
                 block_num=disp_b,
                 warp_per_block=disp_w,
             ),
-            dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
+            dict(
+                {k: v for k, v in comb.items() if k != "card_combine"},
+                **ll,
+                block_num=comb_b,
+                warp_per_block=comb_w,
+            ),
         )
+
+    def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
+        bad = []
+        if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs async_ll_transport='sdma' on one node: its "
+                "transfer posts one SDMA packet per field to each peer"
+            )
+        if cfg.world_size < 2:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs world_size >= 2: an empty row points at "
+                "another rank's expert"
+            )
+        if cfg.world_size > 64:
+            bad.append(
+                "async_ll_recv_layout='segmented' supports world_size <= 64: the receive "
+                "finalize stages one count per source in a 64-entry LDS array"
+            )
+        if (cfg.scale_dim * cfg.scale_type_size) % 4:
+            bad.append(
+                "async_ll_recv_layout='segmented' needs a whole number of dwords per scale row"
+            )
+        try:
+            mode, _ = self._asyncll_options(cfg, self._arch)
+        except ValueError:
+            mode = 0  # reported when the kernels are built
+        if mode == 2:
+            bad.append(
+                "async_ll_recv_layout='segmented' with MORI_ASYNCLL_FUSED_RECV=1: the segmented "
+                "receive keeps the separate RecvTransfer"
+            )
+        return bad
+
+    @classmethod
+    def _quant_formats(cls, arch):
+        # gfx125x pushes; gfx942/gfx950 scatter an fp8 wire, and gfx950 an e2m1 one too.
+        if is_gfx125x_arch(arch):
+            return _PUSH_QUANT_TYPES
+        if arch.startswith("gfx950"):
+            return _SCATTER_QUANT_TYPES + _SCATTER_FP4_QUANT_TYPES
+        return _SCATTER_QUANT_TYPES
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
@@ -1106,26 +1282,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         q = cfg.quant_type
-        push = q in _PUSH_QUANT_TYPES
-        if cfg.is_scatter and not push:
+        refused = self._quant_refusal(cfg, self._arch)
+        bad.extend(refused)
+        if cfg.is_scatter and q == "none":
+            served = "the push" if self._is1250 else "the scatter"
             bad.append(
-                "combine_mode='scatter' (gather only, except the push quant types "
-                f"{_PUSH_QUANT_TYPES})"
+                f"combine_mode='scatter' without a quant type on {self._arch} (gather "
+                f"only, or {served} quant types {self._quant_formats(self._arch)})"
             )
-        if q != "none" and not push:
-            bad.append(f"quant_type={q!r}")
-        if push:
-            if not self._is1250:
-                bad.append(f"quant_type={q!r} (the push combine is gfx125x only)")
+        if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
                     "(bf16 only)"
                 )
-            elif cfg.hidden_dim % 1024:
+            elif cfg.hidden_dim % (1024 if self._is1250 else 128):
                 bad.append(
                     f"quant_type={q!r} with hidden_dim={cfg.hidden_dim} "
-                    "(needs a multiple of 1024)"
+                    f"(needs a multiple of {1024 if self._is1250 else 128})"
                 )
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
@@ -1311,6 +1485,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "dispatch_sendcopy_lsa",
     )
 
+    # Segmented rounds (async_ll_recv_layout, SDMA only): the expert reads the
+    # landing segments, so dispatch's RecvCopy becomes a finalize pass, and the
+    # segmented expert output is sent in place, so combine has no SendCopy.
+    _ASYNCLL_SEG_SEQ = {
+        "dispatch_send": (
+            "dispatch_slotassign",
+            "dispatch_sendcopy_seg",
+            "dispatch_sendtransfer_seg",
+        ),
+        "dispatch_recv": ("dispatch_recvtransfer", "dispatch_recvfinalize_seg"),
+        "combine_send": ("combine_sendtransfer_seg",),
+        "combine_recv": ("combine_recvtransfer", "combine_recvcopy_seg"),
+    }
+
+    @classmethod
+    def _asyncll_seg_seq(cls):
+        return dict(cls._ASYNCLL_SEG_SEQ)
+
     @staticmethod
     def _asyncll_options(cfg, arch):
         # Resolve once per op. Shared copy passes also serve LSA, so topology
@@ -1437,12 +1629,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._asyncll_mode, self._device_index, self._multi_processor_count
         )
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
-        for group, names in sequences.items():
+        seg_sequences = self._asyncll_seg_seq() if cfg.async_ll_segmented else {}
+        for group, names in [*sequences.items(), *seg_sequences.items()]:
             for name in names:
+                if name in plans_by_pass:
+                    continue
                 request = self._asyncll_request(
                     cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
                 )
-                plan = cb.EP_ASYNCLL_PLANS[name](**request)
+                plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the
                 # value is written into the plan's struct once instead of per
@@ -1454,6 +1649,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
             for group, names in sequences.items()
         }
+        self._asyncll_groups_seg = {
+            group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
+            for group, names in seg_sequences.items()
+        }
+        self._seg_layout = asyncll_seg_layout(cfg) if cfg.async_ll_segmented else None
 
         # AsyncLL compiles one geometry -- its specs derive each pass's grid from
         # mpCount and worldSize, so (block, warp) only sets the block width.
@@ -1497,6 +1697,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         def run(*, input, num_tokens, dest_map, **kwargs):
             phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
+            stride = self._seg_stride
+            if stride and "combine_send" in groups:
+                input = self._seg_combine_input(input, stride)
             if phase == "dispatch":
                 if groups[0] == "dispatch_recv":
                     # dispatch_recv() launches this half with only input/dest_map/
@@ -1558,21 +1761,133 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     else 0
                 ),
             )
+            if self.cfg.async_ll_segmented:
+                # Bit 63 marks a segmented-capable op, so compact rounds on it
+                # still exchange the mode word (asyncll::SegModeWord).
+                args["segStride"] = SEG_CAPABLE_BIT | stride
+            table = self._asyncll_groups_seg if stride else self._asyncll_groups
             stream = _raw_stream(self._device_index)
             for group in groups:
-                self._asyncll_groups[group].launch(stream, **args)
+                table[group].launch(stream, **args)
 
         return run
 
     def _reachable_schedule(self, cfg):
         """Schedule rows a launch can select: those starting below the capacity."""
-        rows, lower = [], 0
-        for row in self._schedule:
-            if lower >= cfg.max_num_inp_token_per_rank:
-                break
-            rows.append(row)
-            lower = row.max_tokens if row.max_tokens is not None else lower
+        rows = []
+        for schedule in (self._schedule, self._ll_schedule):
+            lower = 0
+            for row in schedule:
+                if lower >= cfg.max_num_inp_token_per_rank:
+                    break
+                rows.append(row)
+                lower = row.max_tokens if row.max_tokens is not None else lower
         return rows
+
+    def _set_segment_stride(self, stride, num_tokens):
+        if not stride:
+            self._seg_stride = 0
+            return
+        cfg = self.cfg
+        if not cfg.async_ll_segmented:
+            raise ValueError(
+                "segment_stride needs an op built with async_ll_recv_layout='segmented'"
+            )
+        # Only the receive cap is checked here. It is the same on every rank, so a
+        # stride past it fails on every rank before any of them launches -- as long
+        # as S itself is the same on every rank, which the contract requires: compute
+        # it from values every rank shares (e.g. the max token count after the DP
+        # all-gather). A rank that alone passes a stride past the cap raises here
+        # while the others enter the round and wait for it. The
+        # field blocks are sized by max_num_inp_token_per_rank rows per source and
+        # the reverse map and the expert output by effective_max_recv_per_rank,
+        # which is at most that, so the cap is the binding bound.
+        #
+        # A stride below this rank's token count is NOT refused: the other ranks
+        # would launch the round and wait in the receive forever. The send pass
+        # drops the rows past the stride instead and counts the round as an
+        # overflow (segment_error_counts()), so the caller sees a wrong round, not
+        # a hang.
+        cap = cfg.effective_max_recv_per_rank
+        if not 0 < stride <= cap:
+            raise ValueError(
+                f"segment_stride={stride} must be positive and within the per-source "
+                f"receive cap {cap}"
+            )
+        self._seg_stride = int(stride)
+
+    def _seg_combine_input(self, input, stride):
+        """The expert output a segmented combine sends: world_size * stride rows
+        in the dispatch's segment layout, sent from the arena view."""
+        rows = self.cfg.world_size * stride
+        if input.shape[0] != rows:
+            raise ValueError(
+                f"a segmented combine takes the segmented expert output: "
+                f"{rows} rows (world_size x stride {stride}), got {input.shape[0]}"
+            )
+        view = self.combine_in_view()
+        if input.data_ptr() != view.data_ptr():
+            view.copy_(input)
+        return view
+
+    def _seg_words_view(self, key, first, n):
+        view = self._views.get(key)
+        if view is None:
+            ptr = self.arena.local_ptr("send_count") + first * 8
+            view = from_gpu_ptr(ptr, (n,), torch.int64)
+            self._views[key] = view
+        return view
+
+    def segment_error_counts(self):
+        """(overflow, mismatch): cumulative counts of each segmented-layout error on
+        this rank since the op was built or last reset(), counted per peer and
+        round.
+
+        overflow: a segmented round where this rank had more rows for a peer than
+        the stride, i.e. it was called with segment_stride below its own token
+        count. The rows past the stride were dropped. Only the rank that dropped
+        rows counts it; its peers see a short segment and count nothing. mismatch: a
+        peer's round, segmented or compact, did not use this rank's mode and stride,
+        so rows were read at the wrong offsets. Every rank counts that.
+
+        So the counts, and segment_error_flags(), differ between ranks: reduce them
+        across ranks (e.g. an all-reduce max) before acting on them, such as
+        falling back to compact, or the ranks diverge in the next round.
+
+        Use this for totals (e.g. a periodic health check that diffs two reads);
+        segment_error_flags() answers "anything new since I last looked". Reads
+        device memory, so it synchronizes."""
+        if not self.cfg.async_ll_segmented:
+            return (0, 0)
+        first = asyncll_seg_words(self.cfg.world_size)["errors"]
+        overflow, mismatch = self._seg_words_view("seg_errors", first, 2).tolist()
+        return (int(overflow), int(mismatch))
+
+    def segment_error_flags(self, clear=False):
+        """Error bits since the last clear, 0 when none: SEGMENT_ERR_OVERFLOW (1)
+        and SEGMENT_ERR_MISMATCH (2), see segment_error_counts(). clear=True
+        moves the baseline to now. The device only ever adds to the counters, so
+        nothing set while this runs is lost. Synchronizes."""
+        counts = self.segment_error_counts()
+        base = getattr(self, "_seg_error_base", (0, 0))
+        flags = 0
+        if counts[0] > base[0]:
+            flags |= SEGMENT_ERR_OVERFLOW
+        if counts[1] > base[1]:
+            flags |= SEGMENT_ERR_MISMATCH
+        if clear:
+            self._seg_error_base = counts
+        return flags
+
+    def segment_counts(self):
+        """Device int64 [world_size]: n_s, the rows source s sent this rank in the
+        last segmented round (valid rows [s * S, s * S + n_s) of the recv views).
+        Meaningful after dispatch_recv() of a segmented round; None on an op
+        without the segmented layout."""
+        if not self.cfg.async_ll_segmented:
+            return None
+        first = asyncll_seg_words(self.cfg.world_size)["counts"]
+        return self._seg_words_view("seg_counts", first, self.cfg.world_size)
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
@@ -1657,18 +1972,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
-    def kernel_config(self, num_tokens) -> tuning.ScheduleEntry:
+    def kernel_config(self, num_tokens, max_tokens=None) -> tuning.ScheduleEntry:
         """Selected HIP configurations for both phases, using this call's tokens.
 
         This reads the schedule prepared at construction: no table reload,
         compilation or device query. Intra and inter both select from it. On
-        gfx125x, a token count within the LL128 split launches the LL128 kernels
-        instead (except a snapshot call under a push quant type), which this does
-        not report. AsyncLL reports active_qps as None; its kernels run with
-        resolve_active_qps(cfg). A set_active_qps() override replaces both
-        phases' active count.
+        gfx125x, a call the low_latency rule sends to LL128 launches the LL128
+        kernels instead (except a snapshot call under a push quant type), which
+        this does not report. AsyncLL reports active_qps as None; its kernels
+        run with resolve_active_qps(cfg). A set_active_qps() override replaces
+        both phases' active count.
         """
-        selected = tuning.pick_bucket(self._schedule, num_tokens)
+        schedule = self._schedule
+        if self._ll_schedule:
+            family = tuning.internode_kernel_family(self.cfg, max_tokens=max_tokens)
+            if family == "v2_ll":
+                schedule = self._ll_schedule
+        selected = tuning.pick_bucket(schedule, num_tokens)
         override = getattr(self, "_active_qps_override", None)
         if override is None:
             return selected
@@ -1677,16 +1997,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine=selected.combine._replace(active_qps=override),
         )
 
-    def _pick(self, num_tokens, snapshot=False):
+    def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         split = getattr(self, "_ll128_split", None)
         if (
             split is not None
-            and num_tokens <= split["max_tok"]
+            and max_tokens is not None
+            and max_tokens <= split["max_tok"]
             and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
         ):
             return _LL_SPEC, _LL_SPEC
-        selected = self.kernel_config(num_tokens)
+        if snapshot and self._card is not None:
+            raise ValueError(
+                "snapshot=True on an op whose push combine folds the rows of each "
+                "card: the fold reads the latest dispatch, so a handle cannot outlive the "
+                "next one; pass snapshot=False (or, with quant_type none, set "
+                "MORI_EP_BF16_PUSH=0)"
+            )
+        selected = self.kernel_config(num_tokens, max_tokens)
         return selected.dispatch, selected.combine
+
+    def _peak_limit(self, snapshot):
+        split = getattr(self, "_ll128_split", None)
+        if split is not None and not (
+            snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES
+        ):
+            return split["max_tok"]
+        if getattr(self, "_ll_schedule", ()):
+            return self.cfg.internode_auto_ll_max_tokens
+        return None
 
     def _wrap_internode(self, phase, group):
         """One ABI crossing for the whole pass sequence.
@@ -1780,9 +2118,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dispatch, combine = {}, {}
         for spec in self._dispatch_specs:
             sized = []
-            for cap in self._dispatch_caps(cfg, spec):
+            for cap, blocks in self._dispatch_variants(cfg, spec):
                 plan = cb.EpDispatchPlan(
-                    **disp_req,
+                    **self._variant_request(disp_req, blocks),
                     **bound,
                     block_num=spec.block_num,
                     warp_per_block=spec.warp_per_block,
@@ -1792,7 +2130,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 if self.dispatch_staging is not None:
                     plan.bind(staging_base=self.dispatch_staging)
                 self._plans.append(plan)
-                sized.append((cap, plan))
+                sized.append((cap, plan, self._card is not None and not blocks))
             dispatch[spec] = self._wrap_dispatch(sized)
         for spec in self._combine_specs:
             plan = cb.EpCombinePlan(
@@ -1808,6 +2146,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for spec in self._push_specs:
             plan = cb.EpCombinePlan(
                 **comb_req,
+                **self._push_card(),
                 **bound,
                 combine_bf16_push=True,
                 block_num=spec.block_num,
@@ -1829,7 +2168,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 plan.bind(staging_base=self.dispatch_staging)
             self._plans.append(plan)
             n = self._ll128_split["max_tok"]
-            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan)], ll=True)
+            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan, False)], ll=True)
             plan = cb.EpCombinePlan(**ll[1], **ll_bound)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
@@ -1843,7 +2182,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
             capabilities=frozenset(
-                {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
+                {"gather", "scales"}
+                | ({"scatter"} if cfg.is_scatter else set())
+                | ({"quant"} if cfg.quant_type != "none" else set())
             ),
         )
 
@@ -1852,6 +2193,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._recv.zero_()
         if self._ll_recv is not None:
             self._ll_recv.zero_()
+        # The arena zero above also cleared the segment error counters, so the
+        # segment_error_flags() baseline restarts with them.
+        self._seg_error_base = (0, 0)
 
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
@@ -1902,7 +2246,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return "ll_" + name, self._ll_recv_cap
         return self._region(name), self._recv_cap
 
+    def _seg_view(self, key, region, offset, cols, dtype, per_source=None):
+        """Rows [0, world_size * stride) of a segmented field block of
+        per_source rows per source (default max_num_inp_token_per_rank)."""
+        view = self._views.get(key)
+        if view is None:
+            per_source = per_source or self.cfg.max_num_inp_token_per_rank
+            rows = self.cfg.world_size * per_source
+            ptr = self.arena.local_ptr(region) + offset
+            view = from_gpu_ptr(ptr, (rows, cols), dtype)
+            self._views[key] = view
+        return view[: self.cfg.world_size * self._seg_stride]
+
     def recv_tokens(self):
+        if self._seg_stride:
+            offset, cols = self._seg_layout["hidden"], self.cfg.hidden_dim
+            dtype = self.cfg.dispatch_dtype
+            return self._seg_view(
+                "seg_tokens", "inter_dispatch_inp", offset, cols, dtype
+            )
         key = "ll_recv_tokens" if self._ll_last else "recv_tokens"
         view = self._views.get(key)
         if view is not None:
@@ -1917,6 +2279,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def combine_in_view(self):
+        if self._seg_stride:
+            cols, dtype = self.cfg.hidden_dim, self.cfg.combine_dtype
+            # inter_dispatch_staging holds effective_max_recv_per_rank rows per
+            # source, the same as on a compact op (internode_regions.py).
+            return self._seg_view(
+                "seg_combine_in",
+                "inter_dispatch_staging",
+                0,
+                cols,
+                dtype,
+                per_source=self.cfg.effective_max_recv_per_rank,
+            )
         view = self._views.get("combine_in")
         if view is None:
             view = from_gpu_ptr(
@@ -1928,6 +2302,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_weights(self):
+        if self._seg_stride:
+            offset, topk = self._seg_layout["weight"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_weights", region, offset, topk, torch.float32)
         key = "ll_recv_weights" if self._ll_last else "recv_weights"
         view = self._views.get(key)
         if view is None:
@@ -1941,6 +2319,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_indices(self):
+        if self._seg_stride:
+            offset, topk = self._seg_layout["index"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_indices", region, offset, topk, torch.int32)
         key = "ll_recv_indices" if self._ll_last else "recv_indices"
         view = self._views.get(key)
         if view is None:
@@ -1962,13 +2344,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
+        n_i32 = self._scale_i32(self.cfg)
+        if not n_i32:
+            return None
+        if self._seg_stride:
+            # Packed rows, a whole number of dwords (the segmented gate checks).
+            offset = self._seg_layout["scale"]
+            region = "inter_dispatch_inp"
+            return self._seg_view("seg_scales", region, offset, n_i32, torch.int32)
         key = "ll_recv_scales" if self._ll_last else "recv_scales"
         view = self._views.get(key)
         if view is not None:
             return view
-        n_i32 = self._scale_i32(self.cfg)
-        if not n_i32:
-            return None
         stride_i32 = self.scale_stride_bytes() // 4
         region, n = self._recv_region("out_scales")
         rows = from_gpu_ptr(
@@ -2035,6 +2422,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             caps.add(cap)
         return sorted(caps)
 
+    def _dispatch_variants(self, cfg, spec):
+        caps = self._dispatch_caps(cfg, spec)
+        card = self._card or {}
+        blocks = card.get("pull_blocks", 0)
+        edge = card.get("pull_launch_max", 0) if blocks else 0
+        if edge <= 0:
+            return [(cap, blocks) for cap in caps]
+        small = [(cap, 0) for cap in caps if cap <= edge]
+        big = [cap for cap in caps if cap > edge]
+        if big and (not small or small[-1][0] < edge):
+            small.append((edge, 0))
+        return small + [(cap, blocks) for cap in big]
+
+    @staticmethod
+    def _variant_request(req, blocks):
+        out = {k: v for k, v in req.items() if k != "card_pull_blocks"}
+        if blocks:
+            out["card_pull_blocks"] = blocks
+        elif req.get("card_pull_blocks"):
+            out["card_fwd_mark"] = True
+        return out
+
     def _wrap_dispatch(self, sized, ll=False):
         def run(
             *,
@@ -2045,15 +2454,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dest_map,
             num_tokens,
         ):
-            plan = next((p for c, p in sized if num_tokens <= c), None)
+            plan, pull = next(
+                ((p, two) for c, p, two in sized if num_tokens <= c), (None, False)
+            )
             if plan is None:
                 raise ValueError(
                     f"dispatch of {num_tokens} tokens is past this variant's largest "
                     f"call size {sized[-1][0]}"
                 )
             count = self._ll_recv if ll else self._recv
-            plan.launch(
-                stream=torch.cuda.current_stream().cuda_stream,
+            stream = torch.cuda.current_stream().cuda_stream
+            args = dict(
                 token_indices=indices,
                 inp_token_buf=input,
                 weights_buf=weights,
@@ -2064,13 +2475,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            if pull:
+                plan.launch(stream=stream, card_pull=0, **args)
+                plan.launch(stream=stream, card_pull=1, **args)
+            else:
+                plan.launch(stream=stream, **args)
             self.total_recv = count
             self._ll_last = ll
 
         return run
 
     def _wrap_combine(self, plan, ll=False):
-        push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        push = self._is1250 and self.cfg.quant_type in _PUSH_QUANT_TYPES
         src_ptr = self.arena.local_ptr(
             "ll_recv_to_src_token" if ll else "recv_to_src_token"
         )
@@ -2119,6 +2535,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             (mx, push[tuning.KernelConfig("intra", b, w)])
             for mx, b, w in self._bf16_push
         )
+        marks = ()
+        in_view = None
+        if self._card is not None:
+            n = self.cfg.effective_max_recv
+            base = self.arena.local_ptr("fwd_map")
+            rev = (4 * n + 64 + 127) // 128 * 128
+            marks = tuple(
+                from_gpu_ptr(base + off, (n,), torch.int32) for off in (0, rev)
+            )
+        else:
+            in_view = self.arena.local_ptr(self._region("out_tok"))
 
         def run(
             *,
@@ -2130,7 +2557,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             recv_to_src=None,
             recv_idx=None,
         ):
-            if want_weights or total_recv is not self._recv:
+            if (
+                want_weights
+                or total_recv is not self._recv
+                or input.data_ptr() == in_view
+            ):
+                if marks and total_recv is not self._recv:
+                    raise NotImplementedError(
+                        "the bf16 push combine of this op folds the rows of each card "
+                        "from the latest dispatch, so a snapshot handle cannot be "
+                        "combined after it; pass snapshot=False, or set "
+                        "MORI_EP_BF16_PUSH=0"
+                    )
+                for m in marks:
+                    m.zero_()
                 return pull(
                     input=input,
                     dest_map=dest_map,
@@ -2150,7 +2590,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
+        if not self._is1250 or (
+            self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs
+        ):
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )

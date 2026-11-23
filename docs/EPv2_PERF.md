@@ -268,9 +268,7 @@ latency change and a positive bandwidth change mean V2 is better.
   dispatch has rules only for LL T64 and T128 and normal-kernel T4096, and AUTO
   uses the next larger rule for the rest: LL T4–T32 use T64's 128/64/8, LL T256
   and T512 use the LL table's T2048 rule (256/170/16), and normal-kernel T1024
-  and T2048 use T4096's 256/128/16. V1's combine tables also have
-  `fp8_direct_cast` rules (combine sent as FP8) for T64–T4096, which are faster
-  but do not apply to the BF16 combine here.
+  and T2048 use T4096's 256/128/16.
 - **Both sides' measurements match their own tuning tables.** With the same
   rule, V1's measurement in every bucket is within −6% to +13% of its table
   record, and V2's within −10% to +1%.

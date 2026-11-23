@@ -21,7 +21,8 @@
 // SOFTWARE.
 //
 // Where hipcc is, what arch to target, where the kernel sources are, where the
-// cache goes. Resolved once per process.
+// cache goes. Resolved once per process; a plan call may target another arch
+// for its own duration (ScopedArch).
 
 #pragma once
 
@@ -75,13 +76,34 @@ struct Toolchain {
   std::string Diagnose() const;
 };
 
-// Process-wide singleton. Throws std::runtime_error if it cannot be resolved.
+// Process-wide singleton; its arch is MORI_JIT_ARCH, else device 0's. Throws
+// std::runtime_error if it cannot be resolved.
 const Toolchain& GetToolchain();
 
-// Ask for an arch before the toolchain resolves. Not setenv: the resolver reads
-// the environment, and setenv/getenv from two threads is a POSIX data race. No
-// effect once GetToolchain() has resolved; ResolveArch() reports that.
-void SetArchOverride(const std::string& arch);
+// One plan call's arch= (create / describe / precompile). Thread-local and undone
+// on exit, so it never reaches another call. Null or "" keeps the current arch.
+class ScopedArch {
+ public:
+  explicit ScopedArch(const char* arch);
+  ~ScopedArch();
+  ScopedArch(const ScopedArch&) = delete;
+  ScopedArch& operator=(const ScopedArch&) = delete;
+
+ private:
+  std::string saved_;
+};
+
+// The arch this thread renders and compiles for: the live ScopedArch's, else the toolchain's.
+const std::string& ActiveArch();
+
+// What chose ActiveArch(): "arch=", "MORI_JIT_ARCH" or "device 0". For error messages.
+std::string ActiveArchSource();
+
+// GetToolchain() with ActiveArch(): what a compile and its cache key use.
+Toolchain ActiveToolchain();
+
+// Device `dev`'s arch without feature suffixes (":xnack-"), or "" if HIP cannot tell.
+std::string DeviceArch(int dev);
 
 // Test seam: override the resolved toolchain. Pass an empty arch to reset.
 void SetToolchainForTesting(const Toolchain& tc);
