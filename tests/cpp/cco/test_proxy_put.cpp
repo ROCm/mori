@@ -33,8 +33,9 @@
 // small rings so producers wait for ring space. The conn_* cases run on
 // DevComms whose proxy connection type differs from the GDA one.
 //
-// MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases, where
-// "atomic_free" stands for kAtomicFreeCases; those run first, for NICs whose
+// MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases ("all",
+// the default, runs every one), where "atomic_free" stands for
+// kAtomicFreeCases; those run first, for NICs whose
 // atomics into GPU memory fail (the first atomic would fail the shared DevComm).
 // MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n9, each
 // on a DevComm of its own (see their runners); put_sig_after then checks that
@@ -1001,13 +1002,13 @@ static const char* const kAtomicFreeCases[] = {
     "set_window",     "mpsc_set_put",        "conn_set_put", "tm_branch",
     "tm_single",      "tm_agg_set",          "tm_value_set"};
 
-// MORI_CCO_PROXY_TEST_CASES (same on every rank): unset runs every positive
-// case; else a comma-separated list of case names, where "atomic_free" stands
+// MORI_CCO_PROXY_TEST_CASES (same on every rank): unset or "all" runs every
+// positive case; else a comma-separated list of case names, where "atomic_free" stands
 // for kAtomicFreeCases (e.g. on platforms whose NIC atomics into GPU memory
 // fail, which would fail the DevComm the other cases share).
 static bool CaseSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_CASES");
-  if (env == nullptr || env[0] == '\0') return true;
+  if (env == nullptr || env[0] == '\0' || !strcmp(env, "all")) return true;
   const std::string list = std::string(",") + env + ",";
   auto listed = [&](const char* n) {
     return list.find(std::string(",") + n + ",") != std::string::npos;

@@ -88,10 +88,12 @@ GROUPS = (
     "build",
 )
 ALL = frozenset(GROUPS)
-# The groups each lane's jobs test. KIWI runs only on MI300X (build_ops_kiwi).
+# The groups each lane's jobs test. KIWI runs only on MI300X (build_ops_kiwi); cco
+# on MI300X is the internode job's ccoProxy step.
+MI300X_INTRANODE = {"ep", "kiwi", "ccl", "io", "ras", "shmem"}
 LANE_GROUPS = {
     "mori": {"ep", "ccl", "io", "ras", "shmem"},
-    "mi300x": {"ep", "kiwi", "ccl", "io", "ras", "shmem"},
+    "mi300x": MI300X_INTRANODE | {"cco"},
     "umbp": {"umbp"},
     "cco": {"cco", "epv2"},
     "fused": {"fused"},
@@ -165,7 +167,8 @@ AREAS = [
     (
         "cco_tests",
         {"cco"},
-        r"^tests/(cpp|python)/cco/|^examples/cco|^benchmark/cco/|^tools/run_cco_tests\.sh$"
+        r"^tests/(cpp|python)/cco/|^examples/cco|^benchmark/cco/"
+        r"|^tools/run_cco_(tests|proxy_internode)\.sh$"
         r"|^(src|tests/python)/allocator/|^python/mori/ops/sdma_allgather/",
     ),
     (
@@ -234,7 +237,7 @@ AREAS = [
 
 # On a PR the MI300X lanes run only when one of these changed (or with ci:mi300x):
 # EP v1, shmem, KIWI, mlx5, IO, the shared RDMA/SDMA/bootstrap/topology code, CCL,
-# NIC detection, and what builds or runs them there.
+# ccoProxy, NIC detection, and what builds or runs them there.
 MI300X_PATHS = re.compile(
     r"^(src|include/mori|python/mori)/ops/(?!dispatch_combine_v2/|gemm_|ag_gemm/|a2a_gemm/|sdma_allgather/|__init__\.py$)"
     r"|^tests/python/ops/(?!dispatch_combine_v2/)|^examples/ops/"
@@ -242,6 +245,8 @@ MI300X_PATHS = re.compile(
     r"|^(src|include/mori)/application/(transport/(rdma|sdma)|bootstrap|topology|context|memory)/"
     r"|^include/mori/core/|^(src|include/mori)/collective/|^python/mori/(jit/(?!v2/)|ccl/)"
     r"|^tests/python/ccl/|^tools/run_internode_ccl_ag\.sh$|^src/pybind/pybind_(ops|shmem|ccl)\.cpp$"
+    r"|^(src|include/mori)/cco/(proxy/|cco_proxy)|^include/mori/cco/cco_scale_out\.hpp$"
+    r"|^tests/cpp/cco/(test_proxy_put\.cpp|cco_test_harness\.hpp)$|^tools/run_cco_proxy_internode\.sh$"
     r"|^(setup\.py|pyproject\.toml|CMakeLists\.txt)$|^cmake/|^docker/|^3rdparty/"
     r"|^\.github/workflows/ci\.yml$|^\.github/workflows/ci-scope\.yml$"
     r"|^\.github/scripts/ci_scope\.py$|^tools/run_internode_test\.sh$"
@@ -576,8 +581,8 @@ JOBS = {
         ("MI355X internode", {"ep", "ccl", "io"}),
     ),
     "mi300x": (
-        ("MI300X intranode", LANE_GROUPS["mi300x"]),
-        ("MI300X internode", {"ep", "kiwi", "ccl", "io"}),
+        ("MI300X intranode", MI300X_INTRANODE),
+        ("MI300X internode", {"ep", "kiwi", "ccl", "io", "cco"}),
     ),
     "umbp": (("UMBP unit test", {"umbp"}),),
     "cco": (

@@ -907,50 +907,15 @@ jobs:
           wait "$NODE2_PID"
 
       - name: ccoProxy across nodes (1+1, atomic-free and negative cases)
-        # The only run of test_proxy_put: the unit job's fork mode SKIPs it
-        # (MORI_CCO_SKIP_GDA_FULL). Runs after the EP steps whatever they did, so
-        # a ccoProxy failure costs them nothing. A change to tests/cpp/cco alone
-        # does not start this job (scope group cco without epv2).
+        # The unit job's fork mode SKIPs test_proxy_put (MORI_CCO_SKIP_GDA_FULL);
+        # MI300X's internode job runs it too, with every case. Runs after the EP
+        # steps whatever they did, so a ccoProxy failure costs them nothing. A
+        # change to tests/cpp/cco alone does not start this job (scope group cco
+        # without epv2).
         if: ${{ !cancelled() && contains(fromJSON(inputs.groups), 'cco') }}
-        timeout-minutes: 15
-        run: |
-          # Its own cmake tree, building only the test and the libraries it links
-          # (the wheel's tree was configured by pip's isolated cmake and pybind11).
-          # node2 gets the binary and those libraries at the same path. One rank
-          # per node, both on GPU 0 (one rail), through the harness's single-rank
-          # mode.
-          TREE=$GITHUB_WORKSPACE/build_proxy
-          BIN=$TREE/tests/cpp/cco/test_proxy_put
-          UID_FILE=$TREE/proxy_uid.bin
-          $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && \
-            cmake -S . -B $TREE -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx950 -DBUILD_TESTS=ON \
-              -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_PYBINDS=OFF -DBUILD_UMBP=OFF \
-              -DWITH_MPI=OFF > /dev/null && \
-            cmake --build $TREE --target test_proxy_put -j \$(nproc)"
-          LIBS=$($CT exec $CONTAINER ldd $BIN | awk -v d="$TREE/" 'index($3, d) == 1 {print $3}')
-          $CT exec $CONTAINER $BIN --gen-uid $NODE1_IFNAME 0 $UID_FILE
-          tar -chf - $BIN $LIBS $UID_FILE 2>/dev/null | \
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "tar -C / -xf -"
-          # Atomic-free positive cases (no NIC atomics needed) and every negative
-          # case. Each rank must print PASSED; a SKIP fails the step.
-          ENVS="-e HIP_VISIBLE_DEVICES=0 -e MORI_CCO_PROXY_TEST_CASES=atomic_free -e MORI_CCO_PROXY_TEST_NEGATIVE=all"
-          LOG1=$RUNNER_TEMP/proxy_node1.log
-          LOG2=$RUNNER_TEMP/proxy_node2.log
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $ENVS $CONTAINER timeout 600 $BIN --rank 1 --world 2 --uid-file $UID_FILE" \
-            > $LOG2 2>&1 &
-          NODE2_PID=$!
-          RC=0
-          $CT exec $ENVS $CONTAINER timeout 600 $BIN --rank 0 --world 2 --uid-file $UID_FILE \
-            > $LOG1 2>&1 || RC=1
-          wait "$NODE2_PID" || RC=1
-          for LOG in $LOG1 $LOG2; do
-            echo "=== $LOG ==="
-            cat $LOG
-            if grep -q SKIP $LOG; then echo "test_proxy_put SKIPped"; RC=1; fi
-            grep -q '\] PASSED' $LOG || RC=1
-          done
-          exit $RC
+        timeout-minutes: 20
+        # Atomic-free positive cases (no NIC atomics needed) and every negative case.
+        run: bash tools/run_cco_proxy_internode.sh --cases atomic_free
 
       - name: Cleanup node1
         if: always()
