@@ -240,7 +240,8 @@ class PoolManager {
   // pool has no spare copy left. Ranks that copy each other's prefixes end
   // up with several copies of the same content: this drops the old ones
   // first and keeps the N newest, which are where the conversation is being
-  // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 0).
+  // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 1;
+  // 0 is plain least-recently-released).
   void SetEvictionPolicy(uint32_t keep_copies);
 
  private:

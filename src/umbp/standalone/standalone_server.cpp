@@ -466,10 +466,11 @@ class KeyHandleStats {
 // The L1 pools' memory operations, with a fetch's copies issued through the
 // HBM copy engine: the fragments one source device supplies go out as one
 // plan, so the engine's gather kernel carries them in a single launch instead
-// of one hipMemcpyAsync per fragment. Off unless UMBP_L1_GATHER_COPY=1: the
-// default (`HipMemoryApi::CopyBatch`) keeps the copies off the GPUs' compute
-// units, which the engine that owns the pools is running its model on. Kept
-// as a switch so the two can be measured against each other end to end.
+// of one hipMemcpyAsync per fragment. On unless UMBP_L1_GATHER_COPY=0: the
+// other path (`HipMemoryApi::CopyBatch`) keeps the copies off the GPUs'
+// compute units, which the engine that owns the pools is running its model
+// on, but takes far longer per fetch. Kept as a switch so the two can be
+// measured against each other end to end.
 class EngineL1MemoryApi final : public l1::MemoryApi {
  public:
   explicit EngineL1MemoryApi(std::shared_ptr<l1::MemoryApi> inner) : inner_(std::move(inner)) {}
@@ -540,7 +541,7 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
 std::shared_ptr<l1::MemoryApi> MakeL1MemoryApi() {
   std::shared_ptr<l1::MemoryApi> api = l1::MakeHipMemoryApi();
   const char* raw = std::getenv("UMBP_L1_GATHER_COPY");
-  if (raw == nullptr || std::strcmp(raw, "1") != 0) return api;
+  if (raw != nullptr && std::strcmp(raw, "0") == 0) return api;
   MORI_UMBP_INFO("[StandaloneServer] L1 fetch copies go through the HBM copy engine (gather)");
   return std::make_shared<EngineL1MemoryApi>(std::move(api));
 }

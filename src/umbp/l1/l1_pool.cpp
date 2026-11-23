@@ -318,7 +318,9 @@ constexpr uint64_t kEvictionLogEvery = 16384;
 }  // namespace
 
 PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api)) {
-  SetEvictionPolicy(EnvCount("UMBP_L1_KEEP_COPIES", 0));
+  // On by default: with ranks copying each other's prefixes, plain LRU evicts
+  // a conversation's only up-to-date copy while older duplicates of it stay.
+  SetEvictionPolicy(EnvCount("UMBP_L1_KEEP_COPIES", 1));
 }
 
 void PoolManager::SetEvictionPolicy(uint32_t keep_copies) {
