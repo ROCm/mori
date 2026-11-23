@@ -506,6 +506,47 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 
+FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
+  FenceResult total;
+  std::string unsupported;
+  for (auto& it : backends) {
+    FenceResult part = it.second->FenceRemoteEngine(remote);
+    if (!part.supported) {
+      // Skipped: it has no path from the peer. One with a path it cannot cut (XGMI, OFI,
+      // fabric) reports it as a failed endpoint instead, which keeps the result not ok.
+      continue;
+    }
+    total.supported = true;
+    total.endpointsFenced += part.endpointsFenced;
+    total.endpointsFailed += part.endpointsFailed;
+    total.transfersFailed += part.transfersFailed;
+    total.peerKnown = total.peerKnown || part.peerKnown;
+    if (!part.message.empty()) {
+      if (!total.message.empty()) total.message += "; ";
+      total.message += part.message;
+    }
+  }
+  if (total.supported && !total.peerKnown) {
+    if (!total.message.empty()) total.message += "; ";
+    total.message += "no connection with engine " + remote +
+                     " was ever seen and it is not registered: is the key right?";
+  }
+  MORI_IO_INFO(
+      "Fence remote engine {}: supported={} known={} fenced={} failed={} transfers_failed={}",
+      remote.c_str(), total.supported, total.peerKnown, total.endpointsFenced,
+      total.endpointsFailed, total.transfersFailed);
+  return total;
+}
+
+bool IOEngine::UnfenceRemoteEngine(const EngineKey& remote) {
+  bool wasFenced = false;
+  for (auto& it : backends) {
+    wasFenced = it.second->UnfenceRemoteEngine(remote) || wasFenced;
+  }
+  MORI_IO_INFO("Unfence remote engine {}: was_fenced={}", remote.c_str(), wasFenced);
+  return wasFenced;
+}
+
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
   MemoryDesc memDesc;
   memDesc.engineKey = desc.key;

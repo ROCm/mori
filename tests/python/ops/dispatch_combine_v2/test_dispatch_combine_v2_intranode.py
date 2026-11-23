@@ -54,6 +54,7 @@ def _arch():
 
 
 _IS_GFX950 = _arch().startswith("gfx95")  # fp4 (e2m1) is gfx950-only
+_IS_GFX125X = _arch().startswith("gfx125")
 
 
 def _run(extra_env, timeout=600):
@@ -196,6 +197,31 @@ def _cases():
 _CASES = dict(_cases())
 _GFX950_ONLY = {"fp4-gather"}
 
+# The gfx125x default backend is hip, which serves gather and the push quant combine
+# (test_op passes it no weights: it folds none), in bf16 / fp32, with no plain scatter,
+# no std_moe, no routing replay, and a quant hidden dim only in multiples of 1024
+# (hip_backend._unsupported). Those modes are the backend's answer there, not a
+# failure, so they are dropped from the launch as well as skipped: the modes all share
+# one launch, and an unserved one aborts it before the rest run. The quant types the
+# backend does not serve are dropped by _refused_quant below.
+_GFX125X_UNSERVED = {
+    c
+    for c, env in _CASES.items()
+    if _IS_GFX125X
+    and (
+        (env.get("COMBINE") == "scatter" and env.get("QUANT", "none") == "none")
+        or (env.get("QUANT", "none") != "none" and int(env.get("HIDDEN", 7168)) % 1024)
+        or env.get("DTYPE") == "fp8"
+        or env.get("STDMOE")
+        or env.get("REPLAY")
+    )
+}
+_skip_125x = pytest.mark.skip(reason="the gfx125x hip backend does not serve this mode")
+_MARKS = {
+    **{c: _skip_125x for c in _GFX125X_UNSERVED},
+    **{c: _skip_fp4 for c in _GFX950_ONLY},
+}
+
 
 def _refused_quant(case):
     """The case's quant type when its backend refuses it on this arch."""
@@ -213,7 +239,9 @@ def case_output():
     ids = [
         c
         for c in _CASES
-        if (_IS_GFX950 or c not in _GFX950_ONLY) and not _refused_quant(c)
+        if (_IS_GFX950 or c not in _GFX950_ONLY)
+        and c not in _GFX125X_UNSERVED
+        and not _refused_quant(c)
     ]
     rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
     parts = {c: ([], False) for c in ids}
@@ -235,7 +263,7 @@ def case_output():
 
 @pytest.mark.parametrize(
     "case",
-    [pytest.param(c, marks=_skip_fp4) if c in _GFX950_ONLY else c for c in _CASES],
+    [pytest.param(c, marks=_MARKS[c]) if c in _MARKS else c for c in _CASES],
 )
 def test_dispatch_combine_v2_intranode(case, case_output):
     refused = _refused_quant(case)
