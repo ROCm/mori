@@ -1442,10 +1442,20 @@ class EpDispatchCombineOp:
                 "dispatch with the next combine (its recv counts and slot map are "
                 "per round), so a routing handle is only ever used by that combine"
             )
+        if self.cfg.enable_std_moe and weights is None:
+            raise ValueError(
+                "enable_std_moe: dispatch needs weights, convert_combine_input folds "
+                "the forwarded ones"
+            )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
+        # Replay reads n * topk entries of the handle's dest map, and only the handle's
+        # own tokens were written. 0 = not recorded (from_tensors without a count).
+        ct = 0 if routing is None else routing.cur_rank_num_token
+        if ct and n != ct:
+            raise ValueError(f"routing replay needs the handle's {ct} tokens, got {n}")
         peak = max_num_inp_token_across_ranks
         if peak is not None and not n <= peak <= cap:
             raise ValueError(

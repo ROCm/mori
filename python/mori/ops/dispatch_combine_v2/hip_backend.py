@@ -447,7 +447,8 @@ class TokOffExt:
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """C++/JIT-kernel EP op: gather combine, the quantized combine, and on
-    gfx942/gfx950 the recv cap and routing replay.
+    gfx942/gfx950 the unquantized scatter combine, the recv cap, routing replay,
+    local_expert_count and StdMoE.
 
     Dispatch transports bf16/fp32/fp8/fp4, combine reduces in bf16/fp32, and the
     two need not match -- an fp8-in/bf16-out op is just two plans with different
@@ -1317,6 +1318,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             elif cfg.is_scatter:
                 bad.append("enable_std_moe with combine_mode='scatter' (gather only)")
+            elif not self._local_shape_ok(cfg, rows=True):
+                bad.append(
+                    "enable_std_moe with top-k > 64, > 8192 experts a rank or a hidden "
+                    "that is not whole 16 B rows (the convert kernels' limits)"
+                )
             elif cb.local_plan("ep_convert_dispatch") is None:
                 bad.append(
                     "enable_std_moe (libmori_ops_v2.so predates the StdMoE kernels; "
@@ -2225,9 +2231,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    @staticmethod
+    def _local_shape_ok(cfg, rows=False):
+        """EpLocalCfgIsValid's limits on gfx942/gfx950 (wave64): one lane per top-k
+        slot, the count's LDS histogram of 8192 experts, and for the converts bf16
+        rows in whole 16 B."""
+        ok = cfg.num_experts_per_token <= 64 and cfg.num_experts_per_rank <= 8192
+        return ok and (not rows or cfg.hidden_dim % 8 == 0)
+
     def _local_kernels(self, cfg):
         """local_expert_count and the StdMoE converts: gfx942/gfx950 intranode."""
         if self._is1250 or cb.local_plan("ep_local_expert_count") is None:
+            return {}
+        # Past the local kernels' limits the op serves dispatch and combine only.
+        if not self._local_shape_ok(cfg):
             return {}
         self._alloc_local_buffers(cfg)
         arena = self.arena
@@ -2542,8 +2559,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return out
 
     def _wrap_dispatch(self, sized, ll=False):
-        std_moe = self.cfg.enable_std_moe
-
         def run(
             *,
             input,
@@ -2553,11 +2568,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dest_map,
             num_tokens,
         ):
-            if std_moe and weights is None:
-                raise ValueError(
-                    "enable_std_moe: dispatch needs weights, convert_combine_input "
-                    "folds the forwarded ones"
-                )
             plan, pull = next(
                 ((p, two) for c, p, two in sized if num_tokens <= c), (None, False)
             )

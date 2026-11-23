@@ -54,7 +54,7 @@ __device__ void EpLocalExpertCountBody(EpLocalArgs a) {
   const int base = a.rank * kCfg.numExpertPerRank;
   const int stride = gridDim.x * blockDim.x;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-    const unsigned local = static_cast<unsigned>(a.outIdx[i] - base);
+    const unsigned local = static_cast<unsigned>(a.outIdx[i]) - static_cast<unsigned>(base);
     if (local < kEpr) atomicAdd(hist + local, 1);
   }
   __syncthreads();
@@ -83,7 +83,7 @@ __device__ void EpConvertDispatchBody(EpLocalArgs a) {
   T* packedX = reinterpret_cast<T*>(a.packedX);
 
   for (int i = globalWarpId; i < n; i += globalWarpNum) {
-    const unsigned local = static_cast<unsigned>(a.outIdx[i] - base);
+    const unsigned local = static_cast<unsigned>(a.outIdx[i]) - static_cast<unsigned>(base);
     int slot = kBucket;
     if (local < kEpr && laneId == 0) {
       slot = atomicAdd(a.expertCount + local, 1);

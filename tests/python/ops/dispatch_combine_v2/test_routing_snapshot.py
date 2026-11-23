@@ -175,6 +175,13 @@ def run_backend(name, comm, rank, world, d):
     )
 
     if "replay" in op.capabilities:
+        # A replay walks the handle's own token count; any other count is refused
+        # before the launch, so nothing is left half-written.
+        try:
+            op.dispatch(d["x_c"][:-1], d["w_c"][:-1], None, d["idx_a"][:-1], routing=ha)
+            checks["replay_refuses_another_token_count"] = False
+        except ValueError:
+            checks["replay_refuses_another_token_count"] = True
         # Replay the OLDER handle with a new payload: same routing, new tokens.
         recv_c, n_c, _ = dispatch(d["x_c"], d["w_c"], d["idx_a"], routing=ha)
         checks["older_handle_replay_count"] = n_c == n_a

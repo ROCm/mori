@@ -250,7 +250,7 @@ def _run(d, comm):
             has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
             lec_now = op.local_expert_count().clone() if has_lec else None
             packed = None
-            if STDMOE and cap is None:
+            if STDMOE:
                 px, pc, ps = op.convert_dispatch_output()
                 packed = (px, pc.clone(), ps.clone())
             if FRESH:
@@ -444,8 +444,6 @@ def _run(d, comm):
                         f"{sent} match the recv sum and the reverse maps)",
                         flush=True,
                     )
-                if STDMOE:
-                    continue
             rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
                 # Identity GEMM: packed_x keeps the tokens convert_dispatch_output put there.
@@ -466,8 +464,15 @@ def _run(d, comm):
                 out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                # telescopes to (sum_k wts)*input
-                ws = wts[:ct].float().cpu().sum(dim=1, keepdim=True)
+                # telescopes to (sum_k wts)*input, over the k whose PE kept the token
+                w_k = wts[:ct].float().cpu()
+                if cap is not None:
+                    keep = torch.tensor(
+                        [[p >= 0 and p in reach[t] for p in pes[t].tolist()] for t in range(ct)],
+                        dtype=torch.bool,
+                    ).view(ct, K)
+                    w_k = torch.where(keep, w_k, torch.zeros_like(w_k))
+                ws = w_k.sum(dim=1, keepdim=True)
                 exp = (ws * inp[:ct].float().cpu()).to(DTYPE)
                 ok = torch.allclose(
                     out.float().cpu(), exp.float(), atol=5e-2, rtol=5e-2
