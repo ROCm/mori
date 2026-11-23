@@ -42,12 +42,9 @@
 //   4. Subset semantics        — a ranged get writes the requested bytes and
 //      nothing else, which is what distinguishes it from a whole-object read.
 //
-// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT: that any of it is faster.  A
-// resolve stages the whole object before the ranges are known, so a ranged get
-// off SSD still reads the full object from the device.  Making the device read
-// follow the requested extent is D1, and the test that belongs with it counts
-// bytes read at the TierBackend — an assertion this suite would pass without
-// D1's code, which is exactly why it is not written here.
+// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT: that any of it is faster.  The
+// bytes D1 reads off the drive are counted in test_ssd_backend.cpp; section 4b
+// checks the reader's half, ranges rebased onto a window mid-object.
 
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -368,6 +365,78 @@ TEST_F(SsdRangedIoTest, LocalRangedGetWritesOnlyTheRequestedBytes) {
     EXPECT_EQ(buffer[i], 0x7E) << "leading guard clobbered at " << i;
     EXPECT_EQ(buffer[kGuard + kWanted + i], 0x7E) << "trailing guard clobbered at " << i;
   }
+}
+
+// ---------------------------------------------------------------------------
+//  4b. Local: extent-scoped staging, through the client (D1b)
+// ---------------------------------------------------------------------------
+
+// Unlike Pattern (period 256), a window rebased by a wrong 4 KiB multiple cannot match.
+std::vector<char> Aperiodic(size_t size, unsigned seed) {
+  std::vector<char> out(size);
+  for (size_t i = 0; i < size; ++i) {
+    out[i] = static_cast<char>(((i * 131) ^ (i / 4093) ^ (i >> 8) ^ (seed * 29)) & 0xff);
+  }
+  return out;
+}
+
+// Layer-wise restore in miniature: two "layer groups" of several multi-page
+// objects, each two ranges mid-object.  More keys than half the arena forces a
+// second resolve round, which must carry the extents too.
+TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
+  auto config = SsdConfig("ssd-local-extent");
+  config.distributed->ssd_staging_buffer_slots = 32;  // 32 x 4 KiB pages
+  auto* node = Start(std::move(config));
+  ASSERT_NE(node, nullptr);
+  ASSERT_TRUE(node->SupportsRangedIO());
+
+  constexpr size_t kLarge = 16 * kPageSize;  // half the arena: stages whole only alone
+  constexpr size_t kKeys = 6;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("ssd-extent-" + std::to_string(k));
+    objects.push_back(Aperiodic(kLarge, static_cast<unsigned>(k + 1)));
+    ASSERT_EQ(node->BatchPut({keys.back()}, {Addr(objects.back().data())}, {kLarge}),
+              std::vector<bool>({true}));
+  }
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
+
+  // Each group: two disjoint ranges spanning a few pages, off page boundaries.
+  const std::vector<std::vector<size_t>> group_offsets = {{20000, 30000}, {41000, 47000}};
+  const std::vector<std::vector<size_t>> group_sizes = {{3000, 2000}, {5000, 1234}};
+  for (size_t g = 0; g < group_offsets.size(); ++g) {
+    constexpr size_t kGuard = 16;
+    std::vector<std::vector<char>> bufs;
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    std::vector<std::vector<size_t>> sizes(kKeys, group_sizes[g]);
+    std::vector<std::vector<size_t>> offsets(kKeys, group_offsets[g]);
+    for (size_t k = 0; k < kKeys; ++k) {
+      for (size_t r = 0; r < 2; ++r) {
+        bufs.emplace_back(kGuard + group_sizes[g][r] + kGuard, 0x5A);
+        dsts[k].push_back(Addr(bufs.back().data() + kGuard));
+      }
+    }
+    auto got = node->BatchGetRanges(keys, dsts, sizes, offsets);
+    ASSERT_EQ(got, std::vector<bool>(kKeys, true)) << "group " << g;
+    for (size_t k = 0; k < kKeys; ++k) {
+      for (size_t r = 0; r < 2; ++r) {
+        const auto& buf = bufs[k * 2 + r];
+        const size_t n = group_sizes[g][r];
+        EXPECT_EQ(std::memcmp(buf.data() + kGuard, objects[k].data() + group_offsets[g][r], n), 0)
+            << "group " << g << " key " << k << " range " << r;
+        for (size_t i = 0; i < kGuard; ++i) {
+          ASSERT_EQ(buf[i], 0x5A) << "leading guard, group " << g << " key " << k;
+          ASSERT_EQ(buf[kGuard + n + i], 0x5A) << "trailing guard, group " << g << " key " << k;
+        }
+      }
+    }
+  }
+
+  // A whole read afterwards still gets the whole object, not a leftover extent.
+  std::vector<char> whole(kLarge, 0);
+  ASSERT_EQ(node->BatchGet({keys[0]}, {Addr(whole.data())}, {kLarge}), std::vector<bool>({true}));
+  EXPECT_EQ(whole, objects[0]);
 }
 
 // ---------------------------------------------------------------------------

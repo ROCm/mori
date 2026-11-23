@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -57,6 +58,12 @@ enum class TierType : int {
 // triple each.
 inline constexpr uint32_t kMaxBackendsPerPeer = 16;
 
+// Object bytes [offset, offset + length) a reader will touch; length 0 = all.
+struct ObjectExtent {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
@@ -64,6 +71,17 @@ struct TierCapacity {
   // available_bytes for backward-compatible single-backend reports.
   uint64_t max_allocatable_bytes = 0;
 };
+
+// Slots to reserve in a per-key index over a paged tier.  A key takes at least a
+// page, so this bounds the index and a rehash of millions of keys never runs
+// under the index's lock.  The cap spares a fine-grained pool from paying for
+// keys it will not hold.
+inline uint64_t KeyIndexReserve(uint64_t total_bytes, uint64_t page_size) {
+  constexpr uint64_t kMaxReservedKeys = 64ULL << 20;
+  if (page_size == 0) return 0;
+  const uint64_t pages = total_bytes / page_size;
+  return pages < kMaxReservedKeys ? pages : kMaxReservedKeys;
+}
 
 struct LogicalTierCapacity {
   TierType representative_tier = TierType::UNKNOWN;
@@ -74,6 +92,8 @@ struct LogicalTierCapacity {
   // tier it aggregates every tier reachable by offload, so neither of its
   // ratios can be checked against this tier's watermarks.
   double peak_member_utilization = 0.0;
+  // Smaller objects would land only on members whose min_object_size they are under.
+  uint64_t min_object_bytes = 0;
 };
 
 struct TierTransitionMetrics {
@@ -85,6 +105,8 @@ struct TierTransitionMetrics {
   uint64_t promote_failed = 0;  // of `failed`, promotions (the read stays on the source)
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
+  std::map<std::string, uint64_t> read_bytes;   // read off each source medium, by TierTypeName
+  std::map<std::string, uint64_t> write_bytes;  // committed into each target medium
 };
 
 // Local watermark eviction counters; bytes freed are counted by

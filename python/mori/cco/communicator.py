@@ -218,8 +218,10 @@ class ImportedWindow(CCOResource):
     """Window backed by an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem
     tensor buffer) mapped into cco's flat LSA VA via ``ccoMemImport``.
 
-    ``ext_ptr`` must be the base of a HIP VMM allocation exportable to the comm's
-    handle type. ``local_ptr`` is the cco flat-VA alias of that buffer; peers can
+    ``ext_ptr`` must point into a HIP VMM allocation exportable to the comm's
+    handle type, at the same offset from the allocation base on every rank (torch
+    >= 2.14 puts its signal pad before the data). ``local_ptr`` is the cco flat-VA
+    alias of ``ext_ptr`` and window offset 0 is that byte; peers can
     address it through the LSA window just like a ``ccoMemAlloc`` buffer. Cleanup
     deregisters the window and frees the imported alias (unmap + drop the retained
     handle refcount); the external owner keeps its own mapping.
@@ -329,6 +331,18 @@ class DevCommHandle(CCOResource):
         self._check_valid()
         return self._dev_comm.per_rank_size
 
+    @property
+    def sdma_num_queue(self) -> int:
+        """SDMA queues per peer this communicator actually connected.
+
+        Not the requested count: cco adopts what was really set up, and that is
+        0 -- with a logged error but no failure -- when the library was built
+        BUILD_CCO_SDMA=OFF, MORI_ENABLE_SDMA is unset, or no peer reports SDMA.
+        Every ccoSdma put on such a communicator moves no bytes.
+        """
+        self._check_valid()
+        return self._dev_comm.sdma_num_queue
+
     def __repr__(self) -> str:
         if not self.is_valid:
             return "<DevCommHandle: closed>"
@@ -428,7 +442,8 @@ class Communicator:
         """Register an EXTERNAL HIP VMM allocation (e.g. a torch.symm_mem tensor
         buffer) into the flat LSA space without copying: imports its physical
         handle into a flat-VA slot, then registers it as a P2P/LSA window.
-        Collective — all ranks call in the same order with the same size.
+        Collective — all ranks call in the same order with the same size, and
+        ``ext_ptr`` must sit at the same offset in its allocation on every rank.
         """
         self._check_valid("register_external_window")
         r = ImportedWindow(self, ext_ptr, size)

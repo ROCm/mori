@@ -195,7 +195,15 @@ TEST(ActivitySummary, BreaksDownByTierOnlyWhenThereIsMoreThanOne) {
   two.tiers["DRAM"].capacity_bytes = 1024 * 1024 * 1024;
   two.tiers["SSD"].offload_bytes = 4ULL * 1024 * 1024;
   two.tiers["SSD"].capacity_bytes = 8ULL * 1024 * 1024 * 1024;
+  two.transitions.read_bytes["SSD"] = 2ULL * 1024 * 1024;
+  two.transitions.write_bytes["DRAM"] = 2ULL * 1024 * 1024;
   const std::string all = Joined(summary.Render(two, 60.0));
+  EXPECT_NE(all.find("SSD: offload 4.00 MiB load 0 B evict 0 B move-read 2.00 MiB move-write 0 B"),
+            std::string::npos)
+      << all;
+  EXPECT_NE(all.find("DRAM: offload 1.00 MiB load 0 B evict 0 B move-read 0 B move-write 2.00 MiB"),
+            std::string::npos)
+      << all;
   EXPECT_NE(all.find("DRAM"), std::string::npos) << all;
   EXPECT_NE(all.find("SSD"), std::string::npos) << all;
   // The total line must still add them up, or a two-tier node needs mental

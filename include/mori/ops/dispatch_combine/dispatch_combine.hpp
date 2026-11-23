@@ -61,7 +61,8 @@ enum KernelType {
   AsyncLL = 4,
   IntraNodeLL = 5
 };
-enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
+// Value 1 is unused; keep the remaining values stable across the pybind/JIT boundary.
+enum class QuantType { None = 0, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
 
 // Blockwise combine quant types share the same staging/scale layout (per-block float scales);
 // they differ only in the transported element codec: FP8 = 1 byte/elem, FP4 (E2M1) = 0.5 byte/elem
@@ -200,9 +201,11 @@ struct EpDispatchCombineConfig {
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).
   inline __host__ __device__ size_t HiddenDimSz() const { return (size_t)hiddenDim; }
 
+  // Padded to 16 B so every staging slot starts on a vector boundary.
   inline __host__ __device__ size_t XferBytesPerToken(size_t tokenTypeSize) const {
-    return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
-           ScaleBytes();
+    size_t bytes = HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
+                   ScaleBytes();
+    return (bytes + 15) & ~size_t{15};
   }
   inline __host__ __device__ size_t MaxXferBytesPerToken() const {
     return XferBytesPerToken(maxTokenTypeSize);
@@ -231,21 +234,21 @@ struct ShmemBufsInterNodeV1 {
   mori::application::SymmMemObjPtr dispatchStaging;
 };
 
-// InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
+// InterNode / AsyncLL: buffer set used by the non-V1 RDMA paths.
 struct ShmemBufsInterNode {
   mori::application::SymmMemObjPtr dispatchInp;
   mori::application::SymmMemObjPtr combineInp;
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineOut;
   mori::application::SymmMemObjPtr staging;
+  // Dispatch send source, separate from `staging` so combine can't overwrite it.
+  // Only allocated for the AsyncLL kernel.
+  mori::application::SymmMemObjPtr dispatchStaging;
 };
 
 class EpDispatchCombineHandle {
  public:
-  // ccoCommPtr (raw ccoComm*, as uintptr_t) selects the CCO backend for symmetric
-  // buffers; 0 keeps the legacy shmem heap. Reuses a caller-owned cco communicator
-  // (e.g. the one created by the Python mori.cco.Communicator, via comm.ptr).
-  EpDispatchCombineHandle(EpDispatchCombineConfig config, uintptr_t ccoCommPtr = 0);
+  EpDispatchCombineHandle(EpDispatchCombineConfig config);
   ~EpDispatchCombineHandle();
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
@@ -332,12 +335,8 @@ class EpDispatchCombineHandle {
   void InitializeBarrier();
   void FinalizeBarrier();
 
-  // Symmetric allocation router: a CCO window (when useCcoComm) or the shmem heap.
-  // Returns a SymmMemObjPtr whose device p2pPeerPtrs[pe] address peer pe directly,
-  // so the existing kernels (GetAs<T*>(pe)) work unchanged on either backend.
   mori::application::SymmMemObjPtr MallocSymm(size_t size, unsigned int flags);
   void FreeSymmByLocalPtr(void* localPtr);
-  void FinalizeCcoAllocs();
 
  public:
   // Updated at each round of inference
@@ -351,30 +350,14 @@ class EpDispatchCombineHandle {
   // Config
   EpDispatchCombineConfig config;
 
-  // CCO backend: when ccoCommPtr != nullptr, symmetric buffers are carved from a
-  // cco window (LSA flat-VA) instead of the shmem heap. Lets intra-node EP run on
-  // archs where mori-shmem is unavailable (e.g. gfx1250). ccoAllocs tracks the
-  // per-buffer resources so the handle can release them on teardown.
-  void* ccoCommPtr{nullptr};
-  bool useCcoComm{false};
-  struct CcoSymmAlloc {
-    void* win{nullptr};  // ccoWindow_t
-    void* localPtr{nullptr};
-    mori::application::SymmMemObj* cpuObj{nullptr};
-    mori::application::SymmMemObj* gpuObj{nullptr};
-    uintptr_t* p2pDev{nullptr};
-  };
-  std::vector<CcoSymmAlloc> ccoAllocs;
-  // Single CCO arena carved into sub-regions by bump offset (mirrors FlyDSL's
-  // SymmArena). gfx942/ROCm fails hipMemSetAccess after a few *separate* VMM
-  // allocations, so all symmetric buffers share ONE window.
-  void* ccoArenaWin{nullptr};
-  void* ccoArenaLocalPtr{nullptr};
-  size_t ccoArenaSize{0};
-  size_t ccoArenaBump{0};
-
   int fp8BlockwiseCombineScaleDim{0};
   int fp8BlockwiseCombineScaleTypeSize{0};
+  // Temporary workaround for AINIC/KVM environments where RDMA atomics do not land.
+  // Fixed in AINIC firmware 1.117.5-a-230; remove this flag and the "_atomicfree" kernels
+  // once that firmware is deployed on the KVM hosts.
+  // InterNodeV1/V1LL signal remote PEs with RDMA WRITEs instead of RDMA atomics when enabled.
+  // Selects the "_atomicfree" kernel variants at launch; it is not passed to the kernels.
+  bool disableRdmaAtomics{false};
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
 

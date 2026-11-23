@@ -151,6 +151,10 @@ bool MoriIoEngine::Init() {
   rdma_cfg.qpPerTransfer = 4;
   rdma_cfg.enableTransferChunking = true;
   rdma_cfg.numNicsPerTransfer = 4;
+  // Completion is read from the initiator's own CQ and peers never call
+  // PopInboundTransferStatus, so a notification SEND per transfer would only cost
+  // an SQ slot here, an RQ slot on the peer and a notifPool entry it never frees.
+  rdma_cfg.enableNotification = false;
   // UMBP only sets the config defaults above.  All RDMA knobs (qpPerTransfer /
   // postBatchSize / numWorkerThreads / pollCqMode / chunking / numNics / ...)
   // are overridable via MORI_IO_* env in the RDMA backend ctor, shared by every
@@ -487,7 +491,13 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
 
 std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
-  return std::make_unique<MoriIoPlanBuilder>(local_engine_key_, bounce_size_, bounce_ref_);
+  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_);
+}
+
+std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
+                                                         uint64_t bounce_size,
+                                                         const TransferRef& bounce_ref) {
+  return std::make_unique<MoriIoPlanBuilder>(local_key, bounce_size, bounce_ref);
 }
 
 // ---------------------------------------------------------------------------

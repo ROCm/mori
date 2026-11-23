@@ -86,7 +86,8 @@ class HbmCopyEngine final : public TransferEngine {
   void Deregister(const TransferRef&) override {}
 
   // Declare a host region as kernel-addressable, enabling the gather fast path
-  // for plans whose host side lies inside it.
+  // for plans whose host side lies inside it.  A copy between two buffers on
+  // the same GPU needs no such declaration and takes the fast path as it is.
   //
   // A gather kernel cannot dereference plain mmap memory — it faults the GPU —
   // so the region must be hipHostRegister'd first, which is what
@@ -121,6 +122,25 @@ class HbmCopyEngine final : public TransferEngine {
   // where a multi-MiB copy dwarfs the per-call launch overhead.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
+  // Gather streams created since process start, across all engines.  They are
+  // pooled per device and outlive the thread that first used them, so this
+  // tracks the peak number of gathers in flight at once, not the number of
+  // threads that have called Submit.  Lets a test assert the reuse.
+  static uint64_t GatherStreamsCreated();
+
+  // Creates `gather_streams_per_device` gather streams on every GPU, runs an
+  // empty gather on each and a hipMemcpy each way on the null stream, so that
+  // the hardware queues (compute, and SDMA for each copy engine those copies
+  // are given), descriptor staging and kernel code object that copies would
+  // otherwise create on first use already exist.  It also caps each device at
+  // that many gather streams, so that later gathers wait for one rather than
+  // create more.  Call it before serving.  Creating a hardware queue migrates
+  // its context-save area into VRAM, and with the GPU nearly full, as it is
+  // next to an inference server, that has been seen to stall the whole process
+  // for 30-46 s at a time (amdgpu 6.16); so has loading the kernel's code
+  // object on its first launch.
+  static void Prewarm(size_t gather_streams_per_device);
+
  private:
   // Why a plan did not take the gather kernel.  The hot path never computes
   // this: it is filled in only when debug mode is on (UMBP_HBM_COPY_DEBUG), so
@@ -131,7 +151,10 @@ class HbmCopyEngine final : public TransferEngine {
     kTaken = 0,
     kUnrecorded,                  // debug mode off, or a plan the pass never classified
     kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
-    kKindNotHostDevice,           // D2D: no host side to register, so no kernel form
+    kHostToHost,                  // no GPU endpoint; never reaches this engine
+    kAcrossDevices,               // D2D between two GPUs without peer access, or an
+                                  // endpoint without a device
+    kEndpointsOverlap,            // D2D whose source and destination buffers overlap
     kNoDevice,                    // neither endpoint named a device
     kHostNotGatherable,           // host side outside every HostTierRegistration, or
                                   // registered but unreachable from this device

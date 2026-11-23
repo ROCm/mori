@@ -233,10 +233,11 @@ class ScriptedResolveBackend : public MockBackend {
 
   std::map<std::string, ResolveOutcome> outcomes;
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override {
-    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
+    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
       auto it = outcomes.find(keys[i]);
       if (it == outcomes.end()) continue;
@@ -320,6 +321,15 @@ TEST_F(InstrumentedBackendMetrics, MetricsAreGenericOverBackends) {
 
   EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 1.0);
   EXPECT_DOUBLE_EQ(Bytes("evict"), 2048.0);
+}
+
+TEST_F(InstrumentedBackendMetrics, RangedResolveCountsTheSliceNotTheObject) {
+  PutKey("k", 8192);
+  const std::vector<ObjectExtent> slices = {{1024, 512}};
+  backend_->BatchResolve({"k"}, false, false, ResolveReader::kLocal, &slices);
+  backend_->BatchResolve({"k"}, false);
+  Publish();
+  EXPECT_DOUBLE_EQ(Bytes("resolve"), 512.0 + 8192.0);
 }
 
 TEST_F(InstrumentedBackendMetrics, LabelsCarryTheMediumSoOnePanelShowsThemAll) {
@@ -550,6 +560,47 @@ TEST(TransferEngineMetrics, AnEngineNeedsNoMetricsCodeToBeMeasured) {
       c.Counter(Identity(MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
                          {{"engine", "none"}, {"direction", "none"}, {"status", "rejected"}})),
       0.0);
+}
+
+// ---------------------------------------------------------------------------
+//  InstrumentedBackend: check-after-read is forwarded, never defaulted
+// ---------------------------------------------------------------------------
+
+// Every medium on a peer is wrapped, so a decorator that answered the base
+// default (all true) would wave every stale remote read through on every peer.
+class StaleCopyBackend final : public MockBackend {
+ public:
+  using MockBackend::MockBackend;
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    std::vector<bool> out(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = generations[i] % 2 == 0;
+    return out;
+  }
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    finished += keys.size();
+    return BatchStillHolds(keys, generations);
+  }
+  size_t finished = 0;
+};
+
+TEST(InstrumentedBackendStillHolds, AnswersWithTheWrappedMedium) {
+  auto backend = MakeInstrumentedBackend(std::make_unique<StaleCopyBackend>(TierType::DRAM));
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->BatchStillHolds({"a", "b", "c"}, {2, 3, 4}),
+            (std::vector<bool>{true, false, true}));
+}
+
+// The base default only answers.  A decorator that used it would leave every
+// staging lease on this peer to its timer.
+TEST(InstrumentedBackendStillHolds, AFinishedReadReachesTheWrappedMedium) {
+  auto inner = std::make_unique<StaleCopyBackend>(TierType::DRAM);
+  auto* raw = inner.get();
+  auto backend = MakeInstrumentedBackend(std::move(inner));
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->BatchFinishReads({"a", "b"}, {2, 3}), (std::vector<bool>{true, false}));
+  EXPECT_EQ(raw->finished, 2u);
 }
 
 }  // namespace

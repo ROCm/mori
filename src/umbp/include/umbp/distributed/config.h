@@ -181,6 +181,7 @@ struct DramOwnershipConfig {
   bool prefault = true;
   bool numa_strict = false;
   int prefault_threads = 0;
+  uint64_t max_mr_bytes = kDefaultDramMaxMrBytes;  // see UMBPDramConfig
 };
 
 // HBM-tier ownership knobs.  Deliberately NOT a superset of the DRAM ones:
@@ -252,7 +253,12 @@ enum class PeerEvictionMode {
   kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
 };
 
+// UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS, capped at 64; 0 when it is unset or not
+// a positive number.
+size_t RangedScratchShardsFromEnv();
+
 struct PoolClientConfig {
+  UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
 
@@ -262,16 +268,23 @@ struct PoolClientConfig {
   // owns the backing mappings and frees them only after PoolClient::Shutdown has
   // deregistered the regions. Direct PoolClient tests may provide their own.
   //
-  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
-  // — each under its own mutex in PoolClient, so a remote get and a remote put
-  // run concurrently instead of serializing on one lock (the load/offload
-  // overlap sglang's direct linker wants). Each must hold at least one whole
-  // object. Both zero keeps ranged remote I/O disabled with no host memory
-  // registered; SupportsRangedIO() requires both to be set.
-  void* ranged_get_scratch_buffer = nullptr;
-  size_t ranged_get_scratch_size = 0;
-  void* ranged_put_scratch_buffer = nullptr;
-  size_t ranged_put_scratch_size = 0;
+  // Separate arenas for remote ranged GET and remote ranged PUT, each under its
+  // own mutex in PoolClient, so a remote get and a remote put run concurrently
+  // instead of serializing on one lock (the load/offload overlap sglang's direct
+  // linker wants). A direction has one arena that every caller shares, or one
+  // per NUMA node: a remote ranged call then stages through the arena on its
+  // caller buffer's node, and the first one serves a caller whose node is
+  // unknown. Each must hold at least one whole object. None keeps ranged remote
+  // I/O disabled with no host memory registered; SupportsRangedIO() requires
+  // both directions to have one.
+  struct RangedScratchArena {
+    void* buffer = nullptr;
+    size_t size = 0;
+    int numa_node = -1;  // -1: not placed by node
+    size_t shards = 0;   // 0: UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS, else 1
+  };
+  std::vector<RangedScratchArena> ranged_get_scratch;
+  std::vector<RangedScratchArena> ranged_put_scratch;
 
   // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
@@ -303,11 +316,17 @@ struct PoolClientConfig {
   bool cache_remote_fetches = true;
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
+  // See UMBPDistributedConfig::prefetch_budget_bytes.
+  size_t prefetch_budget_bytes = 16ULL << 30;
 
   // Background whole-object pull after a remote ranged read; see
   // UMBPDistributedConfig::ranged_locality_prefetch for why it is not folded
   // into cache_remote_fetches.
   bool ranged_locality_prefetch = true;
+
+  // See UMBPDistributedConfig::remote_single_flight.
+  bool remote_single_flight = true;
+  uint32_t remote_single_flight_wait_ms = 30000;
 
   // Resolve on this node's own media before asking the master to route, and
   // skip the master entirely when the whole batch is local.  See
@@ -326,8 +345,8 @@ struct PoolClientConfig {
   // Local eviction watermarks for DRAM/HBM (SSD has its own pair).  Unless
   // eviction_mode is kMaster, a tiered policy's per-tier pair takes
   // precedence.  From UMBPDramConfig.
-  double local_evict_high_watermark = 0.9;
-  double local_evict_low_watermark = 0.7;
+  double local_evict_high_watermark = 0.95;
+  double local_evict_low_watermark = 0.9;
 
   // How this node evicts when it has a master (env UMBP_EVICTION_MODE =
   // local | master_ranked | master).  Without a master it always evicts
@@ -391,8 +410,8 @@ struct PoolClientConfig {
 // after Init (backend-agnostic refactor Phase 2).
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
                                            DramOwnershipConfig dram, PeerSsdConfig ssd = {},
-                                           double dram_high_watermark = 0.9,
-                                           double dram_low_watermark = 0.7) {
+                                           double dram_high_watermark = 0.95,
+                                           double dram_low_watermark = 0.9) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
@@ -407,7 +426,10 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
+  pc.prefetch_budget_bytes = dc.prefetch_budget_bytes;
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
+  pc.remote_single_flight = dc.remote_single_flight;
+  pc.remote_single_flight_wait_ms = dc.remote_single_flight_wait_ms;
   pc.local_first = dc.local_first;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the

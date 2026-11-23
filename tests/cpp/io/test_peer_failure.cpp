@@ -200,6 +200,9 @@ void CasePortFailureScopedToPort() {
 
   Require(!tracker.IsQpAlive(Qp(10)), "QP on the downed port must be dead");
   Require(tracker.IsQpAlive(Qp(11)), "QP on another port of the same device must stay alive");
+  Require(!tracker.NeedsQpReplacement(Qp(10)), "a temporary port error must not replace its QP");
+  tracker.MarkQpFailed(Qp(10));
+  Require(tracker.NeedsQpReplacement(Qp(10)), "a QP error must still replace a QP on a down port");
 }
 
 // A link flap must not condemn the NIC for the rest of the process.
@@ -269,6 +272,31 @@ void CasePeerUnreachableIsAttributed() {
   Require(event.remoteEngineKey == "prefill-0", "the reporter's attribution must be kept");
 }
 
+// An error completion leaves its QP in ERR: dead from then on, with no event of its
+// own, and an async failure of the same QP is still reported.
+void CaseErrorCompletionMarksQpDead() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.RegisterQp(Qp(11), "decode-1", kPort1, kCqA);
+
+  tracker.MarkQpFailed(Qp(10));
+  Require(!tracker.IsQpAlive(Qp(10)), "a QP an error completion put in ERR must be dead");
+  Require(tracker.IsQpAlive(Qp(11)), "unrelated QP must stay alive");
+  Require(tracker.PendingCount() == 0, "an error completion must not queue an event");
+
+  tracker.Report(PortFailure("mlx5_0", kPort1));
+  tracker.Report(PortRecovery("mlx5_0", kPort1));
+  Require(!tracker.IsQpAlive(Qp(10)), "port recovery must not revive a QP in ERR");
+  Require(tracker.IsQpAlive(Qp(11)), "a QP condemned only by the port must be revived");
+
+  PeerFailureEvent event;
+  while (tracker.Pop(&event)) {
+  }
+  tracker.Report(QpFailure(10));
+  Require(tracker.Pop(&event) && event.reason == PeerFailureReason::LOCAL_QP_ERROR,
+          "an async failure of a QP already in ERR must still be reported");
+}
+
 // One dead peer must not flush every other pending failure out of the queue.
 void CaseRepeatFailuresFoldIntoFirst() {
   PeerFailureTracker tracker;
@@ -312,6 +340,22 @@ void CaseForgetQpKeepsFailure() {
   PeerFailureEvent event;
   Require(tracker.Pop(&event), "pending failure must survive ForgetQp");
   Require(event.remoteEngineKey == "decode-0", "attribution happens at record time");
+}
+
+// A QP destroyed after it failed leaves no verdict for a new QP given its number.
+void CaseReleaseQpClearsItsFailure() {
+  PeerFailureTracker tracker;
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  tracker.Report(QpFailure(10));
+  tracker.MarkQpFailed(Qp(10));
+  tracker.Report(CqFailure("mlx5_0", kCqA));
+  tracker.ReleaseQp(Qp(10));
+
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+  Require(tracker.IsQpAlive(Qp(10)) && !tracker.NeedsQpReplacement(Qp(10)),
+          "a new QP with a released QP's number and CQ must start clean");
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event), "pending failure must survive ReleaseQp");
 }
 
 // Events are drained oldest-first so the first cause is seen before its fallout.
@@ -412,9 +456,11 @@ int main() {
       {"QpFailureSurvivesPortRecovery", CaseQpFailureSurvivesPortRecovery},
       {"CqFailureScopedToCq", CaseCqFailureScopedToCq},
       {"PeerUnreachableIsAttributed", CasePeerUnreachableIsAttributed},
+      {"ErrorCompletionMarksQpDead", CaseErrorCompletionMarksQpDead},
       {"RepeatFailuresFoldIntoFirst", CaseRepeatFailuresFoldIntoFirst},
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
+      {"ReleaseQpClearsItsFailure", CaseReleaseQpClearsItsFailure},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},
       {"PopNullptrIsSafe", CasePopNullptrIsSafe},

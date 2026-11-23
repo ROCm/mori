@@ -35,6 +35,12 @@ claim strict placement on a system that cannot bind memory. A successful BIND
 still restricts physical pages to the selected node even when STRICT is zero;
 STRICT controls error handling, not whether that policy can spill on a fault.
 
+In a container, `mbind` needs `CAP_SYS_NICE`: under Docker's default seccomp
+profile it fails with `EPERM`. Run with `--cap-add SYS_NICE`, `--security-opt
+seccomp=unconfined` or `--privileged`. Without one of them a DRAM tier handles
+the failure as the table above says, and the standalone server's ranged
+scratch, which requires its binding, falls back to one arena per direction.
+
 With `UMBP_DRAM_USE_HUGEPAGES=1`, reserve huge pages per node, not only in
 total. The hugetlb reservation made at `mmap` time is global, but a fault under
 BIND takes pages only from the bound node, so a node whose own pool is short
@@ -50,8 +56,9 @@ the final buffer. The policy JSON's DRAM `numa_node` also accepts a list:
 ```
 
 Policy-created DRAM backends inherit the configured hugepage, prefault, strict
-binding and prefault thread options. Python exposes `dram.numa_nodes`,
-`dram.numa_strict`, and `dram.prefault_threads`. The deprecated `dram.numa_node`
+binding, prefault thread and memory-region size options. Python exposes
+`dram.numa_nodes`, `dram.numa_strict`, `dram.prefault_threads`, and
+`dram.max_mr_bytes`. The deprecated `dram.numa_node`
 property reads the first node (or `-1`); assigning it replaces the entire list.
 The standalone client's child server receives the same configuration.
 
@@ -67,6 +74,19 @@ satisfy a request, contiguous pages are preferred over scattered pages within
 that buffer. Otherwise, a global capacity check precedes allocation of the
 local remainder and then pages from other buffers. Insufficient global space
 leaves all bitmaps unchanged. HBM and SSD backends ignore the hint.
+
+A host buffer larger than `UMBP_DRAM_MAX_MR_BYTES` (default 512 GiB) is
+registered with the NIC as several memory regions of at most that size, in
+whole backing and allocator pages. AMD Pensando AINIC firmware before
+1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+and silently aliases the rest, so the limit must not exceed 2^18 backing
+pages: 512 GiB with 2 MiB pages, 1 GiB with 4 KiB pages. On such a host the
+DRAM tier and the ranged scratch warn at startup about a region with more,
+counted from the pages that actually back it, since a hugepage request that
+fell back to 4 KiB pages has 512 times the entries; the warning names the
+firmware. `0` registers each buffer whole. Each region is its own buffer on
+the same node; a node preference takes the first of that node's regions that
+holds the request.
 
 Logical page spill and physical memory spill are distinct: the former uses
 another tier buffer when the local buffer is full; `MPOL_PREFERRED` also lets
@@ -86,6 +106,36 @@ prefault. GPU registration and the transfer path are unchanged.
 This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
 It does not migrate existing objects or replicate shared keys across sockets.
+
+## Remote writes
+
+A write routed to another node carries the same advisory hint in its slot
+request: the node of the writer's GPU, also when a ranged put stages the bytes
+through the ranged PUT arena, otherwise the node of a registered host source.
+The peer prefers its regions on that node. Without a hint (a CPU caller, or a
+writer that sends none), a tier with buffers on several nodes starts on the node
+with the most free pages instead of the first one, so the nodes fill evenly; a
+tier on one node keeps its order.
+
+Each side of an RDMA transfer picks its NICs from the node of its own memory, so
+the object then travels between NICs on the same node at both ends when the
+reader is the GPU that wrote it.
+
+## Ranged I/O
+
+A remote ranged GET or PUT stages through a host arena, and every GPU on a node
+shares the standalone server's. In one piece, the arena sits on whichever node
+first touch placed it, so its NUMA node picks the NICs of every rank's RDMA leg
+and half the GPUs copy across sockets. The standalone server therefore lays each
+arena out by NUMA node (`UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA`): the configured
+bytes are split evenly over the nodes that have GPUs, each part is bound to its
+node and registered on its own, and is cut into one shard per GPU on it unless
+`UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS` sets the arena's total. A call stages
+through a shard on its caller buffer's node, or that node's whole part when it
+needs more than a shard. Memory is the same as one arena per direction. Each
+part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
+AINIC limit above, or back the arenas with hugepages
+(`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
 
 ## Measured effect
 

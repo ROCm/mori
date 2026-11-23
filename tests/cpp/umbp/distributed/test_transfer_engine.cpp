@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime_api.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -34,14 +35,17 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/common/aligned_buffer.h"
+#include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 #include "umbp/distributed/transfer/posix_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
@@ -290,6 +294,316 @@ TEST(HbmCopyEngine, BuilderSplitsAtHostRegistrationPieces) {
   EXPECT_EQ(std::vector<size_t>({4096, 8192}), planned.plans[0].sizes);
   EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
   ExpectPlanContract(items, planned);
+}
+
+// The blocking copy loop merges adjacent segments into one hipMemcpy, but not
+// the two halves the builder cut at a host registration piece: that call is
+// refused ("invalid argument"), and failed every put of a chunk that crossed a
+// piece boundary.
+TEST(HbmCopyEngine, CopyRunsStopAtHostRegistrationPieces) {
+  HbmCopyEngine engine;
+  const uintptr_t piece = HostRegistrationChunkBytes();
+  auto host = TransferRef::HostBytes(reinterpret_cast<void*>(piece - 4096), 65536);
+  std::vector<char> stub(65536);
+  auto gpu = TransferRef::HostBytes(stub.data(), stub.size(), mori::io::MemoryLocationType::GPU, 0);
+  // Host as the source (a get) and as the destination (a put).
+  for (const bool host_is_src : {true, false}) {
+    const std::vector<TransferItem> items{host_is_src ? MakeItem(host, 0, gpu, 0, 12288, 1)
+                                                      : MakeItem(gpu, 0, host, 0, 12288, 1)};
+    const auto planned = engine.Plan(items);
+    ASSERT_EQ(1u, planned.plans.size());
+    const TransferPlan& plan = planned.plans[0];
+    ASSERT_EQ(std::vector<size_t>({4096, 8192}), plan.sizes);
+    size_t bytes = 0;
+    EXPECT_EQ(1u, CoalescedRunEnd(plan, 0, piece, &bytes));
+    EXPECT_EQ(4096u, bytes);
+    EXPECT_EQ(2u, CoalescedRunEnd(plan, 1, piece, &bytes));
+    EXPECT_EQ(8192u, bytes);
+  }
+
+  // Adjacent segments inside one piece still merge.
+  TransferPlan inside;
+  inside.src = TransferRef::HostBytes(reinterpret_cast<void*>(piece + 4096), 65536);
+  inside.dst = gpu;
+  inside.src_offsets = {0, 4096, 16384};
+  inside.dst_offsets = {0, 4096, 8192};
+  inside.sizes = {4096, 4096, 4096};
+  size_t bytes = 0;
+  EXPECT_EQ(2u, CoalescedRunEnd(inside, 0, piece, &bytes));
+  EXPECT_EQ(8192u, bytes);
+  EXPECT_EQ(3u, CoalescedRunEnd(inside, 2, piece, &bytes));
+  EXPECT_EQ(4096u, bytes);
+}
+
+// Gathers submitted from a succession of short-lived threads, the way the
+// standalone server's gRPC pool retires and spawns threads under load, share a
+// pooled stream.  A stream per thread grew until HIP could not create another.
+TEST(HbmCopyEngine, GatherStreamsOutliveTheirThreads) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr size_t kFragment = 4096;
+  constexpr int kThreads = 16;
+  AlignedBuffer host(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) host.data()[i] = static_cast<char>(i * 131 + 7);
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.data(), host.size());
+  void* device = nullptr;
+  ASSERT_EQ(hipMalloc(&device, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemset(device, 0, kBytes), hipSuccess);
+  const auto src = TransferRef::HostBytes(host.data(), host.size());
+  const auto dst = TransferRef::HostBytes(device, kBytes, mori::io::MemoryLocationType::GPU, 0);
+
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  const uint64_t streams_before = HbmCopyEngine::GatherStreamsCreated();
+  for (int t = 0; t < kThreads; ++t) {
+    std::thread([&, t] {
+      // Two fragments far apart, so they stay two segments: one is hipMemcpy's case.
+      const uint64_t first = t * 2 * kFragment;
+      const uint64_t second = kBytes / 2 + first;
+      auto planned = engine.Plan({MakeItem(src, first, dst, first, kFragment, 1),
+                                  MakeItem(src, second, dst, second, kFragment, 2)});
+      std::vector<TransferFailure> failures;
+      if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+      EXPECT_TRUE(failures.empty());
+    }).join();
+  }
+  if (DeviceGatherLaunchCount() == launches_before) {
+    (void)hipFree(device);
+    GTEST_SKIP() << "host region not gatherable on this device";
+  }
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + kThreads);
+  EXPECT_LE(HbmCopyEngine::GatherStreamsCreated() - streams_before, 1u);
+
+  std::vector<char> copied(kBytes);
+  ASSERT_EQ(hipMemcpy(copied.data(), device, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (int t = 0; t < kThreads; ++t) {
+    for (const size_t offset : {t * 2 * kFragment, kBytes / 2 + t * 2 * kFragment}) {
+      EXPECT_EQ(std::memcmp(copied.data() + offset, host.data() + offset, kFragment), 0)
+          << "thread " << t << " offset " << offset;
+    }
+  }
+  (void)hipFree(device);
+}
+
+TEST(HbmCopyEngine, GathersRunOnPrewarmedStreams) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr size_t kFragment = 4096;
+  constexpr size_t kPrewarmed = 3;
+  AlignedBuffer host(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) host.data()[i] = static_cast<char>(i * 37 + 3);
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.data(), host.size());
+  void* device = nullptr;
+  ASSERT_EQ(hipMalloc(&device, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemset(device, 0, kBytes), hipSuccess);
+  const auto src = TransferRef::HostBytes(host.data(), host.size());
+  const auto dst = TransferRef::HostBytes(device, kBytes, mori::io::MemoryLocationType::GPU, 0);
+
+  const uint64_t streams_before = HbmCopyEngine::GatherStreamsCreated();
+  HbmCopyEngine::Prewarm(kPrewarmed);
+  const uint64_t streams_prewarmed = HbmCopyEngine::GatherStreamsCreated();
+  EXPECT_LE(streams_prewarmed - streams_before, kPrewarmed * devices);
+
+  // Twice as many gathers in flight on device 0 as were prewarmed there: the
+  // extra ones wait for a stream rather than create one.
+  constexpr size_t kGathers = 2 * kPrewarmed;
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  std::vector<std::thread> threads;
+  for (size_t t = 0; t < kGathers; ++t) {
+    threads.emplace_back([&, t] {
+      const uint64_t first = t * 2 * kFragment;
+      const uint64_t second = kBytes / 2 + first;
+      auto planned = engine.Plan({MakeItem(src, first, dst, first, kFragment, 1),
+                                  MakeItem(src, second, dst, second, kFragment, 2)});
+      std::vector<TransferFailure> failures;
+      if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+      EXPECT_TRUE(failures.empty());
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  if (DeviceGatherLaunchCount() == launches_before) {
+    (void)hipFree(device);
+    GTEST_SKIP() << "host region not gatherable on this device";
+  }
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + kGathers);
+  EXPECT_EQ(HbmCopyEngine::GatherStreamsCreated(), streams_prewarmed);
+
+  std::vector<char> copied(kBytes);
+  ASSERT_EQ(hipMemcpy(copied.data(), device, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (size_t t = 0; t < kGathers; ++t) {
+    for (const size_t offset : {t * 2 * kFragment, kBytes / 2 + t * 2 * kFragment}) {
+      EXPECT_EQ(std::memcmp(copied.data() + offset, host.data() + offset, kFragment), 0)
+          << "thread " << t << " offset " << offset;
+    }
+  }
+  (void)hipFree(device);
+}
+
+// Two device buffers with a known pattern in the source, and what a batch of
+// scattered fragments between them must leave behind.
+class DevicePair {
+ public:
+  static constexpr size_t kBytes = 1 << 20;
+
+  DevicePair(int src_device, int dst_device) : src_device_(src_device), dst_device_(dst_device) {
+    pattern_.resize(kBytes);
+    for (size_t i = 0; i < kBytes; ++i) pattern_[i] = static_cast<char>(i * 151 + 11);
+    EXPECT_EQ(hipSetDevice(src_device), hipSuccess);
+    EXPECT_EQ(hipMalloc(&src_, kBytes), hipSuccess);
+    EXPECT_EQ(hipMemcpy(src_, pattern_.data(), kBytes, hipMemcpyHostToDevice), hipSuccess);
+    EXPECT_EQ(hipSetDevice(dst_device), hipSuccess);
+    EXPECT_EQ(hipMalloc(&dst_, kBytes), hipSuccess);
+    EXPECT_EQ(hipMemset(dst_, 0, kBytes), hipSuccess);
+    EXPECT_EQ(hipSetDevice(0), hipSuccess);
+  }
+  ~DevicePair() {
+    (void)hipFree(src_);
+    (void)hipFree(dst_);
+  }
+
+  TransferRef Src() const {
+    return TransferRef::HostBytes(src_, kBytes, mori::io::MemoryLocationType::GPU, src_device_);
+  }
+  TransferRef Dst() const {
+    return TransferRef::HostBytes(dst_, kBytes, mori::io::MemoryLocationType::GPU, dst_device_);
+  }
+
+  // Every fragment landed, and nothing between them was written.
+  void ExpectCopied(const std::vector<TransferItem>& items) const {
+    std::vector<char> expected(kBytes, 0), copied(kBytes);
+    for (const auto& item : items) {
+      std::memcpy(expected.data() + item.dst_offset, pattern_.data() + item.src_offset, item.size);
+    }
+    ASSERT_EQ(hipMemcpy(copied.data(), dst_, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(std::memcmp(copied.data(), expected.data(), kBytes), 0);
+  }
+
+ private:
+  int src_device_;
+  int dst_device_;
+  void* src_ = nullptr;
+  void* dst_ = nullptr;
+  std::vector<char> pattern_;
+};
+
+// Fragments of a ranged read: scattered in the source, packed with gaps in the
+// destination, one of them odd-sized so the kernel's byte loop runs too.
+std::vector<TransferItem> ScatteredItems(const TransferRef& src, const TransferRef& dst) {
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < 48; ++i) {
+    const size_t size = i == 7 ? 4093 : 4096;
+    items.push_back(MakeItem(src, i * 16384 + 512, dst, i * 8192, size, i));
+  }
+  return items;
+}
+
+std::vector<TransferFailure> SubmitAndWait(HbmCopyEngine& engine,
+                                           const std::vector<TransferItem>& items) {
+  auto planned = engine.Plan(items);
+  EXPECT_TRUE(planned.rejected_tags.empty());
+  std::vector<TransferFailure> failures;
+  if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+  return failures;
+}
+
+// A copy between two buffers on one GPU needs no host registration: the whole
+// batch is one kernel launch, where it used to be one hipMemcpy per fragment.
+TEST(HbmCopyEngine, SameGpuFragmentsTakeOneGatherLaunch) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  DevicePair pair(0, 0);
+  HbmCopyEngine engine;
+  const auto items = ScatteredItems(pair.Src(), pair.Dst());
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  EXPECT_TRUE(SubmitAndWait(engine, items).empty());
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  pair.ExpectCopied(items);
+}
+
+// Reads from two source buffers into one destination are two plans, and still
+// one launch: the bucket is the GPU, not the buffer pair.
+TEST(HbmCopyEngine, SameGpuPlansShareOneGatherLaunch) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  DevicePair first(0, 0), second(0, 0);
+  HbmCopyEngine engine;
+  // One fragment per pair: neither plan has anything to gather on its own.
+  const std::vector<TransferItem> items{MakeItem(first.Src(), 4096, first.Dst(), 0, 4096, 0),
+                                        MakeItem(second.Src(), 8192, second.Dst(), 0, 4096, 1)};
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  EXPECT_TRUE(SubmitAndWait(engine, items).empty());
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  first.ExpectCopied({items[0]});
+  second.ExpectCopied({items[1]});
+}
+
+// Between two GPUs the destination's kernel reads the source's memory through
+// peer access, so the batch is still one launch. Either direction.
+TEST(HbmCopyEngine, FragmentsBetweenTwoGpusTakeOneGatherLaunch) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices < 2) GTEST_SKIP() << "needs two GPUs";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  for (const auto& [src_device, dst_device] : {std::pair{0, 1}, std::pair{1, 0}}) {
+    DevicePair pair(src_device, dst_device);
+    HbmCopyEngine engine;
+    const auto items = ScatteredItems(pair.Src(), pair.Dst());
+    const uint64_t launches_before = DeviceGatherLaunchCount();
+    EXPECT_TRUE(SubmitAndWait(engine, items).empty());
+    pair.ExpectCopied(items);
+    if (DeviceGatherLaunchCount() == launches_before) {
+      GTEST_SKIP() << "no peer access between GPU " << src_device << " and " << dst_device;
+    }
+    EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  }
+}
+
+// The kernel copies all fragments at once, so a copy inside one buffer keeps
+// hipMemcpy's one-after-another order.
+TEST(HbmCopyEngine, FragmentsInsideOneBufferKeepHipMemcpy) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr size_t kFragment = 4096;
+  std::vector<char> pattern(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) pattern[i] = static_cast<char>(i * 59 + 5);
+  void* device = nullptr;
+  ASSERT_EQ(hipMalloc(&device, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemcpy(device, pattern.data(), kBytes, hipMemcpyHostToDevice), hipSuccess);
+  const auto buffer = TransferRef::HostBytes(device, kBytes, mori::io::MemoryLocationType::GPU, 0);
+
+  HbmCopyEngine engine;
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < 16; ++i) {
+    items.push_back(
+        MakeItem(buffer, i * 2 * kFragment, buffer, kBytes / 2 + i * 2 * kFragment, kFragment, i));
+  }
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  EXPECT_TRUE(SubmitAndWait(engine, items).empty());
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before);
+
+  std::vector<char> copied(kBytes);
+  ASSERT_EQ(hipMemcpy(copied.data(), device, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (const auto& item : items) {
+    EXPECT_EQ(
+        std::memcmp(copied.data() + item.dst_offset, pattern.data() + item.src_offset, item.size),
+        0)
+        << "fragment " << item.tag;
+  }
+  (void)hipFree(device);
 }
 
 // ---------------------------------------------------------------------------

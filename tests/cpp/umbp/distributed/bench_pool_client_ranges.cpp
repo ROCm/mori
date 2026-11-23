@@ -576,10 +576,8 @@ class Cluster {
     cfg.dram_page_size = page_bytes_;
     cfg.staging_buffer_size = 1024;  // ranged remote must go through the arena
     cfg.dram.buffer_sizes = {dram_capacity};
-    cfg.ranged_get_scratch_buffer = get_scratch.data();
-    cfg.ranged_get_scratch_size = get_scratch.size();
-    cfg.ranged_put_scratch_buffer = put_scratch.data();
-    cfg.ranged_put_scratch_size = put_scratch.size();
+    cfg.ranged_get_scratch = {{get_scratch.data(), get_scratch.size()}};
+    cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch_;
     auto client = std::make_unique<PoolClient>(std::move(cfg));

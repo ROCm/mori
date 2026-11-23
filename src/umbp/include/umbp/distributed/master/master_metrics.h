@@ -174,6 +174,14 @@
 #define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP \
   "Bytes moved to an earlier tier by promote-on-read"
 
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES "mori_umbp_client_tier_move_read_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES_HELP \
+  "Bytes tier moves read off each source medium (not in resolve bytes)"
+
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES "mori_umbp_client_tier_move_write_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES_HELP \
+  "Bytes tier moves wrote into each target medium (already in commit bytes)"
+
 // Labelled by logical tier, so which tier served a read stays visible even
 // though the per-backend labels collapse every instance of a medium into one
 // series.
@@ -244,6 +252,14 @@
   "mori_umbp_ranged_remote_install_failures_total"
 #define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
   "Remote ranged objects that could not be synchronously installed in the local medium"
+
+// Remote reads thrown away after the RDMA read finished, by reason:
+//   stale      — the peer freed or refilled the copy while it was being read
+//   unverified — the ValidateReads check itself failed, so the read is not trusted
+// Nonzero `stale` is the #749 window caught; each one would have been a wrong-bytes hit.
+#define MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL "mori_umbp_client_remote_get_dropped_total"
+#define MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL_HELP \
+  "Remote reads returned as misses because the copy could not be confirmed after the read"
 
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 

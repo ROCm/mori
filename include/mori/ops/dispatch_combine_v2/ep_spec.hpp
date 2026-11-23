@@ -56,6 +56,17 @@ struct EpRequest {
   bool combineFp4F32Scale = false;
   bool combineFp8 = false;
   bool tokOffExt = false;
+  bool combineBf16Push = false;
+  int combineScatterQGroup = 0;    // gfx942/gfx950 fp8 scatter combine: 32 or 128; 0 = off
+  bool combineScatterFp4 = false;  // e2m1 on that wire instead (gfx950)
+  int callTokMax = 0;
+  bool ll128 = false;
+  bool ll128CombineOnly = false;
+  bool cardDedup = false;
+  int cardPullBlocks = 0;
+  bool cardFwdMark = false;
+  bool cardCombine = false;
+  bool ll128Dedup = false;
 };
 
 template <typename Self, typename Visit>
@@ -76,10 +87,21 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(tokOffExt);
+  MORI_FIELD(combineBf16Push);
+  MORI_FIELD(combineScatterQGroup);
+  MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(callTokMax);
+  MORI_FIELD(ll128);
+  MORI_FIELD(ll128CombineOnly);
+  MORI_FIELD(cardDedup);
+  MORI_FIELD(cardPullBlocks);
+  MORI_FIELD(cardFwdMark);
+  MORI_FIELD(cardCombine);
+  MORI_FIELD(ll128Dedup);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 15,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 26,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();
@@ -89,6 +111,11 @@ std::string EpRequestSchema();
 enum class EpKernelKind { Dispatch, Combine };
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind);
+
+// Plan info: Describe(cfg) plus what a caller sizes for the plan -- arena regions
+// (region.<stem>), dispatch staging (stagingBytes), the push combine's landing.
+std::string EpDispatchInfo(const EpCfg& cfg);
+std::string EpCombineInfo(const EpCfg& cfg);
 
 // ---------------------------------------------------------------------------
 // The two Specs. Same Cfg, same Args, different body and different geometry.
@@ -109,9 +136,9 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
   static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {
     if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase) {
       throw std::runtime_error(
-          "ep_dispatch on gfx125x: staging_base was not bound. Allocate "
-          "ep_staging_bytes(world_size, max_recv, scale_bytes, max_tok_per_rank) bytes "
-          "and plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+          "ep_dispatch on gfx125x: staging_base was not bound. Allocate the plan's "
+          "info['stagingBytes'] bytes (EpDispatchPlan.describe gives it before the plan "
+          "exists) and plan.bind(staging_base=buf) -- a null base faults in the kernel.");
     }
     // EpStaging*Offset are EpScaleAlign multiples OF THE BASE, so the base owns the
     // alignment the .bss arrays used to declare themselves. A caller carving staging

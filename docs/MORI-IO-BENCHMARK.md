@@ -120,13 +120,13 @@ is the address each rank advertises to its peer.
 ```bash
 # On the TARGET node (rank 1) — start this FIRST:
 MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
-    --rank 1 --master-ip 10.190.162.0 --self-ip 10.190.162.1 --port 18515 \
+    --rank 1 --master-ip <rank0_ip> --self-ip <rank1_ip> --port 18515 \
     --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
     --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
 
 # On the INITIATOR node (rank 0) — start this SECOND (prints the results table):
 MORI_DISABLE_AUTO_XGMI=1 build/tests/cpp/bench_engine \
-    --rank 0 --master-ip 10.190.162.0 --self-ip 10.190.162.0 --port 18515 \
+    --rank 0 --master-ip <rank0_ip> --self-ip <rank0_ip> --port 18515 \
     --op write --all --sweep-start 1048576 --sweep-max 33554432 --sweep-step 1048576 \
     --iters 500 --warmup-iters 50 --num-qp-per-transfer 4 --enable-sess
 ```
@@ -176,7 +176,7 @@ Most flags share names with the Python benchmark (`--op-type`/`--op`,
 | `--enable-batch-transfer` (default OFF) | `--enable-batch-transfer` / `--disable-batch-transfer` (C++ default **ON**) | Same meaning as Python: **ON** = one N-descriptor batch request (the nixl-equivalent; nixl always batches); **OFF** = `--transfer-batch-size` N *individual* single-transfer submissions per iteration (Python `run_single_once`). The C++ tool defaults **ON** so the out-of-the-box run and `--all-batch` sweep are nixl-comparable; pass `--disable-batch-transfer` for the Python single-submission path. |
 | `--iters` (default `128`) | `--iters` (default `500`), plus `--warmup-iters` | Only the warmup flag is new: it runs untimed iterations before the timed region, matching nixl's `--warmup_iter`. |
 | `--sweep-start-size` / `--sweep-max-size` | `--sweep-start` / `--sweep-max` (long names also accepted) | Names only; `--sweep-step` (`0` = geometric ×2, `>0` = linear) behaves the same in both. |
-| `--backend rdma\|xgmi\|fabric` | same | `--num-streams` / `--num-events` size the XGMI **and** FABRIC HIP pools, as in Python. `fabric` (UALink scale-up, GPU memory only) needs a host whose GPUs expose `/sys/bus/pci/devices/*/ualink`; on RoCE-only hardware the engine reports `No available backend found` at the first transfer. |
+| `--backend rdma\|xgmi\|fabric` | same | `--num-streams` / `--num-events` size the XGMI **and** FABRIC HIP pools, as in Python. `fabric` (UALink scale-up, GPU memory only) needs a host whose GPUs expose `/sys/bus/pci/devices/*/ualink`; on RoCE-only hardware the first transfer fails with `No backend can handle ...`, followed by the reason Fabric rejected the pair. |
 | `--xgmi-multiprocess` (default OFF) | `--xgmi-single-process` (default OFF, i.e. multiprocess) | The defaults are **opposite**. The C++ tool's two-rank path is already Python's `--xgmi-multiprocess`: two processes with distinct engine keys, so the backend takes its `hipIpc*` route. `--xgmi-single-process` adds Python's *default* instead — one process owning both GPUs, no rendezvous and no IPC. `--xgmi-multiprocess` is accepted to document intent but is a no-op. |
 | *(always on)* | `--skip-validate` | Both tools verify transferred data as part of the run. Python compares the target's buffer byte-for-byte over gloo; the C++ tool seeds a rank- and offset-dependent pattern and exchanges one checksum per transferred slot after the sweep (so the check is O(batch) on the wire but still covers every byte), printing `validation: OK` or naming the first mismatching slot and exiting non-zero. `--skip-validate` opts out; passing it to only one rank is safe — that rank contributes nothing and the run reports `validation: skipped` rather than hanging. |
 
@@ -222,10 +222,10 @@ cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 export GLOO_SOCKET_IFNAME=ens14np0  # Set to your NIC interface
 
-# Run on two nodes (replace node_rank and master_addr)
+# Run on two nodes (replace node_rank, master_addr and host)
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.129.65" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.129.65"
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>"
 ```
 
 ### Fabric (cross-node scale-up UALink super-node)
@@ -284,8 +284,8 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
-    --master_addr="10.235.192.57" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --all --enable-sess --enable-batch-transfer \
     --num-qp-per-transfer 2 --num-target-dev 8 --num-initiator-dev 8
 ```
@@ -326,8 +326,8 @@ torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
 ```bash
 numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.235.192.60" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --enable-batch-transfer --enable-sess --buffer-size 1024 \
     --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
     --num-qp-per-transfer 4 --all --num-worker-threads 1 \
@@ -368,8 +368,8 @@ numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
 ```bash
 numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
     torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.235.192.60" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.235.192.60" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --enable-batch-transfer --enable-sess --buffer-size 1024 \
     --transfer-batch-size 128 --num-initiator-dev 1 --num-target-dev 1 \
     --num-qp-per-transfer 16 --all-batch --num-worker-threads 1 \
@@ -409,8 +409,8 @@ numactl --cpunodebind=0 --membind=0 --physcpubind=0-47,96-143 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.132.29" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --transfer-batch-size 1 --all --sweep-start-size=1024 \
     --sweep-max-size=67108864 --op-type write \
     --enable-sess --enable-batch-transfer
@@ -448,8 +448,8 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 
 ```bash
 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-    --master_addr="10.194.132.29" --master_port=1234 \
-    tests/python/io/benchmark.py --host="10.194.132.29" \
+    --master_addr="<master_ip>" --master_port=1234 \
+    tests/python/io/benchmark.py --host="<node_ip>" \
     --transfer-batch-size 1 --all --sweep-start-size=1024 \
     --sweep-max-size=67108864 --op-type read \
     --enable-sess --enable-batch-transfer
@@ -493,7 +493,7 @@ These workload flags apply to both engines (the C++ default and Python); only th
 launch wrapper differs. Shown against the C++ binary:
 
 ```bash
-tests/cpp/io/bench_engine --op write \
+build/tests/cpp/bench_engine --op write \
     --enable-sess --enable-batch-transfer --batch-contiguous \
     --disable-chunking \
     --num-qp-per-transfer 8 --num-worker-threads 8 \

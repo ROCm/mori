@@ -624,6 +624,7 @@ void XgmiBackend::BuildTopologyMap() {
   const fs::path kfdNodes("/sys/class/kfd/kfd/topology/nodes");
   std::error_code ec;
   if (fs::is_directory(kfdNodes, ec)) {
+    std::unordered_map<std::string, std::string> busIdByKfdNode;
     for (const auto& nodeEntry : fs::directory_iterator(kfdNodes, ec)) {
       if (ec) break;
       fs::path propsFile = nodeEntry.path() / "properties";
@@ -644,8 +645,8 @@ void XgmiBackend::BuildTopologyMap() {
           domain = val;
       }
 
-      // hive_id == 0 means CPU node or non-XGMI device
-      if (hiveId == 0 || locationId == 0) continue;
+      // location_id == 0 means CPU node
+      if (locationId == 0) continue;
 
       // Decode PCI BDF from location_id: bus[15:8] device[7:3] function[2:0]
       unsigned bus = (locationId >> 8) & 0xff;
@@ -654,12 +655,49 @@ void XgmiBackend::BuildTopologyMap() {
       char bdf[24];
       std::snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", static_cast<unsigned>(domain), bus,
                     device, function);
-      gpuTopoByBusId[NormalizeBusId(std::string(bdf))] = hiveId;
+      std::string busId = NormalizeBusId(std::string(bdf));
+      busIdByKfdNode[nodeEntry.path().filename().string()] = busId;
+      // hive_id == 0 means a GPU outside any XGMI mesh, e.g. a PCIe-only card
+      if (hiveId != 0) gpuTopoByBusId[busId] = hiveId;
+    }
+
+    // GPUs outside an XGMI hive can still reach each other over PCIe. KFD lists
+    // every GPU it allows P2P DMA to under io_links/p2p_links, which is the
+    // topology the ROCm runtime reports peer access from.
+    constexpr uint64_t kIoLinkEnabled = 1u << 0;
+    constexpr uint64_t kIoLinkNoPeerToPeerDma = 1u << 4;
+    for (const auto& [node, busId] : busIdByKfdNode) {
+      for (const char* linkDir : {"io_links", "p2p_links"}) {
+        fs::path links = kfdNodes / node / linkDir;
+        if (!fs::is_directory(links, ec)) continue;
+        for (const auto& linkEntry : fs::directory_iterator(links, ec)) {
+          if (ec) break;
+          std::ifstream f(linkEntry.path() / "properties");
+          if (!f.is_open()) continue;
+
+          std::string nodeTo;
+          uint64_t flags = 0;
+          std::string key;
+          uint64_t val;
+          while (f >> key >> val) {
+            if (key == "node_to")
+              nodeTo = std::to_string(val);
+            else if (key == "flags")
+              flags = val;
+          }
+          if (!(flags & kIoLinkEnabled) || (flags & kIoLinkNoPeerToPeerDma)) continue;
+
+          auto peer = busIdByKfdNode.find(nodeTo);
+          if (peer != busIdByKfdNode.end()) gpuPeersByBusId[busId].insert(peer->second);
+        }
+      }
     }
   }
 
-  if (!gpuTopoByBusId.empty()) {
-    MORI_IO_INFO("XGMI: Topology map built from KFD with {} GPU entries", gpuTopoByBusId.size());
+  if (!gpuTopoByBusId.empty() || !gpuPeersByBusId.empty()) {
+    MORI_IO_INFO(
+        "XGMI: Topology map built from KFD with {} hive GPU entries, {} GPUs with P2P peers",
+        gpuTopoByBusId.size(), gpuPeersByBusId.size());
     return;
   }
 
@@ -701,7 +739,7 @@ std::optional<int> XgmiBackend::LookupVisibleDevice(const std::string& busId) co
 }
 
 bool XgmiBackend::IsTopologyEligible(int localDeviceId, const std::string& remoteBusId) const {
-  if (gpuTopoByBusId.empty()) {
+  if (gpuTopoByBusId.empty() && gpuPeersByBusId.empty()) {
     return false;
   }
 
@@ -720,11 +758,13 @@ bool XgmiBackend::IsTopologyEligible(int localDeviceId, const std::string& remot
   std::string normalizedRemote = NormalizeBusId(remoteBusId);
   auto localIt = gpuTopoByBusId.find(localBusId);
   auto remoteIt = gpuTopoByBusId.find(normalizedRemote);
-  if (localIt == gpuTopoByBusId.end() || remoteIt == gpuTopoByBusId.end()) {
-    return false;
+  if (localIt != gpuTopoByBusId.end() && remoteIt != gpuTopoByBusId.end() &&
+      localIt->second == remoteIt->second) {
+    return true;
   }
 
-  return localIt->second == remoteIt->second;
+  auto peersIt = gpuPeersByBusId.find(localBusId);
+  return peersIt != gpuPeersByBusId.end() && peersIt->second.count(normalizedRemote) > 0;
 }
 
 std::optional<int> XgmiBackend::ResolveVisibleDeviceId(const MemoryDesc& desc) const {
@@ -774,9 +814,29 @@ bool XgmiBackend::IsSameNodeEngine(const EngineKey& engineKey) const {
   return remoteEngine.hostname == myHostname;
 }
 
+FenceResult XgmiBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // Nothing reaches our memory over XGMI unless we exported some, and a peer known to sit on
+  // another node cannot. Any other peer is assumed to be on this node, including one we have
+  // no record of: it may have our memory descriptor from elsewhere, and deregistering it does
+  // not revoke a mapping it holds.
+  if (remote == myEngKey || !exportedMemory_.load(std::memory_order_acquire)) return FenceResult{};
+  {
+    std::lock_guard<std::mutex> lock(remoteEnginesMu);
+    auto it = peerOnThisNodeSeen_.find(remote);
+    if (it != peerOnThisNodeSeen_.end() && !it->second) return FenceResult{};
+  }
+  return UncutPath(remote, "XGMI", "the IPC mapping of our memory it holds cannot be revoked");
+}
+
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   std::lock_guard<std::mutex> lock(remoteEnginesMu);
   remoteEngines[desc.key] = desc;
+  // Once seen on this node, always: re-registering the key from another node does not
+  // revoke a mapping the earlier incarnation may still hold.
+  bool& onThisNode = peerOnThisNodeSeen_[desc.key];
+  onThisNode =
+      onThisNode || (!myNodeId.empty() && !desc.nodeId.empty() ? desc.nodeId == myNodeId
+                                                               : desc.hostname == myHostname);
   MORI_IO_TRACE("XGMI: Registered remote engine {} hostname {}", desc.key, desc.hostname);
 }
 
@@ -791,6 +851,9 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     MORI_IO_TRACE("XGMI: Skipping non-GPU memory registration for id={}", desc.id);
     return;
   }
+  // Reachable even if the IPC export below fails: a peer in this process falls back to the
+  // direct P2P pointer (GetRemappedAddress).
+  exportedMemory_.store(true, std::memory_order_release);
 
   // hipIpcGetMemHandle is keyed to the *base* of the underlying allocation, not
   // to an interior pointer. When `data` is a sub-region (e.g. a per-layer view
@@ -809,8 +872,22 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     desc.ipcOffset = 0;
   }
 
+  // HIP records the *current* device ordinal in the handle (owners_device_id),
+  // and hipIpcOpenMemHandle rejects a handle whose ordinal is >= the importer's
+  // visible device count. That ordinal is local to this process, so a peer with
+  // a different HIP_VISIBLE_DEVICES (e.g. prefill on 1 GPU, decode TP2 on two
+  // other GPUs) cannot open handles exported while device >= 1 is current.
+  // Export with device 0 current: ordinal 0 exists in every importer, and the
+  // handle still identifies the allocation, which may live on any device.
   hipIpcMemHandle_t handle;
-  hipError_t err = hipIpcGetMemHandle(&handle, allocBase);
+  hipError_t err;
+  {
+    ScopedHipDeviceGuard deviceGuard;
+    err = hipSetDevice(0);
+    if (err == hipSuccess) {
+      err = hipIpcGetMemHandle(&handle, allocBase);
+    }
+  }
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to get IPC handle for memory id={}: {}", desc.id,
                  hipGetErrorString(err));

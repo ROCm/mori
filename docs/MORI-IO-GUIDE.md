@@ -10,13 +10,15 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 - [Python API Quick Reference](#python-api-quick-reference)
 - [Example: Basic Read/Write](#example-basic-readwrite)
 - [Environment & Configuration](#environment--configuration)
+- [Known Issues](#known-issues)
+- [Simulation Mode](#simulation-mode)
 - [Profiling MORI-IO with ROCTX Markers](#profiling-mori-io-with-roctx-markers)
 - [Source Files](#source-files)
 
 ## Design & Concepts
 
 - **IOEngine**: The primary interface for interacting with MORI-IO. It abstracts low-level details of P2P communications and provides high-level APIs for engine registration, memory registration, P2P transfer, etc.
-- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, TCP). It must be created before any data transfer can occur over that medium.
+- **Backend**: A backend represents and manages a specific transfer medium (e.g., RDMA, XGMI, FABRIC, OFI). It must be created before any data transfer can occur over that medium.
 - **Engine Registration**: Before two engines can communicate, the remote engine must be registered with the local engine. This establishes the necessary context for initiating data transfers between them.
 - **Memory Registration**: Application memory must be registered with a local engine before it can participate in data transfer. This ensures the engine can access and manage the memory efficiently during communication.
 - **Read/Write**: One-sided transfer operations initiated by the initiator engine without active involvement from the target engine. These operations can move data directly between registered memory regions.
@@ -27,7 +29,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 
 The image below shows a typical workflow of using MORI-IO.
 
-<img src="mori_io_workflow.jpg">
+![MORI-IO workflow](mori_io_workflow.jpg)
 
 ## Architecture
 
@@ -41,11 +43,11 @@ Inside MORI-IO, there are 5 components:
 |-----------|-------------|
 | **Slow Control Plane** | Exchanges metadata such as memory descriptors, RDMA QP numbers, and custom notification messages. Uses a built-in TCP server with a lightweight protocol (no 3rd-party libraries). |
 | **Fast Control Plane** | Exchanges metadata on the critical path of transfers (e.g., remote engine completion notifications). Uses RDMA network to minimize performance penalty. |
-| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, TCP. |
+| **Data Plane** | Transfers bulk data. Supported transports: RDMA, XGMI, FABRIC, OFI. TCP exists only in [simulation mode](#simulation-mode). |
 | **Metadata Store** | Manages per-engine metadata. Each engine manages its own metadata (no centralized store). |
-| **Transport Store** | Manages multiple transfer backends (RDMA, TCP, XGMI). Provides failover if one backend is in a failure state. |
+| **Transport Store** | Manages multiple transfer backends (RDMA, XGMI, FABRIC, OFI). Provides failover if one backend is in a failure state. |
 
-<img src="mori_io_arch.png">
+![MORI-IO architecture](mori_io_arch.png)
 
 ## Python API Quick Reference
 
@@ -75,7 +77,7 @@ from mori.io import (
 
 | Enum | Values |
 |------|--------|
-| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` |
+| `BackendType` | `Unknown`, `XGMI`, `RDMA`, `TCP` (simulation mode only), `FABRIC`, `OFI` (needs MORI built with libfabric) |
 | `MemoryLocationType` | `Unknown`, `CPU`, `GPU` |
 | `StatusCode` | `SUCCESS`, `INIT`, `IN_PROGRESS`, `ERR_INVALID_ARGS`, `ERR_NOT_FOUND`, `ERR_RDMA_OP`, `ERR_BAD_STATE`, `ERR_GPU_OP` |
 | `PollCqMode` | `POLLING`, `EVENT` |
@@ -85,10 +87,12 @@ from mori.io import (
 | Method | Description |
 |--------|-------------|
 | `get_engine_desc()` | Get engine descriptor for remote registration |
-| `create_backend(type, config)` | Create RDMA/XGMI/TCP backend |
+| `create_backend(type, config)` | Create an RDMA, XGMI, FABRIC or OFI backend (TCP only in simulation mode) |
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
 | `deregister_remote_engine(desc)` | Deregister a remote engine |
+| `fence_remote_engine(engine_key)` | Cut a peer off from this engine's memory so buffers it was writing into can be reused. Returns a `FenceResult`; only trust it when `ok` is set (`endpoints_failed == 0`, and `peer_known`: this engine had a connection with the key or has it registered, so a mistyped key is not ok). A known key can still be another peer's; a caller that cannot rule that out should also expect `endpoints_fenced > 0`. Only RDMA connections can be cut: once XGMI, fabric or OFI could have handed a peer access to this engine's memory (a mapping, an import or a key, which outlive deregistration), the fence reports that path as a failed endpoint, so `ok` stays false. The peer stays fenced (refused in both directions) until `unfence_remote_engine` |
+| `unfence_remote_engine(engine_key)` | Let a fenced peer connect again; returns whether it was fenced. Call once nothing the peer still has in flight can reach buffers that were handed out. Does no network I/O: the peer is told in the background (best effort) and reconnects on its next transfer |
 | `register_memory(ptr, size, device_id, mem_loc)` | Register memory by raw pointer |
 | `register_torch_tensor(tensor)` | Register a PyTorch tensor |
 | `deregister_memory(mem_desc)` | Deregister memory |
@@ -105,10 +109,14 @@ from mori.io import (
 |--------|-------------|
 | `InProgress()` | Transfer still in progress |
 | `Succeeded()` | Transfer completed successfully |
-| `Failed()` | Transfer failed |
+| `Failed()` | Transfer failed. Over RDMA it reports only once none of the transfer's WRs can still move data, so its buffers may then be reused. Exception: when a submission gives up and has to move a QP to the error state, RDMA WRITE packets already on the wire can still land in the remote buffer shortly after; only a fence on the receiving side closes that window |
 | `Code()` | Get status code |
 | `Message()` | Get status message |
 | `Wait()` | Block until transfer completes |
+
+For FABRIC transfers, `TransferStatus.Message()` reports routing rejection reasons and the
+specific HIP call and error when a remote memory import fails. Registration failures appear
+in logs; when another backend is selected, an INFO log gives the Fabric reason and the fallback.
 
 ## Example: Basic Read/Write
 
@@ -177,13 +185,95 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | RC retry budget | The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. `MORI_IO_QP_TIMEOUT` (0–31, default `14`; local ACK timeout = `4.096us * 2^timeout`; `0` disables it and lets an unresponsive peer stall indefinitely), `MORI_IO_QP_RETRY_CNT` (0–7, default `7`), `MORI_IO_QP_RNR_RETRY` (0–7, default `7`; `7` = retry RNR NAKs forever), `MORI_IO_QP_MIN_RNR_TIMER` (0–31, default `12`; IB-spec RNR NAK backoff). Each also honors a transport-wide `MORI_RDMA_QP_*` fallback (e.g. `MORI_RDMA_QP_TIMEOUT`) that tunes the shmem/CCO QPs sharing this path. The `MORI_IO_QP_*` name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the `MORI_RDMA_QP_*` value. |
+| `MORI_IO_QP_MAX_RD_ATOMIC` | RDMA READs (and atomics) each QP keeps in flight, applied as `max_rd_atomic` at RTS. Unset (the default) keeps the device limit; a value of `0`, or at or above the device limit, is ignored. The ionic driver rounds the value down to `2^k - 1` (1, 3, 7, 15). Set it to `1` on AINIC firmware that mishandles retransmitted READs (see [Known Issues](#known-issues)). Also honors the transport-wide `MORI_RDMA_QP_MAX_RD_ATOMIC` fallback, like the RC retry attributes. |
 | `MORI_IO_FAIL_ON_ASYNC_EVENT` | When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set `0` to disable and restore the previous hang-until-timeout behavior. |
+| `MORI_IO_PORT_DOWN_FAIL_FAST` | Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set `0` to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget. |
+| `MORI_IO_FENCE_RELEASE_DELAY_MS` | The connections a fence cut (QPs, CQs, notification buffers) and the sessions it evicted are kept while the peer is fenced, so their QP numbers cannot go to new QPs, and destroyed this long after the peer is unfenced (default `10000`). The fence already stops every new use of them; the delay covers a notification send that passed admission just before the fence, the poll loop's last pass, a caller returning from a session it took before the fence, and a write of the peer still retrying on its side of a cut QP, so keep it above the peer's transport retry budget (`MORI_IO_QP_TIMEOUT`, `MORI_IO_QP_RETRY_CNT`). |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 | `LD_LIBRARY_PATH` | MORI-IO loads libibverbs dynamically at runtime (`dlopen` of `libibverbs.so` / `libibverbs.so.1`) rather than linking it. To use an out-of-tree libibverbs, put its directory on `LD_LIBRARY_PATH`. |
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
+
+## Known Issues
+
+### AINIC firmware: retransmitted RDMA READs lose data or fail the QP
+
+On AMD Pollara (AINIC) 1.117.5 firmware after `a-45`, an RDMA READ that is retransmitted while its QP keeps several READs in flight can go wrong. This was seen on `1.117.5-a-77` and `1.117.5-a-196`, not on `1.117.5-a-45`; until a firmware build with the fix is available, treat every 1.117.5 build after `a-45` as affected. A MORI-IO read, which is an RDMA READ, can then:
+
+- fail with `Work Request Flushed Error` and no `[ROOT CAUSE]` completion before it: the firmware moved the QP to the error state without failing a work request (`a-77`);
+- report success with whole 4 KiB packets of its data never written (`a-77`);
+- report success before all of its data is written, the rest landing up to about 2 s later, occasionally after the buffer has been reused (`a-196`, seen in a KVM guest with SR-IOV VFs).
+
+It happens only when READs are retransmitted, that is when the reader is backpressured (for example READ buffers on the other NUMA node, or many QPs or large READs per NIC); `tx_rdma_ack_timeout` and `req_rx_cqe_err` under `/sys/class/infiniband/<dev>/ports/1/hw_counters/` then grow.
+
+**Workaround:** set `MORI_IO_QP_MAX_RD_ATOMIC=1`, so that each QP keeps one READ in flight. In testing, the `a-196` symptoms did not occur with it; on `a-77` no QP failed silently any more, and data went missing only under heavy receive backpressure with many QPs per NIC. Throughput dropped by about 4% without other load; with small chunks (64 KiB) use more QPs per transfer. Without this setting, MORI-IO logs this known issue once per process, at the first READ over such firmware.
+
+## Simulation Mode
+
+With `MORI_IO_SIM_ENABLE=1`, MORI-IO runs without GPUs or NICs: `create_backend` builds a
+simulated RDMA, TCP or XGMI backend. Engines, routing, sessions, transfer status, a TCP
+control plane (remote memory check, notifications, peer failure) all run for real; no bytes
+move, and each transfer completes after a modelled delay. This lets a GPU-free simulator run
+real inference processes, for example sglang PD disaggregation, through their MORI-IO code.
+
+A transfer of `n` segments and `b` bytes holds its link for
+`b / bandwidth + n * per_segment + per_op` and completes `latency` after that. Each engine has
+one link per direction, and transfers queue on it in order.
+
+| Setting | Description |
+|---------|-------------|
+| `MORI_IO_SIM_ENABLE` | `1` to simulate. |
+| `MORI_IO_SIM_BACKEND` | `tcp` or `xgmi`: simulate an RDMA request as that backend. TCP exists only in simulation. |
+| `MORI_IO_SIM_GPU` | The GPU whose catalog entry times XGMI, for example `mi355x`. |
+| `MORI_IO_SIM_NIC` | The NIC whose catalog entries time RDMA and TCP, for example `pollara400`. |
+| `MORI_IO_SIM_CATALOG` | Catalog file(s) to read, comma-separated. An entry replaces an earlier one for the same backend and GPU or NIC. |
+| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value. |
+| `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
+| `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
+
+The timing of each backend comes from a catalog of measured hardware, a flat YAML file read
+when a simulated backend is created. The wheel ships one as `mori/io/sim_catalog.yaml`
+([source](https://github.com/ROCm/mori/blob/main/python/mori/io/sim_catalog.yaml)). XGMI
+entries are per GPU and RDMA and TCP entries per NIC, since the numbers change with each
+generation:
+
+```yaml
+- backend: xgmi
+  gpu: mi355x
+  bandwidth_gbps: 61.4
+  latency_us: 9
+  per_segment_ns: 19500
+  per_op_us: 0
+  hardware: "AMD Instinct MI355X, xGMI full mesh, 72 GB/s per direction per GPU pair"
+
+- backend: rdma
+  nic: pollara400
+  bandwidth_gbps: 47.4
+  latency_us: 20
+  per_segment_ns: 255
+  per_op_us: 4.3
+  qp_per_transfer: 4        # the RDMA config it was measured with
+  num_worker_threads: 4
+  hardware: "AMD Pensando Pollara 400, 400GbE"
+```
+
+```bash
+export MORI_IO_SIM_CATALOG=$(python -c "import mori.io, os; print(os.path.join(os.path.dirname(mori.io.__file__), 'sim_catalog.yaml'))")
+export MORI_IO_SIM_GPU=mi355x MORI_IO_SIM_NIC=pollara400
+```
+
+selects these. A name the catalog does not have is an error that lists the names it has.
+Without a selection, or for a backend the
+selected hardware has no entry for (TCP above), uncalibrated guesses are used and a warning is
+logged.
+
+RDMA timing depends on the config, so an engine whose `qp_per_transfer` or
+`num_worker_threads` differ from the entry's logs a warning. To time other hardware or another
+config, add an entry with its measured numbers to a catalog file of your own. The
+model does not cap a single transfer's bandwidth: without `enable_transfer_chunking`, one RDMA
+transfer alone reaches only about half the link, which the simulator does not reproduce.
 
 ## Profiling MORI-IO with ROCTX Markers
 
@@ -230,3 +320,33 @@ Either variable can be enabled alone. Enabled values include `1`, `on`, and
 | `tests/cpp/io/bench_engine.cpp` | Performance benchmark (default, nixlbench-matching) |
 | `tests/python/io/benchmark.py` | Performance benchmark (Python, kept for parity) |
 | `docs/MORI-IO-BENCHMARK.md` | Benchmark commands and results |
+
+### NIC fault injection (test builds)
+
+Configure with `-DENABLE_IO_FAULT_INJECTION=ON`. Production builds leave this off.
+`MORI_IO_FAULT` accepts one rule (an invalid rule aborts the process, so a typo never runs fault-free), for example
+`async_event:value=cq_err:op=write`, `port_down:op=write`, or
+`port_flap:value=200:op=write`. Async event rules require a supported event name
+or its numeric `ibv_event_type`; `skip`, `count`, `qpn`, and `op` filter matching
+posts. SRQ events are rejected because MORI-IO does not use an SRQ. Port rules
+accept only `count=1`. Runtime injection errors are logged and fail the catalog
+without throwing through the data path. QP/CQ/device fatal injections change the
+corresponding data-path state; dead CQ/device markers survive Disarm and watch removal, and are retired with
+their owning endpoint/context. New allocations do not inherit those markers. Port down
+lasts until explicit Disarm, while flap recovers after its duration even if the
+rule is disarmed earlier. Automatic
+rule exhaustion stops new triggers without clearing a port-down interval.
+
+Run `MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection`
+for the async catalog, or add `--check-catalog` to validate rules without GPU/NIC
+access. `--check-async-sources` exercises the async source plumbing on the CPU.
+The default catalog is `ibverbs.yaml`. Each hardware entry uses GPU 0 and GPU 1;
+the CPU checks create no engine.
+Synthetic events must not race endpoint destruction: they do not acquire the
+provider's event lifetime protection. The fault catalog exits without teardown.
+
+Port overrides and events are published together before the triggering post,
+so concurrent Disarm queues recovery after PORT_ERR. For a fatal async rule
+matching notification SEND, the FI-only BeforeNotify hook waits up to 5 s for
+the data status to reach SUCCESS before sending the notification. This makes
+notification failure tests reproducible; normal builds add no wait.

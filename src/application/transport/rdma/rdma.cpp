@@ -43,6 +43,7 @@
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/env_utils.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 // mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
@@ -397,17 +398,39 @@ std::optional<uint8_t> ReadIoQpMinRnrTimerEnv() {
   return ReadQpRetryAttrEnv("MORI_IO_QP_MIN_RNR_TIMER", "MORI_RDMA_QP_MIN_RNR_TIMER", 31);
 }
 
+// RDMA READs (and atomics) a requester QP keeps in flight, applied as max_rd_atomic at
+// RTS; unset keeps the device limit. The ionic driver rounds the value down to 2^k - 1
+// (1, 3, 7, 15). 0 would leave the QP unable to issue READs at all.
+std::optional<uint8_t> ReadIoQpMaxRdAtomicEnv() {
+  std::optional<uint8_t> value =
+      ReadQpRetryAttrEnv("MORI_IO_QP_MAX_RD_ATOMIC", "MORI_RDMA_QP_MAX_RD_ATOMIC", 255);
+  if (value.has_value() && value.value() == 0) {
+    MORI_APP_WARN("Ignore a max_rd_atomic override of 0: a QP needs at least one READ in flight");
+    return std::nullopt;
+  }
+  return value;
+}
+
 bool ReadIbEnableRelaxedOrderingEnv() {
   std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
   return enable.has_value() && enable.value() == 1;
 }
 
 int MaybeAddRelaxedOrderingFlag(int accessFlag) {
-#ifdef IBV_ACCESS_RELAXED_ORDERING
+  // IBV_ACCESS_RELAXED_ORDERING is an enumerator of enum ibv_access_flags in
+  // <infiniband/verbs.h> (= IBV_ACCESS_OPTIONAL_FIRST, 1 << 20), not a macro. Guarding it
+  // with #ifdef is therefore always false, which compiled this branch out and made
+  // MORI_IB_ENABLE_RELAXED_ORDERING a silent no-op.
   if (ReadIbEnableRelaxedOrderingEnv()) {
+    static const bool logged = [] {
+      MORI_APP_INFO(
+          "MORI_IB_ENABLE_RELAXED_ORDERING=1: registering memory regions with "
+          "IBV_ACCESS_RELAXED_ORDERING");
+      return true;
+    }();
+    (void)logged;
     return accessFlag | IBV_ACCESS_RELAXED_ORDERING;
   }
-#endif
   return accessFlag;
 }
 
@@ -433,14 +456,23 @@ RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
 ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaultContext; }
 
+// Possible causes of an ibv_reg_mr ENOMEM, printed with every fatal registration
+// failure. Every NIC's registration of a buffer pins it again against
+// RLIMIT_MEMLOCK (CAP_IPC_LOCK inside a container's user namespace does not exempt it).
+static constexpr const char* kRegFailureHint =
+    "ENOMEM usually means RLIMIT_MEMLOCK is too low (ulimit -l) or the region needs more NIC "
+    "translation entries than one MR allows (back it with hugepages or shrink it)";
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
   if (!mr) {
+    const int err = errno;
     MORI_APP_ERROR(
-        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
-        size, effectiveAccessFlag, errno, strerror(errno));
+        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({}), "
+        "RLIMIT_MEMLOCK:{}. {}",
+        ptr, size, effectiveAccessFlag, err, strerror(err), MemlockLimitString(), kRegFailureHint);
     std::abort();
   }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
@@ -454,13 +486,11 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* 
   return handle;
 }
 
-application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(void* ptr,
-                                                                                size_t size,
-                                                                                int dmabuf_fd,
-                                                                                int accessFlag) {
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
+    void* ptr, size_t size, int dmabuf_fd, int accessFlag, uint64_t dmabuf_offset) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
-                                 effectiveAccessFlag);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabuf_offset, size, reinterpret_cast<uint64_t>(ptr),
+                                 dmabuf_fd, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "
@@ -481,23 +511,25 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
 }
 
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufIova0(
-    void* ptr, size_t size, int dmabuf_fd, int accessFlag) {
+    void* ptr, size_t size, int dmabuf_fd, uint64_t dmabuf_offset, int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, 0, dmabuf_fd, effectiveAccessFlag);
+  // iova must share the offset's in-page bits, so keep it allocation-relative.
+  ibv_mr* mr =
+      ibv_reg_dmabuf_mr(pd, dmabuf_offset, size, dmabuf_offset, dmabuf_fd, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabufIova0 failed! addr:{}, size:{}, dmabuf_fd:{}, "
-        "accessFlag:{}, errno:{} ({})",
-        ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
+        "dmabuf_offset:{}, accessFlag:{}, errno:{} ({})",
+        ptr, size, dmabuf_fd, dmabuf_offset, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
   MORI_APP_TRACE(
-      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, iova:0, lkey:{}, "
-      "rkey:{}",
-      ptr, size, dmabuf_fd, mr->lkey, mr->rkey);
+      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, dmabuf_offset:{}, "
+      "iova:{}, lkey:{}, rkey:{}",
+      ptr, size, dmabuf_fd, dmabuf_offset, dmabuf_offset, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
-  handle.addr = 0;
+  handle.addr = dmabuf_offset;
   handle.lkey = mr->lkey;
   handle.rkey = mr->rkey;
   handle.length = mr->length;
@@ -545,6 +577,13 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   // is never freed when its owner unmaps and releases it (e.g. vLLM sleep mode).
   // Exporting the allocation handle does not; it needs the allocation to have
   // been created with the POSIX fd handle type, otherwise fall through.
+  //
+  // Known HIP bug: up to ROCm 7.2.x, hipMemRetainAllocationHandle segfaults
+  // (null+0xf8 in libamdhip64) instead of returning hipErrorInvalidValue on
+  // memory HIP tracks but did not map through hipMemMap: pinned host memory
+  // (hipHostMalloc, hipHostRegister) and hipMalloc. hipMalloc has exported
+  // through HSA above, and RegisterRdmaMemoryRegionAuto keeps pinned host memory
+  // off this path. Fixed upstream in ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
   hipMemGenericAllocationHandle_t handle;
   if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
     hipError_t exportErr =
@@ -579,9 +618,24 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   return fd;
 }
 
+// True only when HIP reports host memory: plain (unregistered) or pinned with
+// hipHostRegister / hipHostMalloc. The pointer is asked rather than the caller,
+// whose label can be wrong (a GPU buffer registered with a default CPU location).
+static bool IsHostMemory(void* ptr) {
+  hipPointerAttribute_t attr{};
+  if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return attr.type == hipMemoryTypeHost || attr.type == hipMemoryTypeUnregistered;
+}
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
                                                                               size_t size,
                                                                               int accessFlag) {
+  // Host memory has no dma-buf exporter, so the dma-buf leg can only fail on it.
+  if (IsHostMemory(ptr)) return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
+
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
 
   auto makeHandle = [&](ibv_mr* mr) {
@@ -605,7 +659,9 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   };
 
   // Default: ibv_reg_mr first, dmabuf fallback (fast on bnxt). Set
-  // MORI_ENABLE_DMABUF_REG to prefer dmabuf first, falling back to ibv_reg_mr.
+  // MORI_ENABLE_DMABUF_REG=1 to prefer dmabuf first (payload MRs and, on Ionic,
+  // CQ/SQ/RQ rings), falling back to ibv_reg_mr for payload.
+  int plainErr = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool useDmabuf = (attempt == 0) ? preferDmabufReg : !preferDmabufReg;
     const char* name = useDmabuf ? "dmabuf" : "ibv_reg_mr";
@@ -615,16 +671,19 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
                      ptr, size, mr->lkey, mr->rkey);
       return makeHandle(mr);
     }
+    const int err = errno;
+    if (!useDmabuf) plainErr = err;
     MORI_APP_WARN(
         "RegisterRdmaMemoryRegionAuto {} registration failed (addr:{}, size:{}, "
         "errno:{} ({}))",
-        name, ptr, size, errno, strerror(errno));
+        name, ptr, size, err, strerror(err));
   }
 
   MORI_APP_ERROR(
       "RegisterRdmaMemoryRegionAuto failed: ibv_reg_mr and dmabuf registration both failed "
-      "(addr:{}, size:{}, accessFlag:{}, errno:{} ({}))",
-      ptr, size, effectiveAccessFlag, errno, strerror(errno));
+      "(addr:{}, size:{}, accessFlag:{}, ibv_reg_mr errno:{} ({}), RLIMIT_MEMLOCK:{}). {}",
+      ptr, size, effectiveAccessFlag, plainErr, strerror(plainErr), MemlockLimitString(),
+      kRegFailureHint);
   std::abort();
 }
 
@@ -641,6 +700,17 @@ bool RdmaDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexc
         "DestroyRdmaEndpointNoThrow is unsupported for provider vendorId={} qpn={} cq={}; "
         "leaving endpoint for normal context teardown",
         static_cast<uint32_t>(ep.vendorId), ep.handle.qpn, static_cast<void*>(ep.ibvHandle.cq));
+  } catch (...) {
+  }
+  return false;
+}
+
+bool RdmaDeviceContext::ModifyEndpointToErrorNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    MORI_APP_WARN(
+        "ModifyEndpointToErrorNoThrow is unsupported for provider vendorId={} qpn={}; "
+        "the peer cannot be fenced through this endpoint",
+        static_cast<uint32_t>(ep.vendorId), ep.handle.qpn);
   } catch (...) {
   }
   return false;

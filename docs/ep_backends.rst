@@ -32,8 +32,10 @@ evaluating a migration.
    * - EPv2, HIP internode preview
      - HIP backend with ``gpu_per_node < world_size``
      - Multiple physical nodes over CCO/GDA
-     - BF16/FP32/FP8 dispatch; no FP4, quantization, standard-MoE conversion or
-       scatter combine. The communicator's node grouping must match the config.
+     - BF16/FP32/FP8 dispatch, plus packed FP4 dispatch with a BF16 or FP32
+       combine (not with ``async_ll``); no FP4 combine, quantization,
+       standard-MoE conversion or scatter combine. The communicator's node
+       grouping must match the config.
 
 This table describes development source, not a guarantee that all paths are
 available in every published wheel. Check the installed release and its
@@ -52,8 +54,9 @@ Import the EPv2 classes explicitly:
    )
 
 Select the backend with ``config.kernel_backend`` or
-``MORI_V2_KERNEL_BACKEND``. The FlyDSL backend is the default. Importing the
-package does not load either backend; construction loads the selected one.
+``MORI_V2_KERNEL_BACKEND``. The default is the HIP backend on gfx125x and the
+FlyDSL backend elsewhere. Importing the package does not load either backend;
+construction loads the selected one.
 EPv2 uses an explicit CCO communicator, described in :doc:`MORI-CCO-GUIDE`.
 It does not inherit the legacy API's process-global SHMEM bootstrap contract.
 
@@ -67,14 +70,18 @@ the following important restrictions:
   ``cvt_scalef32_pk_*_fp4`` pair-at-a-time family, gfx1250 a pack-of-8), so this
   is a per-target port rather than one shared path.
 * FP8 representation differs by target: OCP E4M3 on gfx950 and E4M3FNUZ on gfx942.
-* On the internode path, ``quant_type`` must be ``"none"``. The config rejects
-  anything else whenever ``world_size > gpu_per_node``, independently of the
-  backend -- the quantized-combine staging path there is incomplete. HIP is
-  simply the only backend that has an internode path today.
+* On the internode path, ``quant_type`` must be ``"none"``, because the
+  internode combine is unquantized. The config rejects anything else whenever
+  ``world_size > gpu_per_node``, independently of the backend. HIP is simply the
+  only backend that has an internode path today.
 * ``gpu_per_node`` determines physical node grouping. A single host cannot
   emulate the two-node internode test by changing world size alone.
 * For internode, ``internode_kernel`` chooses ``"v2"``, ``"v2_ll"`` or
-  ``"auto"``. Auto chooses by the current call's token count, not buffer capacity.
+  ``"auto"``. Auto chooses by the ``max_num_inp_token_across_ranks`` passed to
+  ``dispatch`` (the largest token count any rank passes that call), not by
+  buffer capacity, and runs ``"v2"`` when it is not passed. ``low_latency=True``
+  or ``False`` selects ``"v2_ll"`` or ``"v2"``; see the package guide for what
+  it does on gfx125x intranode.
 
 Validation before tuning
 ------------------------

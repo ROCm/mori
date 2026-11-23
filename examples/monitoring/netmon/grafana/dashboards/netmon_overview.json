@@ -1,0 +1,553 @@
+{
+  "uid": "netmon-overview",
+  "title": "netmon overview",
+  "tags": [
+    "netmon",
+    "ainic"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "2s",
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "experiment",
+        "label": "Experiment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_import_info[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/experiment=\"([^\"]+)\"/",
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\"}[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/host=\"(?<value>(?<text>[^\".]+)[^\"]*)\"/",
+        "refresh": 2,
+        "sort": 7,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "target",
+        "label": "NIC",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(last_over_time(netmon_target_info{experiment=\"$experiment\",host=~\"$host\"}[3650d]))",
+          "refId": "V"
+        },
+        "regex": "/display_host_nic=\"(?<text>[^\"]+)\"|target=\"(?<value>[^\"]+)\"/g",
+        "refresh": 2,
+        "sort": 7,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "min_step",
+        "label": "min step, ms",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "netmon-vm"
+        },
+        "query": {
+          "query": "query_result(max(last_over_time(netmon_step_ms{experiment=\"$experiment\"}[3650d])))",
+          "refId": "V"
+        },
+        "regex": "/\\} ([0-9]+) /",
+        "refresh": 2,
+        "hide": 2
+      }
+    ]
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "transparent": true,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 2
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**<span style='color:#2a78d6'>Blue = send</span>, <span style='color:#eb6834'>orange = receive</span>. Solid = average, dashed = observed peak. Gaps = data unavailable.**"
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "RDMA traffic over the selected time",
+      "description": "One row per NIC. Average send / receive: the average of the observations that end in the selected time range (a long observation crossing the start is counted whole). Click a NIC for its detail page. Data marked 'live' comes from ainic-netmon record --push: an online approximation; where a push failed the average of that time bin may be off. Import the recording (ainic-netmon-import --replace) for the exact numbers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 2,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "label_replace(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic!=\"\"}[3650d]) or label_copy(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\",display_nic=\"\"}[3650d]), \"netdev\", \"display_nic\"), \"host_short\", \"$1\", \"host\", \"([^.]+).*\")",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "sum by (target) (label_value(last_over_time(netmon_target_info{experiment=\"$experiment\",target=~\"$target\"}[3650d]), \"speed_mbps\")) * 1e6 > 0",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum by (target) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[${__range_ms}ms])) / sum by (target) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[${__range_ms}ms]))) * 8",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "netmon": {
+            "source": "rdma",
+            "scale": 8.0,
+            "kind": "range_mean",
+            "counter": "tx_rdma_ucast_bytes"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum by (target) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[${__range_ms}ms])) / sum by (target) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[${__range_ms}ms]))) * 8",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "netmon": {
+            "source": "rdma",
+            "scale": 8.0,
+            "kind": "range_mean",
+            "counter": "rx_rdma_ucast_bytes"
+          }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "target",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "includeByName": {
+              "host_short": true,
+              "display_nic": true,
+              "Value #B": true,
+              "Value #C": true,
+              "Value #D": true,
+              "host": true,
+              "target": true
+            },
+            "indexByName": {
+              "host_short": 0,
+              "display_nic": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "host": 5,
+              "target": 6
+            },
+            "renameByName": {
+              "host_short": "Host",
+              "display_nic": "NIC",
+              "Value #B": "Link",
+              "Value #C": "Average send",
+              "Value #D": "Average receive"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—",
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "NIC"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open NIC detail",
+                    "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}&var-host=${__data.fields.host:percentencode}&var-target=${__data.fields.target:percentencode}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Link"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Average send"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Average receive"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "host"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "target"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "${target:text}",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "netmon-vm"
+      },
+      "interval": "${min_step}ms",
+      "maxDataPoints": 2000,
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 6,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Send",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"tx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Send peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "tx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "(sum without (resolution) (sum_over_time(netmon_increase{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) / sum without (resolution) (sum_over_time(netmon_interval_seconds{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval]))) * 8",
+          "legendFormat": "Receive",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "mean_all"
+          }
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "netmon-vm"
+          },
+          "expr": "max without (resolution) (max_over_time(netmon_rate{experiment=\"$experiment\",target=~\"$target\",source=\"rdma\",counter=\"rx_rdma_ucast_bytes\"}[$__interval])) * 8",
+          "legendFormat": "Receive peak",
+          "range": true,
+          "instant": false,
+          "netmon": {
+            "source": "rdma",
+            "counter": "rx_rdma_ucast_bytes",
+            "scale": 8.0,
+            "kind": "max_all"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 3,
+            "axisSoftMin": 0
+          },
+          "noValue": "No data in this time range",
+          "links": [
+            {
+              "title": "Open NIC detail",
+              "url": "/d/netmon-nic/netmon-nic-detail?var-experiment=${experiment:percentencode}&var-host=${__field.labels.host:percentencode}&var-target=${__field.labels.target:percentencode}&${__url_time_range}"
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Send peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Receive peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "repeat": "target",
+      "repeatDirection": "h",
+      "maxPerRow": 4
+    }
+  ]
+}

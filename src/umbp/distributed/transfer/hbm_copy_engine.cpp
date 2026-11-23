@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -77,7 +78,11 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  common/ (upstream 93f2998a).
 // ---------------------------------------------------------------------------
 
-constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
+// Staging each prewarmed stream starts with.  A long prefix read across every
+// layer reaches 8192 fragments; a bigger batch regrows its stream's staging.
+constexpr size_t kPrewarmGatherFragments = 8192;
+// Large enough that hipMemcpy uses a copy engine rather than a CPU write.
+constexpr size_t kPrewarmCopyBytes = 4ULL << 20;
 
 // Mirrors device_gather.hip's kVectorBytes.  Used ONLY to report, in debug
 // mode, whether a segment would take the kernel's uint4 fast path or fall to
@@ -264,26 +269,83 @@ void LogPlanGeometry(const char* path, size_t plan_index, const TransferPlan& pl
   }
 }
 
-// One non-blocking stream per device, per thread.  Submit runs on PoolClient's
-// executor threads, so a shared stream would serialize copies that the
-// hipMemcpy path ran independently.
-std::map<int, hipStream_t>& GatherStreams() {
-  static thread_local std::map<int, hipStream_t>* streams = new std::map<int, hipStream_t>();
-  return *streams;
-}
-
-hipStream_t GatherStream(int device_id) {
-  auto& streams = GatherStreams();
-  auto it = streams.find(device_id);
-  if (it != streams.end()) return it->second;
-  hipStream_t stream = nullptr;
-  if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
-    (void)hipGetLastError();
-    return nullptr;
+// Non-blocking gather streams, pooled per device and lent to one gather at a
+// time, so concurrent copies still run on separate streams.  They are not tied
+// to the calling thread: the standalone server calls Submit from gRPC's sync
+// pool, which retires and spawns threads under load, and every HIP stream holds
+// ~6.4 MiB of device memory for its kernarg pool.  Kept per thread, they leaked
+// until the GPU was full and stream creation failed (which HIP 7.2 turns into a
+// segfault).  A device's pool grows only to its peak number of concurrent
+// gathers, or, once a cap is set, to the cap: past it a gather waits for a
+// stream instead of creating one, because creating one allocates device
+// memory, and with the GPU full that can stall for seconds.  Never destroyed:
+// worker threads can still be copying during static teardown.
+class GatherStreamPool {
+ public:
+  static GatherStreamPool& Instance() {
+    static GatherStreamPool* pool = new GatherStreamPool();
+    return *pool;
   }
-  streams.emplace(device_id, stream);
-  return stream;
-}
+
+  // Streams per device; 0, the default, means no cap.
+  void SetCap(size_t cap) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cap_ = cap;
+  }
+
+  // The current device must already be `device_id`.  nullptr if no stream is
+  // free and a new one cannot be created.
+  hipStream_t Acquire(int device_id) {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      Device& device = devices_[device_id];
+      device.returned.wait(lock,
+                           [&] { return !device.idle.empty() || cap_ == 0 || device.live < cap_; });
+      if (!device.idle.empty()) {
+        hipStream_t stream = device.idle.back();
+        device.idle.pop_back();
+        return stream;
+      }
+      ++device.live;
+    }
+    hipStream_t stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+      (void)hipGetLastError();
+      Discard(device_id);
+      return nullptr;
+    }
+    created_.fetch_add(1, std::memory_order_relaxed);
+    return stream;
+  }
+
+  void Release(int device_id, hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Device& device = devices_[device_id];
+    device.idle.push_back(stream);
+    device.returned.notify_one();
+  }
+
+  // For an acquired stream that will not be released.
+  void Discard(int device_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Device& device = devices_[device_id];
+    --device.live;
+    device.returned.notify_one();
+  }
+
+  uint64_t Created() const { return created_.load(std::memory_order_relaxed); }
+
+ private:
+  struct Device {
+    std::vector<hipStream_t> idle;
+    size_t live = 0;  // created and not discarded
+    std::condition_variable returned;
+  };
+  std::mutex mutex_;
+  std::map<int, Device> devices_;
+  size_t cap_ = 0;
+  std::atomic<uint64_t> created_{0};
+};
 
 // Latches on the first gather failure and never tries again.  A kernel that
 // cannot launch here will not start working later, and the fallback is always
@@ -291,6 +353,36 @@ hipStream_t GatherStream(int device_id) {
 std::atomic<bool>& GatherDisabled() {
   static std::atomic<bool> disabled{false};
   return disabled;
+}
+
+// Whether a kernel on `kernel_device` may dereference memory that lives on
+// `other`. Peer access makes it so, for ordinary and VMM allocations alike and
+// for a buffer another process shared over IPC. It is enabled once per ordered
+// pair, the first time a copy between the two GPUs comes up, and the answer is
+// kept; a pair without it keeps hipMemcpy.
+bool PeerAccessReady(int kernel_device, int other) {
+  static std::mutex* mutex = new std::mutex();
+  static auto* ready = new std::map<std::pair<int, int>, bool>();
+  std::lock_guard<std::mutex> lock(*mutex);
+  const auto key = std::make_pair(kernel_device, other);
+  auto found = ready->find(key);
+  if (found != ready->end()) return found->second;
+  bool ok = false;
+  int previous = -1;
+  (void)hipGetDevice(&previous);
+  if (hipSetDevice(kernel_device) == hipSuccess) {
+    int can = 0;
+    if (hipDeviceCanAccessPeer(&can, kernel_device, other) == hipSuccess && can != 0) {
+      const hipError_t status = hipDeviceEnablePeerAccess(other, 0);
+      ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
+    }
+  }
+  (void)hipGetLastError();
+  if (previous >= 0) (void)hipSetDevice(previous);
+  MORI_UMBP_INFO("[HbmCopyEngine] gather across GPUs {} -> {}: {}", other, kernel_device,
+                 ok ? "enabled" : "unavailable, keeping hipMemcpy");
+  (*ready)[key] = ok;
+  return ok;
 }
 
 // Which device a plan's copies should run on.  A D2D pair between two devices
@@ -339,37 +431,6 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
-namespace {
-// Merges adjacent ranges, but a segment never crosses a host registration piece.
-void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
-  const bool host_is_src = !IsGpu(item.src);
-  const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
-  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
-                              : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
-                                            : 0;
-  const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-    return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
-  };
-  size_t so = static_cast<size_t>(item.src_offset);
-  size_t dof = static_cast<size_t>(item.dst_offset);
-  size_t remaining = static_cast<size_t>(item.size);
-  while (remaining > 0) {
-    size_t sz = remaining;
-    if (host_base != 0) {
-      const uintptr_t host = host_base + (host_is_src ? so : dof);
-      sz = std::min<size_t>(sz, piece - host % piece);
-    }
-    const bool same_piece =
-        host_base == 0 || plan->sizes.empty() ||
-        host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
-    AppendSegment(plan, so, dof, sz, item.tag, same_piece);
-    so += sz;
-    dof += sz;
-    remaining -= sz;
-  }
-}
-}  // namespace
-
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   const size_t piece = HostRegistrationChunkBytes();
@@ -398,6 +459,63 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
   return nullptr;
 }
 
+uint64_t HbmCopyEngine::GatherStreamsCreated() { return GatherStreamPool::Instance().Created(); }
+
+void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
+  if (gather_streams_per_device == 0) return;
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess) {
+    (void)hipGetLastError();
+    return;
+  }
+  // The null stream is warmed either way: with the kernel off, every copy
+  // takes the hipMemcpy fallback.
+  const bool gather = !GatherDisabled().load(std::memory_order_relaxed) && DeviceGatherEnabled();
+  int previous_device = 0;
+  (void)hipGetDevice(&previous_device);
+  if (gather) GatherStreamPool::Instance().SetCap(gather_streams_per_device);
+  size_t warmed = 0;
+  for (int device_id = 0; device_id < devices; ++device_id) {
+    if (hipSetDevice(device_id) != hipSuccess) {
+      (void)hipGetLastError();
+      continue;
+    }
+    // All of a device's streams are held until the null stream's copies are
+    // done, so that each upload and each of those copies is given a copy engine
+    // of its own: with the pool capped, these are the engines a copy can ever
+    // be given, and their queues are the only SDMA queues created.
+    std::vector<hipStream_t> streams;
+    for (size_t i = 0; gather && i < gather_streams_per_device; ++i) {
+      hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
+      if (stream == nullptr) break;
+      streams.push_back(stream);
+      (void)PrewarmDeviceGather(device_id, stream, kPrewarmGatherFragments);
+    }
+    void* host_bytes = nullptr;
+    void* device_bytes = nullptr;
+    if (hipHostMalloc(&host_bytes, kPrewarmCopyBytes, hipHostMallocDefault) == hipSuccess &&
+        hipMalloc(&device_bytes, kPrewarmCopyBytes) == hipSuccess) {
+      // The hipMemcpy fallback runs on the null stream.
+      (void)hipMemcpy(device_bytes, host_bytes, kPrewarmCopyBytes, hipMemcpyHostToDevice);
+      (void)hipMemcpy(host_bytes, device_bytes, kPrewarmCopyBytes, hipMemcpyDeviceToHost);
+    }
+    for (hipStream_t stream : streams) {
+      if (hipStreamSynchronize(stream) == hipSuccess) {
+        GatherStreamPool::Instance().Release(device_id, stream);
+        ++warmed;
+      } else {
+        (void)hipGetLastError();
+        GatherStreamPool::Instance().Discard(device_id);
+      }
+    }
+    if (device_bytes != nullptr) (void)hipFree(device_bytes);
+    if (host_bytes != nullptr) (void)hipHostFree(host_bytes);
+    (void)hipGetLastError();
+  }
+  (void)hipSetDevice(previous_device);
+  MORI_UMBP_INFO("[HbmCopyEngine] prewarmed {} gather streams on {} devices", warmed, devices);
+}
+
 // Run the gather kernel over every eligible segment in the batch, and report
 // which plans it completed.
 //
@@ -408,7 +526,9 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
 // small-fragment batch the kernel wins on.  Direction does not partition the
 // buckets either: once the host side is registered both endpoints are
 // dereferenceable from the device, so one kernel can carry H2D and D2H
-// fragments at once.
+// fragments at once.  D2D joins the same bucket with nothing to register: both
+// of its endpoints are device addresses already, and between two GPUs peer
+// access lets the destination's kernel read the source's.
 //
 // Never reports a plan it did not fully complete.  Anything declined or failed
 // is left for the hipMemcpy loop, which reaches the same result whether or not
@@ -421,8 +541,12 @@ const char* HbmCopyEngine::GatherSkipName(GatherSkip reason) {
       return "unrecorded";
     case GatherSkip::kDisabled:
       return "gather-disabled";
-    case GatherSkip::kKindNotHostDevice:
-      return "kind-not-h2d-or-d2h";
+    case GatherSkip::kHostToHost:
+      return "kind-h2h";
+    case GatherSkip::kAcrossDevices:
+      return "d2d-across-devices";
+    case GatherSkip::kEndpointsOverlap:
+      return "d2d-endpoints-overlap";
     case GatherSkip::kNoDevice:
       return "no-device";
     case GatherSkip::kHostNotGatherable:
@@ -463,23 +587,45 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     std::vector<DeviceGatherFragment> fragments;
     std::vector<size_t> plan_indices;
     size_t total_bytes = 0;
-    // Debug-only shape.  A bucket may legitimately mix directions: once the
-    // host side is registered both endpoints are device-dereferenceable, so
-    // one kernel can carry H2D and D2H fragments at once.
+    // Debug-only shape.  A bucket may legitimately mix directions: every
+    // endpoint in it is device-dereferenceable, so one kernel can carry H2D,
+    // D2H and D2D fragments at once.
     size_t min_fragment = std::numeric_limits<size_t>::max();
     size_t max_fragment = 0;
     size_t h2d_fragments = 0;
     size_t d2h_fragments = 0;
+    size_t d2d_fragments = 0;
   };
   std::map<int, Bucket> buckets;
 
   for (size_t p = 0; p < plans.size(); ++p) {
     const auto& plan = plans[p];
     const hipMemcpyKind kind = KindFor(plan.src, plan.dst);
-    // D2D has no host side to register, and H2H never reaches this engine.
-    if (kind != hipMemcpyHostToDevice && kind != hipMemcpyDeviceToHost) {
-      note(p, GatherSkip::kKindNotHostDevice);
+    if (kind == hipMemcpyHostToHost) {  // never reaches this engine
+      note(p, GatherSkip::kHostToHost);
       continue;
+    }
+    const bool device_to_device = kind == hipMemcpyDeviceToDevice;
+    if (device_to_device) {
+      // Within one GPU both endpoints are addresses its kernel can use as they
+      // are.  Between two GPUs the kernel runs on the destination's and reads
+      // the source's memory, which peer access allows; without it those copies
+      // stay with hipMemcpy.
+      if (plan.src.device < 0 || plan.dst.device < 0 ||
+          (plan.src.device != plan.dst.device &&
+           !PeerAccessReady(plan.dst.device, plan.src.device))) {
+        note(p, GatherSkip::kAcrossDevices);
+        continue;
+      }
+      // The kernel copies every fragment at once, so a plan that reads what it
+      // also writes has no defined result.  Different allocations never
+      // overlap; a copy inside one allocation keeps hipMemcpy's ordering.
+      const auto src_base = reinterpret_cast<uintptr_t>(plan.src.host_ptr);
+      const auto dst_base = reinterpret_cast<uintptr_t>(plan.dst.host_ptr);
+      if (src_base < dst_base + plan.dst.size && dst_base < src_base + plan.src.size) {
+        note(p, GatherSkip::kEndpointsOverlap);
+        continue;
+      }
     }
     const int device_id = DeviceFor(plan);
     if (device_id < 0) {
@@ -498,6 +644,11 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     for (size_t i = 0; i < plan.sizes.size() && eligible; ++i) {
       const void* fragment_src = src + plan.src_offsets[i];
       void* fragment_dst = dst + plan.dst_offsets[i];
+      if (device_to_device) {
+        fragments.push_back({fragment_src, fragment_dst, plan.sizes[i]});
+        plan_bytes += plan.sizes[i];
+        continue;
+      }
       const void* host_side = host_is_src ? fragment_src : fragment_dst;
       // A kernel cannot dereference plain mmap memory — it faults the GPU — so
       // an uncovered host side disqualifies the whole plan. Nor can it use the
@@ -528,7 +679,9 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       bucket.min_fragment = std::min(bucket.min_fragment, fragment.bytes);
       bucket.max_fragment = std::max(bucket.max_fragment, fragment.bytes);
     }
-    (host_is_src ? bucket.h2d_fragments : bucket.d2h_fragments) += fragments.size();
+    (device_to_device ? bucket.d2d_fragments
+     : host_is_src    ? bucket.h2d_fragments
+                      : bucket.d2h_fragments) += fragments.size();
     bucket.fragments.insert(bucket.fragments.end(), fragments.begin(), fragments.end());
     bucket.plan_indices.push_back(p);
     bucket.total_bytes += plan_bytes;
@@ -549,7 +702,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kTooFewFragments);
       continue;
     }
-    if (bucket.total_bytes / bucket.fragments.size() >= kGatherFragmentThreshold) {
+    if (!GatherShapeEligible(bucket.fragments.size(), bucket.total_bytes)) {
       note_bucket(GatherSkip::kFragmentAtOrAboveThreshold);
       continue;
     }
@@ -558,7 +711,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kSetDeviceFailed);
       continue;
     }
-    hipStream_t stream = GatherStream(device_id);
+    hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
     if (stream == nullptr) {
       note_bucket(GatherSkip::kNoStream);
       continue;
@@ -569,21 +722,24 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     // perturb what is being measured.
     const auto started = std::chrono::steady_clock::now();
     if (!LaunchDeviceGather(bucket.fragments.data(), bucket.fragments.size(), device_id, stream)) {
+      GatherStreamPool::Instance().Release(device_id, stream);
       note_bucket(GatherSkip::kLaunchFailed);
       continue;
     }
     const hipError_t sync = hipStreamSynchronize(stream);
     if (sync != hipSuccess) {
       // Latch off: a kernel that cannot complete here will not start working
-      // later, and every caller still has the fallback.
+      // later, and every caller still has the fallback.  The stream is dropped
+      // rather than returned to the pool.
       (void)hipGetLastError();
+      GatherStreamPool::Instance().Discard(device_id);
       GatherDisabled().store(true, std::memory_order_relaxed);
-      GatherStreams().erase(device_id);
       MORI_UMBP_ERROR("[HbmCopyEngine] gather sync dev={} failed: {}", device_id,
                       hipGetErrorString(sync));
       note_bucket(GatherSkip::kSyncFailed);
       continue;
     }
+    GatherStreamPool::Instance().Release(device_id, stream);
     for (size_t p : bucket.plan_indices) done[p] = 1;
     if (!debug) continue;
 
@@ -593,10 +749,10 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     note_bucket(GatherSkip::kTaken);
     if (!DebugSampleThisCall()) continue;
     MORI_UMBP_INFO(
-        "[HbmCopyEngine][dbg] path=gather dev={} plans={} segs={} h2d={} d2h={} bytes={} "
+        "[HbmCopyEngine][dbg] path=gather dev={} plans={} segs={} h2d={} d2h={} d2d={} bytes={} "
         "seg_min={} seg_mean={} seg_max={} seconds={:.6f} GiBps={:.3f}",
         device_id, bucket.plan_indices.size(), bucket.fragments.size(), bucket.h2d_fragments,
-        bucket.d2h_fragments, bucket.total_bytes, bucket.min_fragment,
+        bucket.d2h_fragments, bucket.d2d_fragments, bucket.total_bytes, bucket.min_fragment,
         bucket.total_bytes / bucket.fragments.size(), bucket.max_fragment, seconds,
         GiBps(bytes, seconds));
     for (size_t p : bucket.plan_indices) LogPlanGeometry("gather", p, plans[p], device_id);
@@ -659,13 +815,27 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     //
     // hipMemcpy is BLOCKING, so this loop is already launch-to-completion and
     // the debug clock below needs no synchronize of its own.
+    //
+    // Coalesce adjacent segments before issuing hipMemcpy.  When DRAM pages are
+    // sequential in both source and destination (the common case: a key's pages
+    // occupy a contiguous run in both the DRAM pool buffer and the caller's GPU
+    // buffer) each run merges into one large call.  This is critical on the H2D
+    // pageable path: hipMemcpy without hipHostRegister allocates a temporary
+    // pinned staging buffer per call, and the per-call overhead dominates for
+    // small (e.g. 64 KiB) pages — 32,000 calls × ~50 µs ≈ 1.6 s for 500 keys.
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
-    for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i], kind);
+    const size_t piece = HostRegistrationChunkBytes();
+    for (size_t i = 0; i < plan.sizes.size();) {
+      // Never across a host registration piece: the builder split there, and a
+      // merged call fails with "invalid argument" (CoalescedRunEnd).
+      size_t coalesced = 0;
+      const size_t j = CoalescedRunEnd(plan, i, piece, &coalesced);
+      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
-      plan_bytes += plan.sizes[i];
+      plan_bytes += coalesced;
+      i = j;
     }
     if (debug && err == hipSuccess) {
       const double seconds = Seconds(started, std::chrono::steady_clock::now());

@@ -35,7 +35,8 @@ struct DeviceGatherFragment {
 };
 
 // Copies `count` independent fragments between a HostTierRegistration-covered
-// region and one GPU in a single kernel launch, in either direction.
+// region and one GPU in a single kernel launch, in either direction, or between
+// two GPU buffers: on that GPU, or one of them on a GPU it has peer access to.
 //
 // This exists because the DRAM tier's copy path is scatter-gather by nature:
 // reading one layer out of page-granular objects means dozens of small strided
@@ -49,12 +50,24 @@ struct DeviceGatherFragment {
 // Only worth it below roughly 128 KiB per fragment. Above that the copy engine
 // wins, because one large hipMemcpyAsync already amortizes its submission.
 //
-// The host side must be inside a HostTierRegistration-covered range: a kernel
-// cannot dereference plain mmap memory at all, it faults. Returns false before
+// A host side must be inside a HostTierRegistration-covered range: a kernel
+// cannot dereference plain mmap memory at all, it faults. Fragments are copied
+// concurrently, so no fragment may read what another writes. Returns false before
 // enqueueing any work when the launch could not be issued, so the caller can
 // fall back to hipMemcpy.
+//
+// The descriptors are staged in a buffer kept per `stream`, so the caller must
+// not use `stream` from another thread until it has synchronized this launch.
 bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
                         hipStream_t stream);
+
+// Sizes `stream`'s descriptor staging for `capacity` fragments and runs an
+// empty gather on it, so that a later LaunchDeviceGather of up to `capacity`
+// fragments allocates nothing.  The whole staging buffer is uploaded, which
+// makes the upload large enough to take a copy engine as a real batch's does.
+// Same contract as LaunchDeviceGather: the current device must be `device_id`,
+// and the caller synchronizes `stream`.
+bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity);
 
 // Whether the gather kernel path is compiled in and not disabled via
 // UMBP_DRAM_GATHER_KERNEL=0.

@@ -47,6 +47,27 @@ namespace fs = std::filesystem;
 // Module
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// A code object loads only on the arch it targets: refuse another before compiling it.
+void CheckLoadableArch(int dev, const std::string& target) {
+  const std::string devArch = DeviceArch(dev);
+  if (devArch.empty() || devArch == target.substr(0, target.find(':'))) return;
+  const std::string source = ActiveArchSource();
+  std::string msg = "mori jit: building for " + target + " (set by " + source + "), but device " +
+                    std::to_string(dev) + " is " + devArch +
+                    " and a code object loads only on the arch it targets";
+  if (target.rfind("gfx1250", 0) == 0 && devArch.rfind("gfx1250", 0) == 0)
+    msg += " (gfx1250 and gfx1250-strict are separate targets)";
+  if (source != "device 0")
+    msg +=
+        ". Leave arch= and MORI_JIT_ARCH unset to build for the device; they are for "
+        "describe() and precompile()";
+  throw std::runtime_error(msg);
+}
+
+}  // namespace
+
 Module::Module(const std::string& hsacoPath, std::string entry)
     : path_(hsacoPath), entryName_(std::move(entry)) {
   hipError_t err = hipModuleLoad(&module_, hsacoPath.c_str());
@@ -174,7 +195,7 @@ Compiler& Compiler::Instance() {
 
 std::string Compiler::CacheDirFor(const std::string& name, const std::string& code,
                                   const std::vector<std::string>& sourceDeps) const {
-  const Toolchain& tc = GetToolchain();
+  const Toolchain tc = ActiveToolchain();
 
   Sha256 h;
   h.Update(name);
@@ -202,7 +223,7 @@ std::string Compiler::CacheDirFor(const std::string& name, const std::string& co
 
 std::string Compiler::EnsureCompiled(const std::string& name, const std::string& code,
                                      const std::vector<std::string>& sourceDeps) {
-  const Toolchain& tc = GetToolchain();
+  const Toolchain tc = ActiveToolchain();
   const std::string dir = CacheDirFor(name, code, sourceDeps);
 
   if (!CacheEntryValid(dir)) {
@@ -284,6 +305,7 @@ std::shared_ptr<Module> Compiler::Build(const std::string& name, const std::stri
     if (it != impl.modules.end()) return it->second;
   }
 
+  CheckLoadableArch(dev, ActiveArch());
   const std::string dir = EnsureCompiled(name, code, sourceDeps);
 
   auto mod = std::make_shared<Module>(dir + "/" + kObjectFile, entry);

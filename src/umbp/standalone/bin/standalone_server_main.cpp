@@ -33,6 +33,7 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -41,7 +42,9 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
 #include "umbp/common/fd_limit.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 
@@ -198,6 +201,20 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES",
+                    &dist.ranged_scratch_use_hugepages, error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_HUGEPAGE_SIZE",
+                    &dist.ranged_scratch_hugepage_size, error)) {
+    return false;
+  }
+  // Every GPU on the node shares this server's arenas.
+  dist.ranged_scratch_numa_layout = true;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA", &dist.ranged_scratch_numa_layout,
+                    error)) {
+    return false;
+  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;
@@ -240,6 +257,21 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT", &dist.remote_single_flight, error)) {
+    return false;
+  }
+  size_t single_flight_wait_ms = dist.remote_single_flight_wait_ms;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT_WAIT_MS", &single_flight_wait_ms,
+                    error)) {
+    return false;
+  }
+  if (single_flight_wait_ms > std::numeric_limits<uint32_t>::max()) {
+    *error = "UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT_WAIT_MS is out of range";
+    return false;
+  }
+  dist.remote_single_flight_wait_ms = static_cast<uint32_t>(single_flight_wait_ms);
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES", &dist.prefetch_budget_bytes, error))
+    return false;
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
@@ -259,6 +291,18 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Backend and GPU initialization create threads. They must inherit the mask
+  // so SIGTERM reaches the waiter and shutdown can withdraw Indexer residency.
+  sigset_t signal_set;
+  sigemptyset(&signal_set);
+  sigaddset(&signal_set, SIGINT);
+  sigaddset(&signal_set, SIGTERM);
+  const int block_rc = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
+  if (block_rc != 0) {
+    MORI_UMBP_ERROR("[StandaloneServer] failed to block signals: {}", std::strerror(block_rc));
+    return 1;
+  }
+
   mori::umbp::RaiseOpenFileLimit();
   mori::umbp::UMBPConfig config = mori::umbp::UMBPConfig::FromEnvironment();
   config.role = mori::umbp::UMBPRole::Standalone;
@@ -286,22 +330,20 @@ int main(int argc, char** argv) {
     address = mori::umbp::standalone::DefaultStandaloneAddress();
   }
 
+  // Before the server exists: registering its host pool, which carries on in
+  // the background, would slow each queue creation here to about a second.
+  // 8 covers the peak number of concurrent gathers per GPU under TP8 serving;
+  // 0 turns the prewarm off.
+  if (!config.sim.enabled) {
+    mori::umbp::HbmCopyEngine::Prewarm(
+        mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
+  }
+
   std::unique_ptr<mori::umbp::standalone::StandaloneServer> server;
   try {
     server = std::make_unique<mori::umbp::standalone::StandaloneServer>(config, address);
   } catch (const std::exception& exc) {
     MORI_UMBP_ERROR("[StandaloneServer] backend initialization failed: {}", exc.what());
-    return 1;
-  }
-
-  sigset_t signal_set;
-  sigemptyset(&signal_set);
-  sigaddset(&signal_set, SIGINT);
-  sigaddset(&signal_set, SIGTERM);
-
-  const int block_rc = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
-  if (block_rc != 0) {
-    MORI_UMBP_ERROR("[StandaloneServer] failed to block signals: {}", std::strerror(block_rc));
     return 1;
   }
 

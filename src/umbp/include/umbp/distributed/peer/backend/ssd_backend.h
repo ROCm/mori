@@ -80,6 +80,8 @@ class SsdBackend : public MediumBackend {
   };
 
   explicit SsdBackend(Config cfg);
+  SsdBackend(Config cfg, std::unique_ptr<PeerSsdManager> manager,
+             std::unique_ptr<PageMemorySource> staging_source);
   ~SsdBackend() override;
 
   SsdBackend(const SsdBackend&) = delete;
@@ -116,18 +118,30 @@ class SsdBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override;
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
+  // Checks the staging lease a remote reader read from, not the record on disk:
+  // the reader's pages point into staging.
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override;
+  // Also counts the reader out of each staging lease it names.  When the last
+  // remote reader of a lease is out, the lease is expired on the spot, so the
+  // span returns to the arena at the next reap or the next span search that
+  // finds no room, not a full read_lease_ttl later.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's order (the file tier's segment order, or its LRU) minus keys
   // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
   bool OwnsEvictionOrder() const override;
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -169,15 +183,78 @@ class SsdBackend : public MediumBackend {
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
     std::shared_ptr<const void> hold;  // copied into each kLocal hit
+    // ResolvedEntry::generation for this staging span.  The span goes back to
+    // the arena only with the lease, so a lease that still carries it still
+    // holds the bytes a remote reader was told about.
+    uint64_t generation = 0;
+    // Remote resolve answers that named this lease and have not been finished
+    // (BatchFinishReads).  Reaching 0 expires the lease early.  A reader that
+    // never finishes leaves it above 0, and the lease to expires_at.
+    uint32_t remote_readers = 0;
   };
+
+  // A lease ClearLocal took while a local reader still held it; freed once
+  // those holds are gone.
+  struct ExtentStage {
+    StagingSpan span;
+    ObjectExtent window;
+    std::shared_ptr<const void> hold;
+  };
+
+  // Spans handed back by their last hold, on their own lock so a reader never
+  // waits on mutex_ to return one.
+  struct ReturnedSpans {
+    std::mutex mu;
+    std::vector<StagingSpan> spans;
+    std::atomic<size_t> count{0};
+    void Return(StagingSpan span);
+  };
+
+  // The hold on a span holding only object bytes `window` (D1): it goes back
+  // when the last reader drops it.
+  struct ExtentHold {
+    ExtentHold(std::shared_ptr<ReturnedSpans> to, StagingSpan s) : sink(std::move(to)), span(s) {}
+    ~ExtentHold() { sink->Return(span); }
+    std::shared_ptr<ReturnedSpans> sink;
+    StagingSpan span;
+  };
+  static constexpr uint64_t kExtentAlign = 4096;  // the SSD record alignment
+
+  // One local staged read of a key (+ window) that other local resolves of the
+  // same bytes join instead of staging their own copy: the TP ranks of a
+  // replicated-KV model ask for identical extents at once.  Guarded by mutex_.
+  class SharedStage {
+   public:
+    // `entry` must stay put until Wait returns.
+    void Join(ResolvedEntry* entry) { joiners_.push_back(entry); }
+    // Hands every joiner the outcome and a hold; true if later resolves may still attach.
+    bool Finish(ResolveOutcome outcome, StagingSpan staged, uint64_t object_size,
+                ObjectExtent staged_window, const std::shared_ptr<const void>& reader_hold);
+    // False on timeout: `entry` gets kBusy and stops being a joiner.
+    bool Wait(std::unique_lock<std::mutex>& lock, ResolvedEntry* entry);
+
+    bool done = false;
+    StagingSpan span;  // a done extent's, for late joiners
+    uint64_t size = 0;
+    ObjectExtent window;
+    std::weak_ptr<const void> hold;  // joinable while any reader still holds it
+
+   private:
+    std::condition_variable cv_;
+    std::vector<ResolvedEntry*> joiners_;  // in waiting calls' results
+  };
+  static constexpr std::chrono::seconds kJoinWait{30};
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
-  // Caller MUST hold mutex_.  Frees every read lease that has expired and has
-  // no hold left; returns how many.
+  // Caller MUST hold mutex_.  Frees every returned span, every read lease that
+  // has expired and has no hold left, and every extent stage with no hold left;
+  // returns how many.
   size_t ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now);
+  // Caller MUST hold mutex_.  Frees the spans in returned_; returns how many.
+  size_t DrainReturnedSpansLocked();
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -214,10 +291,16 @@ class SsdBackend : public MediumBackend {
   TransferRef buffer_ref_;
   std::vector<uint8_t> buffer_desc_;
   std::vector<bool> staging_page_used_;
+  uint32_t staging_cursor_ = 0;  // next-fit: where the last span search stopped
+  std::shared_ptr<ReturnedSpans> returned_ = std::make_shared<ReturnedSpans>();
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
+  std::vector<ExtentStage> extent_stages_;
+  // Key (+ window) -> its local staged read: in flight, or an extent still held.
+  std::unordered_map<std::string, std::shared_ptr<SharedStage>> shared_stages_;
+  bool extent_staging_ = false;  // set at Init (UMBP_SSD_EXTENT_STAGING)
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records
   // through the file->GPU GdsEngine instead of the staging arena.  Off by
@@ -244,7 +327,14 @@ class SsdBackend : public MediumBackend {
   // slot_full_rejects_ is the one to watch: it counts resolve batches that
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
+  // Puts refused because the arena had no span for them.  The master routes
+  // the next put the same way, so without this a full arena fails puts silently.
+  std::atomic<uint64_t> put_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
+  // Leases their last remote reader ended before the timer did.
+  std::atomic<uint64_t> staging_reader_releases_{0};
+  std::atomic<uint64_t> extent_stages_total_{0};  // extent-scoped device reads
+  std::atomic<uint64_t> extent_stage_bytes_{0};   // their window bytes
   // Migration pins (a source read, or a target after commit): file range or staging.
   std::atomic<uint64_t> migrations_in_place_{0};
   std::atomic<uint64_t> migrations_staged_{0};

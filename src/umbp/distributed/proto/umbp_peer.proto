@@ -24,6 +24,9 @@ service UMBPPeer {
   rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
   rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
   rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
+  // Check-after-read for remote readers: a reader that copied bytes out of a
+  // resolved key asks whether that copy was still the key's when it finished.
+  rpc ValidateReads     (ValidateReadsRequest)      returns (ValidateReadsResponse);
 }
 
 // ============================================================
@@ -72,6 +75,11 @@ message AllocateSlotRequest {
   // backend registered for `tier`.
   optional string backend_name = 4;
   string logical_tier = 5;
+  // The NUMA node the writer's source lives on (its GPU's, or its staging
+  // arena's).  A peer whose DRAM tier has one buffer per node prefers the
+  // buffer on that node, so the reader that wrote the object fetches it through
+  // NICs on the same node index at both ends.  Absent: no preference.
+  optional int32 preferred_numa_node = 6;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with
@@ -84,6 +92,9 @@ enum AllocateSlotOutcome {
   ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
   ALLOCATE_SLOT_OUTCOME_FAILED                 = 3;  // generic — see peer log for reason
   ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE        = 4;  // tier exhausted; retry on another peer
+  // Another writer holds this key's pending slot and its commit stores the
+  // bytes, so the writer counts the key as stored, as a local put does.
+  ALLOCATE_SLOT_OUTCOME_IN_FLIGHT              = 5;
 }
 
 message AllocateSlotResponse {
@@ -237,4 +248,29 @@ message BatchResolveKeysResponse {
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;
   repeated uint32 page_index   = 8;
+  // Per key: which copy the pages above belong to.  A medium draws a fresh
+  // value every time it fills a slot or staging span, so the same key read
+  // twice names the same copy only if nothing was freed or reused between.
+  // The reader hands it back in ValidateReads.  0 = this medium does not stamp
+  // copies (nothing to check); absent entirely = an old peer.
+  repeated uint64 generation = 11;
+}
+
+// Parallel arrays, one entry per key read.  backend_id and generation are the
+// values the same peer returned in BatchResolveKeysResponse.
+message ValidateReadsRequest {
+  repeated string keys       = 1;
+  repeated uint32 backend_id = 2;
+  repeated uint64 generation = 3;
+  // The reader is done with every copy listed, read or not: the peer may stop
+  // holding them for it now rather than when the read lease runs out.  Each
+  // resolve answer a reader keeps is listed once.  An old reader never sets
+  // this, and what it resolved waits out the lease as before.
+  bool release = 4;
+}
+
+message ValidateReadsResponse {
+  // Parallel to request.keys.  False: the copy was freed or replaced while the
+  // reader was copying, so what it read may be another key's bytes.
+  repeated bool still_valid = 1;
 }

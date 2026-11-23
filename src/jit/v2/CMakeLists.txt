@@ -7,7 +7,8 @@ target_include_directories(mori_jit PUBLIC ${CMAKE_SOURCE_DIR}/include)
 
 # hip::host only — the HIP runtime API, no device compilation. mori_jit must
 # keep building with a plain C++ compiler; see docs/MORI_JIT_V2_DESIGN.md §3.5.
-target_link_libraries(mori_jit PUBLIC mori_logging hip::host)
+# dladdr lives in libdl below glibc 2.34, which the manylinux wheels target.
+target_link_libraries(mori_jit PUBLIC mori_logging hip::host ${CMAKE_DL_LIBS})
 
 # Development builds can find the kernel sources without an env var. Wheel
 # installs fall back to the packaged _jit-sources next to the .so.

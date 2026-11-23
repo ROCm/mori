@@ -57,3 +57,11 @@ if(WITH_MPI)
 endif()
 
 target_include_directories(mori_collective PUBLIC ${CMAKE_SOURCE_DIR}/include)
+
+# Find libmori_shmem/libmori_application beside it, like the other packaged
+# libraries; a build-tree RUNPATH makes auditwheel vendor second copies of both.
+set_target_properties(
+  mori_collective
+  PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+             BUILD_WITH_INSTALL_RPATH TRUE)

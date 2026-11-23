@@ -100,9 +100,13 @@ class IOEngine:
                 config = mori_cpp.FabricBackendConfig()
             elif type is mori_cpp.BackendType.OFI:
                 config = mori_cpp.OfiBackendConfig()
+            elif type is mori_cpp.BackendType.TCP:
+                config = mori_cpp.TcpBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
         result = self._engine.CreateBackend(type, config)
+        if mori_cpp.io_sim_enabled():
+            return result
         if type is mori_cpp.BackendType.XGMI:
             self._load_scatter_gather_kernel()
         elif type is mori_cpp.BackendType.FABRIC:
@@ -243,6 +247,37 @@ class IOEngine:
         None means nothing has been observed to fail, not that peers are healthy.
         """
         return self._engine.PopPeerFailure()
+
+    def fence_remote_engine(self, engine_key: str) -> "mori_cpp.FenceResult":
+        """Cut a peer off from this engine's memory.
+
+        Afterwards none of the peer's connections can deliver another write, so
+        buffers it was targeting can be reused. Only trust that when the result
+        has ``ok`` set; ``endpoints_failed > 0`` means the peer may still write.
+        Paths that cannot be cut count as failed endpoints: an XGMI mapping, a
+        fabric import, or an OFI key of memory this engine registered, which any
+        peer may hold, registered with this engine or not. Otherwise fencing a peer
+        this engine has no connection to is ok and a no-op.
+
+        The peer stays fenced: it cannot reconnect, in either direction, until
+        ``unfence_remote_engine``. Otherwise a peer that noticed its connection
+        died would rebuild it and land the writes it still had queued.
+        """
+        return self._engine.FenceRemoteEngine(engine_key)
+
+    def unfence_remote_engine(self, engine_key: str) -> bool:
+        """Let a fenced peer connect again; True if it was fenced.
+
+        Call this once nothing the peer still has in flight can reach buffers that
+        were handed out, for example after telling it to abort the request.
+
+        The peer is told which of its QPs the fence killed, so it rebuilds them on
+        its next transfer, even ones it has not used since, instead of pacing their
+        replacement (up to 60 s after repeated fences). That is best effort and
+        waits at most the control-plane timeout for an unreachable peer. QPs a
+        fence could not kill are tried again by the next fence.
+        """
+        return self._engine.UnfenceRemoteEngine(engine_key)
 
     def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
         return self._engine.WaitAll(statuses, timeout_ms)

@@ -108,6 +108,7 @@ std::map<std::string, LogicalTierCapacity> LogicalCapsFromProto(
     cap.capacity.max_allocatable_bytes = value.max_allocatable_bytes();
     cap.put_eligible = value.put_eligible();
     cap.peak_member_utilization = value.peak_member_utilization();
+    cap.min_object_bytes = value.min_object_bytes();
     out[value.name()] = cap;
   }
   return out;

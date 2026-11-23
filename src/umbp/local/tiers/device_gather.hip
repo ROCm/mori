@@ -26,8 +26,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
@@ -71,25 +72,31 @@ __global__ void GatherFragmentsKernel(const DeviceGatherFragment* __restrict__ f
   for (size_t i = index; i < fragment.bytes; i += stride) dst[i] = src[i];
 }
 
-// Per-thread, per-device descriptor staging.
+// Per-stream descriptor staging.
 //
-// Per-thread because two threads serving the same device share one stream (see
-// DeviceStream), so a shared staging buffer would be a data race even though
-// the stream itself is ordered. Never freed, for the same reason DeviceStream
-// never destroys its streams: releasing HIP resources from a thread or static
-// destructor races with runtime teardown. The count is bounded by the server's
-// worker threads times the devices they touch.
+// The caller holds `stream` exclusively from the upload to the synchronize
+// (see LaunchDeviceGather), so a stream's buffer is never in use twice at once,
+// and the count is bounded by the caller's streams rather than by however many
+// threads have ever called in. Never freed, for the same reason the streams are
+// never destroyed: releasing HIP resources from a static destructor races with
+// runtime teardown.
 struct DescriptorStaging {
   DeviceGatherFragment* host = nullptr;
   DeviceGatherFragment* device = nullptr;
   size_t capacity = 0;
 };
 
-DescriptorStaging* StagingFor(int device_id, size_t count) {
-  static thread_local std::map<int, DescriptorStaging>* staging_by_device =
-      new std::map<int, DescriptorStaging>();
+DescriptorStaging* StagingFor(hipStream_t stream, int device_id, size_t count) {
+  static std::mutex* staging_mutex = new std::mutex();
+  static auto* staging_by_stream = new std::unordered_map<hipStream_t, DescriptorStaging>();
 
-  DescriptorStaging& staging = (*staging_by_device)[device_id];
+  DescriptorStaging* staging_entry = nullptr;
+  {
+    // References into an unordered_map stay valid across rehashing.
+    std::lock_guard<std::mutex> lock(*staging_mutex);
+    staging_entry = &(*staging_by_stream)[stream];
+  }
+  DescriptorStaging& staging = *staging_entry;
   if (staging.capacity >= count) return &staging;
 
   // Grow with headroom so a slowly increasing batch size does not reallocate
@@ -154,7 +161,7 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
       (chunks + kThreadsPerBlock - 1) / kThreadsPerBlock, 1, kMaxBlocksPerFragment));
   if (count > std::numeric_limits<unsigned>::max() / blocks_per_fragment) return false;
 
-  DescriptorStaging* staging = StagingFor(device_id, count);
+  DescriptorStaging* staging = StagingFor(stream, device_id, count);
   if (staging == nullptr) return false;
 
   std::memcpy(staging->host, fragments, count * sizeof(DeviceGatherFragment));
@@ -178,6 +185,32 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
     return false;
   }
   LaunchCounter().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
+  DescriptorStaging* staging = StagingFor(stream, device_id, capacity);
+  if (staging == nullptr) return false;
+
+  const size_t bytes = staging->capacity * sizeof(DeviceGatherFragment);
+  std::memset(staging->host, 0, bytes);
+  hipError_t status =
+      hipMemcpyAsync(staging->device, staging->host, bytes, hipMemcpyHostToDevice, stream);
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] prewarm descriptor upload failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    (void)hipGetLastError();
+    return false;
+  }
+  // One zero-byte fragment: loads the kernel on this device, copies nothing.
+  hipLaunchKernelGGL(GatherFragmentsKernel, dim3(1), dim3(kThreadsPerBlock), 0, stream,
+                     staging->device, 1u);
+  status = hipGetLastError();
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] prewarm kernel launch failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    return false;
+  }
   return true;
 }
 

@@ -24,8 +24,8 @@
 Two backends live beside this module -- FlyDSL (``flydsl_backend``) and HIP/JIT
 (``hip_backend``) -- behind one class. ``EpDispatchCombineOp(cfg, comm)`` returns
 whichever ``cfg.kernel_backend`` (or ``MORI_V2_KERNEL_BACKEND``) names, defaulting
-to flydsl; ``EpDispatchCombineOpHip(cfg, comm)`` is the explicit form, and
-``isinstance(op, EpDispatchCombineOp)`` holds either way.
+to hip on gfx125x and flydsl elsewhere; ``EpDispatchCombineOpHip(cfg, comm)`` is
+the explicit form, and ``isinstance(op, EpDispatchCombineOp)`` holds either way.
 
 Neither backend is imported here. Selecting one imports only that one, so the HIP
 backend works on a machine with no flydsl.
@@ -41,14 +41,17 @@ A subclass supplies four hooks -- two with no default, two with one::
 That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
 its own arena and KernelSet there, so ``_unsupported`` is the only hook it defines.
 
-Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
-Behavioural differences between the backends are *data* on the KernelSet, not
-methods to override, after aiter's ``MOEMetadata``.
+The shared dispatch/combine body and lifecycle live here. HIP overrides _pick()
+to select its KernelConfig keys; the default selector serves FlyDSL's B/W keys.
+KernelSet flags describe in-kernel staging, optional capabilities and why a config
+cannot be served.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Callable
@@ -58,25 +61,65 @@ import torch
 from mori.tensor_utils import from_gpu_ptr
 from mori.jit.config import detect_wave_size
 
+from .quant_types import (
+    QUANT_TYPES,
+    is_gfx125x,
+    is_gfx125x_arch,
+    names_for,
+    quant_element,
+    quant_group,
+    resolve_quant_type,
+)
+
+logger = logging.getLogger(__name__)
+
 WAVE = detect_wave_size()
 
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
 
+def _gfx125x() -> bool:
+    try:
+        from mori.jit.core import _FASTPATH_ARCH_PREFIX, _target_arch
+
+        return _target_arch().startswith(_FASTPATH_ARCH_PREFIX)
+    except Exception:
+        return False
+
+
 def _default_backend() -> str:
-    from mori.ops.dispatch_combine import _is_gfx125x
-
-    return "hip" if _is_gfx125x() else "flydsl"
+    return "hip" if _gfx125x() else "flydsl"
 
 
-_FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
+# The LDS a gfx125x dispatch block can give its token-row slabs: ep_cfg.hpp's
+# Ep1250xLdsBytes less EpDispatch1250xStaticLdsBytes.
+_DISPATCH_SLAB_LDS_1250 = 327680 - 4096
+
+
+def _dispatch_warp_cap(token_nbytes: int) -> int:
+    """Most warps, a power of two, a gfx125x dispatch block holds for this token row.
+
+    Each warp stages a whole row in LDS; more warps than fit launch and never run.
+    The same bound as MakeEpCfg, which halves its default of 16 until the slabs fit.
+    """
+    cap = 1
+    while cap * 2 * token_nbytes <= _DISPATCH_SLAB_LDS_1250:
+        cap *= 2
+    return cap
+
+
+_QUANT_TYPES = QUANT_TYPES
+_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
 # The quant types the hip backend runs as its gfx125x push combine: the sender
 # quantizes into the destination's landing rows and the destination reduces them.
-_PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
+_PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise_1x32",)
+# Removed quant types and their replacement, named in the error.
+_REMOVED_QUANT_TYPES = {"fp8_direct_cast": "fp8_blockwise"}
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
+
+_UNKNOWN_PEAK = object()
 
 _DT = {
     torch.bfloat16: 2,
@@ -106,7 +149,10 @@ class EpDispatchCombineConfig:
     scale_type_size: int = 0
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
-    quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # Combine wire quant: "none", an explicit fp{8,4}_blockwise_1x{32,128}, or
+    # fp8_blockwise / fp4_blockwise for the arch's default group (see
+    # quant_types.py). Holds the explicit name after construction.
+    quant_type: str = "none"
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
@@ -114,8 +160,10 @@ class EpDispatchCombineConfig:
     # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
     # field overrides the tuning table for every token bucket while the fields
     # left None stay tuned, so you can fix one knob without hand-writing the
-    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
-    # for a leg and bypass the table entirely.
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override a leg's whole
+    # geometry in every bucket, table and pinned fields included: block,rdma,warp,
+    # plus an optional fourth field for the active QP count that also beats
+    # active_qps.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -125,6 +173,11 @@ class EpDispatchCombineConfig:
     # distinct (block, warp) variants and picks one at runtime from
     # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
     schedule: tuple = None
+    # Which hip tuning table an intranode auto schedule comes from: "peak" (fastest
+    # within ~3%) or "capped" (no grid over 64 blocks, leaving CUs to the expert
+    # GEMMs). None = MORI_EP_TUNING_PROFILE, else capped on gfx125x and peak elsewhere;
+    # resolved in _resolve_geometry. AsyncLL sizes its grids from the CU count instead.
+    tuning_profile: str = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
     # --- internode -----------------------------------------------------------
@@ -134,16 +187,23 @@ class EpDispatchCombineConfig:
     # and must agree with the communicator's LSA team, which the op checks at
     # construction rather than assuming.
     gpu_per_node: int = None
-    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
-    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
-    # so the default is the value the only consumer wants.
-    num_qp_per_pe: int = 2
+    # Allocated QPs per peer on the RDMA leg, fixed for this op's lifetime.
+    # The intranode path does not use QPs. How many a kernel sends on -- the
+    # active count, a compile-time constant of each kernel -- is chosen per
+    # phase and per token bucket by the tuning table, within this allocation.
+    num_qp_per_pe: int = 8
+    # Pin the active count for every bucket and both phases, over the table.
+    # None: the table's count, else min(2, num_qp_per_pe).
+    active_qps: int = None
+    # Extra active counts compiled for every bucket geometry, so that
+    # op.set_active_qps() can switch to any of them without compiling.
+    active_qp_counts: tuple = None
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
     max_token_type_size: int = None
     # RDMA-block split of the grid, per phase. Runtime, never compiled in:
     # dispatch and combine are deliberately tuned to DIFFERENT values (see
-    # internode_tuning_configs), so one compiled-in value cannot serve both.
+    # hip_tuning_configs), so one compiled-in value cannot serve both.
     # Pinnable like the block/warp fields above, and clamped to < block_num.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
@@ -153,18 +213,18 @@ class EpDispatchCombineConfig:
     #   "v2"     the general path: chunked, deduplicating, sized for wide tokens.
     #   "v2_ll"  low latency: no dedup across expert slots, one entry per node
     #            per token, which wins while the wire is not the bottleneck.
-    #   "auto"   compile BOTH and pick per launch from the token count, at
-    #            internode_auto_ll_max_tokens. This is the only mode that can switch
-    #            at runtime, and it is the only one that pays for both compiles.
+    #   "auto"   compile BOTH and pick per launch from max_num_inp_token_across_ranks,
+    #            at internode_auto_ll_max_tokens ("v2" without it). The only mode that
+    #            switches at runtime, and the only one that pays for both compiles.
     internode_kernel: str = "auto"
-    # The "auto" crossover. Compared against THIS CALL's token count -- dispatch
-    # uses input.shape[0], combine routing.cur_rank_num_token -- so one op
+    # The "auto" crossover. Compared against the max_num_inp_token_across_ranks
+    # this call's dispatch is given -- its combine reuses it -- so one op
     # alternates between the families as the batch changes; it is not a property
     # of the shape. Unrelated to max_num_inp_token_per_rank, which is the
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
-    # Which kernel backend serves this op: "flydsl" (default, full intranode
-    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
+    # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
+    # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
     # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
     # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
@@ -172,6 +232,97 @@ class EpDispatchCombineConfig:
     # default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
+    # Opt in to the AsyncLL kernel family (hip backend only). It is not a member
+    # of internode_kernel because it is not an internode-only choice: AsyncLL runs
+    # on one node too, which is where it is validated, and hanging it off a field
+    # named "internode" would say otherwise.
+    #
+    # What it buys is the send/recv split -- dispatch_send/dispatch_recv and
+    # combine_send/combine_recv become separate launches, so the caller can run
+    # its own work in the seam while the transfers drain. Every other family does
+    # send and recv in one kernel and has no such seam.
+    #
+    # Intranode it moves tokens with ccoSdma, the copy engine, rather than with
+    # peer stores: that is the v1 AsyncLL protocol transcribed onto cco, and it is
+    # what the cross-node leg will reuse. It is therefore NOT the fastest way to
+    # dispatch on a single node -- the ordinary v2 intranode kernels are, by about
+    # 2x on MI355X -- and it is off by default for that reason.
+    async_ll: bool = False
+    # How AsyncLL's transfer passes move bytes between same-node peers.
+    #
+    #   "sdma" (default) -- ccoSdma, the copy engine. The transfer occupies no
+    #       CUs, so it can drain under whatever the caller runs in the send/recv
+    #       seam, and it is the shape the cross-node (ccoGda) leg will reuse.
+    #   "lsa" -- peer stores over the flat symmetric VA. Faster only at small
+    #       batch; it spends the grid on the copy, so there is nothing left to
+    #       overlap and it contends with its own HBM traffic.
+    #
+    # Measured on an idle reserved MI355X node, EP8, hidden 7168, bf16,
+    # dispatch+combine as a graph, two sweeps agreeing within 0.3pp:
+    #
+    #   tok/rank      64     128     256     512    1024    2048   (us)
+    #   sdma       102.0   136.8   194.3   292.1   523.1   982.0
+    #   lsa         97.7   138.9   201.5   320.3   581.4  1094.2
+    #
+    # So "lsa" wins by ~4% at 64 tokens and loses by up to ~11% from 128 up,
+    # which is why "sdma" is the default. Neither closes the gap to the ordinary
+    # v2 intranode kernels (62.5 / 856.9 us at the ends): AsyncLL stages each
+    # payload through an extra buffer so an RDMA leg can reuse the protocol, and
+    # that cost is the same for both transports.
+    #
+    # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
+    # the point is the overlap, or when this op will later run across nodes.
+    async_ll_transport: str = "sdma"
+    # Give this op its own SDMA queue per peer instead of the shared one (sdma
+    # transport only). Set it when two ops interleave on one stream, e.g.
+    # single-stream two-batch overlap: a recv then no longer waits for the other
+    # op's send. With the ops on separate streams, a two-op microbenchmark is
+    # slower but DeepSeek-V4 prefill was still faster, so measure that case.
+    async_ll_own_sdma_queue: bool = False
+    # Receive layout of async_ll over "sdma" on one node: "compact" (default),
+    # "segmented" or "auto".
+    #
+    # "compact" copies every source's rows into a dense prefix [0, total_recv) of
+    # the recv views. On an op built "segmented", a dispatch with
+    # segment_stride=S instead lands source s's rows at [s * S, s * S + n_s) and
+    # the recv views are that landing region (world_size * S rows): no receive
+    # compaction, and combine sends the expert output from the same layout. A
+    # dispatch without segment_stride still runs a compact round on that op
+    # (e.g. under CUDA graphs).
+    #
+    # Contract of a segmented round:
+    #   * all world_size * S rows are input rows, and total_recv reads that count
+    #     (pass it as e.g. aiter fused_moe num_local_tokens; do not truncate the
+    #     views). Rows outside the valid ranges (holes, often most of them) carry
+    #     a non-local expert with weight 0 and zeroed scales, so expert_mask drops
+    #     them; their hidden bytes are stale, so never reduce hidden states across
+    #     rows (per-tensor scale, global absmax). segment_counts() has the n_s.
+    #   * write the expert output into combine_in_view(); any other tensor is
+    #     copied there first.
+    #   * S must be the same on every rank, so compute it from values every rank
+    #     shares (e.g. the max token count after the DP all-gather); so must the
+    #     choice of segmented or compact. S is at least every rank's token count
+    #     and at most effective_max_recv_per_rank.
+    #       - S past that cap is refused on the host before launch. On every rank
+    #         that is fine; a rank that alone passes one leaves the others
+    #         waiting for it.
+    #       - The other violations do not hang; they are counted
+    #         (segment_error_counts()). S below a rank's rows for a peer drops the
+    #         rest and counts an overflow on that rank only; a stride or mode that
+    #         differs between ranks counts a mismatch on every rank.
+    #       - So the error flags differ between ranks: reduce them across ranks
+    #         before acting on them (e.g. falling back to compact).
+    #   * the views' row count follows S, so a CUDA graph needs a fixed S.
+    #
+    # "segmented" is refused on a config that does not support it; "auto" picks
+    # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
+    async_ll_recv_layout: str = "compact"
+    low_latency: bool | None = None
+
+    @property
+    def async_ll_segmented(self) -> bool:
+        """Whether this op can run segmented rounds (async_ll_recv_layout)."""
+        return self.async_ll_recv_layout == "segmented"
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -185,8 +336,47 @@ class EpDispatchCombineConfig:
                 "node * gpu_per_node + local rank and a partial node has no such "
                 "encoding"
             )
-        if self.num_qp_per_pe < 1:
-            raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+        # 64 is kCombineBarrierMarkerTotal (ep_internode_cfg.hpp): QP 0 carries
+        # the remainder of that fixed per-combine total, so it caps how many QPs
+        # a kernel may send on, and so the most worth allocating.
+        if type(self.num_qp_per_pe) is not int or not 1 <= self.num_qp_per_pe <= 64:
+            raise ValueError(
+                f"num_qp_per_pe must be an integer in [1, 64], got {self.num_qp_per_pe}"
+            )
+        if self.active_qps is not None:
+            if (
+                type(self.active_qps) is not int
+                or not 1 <= self.active_qps <= self.num_qp_per_pe
+            ):
+                raise ValueError(
+                    "active_qps must be an integer between 1 and num_qp_per_pe"
+                )
+            if not self.is_internode:
+                raise ValueError("active_qps is only supported by the internode path")
+        if self.active_qp_counts is not None:
+            counts = tuple(self.active_qp_counts)
+            if not counts or any(
+                type(count) is not int or not 1 <= count <= self.num_qp_per_pe
+                for count in counts
+            ):
+                raise ValueError(
+                    "active_qp_counts must contain integers in "
+                    f"[1, num_qp_per_pe={self.num_qp_per_pe}]"
+                )
+            self.active_qp_counts = tuple(sorted(set(counts)))
+            if not self.is_internode:
+                raise ValueError(
+                    "active_qp_counts is only supported by the internode path"
+                )
+        if self.async_ll_recv_layout not in ("compact", "segmented", "auto"):
+            raise ValueError(
+                "async_ll_recv_layout must be 'compact', 'segmented' or 'auto', "
+                f"got {self.async_ll_recv_layout!r}"
+            )
+        if self.async_ll_recv_layout == "auto" and not self.async_ll:
+            self.async_ll_recv_layout = "compact"
+        if self.async_ll_recv_layout == "segmented" and not self.async_ll:
+            raise ValueError("async_ll_recv_layout='segmented' needs async_ll=True")
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
@@ -197,10 +387,12 @@ class EpDispatchCombineConfig:
                 "Set data_type alone for a symmetric op, or set both explicitly for "
                 "asymmetric dispatch/combine dtypes."
             )
-        if self.quant_type not in _QUANT_TYPES:
+        if self.quant_type in _REMOVED_QUANT_TYPES:
             raise ValueError(
-                f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
+                f"quant_type {self.quant_type!r} was removed; use "
+                f"{_REMOVED_QUANT_TYPES[self.quant_type]!r}"
             )
+        self.quant_type = resolve_quant_type(self.quant_type, is_gfx125x())
         if self.is_internode and self.max_num_inp_token_per_rank % WAVE:
             # The internode send buffer is addressed as
             # pe * max_num_inp_token_per_rank + slot, but slots are handed out in
@@ -223,6 +415,20 @@ class EpDispatchCombineConfig:
                 "internode_auto_ll_max_tokens must be >= 0, got "
                 f"{self.internode_auto_ll_max_tokens}"
             )
+        if self.low_latency is not None:
+            if type(self.low_latency) is not bool:
+                raise ValueError(
+                    "low_latency must be True, False or None, got "
+                    f"{self.low_latency!r}"
+                )
+            if self.is_internode:
+                family = "v2_ll" if self.low_latency else "v2"
+                if self.internode_kernel not in ("auto", family):
+                    raise ValueError(
+                        f"low_latency={self.low_latency} conflicts with "
+                        f"internode_kernel={self.internode_kernel!r}"
+                    )
+                self.internode_kernel = family
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
@@ -230,21 +436,14 @@ class EpDispatchCombineConfig:
         # A quantised combine scatters: each destination writes its own partial
         # back. That is intranode-only, and it is what kept quant off the
         # internode path -- the backend would accept the quant type and then
-        # reject the scatter this rule had just set.
-        #
-        # The internode kernels do carry an fp8 staging path
-        # (EpCombineAllInternalFp8 reduces nNodes fp8 slots into one bf16
-        # output), but it does not produce correct tokens: measured on 2x8
-        # MI308X, weights are exact while ~51% of hidden elements are outside a
-        # 30% tolerance and some are exactly zero. Rejecting here rather than
-        # relying on the scatter rule to reject by accident, because an accepted
-        # config that returns corrupt data is the worst of the three outcomes.
+        # reject the scatter this rule had just set. The internode combine is
+        # unquantized, so reject here rather than rely on the scatter rule.
         if self.quant_type != "none":
             if self.is_internode:
                 raise ValueError(
                     f"quant_type={self.quant_type!r} is not supported on the "
-                    "internode path (world_size > gpu_per_node): the fp8 combine "
-                    "staging path there is incomplete and returns wrong tokens. "
+                    "internode path (world_size > gpu_per_node): the internode "
+                    "combine is unquantized. "
                     "Use quant_type='none', or an intranode config."
                 )
             self.combine_mode = "scatter"
@@ -260,16 +459,11 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
-            push = self.quant_type in _PUSH_QUANT_TYPES
-            if (
-                (self.combine_mode != "gather" and not push)
-                or (self.quant_type != "none" and not push)
-                or self.enable_std_moe
-            ):
+            quant = self.quant_type != "none"
+            if (self.combine_mode != "gather" and not quant) or self.enable_std_moe:
                 raise ValueError(
-                    "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    f"quant_type=none (or one of {_PUSH_QUANT_TYPES}), "
-                    "enable_std_moe=False"
+                    "combine_data_type (asymmetric dtype) requires combine_mode=gather "
+                    "or a quantized combine, and enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.
@@ -318,19 +512,21 @@ class EpDispatchCombineConfig:
             if getattr(self, field_name) is not None
         )
 
+        from .hip_tuning_configs import PROFILES
+
+        if self.tuning_profile not in (None, *PROFILES):
+            raise ValueError(
+                f"tuning_profile {self.tuning_profile!r}: want one of {PROFILES}"
+            )
         self._resolve_geometry()
 
     def _resolve_geometry(self):
-        """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
-        neither a schedule nor any block/warp, pull the tuned geometry for this
-        device/shape/dtype from the SELECTED BACKEND's tuning table (so the plain
-        constructor is tuned automatically — EpDispatchCombineConfig.tuned() is now
-        just an explicit alias). If any field is pinned, honor it and fill the rest
-        with the single-shot fallback (no schedule).
+        """Fill defaults and the intranode schedule for the selected backend.
 
-        Each backend tunes its OWN kernel: the hip and flydsl kernels are different
-        implementations with different optima, so hip reads hip_tuning_configs and
-        flydsl reads tuning_configs -- they never share a table."""
+        Internode only gets fallback values here. Its backend builds the full
+        schedule via hip_tuning_configs.resolve_schedule(), retaining any
+        fields the caller pinned in _pinned_geometry.
+        """
         pinned = self.schedule is not None or any(
             g is not None
             for g in (
@@ -341,13 +537,8 @@ class EpDispatchCombineConfig:
             )
         )
         if self.is_internode:
-            # The intranode tables are keyed on a single node's geometry and
-            # carry no rdma_block_num, so they have nothing to say about this
-            # config. Internode geometry comes from internode_tuning_configs,
-            # which the backend applies per phase and per token count. A
-            # `schedule` bucket already carries per-phase block and warp counts,
-            # but it has no rdma_block_num field at all, so it cannot carry the
-            # DIFFERENT rdma values dispatch and combine are tuned to.
+            # cfg.schedule describes intranode block/warp pairs only. Internode
+            # needs an independent RDMA split for each phase as well.
             self.schedule = None
             if self.dispatch_block_num is None:
                 self.dispatch_block_num = 96
@@ -362,6 +553,13 @@ class EpDispatchCombineConfig:
             if self.combine_rdma_block_num is None:
                 self.combine_rdma_block_num = 64
             return
+        # The gfx125x dispatch stages a token row a warp in LDS, so the warps a block
+        # holds depend on the row (_dispatch_warp_cap) -- MakeEpCfg bounds its own
+        # default the same way. The tables cannot do this themselves: they are keyed
+        # by the transported dtype, which calls fp32 "bf16", and not by what a row
+        # takes. Every warp count below is one we pick, a tuned row or a single-shot
+        # default; one the caller pinned is left alone.
+        warp_cap = _dispatch_warp_cap(self.token_nbytes) if _gfx125x() else None
         if not pinned:
             backend = (
                 self.kernel_backend
@@ -369,8 +567,12 @@ class EpDispatchCombineConfig:
                 or _default_backend()
             )
             if backend == "hip":
-                from .hip_tuning_configs import lookup
+                from .hip_tuning_configs import default_profile, lookup, tuning_profile
 
+                if not self.async_ll:
+                    self.tuning_profile = tuning_profile(
+                        self.tuning_profile, default=default_profile()
+                    )
                 # hip keys on the expert count too: it sizes dispatch's per-block
                 # expert counters, so it can move the geometry. FlyDSL's table has no
                 # such axis, hence the split call rather than a shared kwarg.
@@ -381,6 +583,9 @@ class EpDispatchCombineConfig:
                     dtype=self.dispatch_dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
                     quant_type=self.quant_type,
+                    dispatch_dtype=self.dispatch_dtype,
+                    combine_dtype=self.combine_dtype,
+                    profile="peak" if self.async_ll else self.tuning_profile,
                 )
             else:
                 from .tuning_configs import lookup
@@ -390,12 +595,20 @@ class EpDispatchCombineConfig:
                     self.hidden_dim,
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
+                    quant=self.quant_type != "none",
                 )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
             self.warp_num_per_block = t["warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
+            if warp_cap is not None:
+                self.warp_num_per_block = min(self.warp_num_per_block, warp_cap)
+                if self.schedule:
+                    self.schedule = tuple(
+                        (edge, db, min(dw, warp_cap), cbn, cw)
+                        for edge, db, dw, cbn, cw in self.schedule
+                    )
         else:
             # explicit geometry: fill any unset field with the single-shot default
             if self.dispatch_block_num is None:
@@ -403,7 +616,8 @@ class EpDispatchCombineConfig:
             if self.combine_block_num is None:
                 self.combine_block_num = 80
             if self.warp_num_per_block is None:
-                self.warp_num_per_block = 16
+                # Unset beside a field that was pinned: still ours to choose.
+                self.warp_num_per_block = 16 if warp_cap is None else min(16, warp_cap)
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
 
@@ -443,59 +657,36 @@ class EpDispatchCombineConfig:
         return self.combine_mode == "scatter"
 
     @property
-    def fp8_direct_cast(self):
-        return self.quant_type == "fp8_direct_cast"
+    def quant_element(self):
+        """ "fp8" / "fp4" on a quantized combine wire, else None."""
+        return quant_element(self.quant_type)
+
+    @property
+    def quant_group(self):
+        """Elements per combine scale (32 or 128), 0 when unquantized."""
+        return quant_group(self.quant_type)
 
     @property
     def fp8_blockwise(self):
-        return self.quant_type == "fp8_blockwise"
+        """An fp8 combine wire, whatever its group."""
+        return self.quant_element == "fp8"
 
     @property
     def combine_scale_dim(self):
-        """Per-token block count for fp8_blockwise combine (block_elems=128)."""
-        return self.hidden_dim // 128 if self.fp8_blockwise else 0
+        """Per-token scale count of the fp8 combine wire."""
+        return self.hidden_dim // self.quant_group if self.fp8_blockwise else 0
+
+    @property
+    def combine_scale_bytes(self):
+        """Per-token scale bytes of the fp8 combine wire: one E8M0 byte per 1x32
+        group, one f32 per 1x128 block, rounded up to a dword."""
+        size = 1 if self.quant_group == 32 else 4
+        return (self.combine_scale_dim * size + 3) // 4 * 4
 
     @property
     def wire_elem_size(self):
-        """comb_inp transport element size: 1 byte for fp8 paths, else elem_size."""
-        return (
-            1
-            if self.quant_type in ("fp8_direct_cast", "fp8_blockwise")
-            else self.elem_size
-        )
-
-    @classmethod
-    def tuned(cls, **kwargs):
-        """Build a config with block/warp geometry pulled from tuning_configs
-        (unless explicitly overridden in kwargs). Kept for back-compat and to
-        force per-field tuning even when some geometry is overridden; the plain
-        constructor is now also tuned-by-default (see _resolve_geometry)."""
-        from .tuning_configs import lookup
-
-        dt = kwargs.get("data_type", torch.bfloat16)
-        dtype = (
-            "fp4"
-            if dt == torch.float4_e2m1fn_x2
-            else ("fp8" if dt in _FP8_DTYPES else "bf16")
-        )
-        # The intranode tables say nothing about an internode config -- they are
-        # keyed on a single node's geometry and carry no rdma_block_num -- and
-        # pre-filling here would be indistinguishable from a caller pin, which
-        # the internode backend honours over its own table. Leave it alone and
-        # let _resolve_geometry / internode_tuning_configs do the work.
-        gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
-        if kwargs["world_size"] // gpu_per_node > 1:
-            return cls(**kwargs)
-
-        t = lookup(
-            kwargs["world_size"],
-            kwargs["hidden_dim"],
-            kwargs["num_experts_per_token"],
-            dtype=dtype,
-        )
-        for k, v in t.items():
-            kwargs.setdefault(k, v)
-        return cls(**kwargs)
+        """comb_inp transport element size: 1 byte for fp8_blockwise, else elem_size."""
+        return 1 if self.fp8_blockwise else self.elem_size
 
     @property
     def dispatch_dtype(self):
@@ -606,20 +797,25 @@ class KernelSet:
     with a new quirk adds a flag here, not a method to every subclass.
     """
 
-    # (block_num, warp_num) -> callable. Keys must cover every spec the op's
-    # schedule can select; the op clamps to what is present.
-    dispatch: dict[tuple[int, int], Callable]
-    combine: dict[tuple[int, int], Callable]
+    # Backend selection key -> callable. HIP uses KernelConfig; FlyDSL uses
+    # (block_num, warp_num). _pick() returns keys from these same maps.
+    dispatch: dict[tuple, Callable]
+    combine: dict[tuple, Callable]
     # Replay-routing dispatch. None = this backend has no replay.
-    dispatch_replay: dict[tuple[int, int], Callable] | None = None
+    dispatch_replay: dict[tuple, Callable] | None = None
+
+    # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
+    # but launches only half the pass sequence, so the caller can put its own work
+    # between the two. None = this backend runs send and recv in one launch and
+    # has no seam to expose.
+    dispatch_send: dict[tuple, Callable] | None = None
+    dispatch_recv: dict[tuple, Callable] | None = None
+    combine_send: dict[tuple, Callable] | None = None
+    combine_recv: dict[tuple, Callable] | None = None
 
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
     stages_in_kernel: bool = False
-    # True  -> the kernels reset their own counters/barriers; the op must not
-    #          memset them, and on symmetric regions it MUST NOT (a peer may have
-    #          already delivered a signal, and wiping it hangs both ranks).
-    self_resets_counters: bool = True
 
     # Advertised feature names, for callers that want to probe before asking.
     capabilities: frozenset[str] = frozenset()
@@ -630,7 +826,25 @@ class KernelSet:
 
 
 class EpDispatchRoutingHandle:
-    """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
+    """Per-call routing (mori EpDispatchRoutingHandle parity).
+
+    Lifetime: by default the handle ALIASES op-owned buffers -- its
+    disp_dest_tok_id_map is the op's routing_dest_map and its total_recv_token_num
+    is the op's total_recv -- so it is valid only until the next
+    dispatch(return_routing=True) on the same op, which overwrites both. That keeps
+    the serving path (dispatch -> experts -> combine) free of allocations. A caller
+    that holds several handles at once (one per MoE layer, then the backward in
+    reverse) passes dispatch(..., snapshot=True): the handle then owns its dest map
+    and count, and combine / replay with it stay correct after later dispatches.
+
+    Either way only the routing is the handle's. What dispatch delivered into the
+    arena (recv tokens, weights, indices, scales, and the reverse map below until
+    its first access clones it) is overwritten by the next dispatch. Combine
+    re-stages the tokens from its `input`, but the weight fold
+    (combine(..., weights=...)) reads the forwarded weights straight from the
+    arena, so the caller must make sure the arena holds this handle's: a weighted
+    combine is valid with the handle of the latest dispatch, or after a replay
+    dispatch(..., routing=handle), which rewrites them at the handle's slots.
 
     disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
@@ -660,23 +874,31 @@ class EpDispatchRoutingHandle:
         cur_rank_num_token=0,
         *,
         reverse_src_view=None,
+        reverse_encode=None,
+        recv_maps=None,
+        max_num_inp_token_across_ranks=_UNKNOWN_PEAK,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
+        self.recv_maps = recv_maps
         self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
         self.cur_rank_num_token = cur_rank_num_token
+        self.max_num_inp_token_across_ranks = max_num_inp_token_across_ranks
         # Either an already-materialized reverse map (from_tensors round-trip) or
         # a live arena view to clone on first access (dispatch()).
         self._reverse_cache = disp_tok_id_to_src_tok_id_local
         self._reverse_src_view = reverse_src_view
+        self._reverse_encode = reverse_encode
 
     @property
     def disp_tok_id_to_src_tok_id_local(self):
         if self._reverse_cache is None:
             # First access (post-barrier): clone off the arena so it survives the
             # next dispatch overwriting the region.
-            self._reverse_cache = self._reverse_src_view.clone()
+            src = self._reverse_src_view
+            encode = self._reverse_encode
+            self._reverse_cache = src.clone() if encode is None else encode(src)
         return self._reverse_cache
 
     def tensors(self):
@@ -689,8 +911,35 @@ class EpDispatchRoutingHandle:
         )
 
     @classmethod
-    def from_tensors(cls, tensors, cur_rank_num_token=0):
-        return cls(*tensors, cur_rank_num_token=cur_rank_num_token)
+    def from_tensors(
+        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=_UNKNOWN_PEAK
+    ):
+        return cls(
+            *tensors,
+            cur_rank_num_token=cur_rank_num_token,
+            max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
+        )
+
+
+def supported_quant_types(backend=None, arch=None) -> dict[str, str]:
+    """The quant_type names `backend` serves intranode on `arch`, each mapped to
+    the explicit format it resolves to there. Any other name is refused when the
+    op is built. Defaults: this machine's arch, and the backend an op would pick
+    (MORI_V2_KERNEL_BACKEND, else hip on gfx125x and flydsl elsewhere). Shape
+    limits (a hidden size, a combine dtype) are checked at construction only.
+    """
+    if arch is None:
+        from mori.jit.core import _target_arch
+
+        arch = _target_arch()
+    gfx125x = is_gfx125x_arch(arch)
+    name = (
+        backend
+        or os.environ.get("MORI_V2_KERNEL_BACKEND")
+        or ("hip" if gfx125x else "flydsl")
+    )
+    cls = EpDispatchCombineOp._resolve_backend(name)
+    return names_for(cls._quant_formats(arch), gfx125x)
 
 
 class EpDispatchCombineOp:
@@ -698,6 +947,16 @@ class EpDispatchCombineOp:
 
     _BACKENDS: dict[str, type] = {}
     backend_name: str | None = None
+
+    # What the AsyncLL recv halves need from their send halves. Class-level so
+    # every backend has them whether or not it implements the split, and so a
+    # recv without a send raises rather than hitting a missing attribute.
+    _async_pending_dispatch_tokens = None
+    _async_pending_dispatch_input = None
+    _async_pending_dispatch_map = None
+    _async_pending_combine = None
+
+    _snapshot_zeroes_count = False
 
     # -- registration / selection -----------------------------------------
 
@@ -755,10 +1014,9 @@ class EpDispatchCombineOp:
 
     # -- hooks a subclass must supply --------------------------------------
     #
-    # Exactly four, and no more: the arena layout, the kernels, and (optionally)
-    # what the backend cannot do and which arena region a shared view reads.
-    # Everything a caller touches -- dispatch(), combine(), the views, _pick,
-    # close -- is implemented once, here.
+    # Arena layout, kernel construction, supported features and region names.
+    # Dispatch/combine and lifecycle are shared. HIP also overrides _pick() for
+    # its unified intra/inter kernel configuration keys.
 
     def _regions(self, cfg) -> list[tuple[str, int]]:
         """[(region_name, nbytes)] this backend needs carved out of the arena.
@@ -792,6 +1050,41 @@ class EpDispatchCombineOp:
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
+
+    @classmethod
+    def _quant_formats(cls, arch: str) -> tuple[str, ...]:
+        """Explicit quant types this backend's intranode combine serves on `arch`."""
+        return ()
+
+    @classmethod
+    def _quant_refusal(cls, cfg, arch: str) -> tuple[str, ...]:
+        """Why `cfg.quant_type` is refused on `arch`; empty if it is served."""
+        formats = cls._quant_formats(arch)
+        if cfg.quant_type == "none" or cfg.quant_type in formats:
+            return ()
+        return (
+            f"quant_type={cfg.quant_type!r} on {arch or 'this GPU'} (the "
+            f"{cls.backend_name} backend serves {', '.join(formats) or 'none'})",
+        )
+
+    def _set_segment_stride(self, stride, num_tokens):
+        """Record this round's segment stride (None or 0 = compact). Only the
+        hip backend's AsyncLL has the segmented layout."""
+        if stride:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no segmented dispatch"
+            )
+
+    # The segmented layout's introspection (see async_ll_recv_layout). Backends
+    # without it report nothing.
+    def segment_error_counts(self):
+        return (0, 0)
+
+    def segment_error_flags(self, clear=False):
+        return 0
+
+    def segment_counts(self):
+        return None
 
     def _region(self, name):
         """Arena region a shared view should read.
@@ -832,7 +1125,7 @@ class EpDispatchCombineOp:
 
     # -- shared: variant selection -----------------------------------------
 
-    def _pick(self, num_tokens):
+    def _pick(self, num_tokens, snapshot=False, max_tokens=None):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
         otherwise. Clamped to variants that were actually built, so the hot path
@@ -859,10 +1152,60 @@ class EpDispatchCombineOp:
             comb_spec = self._combine_specs[-1]
         return disp_spec, comb_spec
 
+    _warned_no_peak = False
+
+    def _peak_limit(self, snapshot):
+        return None
+
+    def _check_no_peak(self, snapshot):
+        limit = self._peak_limit(snapshot)
+        if limit is None:
+            return
+        if self.cfg.low_latency:
+            raise ValueError(
+                "low_latency=True needs max_num_inp_token_across_ranks on this op: "
+                f"its low-latency kernels serve calls of at most {limit} tokens per "
+                "rank, and every rank must take the same kernels in a call. Pass the "
+                "largest token count across ranks."
+            )
+        if self.cfg.rank == 0 and not self._warned_no_peak:
+            self._warned_no_peak = True
+            logger.warning(
+                "dispatch() without max_num_inp_token_across_ranks runs this op's "
+                "regular kernels. Pass the largest token count across ranks to run "
+                "calls of at most %d tokens per rank on its low-latency kernels, or "
+                "set low_latency=False to keep the regular ones.",
+                limit,
+            )
+
+    def _routing_peak(self, routing, snapshot):
+        peak = getattr(routing, "max_num_inp_token_across_ranks", _UNKNOWN_PEAK)
+        if peak is not _UNKNOWN_PEAK:
+            return peak
+        if self._peak_limit(snapshot) is not None:
+            raise ValueError(
+                "this routing handle does not carry the "
+                "max_num_inp_token_across_ranks its dispatch was given, and this op "
+                "picks the combine kernels from it. Pass it to "
+                "EpDispatchRoutingHandle.from_tensors (None if the dispatch was given "
+                "none)."
+            )
+        return None
+
+    def _warn_unused_low_latency(self):
+        if self.cfg.low_latency and self.cfg.rank == 0:
+            logger.warning(
+                "low_latency=True has no effect on this op: the %s backend has no "
+                "low-latency kernels for this shape, dtype and device.",
+                self.backend_name,
+            )
+
     @staticmethod
     def _specs_from(cfg):
         """The (block, warp) variants to build, de-duplicated from the schedule."""
-        if cfg.schedule and not cfg.is_scatter:
+        # A plain scatter keeps one combine geometry; the gather's buckets are not
+        # tuned for it. A quantized one takes the buckets lookup(quant=True) gave.
+        if cfg.schedule and (not cfg.is_scatter or cfg.quant_type != "none"):
             disp = sorted({(db, dw) for (_, db, dw, _, _) in cfg.schedule})
             comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
         elif cfg.schedule:
@@ -908,10 +1251,34 @@ class EpDispatchCombineOp:
             )
         return cache
 
+    def _snapshot_recv_views(self, disp_spec):
+        return None
+
+    def _reverse_source(self, disp_spec):
+        reverse = getattr(self, "_reverse_view", None)
+        if reverse is None:
+            reverse = from_gpu_ptr(
+                self.arena.local_ptr(self._region("recv_to_src_token")),
+                (self._recv_cap,),
+                torch.int32,
+            )
+            self._reverse_view = reverse
+        return reverse, None
+
     # -- shared: the ops ---------------------------------------------------
 
     def dispatch(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        snapshot=False,
+        segment_stride=None,
+        max_num_inp_token_across_ranks=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -922,6 +1289,23 @@ class EpDispatchCombineOp:
         total_recv[, routing]); out == arena disp_out, safe to read without
         .clone() because combine stages into a separate out_tok buffer.
 
+        snapshot=: with return_routing=True, give the handle its own dest map
+        (the kernel writes it directly, no copy) and its own copy of total_recv,
+        so it outlives later return_routing dispatches on this op. Without it the
+        handle is valid only until the next one; see EpDispatchRoutingHandle.
+        Intranode gather combine without StdMoE only: the internode and scatter
+        combines also read routing state the op keeps in the arena, and StdMoE's
+        convert reads the op's slot map and forwarded weights.
+
+        max_num_inp_token_across_ranks=: the largest input.shape[0] any rank
+        passes to this call. It picks LL128 on a gfx125x op whose capacity is
+        above the LL128 limit, and the family under internode "auto"; without
+        it those ops run their regular kernels (with low_latency=True the
+        gfx125x one raises). Pass the same value on every rank: only
+        n <= value <= capacity is checked, and ranks that pass different
+        values, or pass it on some ranks only, can pick different kernels and
+        hang. The returned handle keeps it for combine.
+
         out_scales is [max_recv, scale_dim_i32] on both backends but is not always
         CONTIGUOUS -- a backend may lay the rows down wider and return a strided
         view. Read by pointer, stride by scale_stride_bytes(), not by this shape.
@@ -929,22 +1313,90 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
+
+        segment_stride=S runs a segmented round on an op built with
+        async_ll_recv_layout="segmented"; the returned views then have
+        world_size * S rows and total_recv reads world_size * S. See
+        EpDispatchCombineConfig.async_ll_recv_layout for the contract.
+        """
+        with self._asyncll_call("dispatch"):
+            return self._dispatch_impl(
+                input,
+                weights,
+                scales,
+                indices,
+                routing=routing,
+                return_routing=return_routing,
+                kernels=self._kernels.dispatch,
+                snapshot=snapshot,
+                segment_stride=segment_stride,
+                max_num_inp_token_across_ranks=max_num_inp_token_across_ranks,
+            )
+
+    def _dispatch_impl(
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing,
+        return_routing,
+        kernels,
+        snapshot=False,
+        segment_stride=None,
+        max_num_inp_token_across_ranks=None,
+    ):
+        """The body of dispatch(), parameterised by which kernel table runs.
+
+        dispatch() passes the whole-phase table; dispatch_send() passes the send
+        half. Everything else -- the capacity check, the replay choice, the views
+        returned -- is identical, which is why this is one function and not two
+        that drift.
         """
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either routing= (replay) or return_routing=True, not both"
             )
+        if snapshot and not return_routing:
+            raise ValueError(
+                "snapshot=True applies to the handle return_routing=True returns"
+            )
+        if snapshot and (
+            self.cfg.is_internode or self.cfg.is_scatter or self.cfg.enable_std_moe
+        ):
+            raise ValueError(
+                "snapshot=True is intranode gather without StdMoE only: the internode "
+                "and scatter combines and StdMoE's convert also read state the op "
+                "keeps in the arena"
+            )
+        # AsyncLL's combine reads dispReceiverIdxMap, which every dispatch's
+        # RecvCopy rewrites, so a handle cannot outlive the next dispatch however
+        # its dest map is held. The pattern snapshot exists for -- dispatch A,
+        # dispatch B, then combine A -- is also exactly what AsyncLL's call-order
+        # check refuses, because its signal slots pair each dispatch with the
+        # combine that follows it.
+        if snapshot and self.cfg.async_ll:
+            raise ValueError(
+                "snapshot=True does not apply to async_ll: AsyncLL pairs every "
+                "dispatch with the next combine (its recv counts and slot map are "
+                "per round), so a routing handle is only ever used by that combine"
+            )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
-        disp_spec, _ = self._pick(n)
+        peak = max_num_inp_token_across_ranks
+        if peak is not None and not n <= peak <= cap:
+            raise ValueError(
+                f"max_num_inp_token_across_ranks={peak} must be at least this "
+                f"rank's {n} tokens and at most max_num_inp_token_per_rank={cap}"
+            )
+        if peak is None:
+            self._check_no_peak(snapshot)
+        disp_spec, _ = self._pick(n, snapshot, peak)
 
-        if not self._kernels.self_resets_counters:
-            # Only this one: the kernels self-clear dest_pe_counter and the grid
-            # barrier, but total_recv is cleared in COMBINE, not in dispatch.
-            self.total_recv.zero_()
-
+        recv_views = None
         if routing is not None:
             table = self._kernels.dispatch_replay
             if table is None:
@@ -953,12 +1405,19 @@ class EpDispatchCombineOp:
                 )
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
-            kern = self._kernels.dispatch[disp_spec]
-            if return_routing:
+            kern = kernels[disp_spec]
+            if snapshot:
+                # No fill: dispatch writes every (tok, k) entry below n, and
+                # nothing reads past n.
+                dest_map = torch.empty_like(self.routing_dest_map)
+                recv_views = self._snapshot_recv_views(disp_spec)
+            elif return_routing:
                 dest_map = self.routing_dest_map
             else:
                 dest_map = self.token_dest_map
 
+        # Last check before the launch, so a refused stride leaves no state behind.
+        self._set_segment_stride(segment_stride, n)
         kern(
             input=input,
             indices=indices,
@@ -967,37 +1426,43 @@ class EpDispatchCombineOp:
             dest_map=dest_map,
             num_tokens=n,
         )
+        recv_maps = None if recv_views is None else tuple(v.clone() for v in recv_views)
+        # What dispatch_recv() needs to launch the other half -- recorded only
+        # when this WAS the send half. Recording it for a plain dispatch() was not
+        # harmless bookkeeping: it kept the previous round's input activations
+        # alive until the next call, for every kernel family. dispatch_recv()
+        # drops the references again once it has launched.
+        if kernels is not self._kernels.dispatch:
+            self._async_pending_dispatch_tokens = n
+            self._async_pending_dispatch_input = input
+            self._async_pending_dispatch_map = dest_map
 
+        count = self.total_recv.clone() if snapshot else self.total_recv
+        if snapshot and self._snapshot_zeroes_count:
+            self.total_recv.zero_()
         base = (
             self.recv_tokens(),
             self.recv_weights(),
             self.recv_scales(),
             self.recv_indices(),
-            self.total_recv,
+            count,
         )
         if not return_routing:
             return base
 
-        # A live arena view: the reverse map is cloned lazily on first access,
-        # which must happen after the caller's post-dispatch barrier (see
-        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
-        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
-        # host cost on a path where the host already paces the GPU.
-        reverse = getattr(self, "_reverse_view", None)
-        if reverse is None:
-            reverse = from_gpu_ptr(
-                self.arena.local_ptr(self._region("recv_to_src_token")),
-                (self._recv_cap,),
-                torch.int32,
-            )
-            self._reverse_view = reverse
+        reverse, encode = self._reverse_source(disp_spec)
+        own = recv_maps is not None and encode is None
         handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
-            total_recv_token_num=self.total_recv,
+            total_recv_token_num=count,
+            disp_tok_id_to_src_tok_id_local=recv_maps[0] if own else None,
             cur_rank_num_token=n,
-            reverse_src_view=reverse,
+            reverse_src_view=reverse if recv_maps is None else recv_maps[0],
+            reverse_encode=encode,
+            recv_maps=recv_maps,
+            max_num_inp_token_across_ranks=peak,
         )
         return base + (handle,)
 
@@ -1006,14 +1471,25 @@ class EpDispatchCombineOp:
         indices are accepted for API parity but unused; routing carries the mapping.
 
         `weights` is a REQUEST, not an input: passing it asks for the weight fold,
-        whose values come from the forwarded out_wts, not from this argument. The
-        fold is for training backward (mori a668e25e) and costs more than the whole
-        token payload on gfx1250, so inference passes None -- as v1 does, gating on
-        the same null pointer.
+        whose values come from the forwarded out_wts, not from this argument, so
+        they must be this routing's (see EpDispatchRoutingHandle). The fold is for
+        training backward (mori a668e25e) and costs more than the whole token
+        payload on gfx1250, so inference passes None -- as v1 does, gating on the
+        same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
+        self._asyncll_check_weight_fold(weights)
+        with self._asyncll_call("combine"):
+            return self._combine_impl(
+                input, weights, indices, routing=routing, kernels=self._kernels.combine
+            )
+
+    def _combine_impl(self, input, weights, indices, *, routing, kernels):
+        """The body of combine(), parameterised by which kernel table runs. See
+        _dispatch_impl."""
         ct = routing.cur_rank_num_token
-        _, comb_spec = self._pick(ct)
+        snapshot = routing.total_recv_token_num is not self.total_recv
+        _, comb_spec = self._pick(ct, snapshot, self._routing_peak(routing, snapshot))
 
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;
@@ -1027,13 +1503,24 @@ class EpDispatchCombineOp:
         # [0, ct), so the prior contents of the returned slice never leak.
 
         want_weights = weights is not None
-        self._kernels.combine[comb_spec](
+        maps = getattr(routing, "recv_maps", None)
+        own = {} if maps is None else dict(recv_to_src=maps[0], recv_idx=maps[1])
+        kernels[comb_spec](
             input=input,
             dest_map=routing.disp_dest_tok_id_map,
             total_recv=routing.total_recv_token_num,
             num_tokens=ct,
             want_weights=want_weights,
+            **own,
         )
+        # Same rule as dispatch: only the send half leaves anything for later.
+        if kernels is not self._kernels.combine:
+            self._async_pending_combine = (
+                input,
+                routing.disp_dest_tok_id_map,
+                ct,
+                want_weights,
+            )
 
         cdt = self.cfg.combine_dtype
         hidden = self.cfg.hidden_dim
@@ -1052,6 +1539,193 @@ class EpDispatchCombineOp:
         )
         return out, outw
 
+    # -- the AsyncLL seam ------------------------------------------------
+    #
+    # dispatch() and combine() above run a whole phase in one call. On the
+    # AsyncLL family each splits in two, and the point of the split is what the
+    # caller does in between:
+    #
+    #     out, ..., routing = op.dispatch_send(x, w, s, idx, return_routing=True)
+    #     ...                       # anything; the SDMA copies drain under it
+    #     op.dispatch_recv()        # now the tokens are in `out`
+    #
+    # The send half returns the same tuple dispatch() does, but the output buffers
+    # are NOT populated until the matching recv call has run. Reading them in the
+    # seam reads stale data: the previous round's on a compact round, and on a
+    # segmented round (async_ll_recv_layout) bytes the engines are still writing,
+    # since those views are the landing region itself.
+
+    # The AsyncLL protocol's call order, as a state machine. What each call is
+    # allowed to see, and what it leaves behind:
+    #
+    #   idle --dispatch_send--> sent --dispatch_recv--> dispatched
+    #   dispatched --combine_send--> combining --combine_recv--> idle
+    #
+    # with dispatch() and combine() taking both steps of their half at once.
+    #
+    # This is not API tidiness; the protocol's signal slots carry the coupling
+    # and an unpaired call leaves state the NEXT call misreads:
+    #
+    #   * dispatch twice, no combine between: the recv counts are cleared only by
+    #     combine's send leg, so the second RecvTransfer finds the previous
+    #     round's non-zero count and its "0 means not arrived" wait passes at
+    #     once -- it then reads a payload that may still be in flight. Observed
+    #     on 8xMI308X and 8xMI355X, both transports, as wrong received counts
+    #     (560 against 548) and wrong combine output, in 1-2 of 6 attempts.
+    #   * dispatch_send twice: the slot counter keeps climbing past
+    #     MaxNumTokensToSendPerRank unchecked and writes into the next PE's slice.
+    #   * combine twice: the count is already 0, so the biased read underflows.
+    #     The kernels now skip instead of faulting, but the round is still wrong.
+    #   * cross-node combine twice: the epoch is an add of 1 per combine while
+    #     crossDeviceBarrierFlag moves once per dispatch, so one unpaired call
+    #     shifts them permanently and the wait never matches again -- a hang that
+    #     only reset() clears.
+    #
+    # Hence an error at the call rather than a diagnosis three kernels later. It
+    # is host-side bookkeeping on a path that already launches nine kernels, and
+    # it is only armed for async_ll: no other family couples its calls this way.
+    _ASYNCLL_ORDER = {
+        "dispatch": ("idle", "dispatched"),
+        "dispatch_send": ("idle", "sent"),
+        "dispatch_recv": ("sent", "dispatched"),
+        "combine": ("dispatched", "idle"),
+        "combine_send": ("dispatched", "combining"),
+        "combine_recv": ("combining", "idle"),
+    }
+    _asyncll_state = "idle"
+
+    def _asyncll_check_weight_fold(self, weights):
+        """Refuse an AsyncLL combine weight fold at the CALL, not three layers in.
+
+        The backend raises this too, but from inside the kernel wrapper -- after
+        _combine_impl has already staged `input` into the out_tok region, and
+        after the call-order check below has advanced the state. Both are wrong
+        places to find out: a caller that catches the error is left with a
+        half-written staging buffer and a state machine that has moved on.
+        """
+        if weights is not None and getattr(self.cfg, "async_ll", False):
+            raise NotImplementedError(
+                "AsyncLL combine does not produce output weights: its combine "
+                "payload carries no per-token metadata (v1's AsyncLL is the "
+                "same). Call combine() with weights=None, or use a non-AsyncLL "
+                "kernel family if you need the fold."
+            )
+
+    @contextlib.contextmanager
+    def _asyncll_call(self, call):
+        """Refuse `call` if it is out of order; advance only once it has run.
+
+        Advancing at the top -- before the body -- meant a call that then failed
+        its own argument checks (too many tokens, snapshot=True on async_ll,
+        routing= together with return_routing=) left the state moved on for a
+        launch that never happened, and the caller's next, correct call was
+        refused as out of order. So the check is up front and the advance is on
+        the way out: an exception from the body leaves the state where it was.
+        No-op off the AsyncLL family.
+        """
+        if not getattr(self.cfg, "async_ll", False):
+            yield
+            return
+        want, nxt = self._ASYNCLL_ORDER[call]
+        if self._asyncll_state != want:
+            raise RuntimeError(
+                f"{call}() is not valid here: AsyncLL is {self._asyncll_state!r} "
+                f"and this call needs {want!r}. The order is dispatch_send -> "
+                "dispatch_recv -> combine_send -> combine_recv (dispatch() and "
+                "combine() take both steps of their half). An unpaired call "
+                "leaves the recv counts and the combine epoch out of step, which "
+                "shows up as wrong data or a hang in a LATER round, not here. "
+                "Call reset() if you need to start over."
+            )
+        yield
+        self._asyncll_state = nxt
+
+    def _async_half(self, which):
+        table = getattr(self._kernels, which)
+        if table is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no {which}: it runs send and "
+                "recv in one launch. Build the op with async_ll=True (hip backend) "
+                "to get the split."
+            )
+        return table
+
+    def dispatch_send(
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        segment_stride=None,
+    ):
+        """Enqueue the send half of a dispatch and return immediately.
+
+        Same arguments and same return as :meth:`dispatch`. The returned views are
+        only valid after :meth:`dispatch_recv`.
+        """
+        with self._asyncll_call("dispatch_send"):
+            return self._dispatch_impl(
+                input,
+                weights,
+                scales,
+                indices,
+                routing=routing,
+                return_routing=return_routing,
+                kernels=self._async_half("dispatch_send"),
+                segment_stride=segment_stride,
+            )
+
+    def dispatch_recv(self):
+        """Run the recv half of the dispatch the last :meth:`dispatch_send` began."""
+        with self._asyncll_call("dispatch_recv"):
+            n = self._async_pending_dispatch_tokens
+            if n is None:
+                raise RuntimeError("dispatch_recv without a preceding dispatch_send")
+            self._async_pending_dispatch_tokens = None
+            spec, _ = self._pick(n)
+            self._async_half("dispatch_recv")[spec](
+                input=self._async_pending_dispatch_input,
+                dest_map=self._async_pending_dispatch_map,
+                num_tokens=n,
+            )
+            # Launched, so nothing reads these again; holding them would keep the
+            # caller's input alive until the next round. combine_recv already drops
+            # its whole tuple the same way.
+            self._async_pending_dispatch_input = None
+            self._async_pending_dispatch_map = None
+
+    def combine_send(self, input, weights=None, indices=None, *, routing):
+        """Enqueue the send half of a combine and return immediately."""
+        self._asyncll_check_weight_fold(weights)
+        with self._asyncll_call("combine_send"):
+            return self._combine_impl(
+                input,
+                weights,
+                indices,
+                routing=routing,
+                kernels=self._async_half("combine_send"),
+            )
+
+    def combine_recv(self):
+        """Run the recv half of the combine the last :meth:`combine_send` began."""
+        with self._asyncll_call("combine_recv"):
+            state = self._async_pending_combine
+            if state is None:
+                raise RuntimeError("combine_recv without a preceding combine_send")
+            self._async_pending_combine = None
+            inp, dest_map, ct, want_weights = state
+            _, spec = self._pick(ct)
+            self._async_half("combine_recv")[spec](
+                input=inp,
+                dest_map=dest_map,
+                total_recv=None,
+                num_tokens=ct,
+                want_weights=want_weights,
+            )
+
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The
         kernels self-reset their counters already; this forces a clean slate.
@@ -1059,14 +1733,14 @@ class EpDispatchCombineOp:
         Collective, like every other call here: cross_device_flag is the local
         half of the cross-device barrier and arena.zero() has just wiped the peer
         half, so one rank resetting alone would leave the two disagreeing."""
+        # This is the one way out of a half-finished exchange, and it is what the
+        # call-order error tells a caller to use: the counts and the epoch it
+        # zeroes below are exactly the state that order was protecting.
+        self._asyncll_state = "idle"
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
         self.dest_pe_counter.zero_()
-        # tokoff-ext keeps the slot allocator outside the arena (gfx1250).
-        tokoff_ext = getattr(self, "_tokoff_ext", None)
-        if tokoff_ext is not None:
-            tokoff_ext.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()

@@ -149,14 +149,16 @@ class TopoPathPci {
 
 class TopoSystemPci {
  public:
-  TopoSystemPci();
+  // `sysfsPciDevices` is the directory that lists the PCI functions; a test
+  // points it at a tree it built.
+  explicit TopoSystemPci(const std::string& sysfsPciDevices = "/sys/bus/pci/devices");
   ~TopoSystemPci();
 
   TopoPathPci* Path(PciBusId, PciBusId);
   TopoNodePci* Node(PciBusId);
 
  private:
-  void Load();
+  void Load(const std::string& sysfsPciDevices);
   void Validate();
 
  private:

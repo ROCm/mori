@@ -54,19 +54,154 @@ class ThreadMode:
     """How participating lanes contribute to a GDA data-path operation.
 
     ``INDEPENDENT`` makes each participating thread issue its own transfer.
-    ``AGGREGATE`` coalesces the warp's lanes into one transfer and is valid only
-    with ``CoopScope.THREAD``; every lane in the warp must enter the operation.
+    ``AGGREGATE`` gives the warp's lanes one reservation and one doorbell (each
+    lane still posts its own WQE; a signal fires once, with the last active
+    lane's signal_id / signal_val) and is valid only with ``CoopScope.THREAD``;
+    every lane in the warp must enter the operation, with the same peer and ctx.
     """
 
     INDEPENDENT = 0
     AGGREGATE = 1
 
 
+class Team:
+    """C++ ``ccoTeamMode``: how a GDA op numbers ``peer``. ``WORLD`` is a world
+    rank; ``GDA`` an index in the DevComm's GDA team, i.e. the node index on a
+    ``GDA_CONNECTION_RAIL`` connection."""
+
+    WORLD = 0
+    GDA = 2
+
+
+class GdaDoorbell:
+    """C++ ``ccoGdaDoorbellMode``, a GDA handle's compile-time mode
+    (``ccoGda<P, Mode>``); each mode has its own wrapper symbols.
+
+    The mode belongs to the handle, the doorbell state to the QP: one per (peer,
+    ctx % gda_context_count). Handles on one context, and per-call ``ctx=``
+    values that land on it, share its QPs whatever their mode."""
+
+    # A post rings its own doorbell (coalesced with posts behind it).
+    IMMEDIATE = 0
+    # A post writes its WQEs and a ready mark but does not ring; the next ring
+    # that reaches it (an IMMEDIATE post or signal after it, flush, flush_peer,
+    # flush_async, a full SQ) releases it. Mixes freely with IMMEDIATE on a QP.
+    DEFERRED = 1
+    # A post writes its WQEs only; only a CALLER_ORDERED flush releases it.
+    # Contract, unchecked: every post on the QP has returned when that flush
+    # starts (e.g. posters bump a counter after the post returns, the flusher
+    # waits for it); while any is pending, only CALLER_ORDERED handles post to or
+    # flush the QP, so give such traffic its own contexts; fewer than the SQ
+    # depth in WQEs (one per posting lane, plus one per signal) between two
+    # flushes. flush() rings every peer's QP on the context, so the contract then
+    # covers all of them. No signal(): put with a signal_op instead.
+    CALLER_ORDERED = 2
+
+
+# Symbol suffix per mode: put / put_value / get have all three; a flush only
+# CALLER_ORDERED's, since any other flush releases deferred posts.
+GDA_DOORBELL_TAG = {
+    GdaDoorbell.IMMEDIATE: "",
+    GdaDoorbell.DEFERRED: "__deferred",
+    GdaDoorbell.CALLER_ORDERED: "__caller_ordered",
+}
+GDA_FLUSH_DOORBELL_TAG = {**GDA_DOORBELL_TAG, GdaDoorbell.DEFERRED: ""}
+
+
+def gda_doorbell_tag(doorbell, *, flush=False):
+    """Symbol suffix of ``doorbell`` for a data-path op, or a flush op."""
+    table = GDA_FLUSH_DOORBELL_TAG if flush else GDA_DOORBELL_TAG
+    # A bool is an int: True would read as DEFERRED.
+    if isinstance(doorbell, bool) or doorbell not in table:
+        raise ValueError(
+            "cco: GDA doorbell must be GdaDoorbell.IMMEDIATE, DEFERRED or "
+            f"CALLER_ORDERED, not {doorbell!r}"
+        )
+    return table[doorbell]
+
+
+class GdaFlags:
+    """The trailing ``flags`` word of the GDA wrappers that take a peer (put,
+    put_value, get, signal, flush_peer, flush_async). Pass a compile-time
+    constant: the wrapper is inlined and its dispatch on ``flags`` then folds
+    to one instantiation. Any other bit traps."""
+
+    # peer is numbered in Team.GDA rather than Team.WORLD.
+    TEAM_GDA = 1 << 8
+
+
+def gda_flags(*, team=Team.WORLD):
+    """:class:`GdaFlags` for one GDA op; the argument is C++'s template one."""
+    if team not in (Team.WORLD, Team.GDA):
+        raise ValueError("cco: GDA team must be Team.WORLD or Team.GDA")
+    return GdaFlags.TEAM_GDA if team == Team.GDA else 0
+
+
 class SdmaOptFlags:
-    """Runtime SDMA option bits accepted by the C wrapper."""
+    """C++ ``ccoSdmaOptFlags``. The window put/get wrappers (``cco_sdma_put__<tag>``
+    and friends) honour AGGREGATE only; :class:`SdmaFlags` carries both."""
 
     DEFAULT = 0
     AGGREGATE = 1
+    SIGNAL_PER_COPY = 2
+
+
+class SdmaFlags:
+    """The ``flags`` word of ``cco_sdma_{put,get}_ptr__<coop>``: every template axis
+    of ``ccoSdma::putPtr`` / ``getPtr`` besides Coop. Bits 0-1 are
+    :class:`SdmaOptFlags`. Pass a compile-time constant: the wrapper is inlined
+    and its dispatch on ``flags`` then folds to one instantiation."""
+
+    AGGREGATE = SdmaOptFlags.AGGREGATE
+    SIGNAL_PER_COPY = SdmaOptFlags.SIGNAL_PER_COPY
+    LOCAL_SIGNAL = 1 << 2
+    REMOTE_SIGNAL = 1 << 3
+    SAME_QUEUE = 1 << 4
+
+
+class SdmaCmp:
+    """C++ ``ccoSdmaCmp``: the comparison of an engine-side wait
+    (``Sdma.post_wait_mem``), applied to ``(*flag & mask)`` against ``value``."""
+
+    ALWAYS = 0
+    LT = 1
+    LE = 2
+    EQ = 3
+    NE = 4
+    GE = 5
+    GT = 6
+
+
+def sdma_flags(
+    coop,
+    *,
+    local_signal=False,
+    remote_signal=False,
+    aggregate=False,
+    signal_per_copy=False,
+    same_queue=False,
+):
+    """:class:`SdmaFlags` for one put/get; the arguments are C++'s template ones."""
+    if same_queue and coop != CoopScope.THREAD:
+        raise ValueError("cco: same_queue requires CoopScope.THREAD")
+    return (
+        (SdmaFlags.LOCAL_SIGNAL if local_signal else 0)
+        | (SdmaFlags.REMOTE_SIGNAL if remote_signal else 0)
+        | (SdmaFlags.AGGREGATE if aggregate else 0)
+        | (SdmaFlags.SIGNAL_PER_COPY if signal_per_copy else 0)
+        | (SdmaFlags.SAME_QUEUE if same_queue else 0)
+    )
+
+
+def sdma_signals(signal, local_signal, remote_signal):
+    """(local_signal, remote_signal) of a window put/get. ``signal`` is the old
+    name of ``local_signal``; a call naming neither signal keeps the old
+    default, a local one."""
+    if signal is not None and local_signal is not None:
+        raise TypeError("cco: pass signal or local_signal, not both")
+    if local_signal is None:
+        local_signal = signal if signal is not None else remote_signal is None
+    return bool(local_signal), bool(remote_signal)
 
 
 SIGNAL_TAG = {
@@ -89,6 +224,8 @@ DATA_PATH_TAG = {
 GDA_DATA_TAGS = tuple(DATA_PATH_TAG.values())
 GDA_SIGNAL_TAGS = tuple(SIGNAL_TAG.values())
 COOP_TAGS = tuple(COOP_TAG.values())
+GDA_DOORBELL_TAGS = tuple(GDA_DOORBELL_TAG.values())
+GDA_FLUSH_DOORBELL_TAGS = tuple(dict.fromkeys(GDA_FLUSH_DOORBELL_TAG.values()))
 
 _U64 = "uint64"
 _I32 = "int32"
@@ -131,6 +268,7 @@ _add(
 # lgkmcnt). See cco_lsa_win_base in the device wrapper.
 _add("lsa_win_base", "cco_lsa_win_base", [_U64], _U64, pure=True, family="lsa")
 _add("lsa_stride", "cco_lsa_stride", [_U64], _U64, pure=True, family="lsa")
+_add("local_ptr", "cco_local_ptr", [_U64, _U64], _U64, pure=True, family="lsa")
 
 # Benchmark-only publication primitive. It is not a cooperative barrier:
 # leaderOnly=1 fences thread 0 only, so producers must synchronize first and
@@ -172,6 +310,40 @@ for _op in ("put", "get"):
             tag=_tag,
         )
 
+# SDMA 2D put/get: (devComm, peer, dstWin, dstOff, dstPitch, srcWin, srcOff,
+# srcPitch, widthBytes, height, qid, flags).
+_sdma_xfer2d_args = [
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+]
+for _op in ("put", "get"):
+    for _tag in (
+        "thread",
+        "warp",
+        "block",
+        "thread_ns",
+        "warp_ns",
+        "block_ns",
+    ):
+        _add(
+            f"sdma_{_op}2d_{_tag}",
+            f"cco_sdma_{_op}2d__{_tag}",
+            _sdma_xfer2d_args,
+            _I32,
+            family=f"sdma_{_op}2d",
+            tag=_tag,
+        )
+
 for _tag in COOP_TAGS:
     _add(
         f"sdma_quiet_{_tag}",
@@ -196,8 +368,87 @@ _add(
     _I32,
     family="sdma_quiet_queue",
 )
+# ccoSdma::putPtr / getPtr; the last argument is SdmaFlags.
+for _op in ("put", "get"):
+    for _tag in COOP_TAGS:
+        _add(
+            f"sdma_{_op}_ptr_{_tag}",
+            f"cco_sdma_{_op}_ptr__{_tag}",
+            [_U64, _I32, _U64, _U64, _U64, _I32, _I32],
+            _I32,
+            family=f"sdma_{_op}_ptr",
+            tag=_tag,
+        )
+_add(
+    "sdma_wait_signal",
+    "cco_sdma_wait_signal",
+    [_U64, _I32, _I32, _U64],
+    _I32,
+    family="sdma_wait_signal",
+)
+# Older spelling of sdma_put_ptr_thread with SdmaFlags.REMOTE_SIGNAL.
+_add(
+    "sdma_put_ptr_rsig_thread",
+    "cco_sdma_put_ptr_rsig__thread",
+    [_U64, _I32, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_put_ptr_rsig",
+    tag="thread",
+)
+_add(
+    "sdma_signal_slot",
+    "cco_sdma_signal_slot",
+    [_U64, _I32, _I32],
+    _U64,
+    pure=True,
+    family="sdma_signal_slot",
+)
 
-# GDA data path.
+# Engine-side wait and broadcast. `flags` is the SdmaFlags subset the C++ call
+# takes: AGGREGATE for the waits; AGGREGATE | LOCAL_SIGNAL | REMOTE_SIGNAL for
+# the broadcast. value / mask / expected are 32-bit quantities in a uint64.
+for _tag in COOP_TAGS:
+    # (devComm, peer, qid, win, off, value, cmp, mask, flags)
+    _add(
+        f"sdma_post_wait_mem_{_tag}",
+        f"cco_sdma_post_wait_mem__{_tag}",
+        [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_mem",
+        tag=_tag,
+    )
+    # (devComm, peer, qid, srcLsaRank, sigQid, expected, flags)
+    _add(
+        f"sdma_post_wait_signal_{_tag}",
+        f"cco_sdma_post_wait_signal__{_tag}",
+        [_U64, _I32, _I32, _I32, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_signal",
+        tag=_tag,
+    )
+    # (devComm, peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff,
+    #  nbytes, qid, flags)
+    _add(
+        f"sdma_put_broadcast_{_tag}",
+        f"cco_sdma_put_broadcast__{_tag}",
+        [_U64, _I32, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _U64, _I32, _I32],
+        _I32,
+        family="sdma_put_broadcast",
+        tag=_tag,
+    )
+# ccoSdma::postWaitMemPutPtr: wait + copy + signals in one reservation, one
+# doorbell. (devComm, peer, qid, win, off, value, cmp, mask, dst, src, nbytes, flags)
+_add(
+    "sdma_post_wait_mem_put_ptr_thread",
+    "cco_sdma_post_wait_mem_put_ptr__thread",
+    [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_post_wait_mem_put_ptr",
+    tag="thread",
+)
+
+# GDA data path. Every op that takes a peer ends in a GdaFlags word.
+# (devComm, ctx, peer, dstWin, dstOff, srcWin, srcOff, nbytes, sigId, sigVal, flags)
 _gda_put_args = [
     _U64,
     _I32,
@@ -209,37 +460,43 @@ _gda_put_args = [
     _U64,
     _I32,
     _U64,
+    _I32,
 ]
-_gda_put_value_args = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64]
-_gda_get_args = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64]
+# (devComm, ctx, peer, dstWin, dstOff, value, sigId, sigVal, flags)
+_gda_put_value_args = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32]
+# (devComm, ctx, peer, remoteWin, remoteOff, localWin, localOff, nbytes, flags)
+_gda_get_args = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64, _I32]
 
-for _tc in GDA_DATA_TAGS:
-    for _sig in GDA_SIGNAL_TAGS:
-        _tag = f"{_tc}__{_sig}"
+# One symbol per doorbell mode; the friendly name ends in _deferred /
+# _caller_ordered like the symbol does in __deferred / __caller_ordered.
+for _db in GDA_DOORBELL_TAGS:
+    for _tc in GDA_DATA_TAGS:
+        for _sig in GDA_SIGNAL_TAGS:
+            _tag = f"{_tc}__{_sig}{_db}"
+            _add(
+                f"gda_put_{_tc}_{_sig}{_db[1:]}",
+                f"cco_gda_put__{_tag}",
+                _gda_put_args,
+                _I32,
+                family="gda_put",
+                tag=_tag,
+            )
+            _add(
+                f"gda_put_value_{_tc}_{_sig}{_db[1:]}",
+                f"cco_gda_put_value__{_tag}",
+                _gda_put_value_args,
+                _I32,
+                family="gda_put_value",
+                tag=_tag,
+            )
         _add(
-            f"gda_put_{_tc}_{_sig}",
-            f"cco_gda_put__{_tag}",
-            _gda_put_args,
+            f"gda_get_{_tc}{_db[1:]}",
+            f"cco_gda_get__{_tc}{_db}",
+            _gda_get_args,
             _I32,
-            family="gda_put",
-            tag=_tag,
+            family="gda_get",
+            tag=f"{_tc}{_db}",
         )
-        _add(
-            f"gda_put_value_{_tc}_{_sig}",
-            f"cco_gda_put_value__{_tag}",
-            _gda_put_value_args,
-            _I32,
-            family="gda_put_value",
-            tag=_tag,
-        )
-    _add(
-        f"gda_get_{_tc}",
-        f"cco_gda_get__{_tc}",
-        _gda_get_args,
-        _I32,
-        family="gda_get",
-        tag=_tc,
-    )
 
 for _coop in COOP_TAGS:
     for _sig in ("inc", "add"):
@@ -247,7 +504,7 @@ for _coop in COOP_TAGS:
         _add(
             f"gda_signal_{_coop}_{_sig}",
             f"cco_gda_signal__{_tag}",
-            [_U64, _I32, _I32, _I32, _U64],
+            [_U64, _I32, _I32, _I32, _U64, _I32],
             _I32,
             family="gda_signal",
             tag=_tag,
@@ -276,21 +533,43 @@ _add(
     family="gda_reset_signal",
 )
 
-for _coop in ("warp", "block"):
+for _db in GDA_FLUSH_DOORBELL_TAGS:
+    for _coop in ("warp", "block"):
+        _add(
+            f"gda_flush_{_coop}{_db[1:]}",
+            f"cco_gda_flush__{_coop}{_db}",
+            [_U64, _I32],
+            _I32,
+            family="gda_flush",
+            tag=f"{_coop}{_db}",
+        )
+        _add(
+            f"gda_flush_peer_{_coop}{_db[1:]}",
+            f"cco_gda_flush_peer__{_coop}{_db}",
+            [_U64, _I32, _I32, _I32],
+            _I32,
+            family="gda_flush_peer",
+            tag=f"{_coop}{_db}",
+        )
+    # (devComm, ctx, peer, flags) -> request, for gda_wait_<coop>
+    for _coop in COOP_TAGS:
+        _add(
+            f"gda_flush_async_{_coop}{_db[1:]}",
+            f"cco_gda_flush_async__{_coop}{_db}",
+            [_U64, _I32, _I32, _I32],
+            _U64,
+            family="gda_flush_async",
+            tag=f"{_coop}{_db}",
+        )
+
+for _coop in COOP_TAGS:
+    # (devComm, ctx, request) -> 0
     _add(
-        f"gda_flush_{_coop}",
-        f"cco_gda_flush__{_coop}",
-        [_U64, _I32],
+        f"gda_wait_{_coop}",
+        f"cco_gda_wait__{_coop}",
+        [_U64, _I32, _U64],
         _I32,
-        family="gda_flush",
-        tag=_coop,
-    )
-    _add(
-        f"gda_flush_peer_{_coop}",
-        f"cco_gda_flush_peer__{_coop}",
-        [_U64, _I32, _I32],
-        _I32,
-        family="gda_flush_peer",
+        family="gda_wait",
         tag=_coop,
     )
 
@@ -304,11 +583,24 @@ __all__ = [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaDoorbell",
+    "GDA_DOORBELL_TAG",
+    "GDA_FLUSH_DOORBELL_TAG",
+    "gda_doorbell_tag",
+    "GdaFlags",
+    "gda_flags",
     "SdmaOptFlags",
+    "SdmaFlags",
+    "SdmaCmp",
+    "sdma_flags",
+    "sdma_signals",
     "SIGNAL_TAG",
     "COOP_TAG",
     "DATA_PATH_TAG",
     "GDA_DATA_TAGS",
     "GDA_SIGNAL_TAGS",
     "COOP_TAGS",
+    "GDA_DOORBELL_TAGS",
+    "GDA_FLUSH_DOORBELL_TAGS",
 ]

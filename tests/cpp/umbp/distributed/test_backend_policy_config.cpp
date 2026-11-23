@@ -80,6 +80,38 @@ TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
   EXPECT_EQ(dram.prefault_threads, 4);
 }
 
+TEST(BackendPolicyConfig, SsdPolicyKeepsPeerSsdSettings) {
+  const char* json = R"({"schema_version":1,"backends":{
+    "dram":{"type":"dram","capacity":"1GiB","numa_node":[0]},
+    "ssd0":{"type":"ssd","capacity":"8GiB","path":"/tmp/umbp-ssd-test"}},
+    "tiers":[{"name":"dram","backends":{"dram":100},"offload_to":["ssd"],
+              "offload_trigger":"on_evict"},
+             {"name":"ssd","backends":{"ssd0":100}}],"entry_tier":"dram"})";
+  auto loaded = LoadBackendPolicyJson(json);
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+  PoolClientConfig output;
+  output.dram_page_size = 4096;
+  output.ssd.ssd.verify_crc = false;
+  output.ssd.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
+  output.ssd.ssd.segment_size_bytes = 256ULL << 20;
+  // The policy's own capacity and path must still win over the peer's.
+  output.ssd.ssd.storage_dir = "/peer/ssd0,/peer/ssd1";
+  output.ssd.ssd.capacity_bytes = 1ULL << 30;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  const BackendInstanceConfig* ssd = nullptr;
+  for (const auto& backend : output.backends) {
+    if (backend.name == "ssd0") ssd = &backend;
+  }
+  ASSERT_NE(ssd, nullptr);
+  EXPECT_TRUE(ssd->ssd.enabled);
+  EXPECT_EQ(ssd->ssd.ssd.capacity_bytes, 8ULL << 30);
+  EXPECT_EQ(ssd->ssd.ssd.storage_dir, "/tmp/umbp-ssd-test");
+  EXPECT_FALSE(ssd->ssd.ssd.verify_crc);
+  EXPECT_EQ(ssd->ssd.ssd.durability.mode, UMBPDurabilityMode::Relaxed);
+  EXPECT_EQ(ssd->ssd.ssd.segment_size_bytes, 256ULL << 20);
+}
+
 // The three-tier example we ship, read from disk rather than copied here, so
 // that editing one without the other fails this test.
 TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
@@ -334,6 +366,24 @@ TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
      "tiers":[{"backends":{"s":1}}]}
   )json");
   EXPECT_FALSE(negative.ok());
+}
+
+TEST(BackendPolicyConfig, LowersSsdMinObjectSizeOntoTierMembers) {
+  auto loaded = LoadBackendPolicyJson(R"json(
+    {"backends":{"d":{"type":"dram","capacity":"1GiB"},
+                 "s":{"type":"ssd","capacity":"1GiB","path":"/tmp/a","min_object_size":"64KiB"}},
+     "tiers":[{"backends":{"d":1,"s":2}}]}
+  )json");
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+  PoolClientConfig output;
+  output.dram_page_size = 64ULL << 10;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.logical_tiers.size(), 1u);
+  for (const auto& member : output.logical_tiers[0].members) {
+    EXPECT_EQ(member.min_object_bytes, member.backend_name == "s" ? 64ULL << 10 : 0u)
+        << member.backend_name;
+  }
 }
 
 TEST(BackendPolicyConfig, ApplyIsAtomicWhenLoweringFails) {

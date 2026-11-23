@@ -1,8 +1,8 @@
 # MoriDetectDevice.cmake — Auto-detect GPU architecture and RDMA NIC type.
 #
 # Provides: mori_detect_device_config() Sets the following variables in the
-# caller's scope: MORI_GPU_ARCH          — GPU architecture string (e.g.
-# "gfx942") MORI_DEVICE_NIC        — NIC type: "mlx5", "bnxt", or "ionic"
+# caller's scope: MORI_GPU_ARCH          — GPU architecture(s) (e.g. "gfx942")
+# MORI_DEVICE_NIC        — NIC type: "mlx5", "bnxt", or "ionic"
 # MORI_DEVICE_NIC_DEFINE — Compile definition (e.g. "MORI_DEVICE_NIC_BNXT"),
 # empty for mlx5 (the default provider) MORI_IONIC_CCQE_DEFINE — "IONIC_CCQE"
 # when the ionic collapsed-CQE device path must be compiled in, empty otherwise
@@ -19,7 +19,34 @@
 
 include_guard(GLOBAL)
 
-set(_MORI_SUPPORTED_ARCHS "gfx942;gfx950")
+set(_MORI_SUPPORTED_ARCHS "gfx942;gfx950;gfx1250;gfx1250-strict")
+
+# Supported archs named in `text`, in _MORI_SUPPORTED_ARCHS order, matching
+# whole target names: "gfx1250" is a substring of "gfx1250-strict".
+function(_mori_match_archs text out_var)
+  string(REGEX MATCHALL "gfx[0-9a-f]+(-strict)?" _tokens "${text}")
+  set(_found "")
+  foreach(_arch ${_MORI_SUPPORTED_ARCHS})
+    if(_arch IN_LIST _tokens)
+      list(APPEND _found "${_arch}")
+    endif()
+  endforeach()
+  set(${out_var}
+      "${_found}"
+      PARENT_SCOPE)
+endfunction()
+
+# The first of them.
+function(_mori_match_arch text out_var)
+  _mori_match_archs("${text}" _found)
+  set(_first "")
+  if(_found)
+    list(GET _found 0 _first)
+  endif()
+  set(${out_var}
+      "${_first}"
+      PARENT_SCOPE)
+endfunction()
 
 set(MORI_IONIC_CCQE
     "AUTO"
@@ -31,18 +58,16 @@ set_property(CACHE MORI_IONIC_CCQE PROPERTY STRINGS AUTO ON OFF)
 # GPU architecture detection
 # ---------------------------------------------------------------------------
 function(_mori_detect_gpu_arch out_var)
-  # 1. Env override
+  # 1. Env override: every listed arch, as setup.py builds them
   if(DEFINED ENV{MORI_GPU_ARCHS})
-    foreach(_arch ${_MORI_SUPPORTED_ARCHS})
-      string(FIND "$ENV{MORI_GPU_ARCHS}" "${_arch}" _pos)
-      if(NOT _pos EQUAL -1)
-        message(STATUS "Mori GPU arch: ${_arch} (from MORI_GPU_ARCHS env)")
-        set(${out_var}
-            "${_arch}"
-            PARENT_SCOPE)
-        return()
-      endif()
-    endforeach()
+    _mori_match_archs("$ENV{MORI_GPU_ARCHS}" _arch)
+    if(_arch)
+      message(STATUS "Mori GPU arch: ${_arch} (from MORI_GPU_ARCHS env)")
+      set(${out_var}
+          "${_arch}"
+          PARENT_SCOPE)
+      return()
+    endif()
   endif()
 
   # 1. GPU_TARGETS / AMDGPU_TARGETS already set (e.g. by ROCm CMake or user)
@@ -102,31 +127,27 @@ function(_mori_detect_gpu_arch out_var)
       OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
       RESULT_VARIABLE _rc)
     if(_rc EQUAL 0)
-      foreach(_arch ${_MORI_SUPPORTED_ARCHS})
-        string(FIND "${_rocminfo_out}" "${_arch}" _pos)
-        if(NOT _pos EQUAL -1)
-          message(STATUS "Mori GPU arch: ${_arch} (from rocminfo)")
-          set(${out_var}
-              "${_arch}"
-              PARENT_SCOPE)
-          return()
-        endif()
-      endforeach()
-    endif()
-  endif()
-
-  # 1. AMDGPU_TARGETS env
-  if(DEFINED ENV{AMDGPU_TARGETS})
-    foreach(_arch ${_MORI_SUPPORTED_ARCHS})
-      string(FIND "$ENV{AMDGPU_TARGETS}" "${_arch}" _pos)
-      if(NOT _pos EQUAL -1)
-        message(STATUS "Mori GPU arch: ${_arch} (from AMDGPU_TARGETS env)")
+      _mori_match_arch("${_rocminfo_out}" _arch)
+      if(_arch)
+        message(STATUS "Mori GPU arch: ${_arch} (from rocminfo)")
         set(${out_var}
             "${_arch}"
             PARENT_SCOPE)
         return()
       endif()
-    endforeach()
+    endif()
+  endif()
+
+  # 1. AMDGPU_TARGETS env
+  if(DEFINED ENV{AMDGPU_TARGETS})
+    _mori_match_arch("$ENV{AMDGPU_TARGETS}" _arch)
+    if(_arch)
+      message(STATUS "Mori GPU arch: ${_arch} (from AMDGPU_TARGETS env)")
+      set(${out_var}
+          "${_arch}"
+          PARENT_SCOPE)
+      return()
+    endif()
   endif()
 
   message(WARNING "Mori: cannot detect GPU architecture. "

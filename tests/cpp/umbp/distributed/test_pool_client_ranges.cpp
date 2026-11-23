@@ -251,7 +251,8 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, size_t dram_capacity,
                                          std::vector<char>& get_scratch,
                                          std::vector<char>& put_scratch,
-                                         bool locality_prefetch = true) {
+                                         bool locality_prefetch = true,
+                                         bool remote_single_flight = true) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -272,16 +273,46 @@ class PoolClientRangesTest : public ::testing::Test {
     // test hands it a size rather than a buffer.
     cfg.dram.buffer_sizes = {dram_capacity};
     // Separate GET and PUT arenas so remote ranged get/put run concurrently.
-    cfg.ranged_get_scratch_buffer = get_scratch.data();
-    cfg.ranged_get_scratch_size = get_scratch.size();
-    cfg.ranged_put_scratch_buffer = put_scratch.data();
-    cfg.ranged_put_scratch_size = put_scratch.size();
+    cfg.ranged_get_scratch = {{get_scratch.data(), get_scratch.size()}};
+    cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
+    cfg.remote_single_flight = remote_single_flight;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
     EXPECT_TRUE(client->RegisterMemory(put_scratch.data(), put_scratch.size()));
+    return client;
+  }
+
+  // MakeClient with its arenas laid out by NUMA node instead: one GET and one PUT
+  // buffer per entry of `nodes`, in that order, and no locality prefetch, so every
+  // read of a remote key goes through an arena.
+  std::unique_ptr<PoolClient> MakeNumaArenaClient(const std::string& node_id,
+                                                  const std::vector<int>& nodes,
+                                                  std::vector<std::vector<char>>& get_arenas,
+                                                  std::vector<std::vector<char>>& put_arenas) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = master_address_;
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.auto_peer_service_port = true;
+    cfg.dram_page_size = kPageSize;
+    cfg.staging_buffer_size = 1024;
+    cfg.dram.buffer_sizes = {kCallerCapacity};
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i], 1});
+      cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i], 1});
+    }
+    cfg.cache_remote_fetches = false;
+    cfg.ranged_locality_prefetch = false;
+    auto client = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(client->Init());
+    for (auto* arenas : {&get_arenas, &put_arenas}) {
+      for (auto& arena : *arenas) EXPECT_TRUE(client->RegisterMemory(arena.data(), arena.size()));
+    }
     return client;
   }
 
@@ -379,10 +410,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     tiered_get_scratch_.resize(kScratchSize);
     tiered_put_scratch_.resize(kScratchSize);
-    cfg.ranged_get_scratch_buffer = tiered_get_scratch_.data();
-    cfg.ranged_get_scratch_size = tiered_get_scratch_.size();
-    cfg.ranged_put_scratch_buffer = tiered_put_scratch_.data();
-    cfg.ranged_put_scratch_size = tiered_put_scratch_.size();
+    cfg.ranged_get_scratch = {{tiered_get_scratch_.data(), tiered_get_scratch_.size()}};
+    cfg.ranged_put_scratch = {{tiered_put_scratch_.data(), tiered_put_scratch_.size()}};
     cfg.cache_remote_fetches = false;
 
     BackendInstanceConfig cold;
@@ -659,6 +688,40 @@ TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
   opted_in->Close();
 }
 
+// A hugepage request the host cannot serve falls back to 4 KiB pages; the node still comes up.
+TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
+  auto config = DistributedConfig("ranges-scratch-fell-back", 4 * kPageSize);
+  config.distributed->ranged_scratch_use_hugepages = true;
+  config.distributed->ranged_scratch_hugepage_size = 3 * 1024 * 1024;  // no such hugepage size
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+  client->Close();
+}
+
+// The standalone server's layout: each arena split across the NUMA nodes that have
+// GPUs, one shard per GPU, and a remote ranged read round-trips through it.
+TEST_F(PoolClientRangesTest, DistributedScratchLaidOutByNumaNode) {
+  auto config = DistributedConfig("ranges-numa-layout", 16 * kObjectSize);
+  config.distributed->ranged_scratch_numa_layout = true;
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 7 + 5) & 0xff);
+  const std::string key = "numa-layout-remote";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(client.get(), key));
+  std::vector<char> out(4000, 0);
+  ASSERT_EQ(client->BatchGetRanges({key}, {{reinterpret_cast<uintptr_t>(out.data())}},
+                                   {{out.size()}}, {{100}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(out.data(), object.data() + 100, out.size()), 0);
+  client->Close();
+}
+
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   const std::string key = "range-stale-self";
   std::vector<char> stale_object(kObjectSize, 0x11);
@@ -799,6 +862,77 @@ TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
   for (size_t k = 0; k < kKeys; ++k) {
     EXPECT_EQ(std::memcmp(out[k].data(), objects[k].data(), kObjectSize), 0) << "key=" << keys[k];
   }
+}
+
+// Arenas laid out by NUMA node: a remote ranged call stages through the arena on
+// its caller buffer's node -- a GPU's for device memory -- and a caller whose node
+// is unknown through the first arena.
+TEST_F(PoolClientRangesTest, NumaGroupedArenasStageOnTheCallersNode) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices < 1) GTEST_SKIP() << "no GPU";
+  int first_node = -1;
+  int last_node = -1;
+  mori::application::detail::GpuLocalCpuList(0, first_node);
+  mori::application::detail::GpuLocalCpuList(devices - 1, last_node);
+  if (first_node < 0 || last_node < 0 || first_node == last_node) {
+    GTEST_SKIP() << "needs GPUs on two NUMA nodes";
+  }
+  constexpr char kPoison = static_cast<char>(0x6b);
+  const auto poisoned = [&](const std::vector<char>& v) {
+    return std::all_of(v.begin(), v.end(), [&](char c) { return c == kPoison; });
+  };
+  std::vector<std::vector<char>> get_arenas(2, std::vector<char>(kScratchSize, kPoison));
+  std::vector<std::vector<char>> put_arenas(2, std::vector<char>(kScratchSize, kPoison));
+  auto numa_client =
+      MakeNumaArenaClient("ranges-numa_client", {first_node, last_node}, get_arenas, put_arenas);
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 31 + 3) & 0xff);
+  const std::string key = "numa-numa_client";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  numa_client->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(numa_client.get(), key));
+
+  int previous = 0;
+  ASSERT_EQ(hipGetDevice(&previous), hipSuccess);
+  ASSERT_EQ(hipSetDevice(devices - 1), hipSuccess);
+  void* gpu = nullptr;
+  const hipError_t malloc_rc = hipMalloc(&gpu, kObjectSize);
+  ASSERT_EQ(hipSetDevice(previous), hipSuccess);
+  ASSERT_EQ(malloc_rc, hipSuccess);
+  struct Release {
+    void* ptr;
+    ~Release() { (void)hipFree(ptr); }
+  } release{gpu};
+
+  // A span, not the whole object, so the read cannot bypass the arena.
+  constexpr size_t kOffset = 100;
+  constexpr size_t kSpan = 4000;
+  ASSERT_EQ(numa_client->BatchGetRanges({key}, {{gpu}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  std::vector<char> actual(kSpan);
+  ASSERT_EQ(hipMemcpy(actual.data(), gpu, kSpan, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_arenas[1].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_arenas[0]));
+
+  std::fill(get_arenas[1].begin(), get_arenas[1].end(), kPoison);
+  std::vector<char> host(kSpan, 0);
+  ASSERT_EQ(numa_client->BatchGetRanges({key}, {{host.data()}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(host.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_arenas[0].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_arenas[1]));
+
+  // A write from the last GPU assembles its object in that node's PUT arena.
+  ASSERT_EQ(hipMemcpy(gpu, object.data(), kObjectSize, hipMemcpyHostToDevice), hipSuccess);
+  const std::string put_key = "numa-numa_client-put";
+  ASSERT_EQ(numa_client->BatchPutRanges({put_key}, {kObjectSize}, {{gpu}}, {{kObjectSize}}, {{0}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(put_arenas[1].data(), object.data(), kObjectSize), 0);
+  EXPECT_TRUE(poisoned(put_arenas[0]));
+  numa_client->Shutdown();
 }
 
 // One object too big for the WHOLE arena must not decide arena sizing for its
@@ -1192,6 +1326,32 @@ TEST_F(PoolClientRangesTest, LocalityPrefetchOffLeavesNothingLocal) {
   quiet->Shutdown();
 }
 
+// A queued request's keys pulled from their owner before the read, so the read
+// is local; locality prefetch is off, so BatchPrefetch is the only pull.
+TEST_F(PoolClientRangesTest, BatchPrefetchPullsAPeersKeyIntoThisNode) {
+  std::vector<char> node_get(kScratchSize), node_put(kScratchSize);
+  auto node = MakeClient("ranges-batch-prefetch", kCallerCapacity, node_get, node_put,
+                         /*locality_prefetch=*/false);
+
+  const std::string key = "batch-prefetch";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 41 + 5) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  node->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(node.get(), key));
+  ASSERT_FALSE(LocallyResident(node.get(), key));
+
+  EXPECT_EQ(node->BatchPrefetch({key}), 1u);
+  ASSERT_TRUE(WaitLocallyResident(node.get(), key));
+
+  target_->Shutdown();
+  std::vector<char> out(kObjectSize, 0);
+  ASSERT_TRUE(node->BatchGet({key}, {out.data()}, {kObjectSize}).front());
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+  node->Shutdown();
+}
+
 // Eight layer groups over one cold key must schedule ONE whole-object pull, not
 // one per group: the dedup set is what keeps the duplicate traffic bounded at
 // 1x the object instead of 8x.
@@ -1545,4 +1705,134 @@ TEST_F(PoolClientRangesTest, ConcurrentMixedShapesAllReturnCorrectBytes) {
 }
 
 }  // namespace
+// ---- remote single-flight --------------------------------------------------
+
+namespace {
+
+std::vector<char> SingleFlightObject(size_t salt) {
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) {
+    object[i] = static_cast<char>((i * 89 + salt * 151 + 7) & 0xff);
+  }
+  return object;
+}
+
+// Whole-object read of `keys` into `out` as quarter spans, the shape a reader
+// that restores every layer at once sends.
+std::vector<bool> ReadWholeObjects(PoolClient* client, const std::vector<std::string>& keys,
+                                   std::vector<std::vector<char>>* out) {
+  constexpr size_t kQuarter = kObjectSize / 4;
+  std::vector<std::vector<void*>> ptrs(keys.size());
+  std::vector<std::vector<size_t>> sizes(keys.size()), offsets(keys.size());
+  for (size_t k = 0; k < keys.size(); ++k) {
+    for (size_t q = 0; q < 4; ++q) {
+      ptrs[k].push_back((*out)[k].data() + q * kQuarter);
+      sizes[k].push_back(kQuarter);
+      offsets[k].push_back(q * kQuarter);
+    }
+  }
+  return client->BatchGetRanges(keys, ptrs, sizes, offsets);
+}
+
+}  // namespace
+
+// Eight readers of the same remote keys at once -- every TP rank of an engine
+// restoring one TP-replicated prefix through a node-shared server.  Each key
+// must cross the wire once: one leader per key, nobody re-pulling after the
+// wait, and every reader still gets the right bytes.
+TEST_F(PoolClientRangesTest, ConcurrentWholeObjectReadersPullEachRemoteKeyOnce) {
+  constexpr size_t kKeys = 4;  // 8 pages of the caller's 16: every leader gets a slot
+  constexpr size_t kReaders = 8;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("single-flight-" + std::to_string(k));
+    objects.push_back(SingleFlightObject(k));
+    SeedRemoteObject(keys.back(), objects.back());
+  }
+
+  std::atomic<size_t> ready{0};
+  std::atomic<size_t> bad{0};
+  std::vector<std::thread> readers;
+  for (size_t r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      std::vector<std::vector<char>> out(kKeys, std::vector<char>(kObjectSize, 0));
+      ready.fetch_add(1);
+      while (ready.load() < kReaders) std::this_thread::yield();
+      const auto got = ReadWholeObjects(caller_.get(), keys, &out);
+      for (size_t k = 0; k < kKeys; ++k) {
+        if (!got[k] || out[k] != objects[k]) bad.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : readers) t.join();
+
+  EXPECT_EQ(bad.load(), 0u);
+  const SingleFlightActivity stats = caller_->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead, kKeys) << "one pull per key";
+  EXPECT_EQ(stats.refetched, 0u) << "a reader that waited pulled the key again";
+  EXPECT_EQ(stats.timed_out, 0u);
+  // Readers that arrived after a commit hit phase 1 and never got this far.
+  EXPECT_EQ(stats.served_local, stats.joined + stats.already_local);
+  for (const auto& key : keys) EXPECT_TRUE(LocallyResident(caller_.get(), key));
+}
+
+// The same key twice in one call: the second entry follows the first's pull
+// rather than allocating a second slot for it.
+TEST_F(PoolClientRangesTest, SameRemoteKeyTwiceInOneCallIsPulledOnce) {
+  const std::string key = "single-flight-twice";
+  const std::vector<char> object = SingleFlightObject(99);
+  SeedRemoteObject(key, object);
+
+  std::vector<std::vector<char>> out(2, std::vector<char>(kObjectSize, 0));
+  const auto got = ReadWholeObjects(caller_.get(), {key, key}, &out);
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_TRUE(got[0]);
+  EXPECT_TRUE(got[1]);
+  EXPECT_EQ(out[0], object);
+  EXPECT_EQ(out[1], object);
+
+  const SingleFlightActivity stats = caller_->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead, 1u);
+  EXPECT_EQ(stats.joined, 1u);
+  EXPECT_EQ(stats.served_local, 1u);
+  EXPECT_EQ(stats.refetched, 0u);
+}
+
+// Off means off: concurrent readers still get their bytes, and nothing is
+// claimed, joined or counted.
+TEST_F(PoolClientRangesTest, RemoteSingleFlightOffLeavesReadsAlone) {
+  std::vector<char> off_get(kScratchSize), off_put(kScratchSize);
+  auto off = MakeClient("ranges-single-flight-off", kCallerCapacity, off_get, off_put,
+                        /*locality_prefetch=*/true, /*remote_single_flight=*/false);
+  const std::string key = "single-flight-off";
+  const std::vector<char> object = SingleFlightObject(7);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  off->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(off.get(), key));
+
+  constexpr size_t kReaders = 4;
+  std::atomic<size_t> ready{0};
+  std::atomic<size_t> bad{0};
+  std::vector<std::thread> readers;
+  for (size_t r = 0; r < kReaders; ++r) {
+    readers.emplace_back([&] {
+      std::vector<std::vector<char>> out(1, std::vector<char>(kObjectSize, 0));
+      ready.fetch_add(1);
+      while (ready.load() < kReaders) std::this_thread::yield();
+      const auto got = ReadWholeObjects(off.get(), {key}, &out);
+      if (!got[0] || out[0] != object) bad.fetch_add(1);
+    });
+  }
+  for (auto& t : readers) t.join();
+
+  EXPECT_EQ(bad.load(), 0u);
+  const SingleFlightActivity stats = off->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead + stats.joined + stats.already_local + stats.served_local + stats.refetched +
+                stats.timed_out,
+            0u);
+  off->Shutdown();
+}
+
 }  // namespace mori::umbp

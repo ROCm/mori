@@ -20,7 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import pytest
+import gc
 import os
+import threading
 import time
 from contextlib import contextmanager
 import torch
@@ -29,6 +31,7 @@ from mori.io import (
     BackendType,
     IOEngine,
     EngineDesc,
+    FenceResult,
     MemoryDesc,
     StatusCode,
     MemoryLocationType,
@@ -574,6 +577,374 @@ def test_multithread_batch_error_path_is_recoverable():
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
 
 
+def _write_and_wait(initiator, initiator_mem, target_mem):
+    status = initiator.write(
+        initiator_mem, 0, target_mem, 0, 64, initiator.allocate_transfer_uid()
+    )
+    wait_status(status)
+    return status
+
+
+def _engine_pair_with_failed_qp(name):
+    """An engine pair whose one QP is in the error state: a write to memory the
+    target has deregistered ends with a remote access error."""
+    initiator, target = create_connected_engine_pair(
+        name, qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+    target.deregister_memory(target_mem)
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Failed()
+    return initiator, target, initiator_tensor, initiator_mem, target_mem
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_new_session_replaces_failed_qp():
+    initiator, target, initiator_tensor, initiator_mem, _ = _engine_pair_with_failed_qp(
+        "replace_failed_qp"
+    )
+    target_tensor = torch.zeros_like(initiator_tensor, device=torch.device("cuda", 1))
+    target_mem = target.register_torch_tensor(target_tensor)
+
+    status = _write_and_wait(initiator, initiator_mem, target_mem)
+    assert status.Succeeded(), status.Message()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_transfer_to_gone_peer_after_qp_failure_fails_without_raising():
+    initiator, target, _, initiator_mem, target_mem = _engine_pair_with_failed_qp(
+        "gone_peer"
+    )
+    del target
+    gc.collect()
+
+    # The session's QP failed, so the write tries to replace the session and cannot
+    # reach the target any more.
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Failed()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_failed_qp_replacements_back_off():
+    initiator, target, _, initiator_mem, target_mem = _engine_pair_with_failed_qp(
+        "replacement_backoff"
+    )
+
+    def write_builds_qp():
+        # A write on a new QP fails on the deregistered memory again; one on the
+        # failed QP is flushed.
+        status = _write_and_wait(initiator, initiator_mem, target_mem)
+        assert status.Failed()
+        return "Flushed" not in status.Message()
+
+    assert write_builds_qp()
+    # The new QP failed at once, so the next replacement waits a second.
+    assert not any(write_builds_qp() for _ in range(5))
+    time.sleep(1.2)
+    assert write_builds_qp()
+
+
+def _write_refused(initiator, initiator_mem, target_mem):
+    """A fenced peer is refused with an exception where a connection would have to be
+    built, and with a failed status where an old session is still cached."""
+    try:
+        return _write_and_wait(initiator, initiator_mem, target_mem).Failed()
+    except RuntimeError:
+        return True
+
+
+def _seconds_until_write_lands(initiator, initiator_mem, target_mem, budget_s=20.0):
+    """Retries the write as a connector would; None if it never lands within the budget."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < budget_s:
+        try:
+            if _write_and_wait(initiator, initiator_mem, target_mem).Succeeded():
+                return time.perf_counter() - t0
+        except RuntimeError:
+            pass
+        time.sleep(0.05)
+    return None
+
+
+def _write_eventually(initiator, initiator_mem, target_mem, budget_s=20.0):
+    return (
+        _seconds_until_write_lands(initiator, initiator_mem, target_mem, budget_s)
+        is not None
+    )
+
+
+# QP replacement after a failure is paced at 1 s or more (#831), so recovering faster than
+# this shows the fence did not leave the producer waiting that out.
+FENCE_RECOVERY_BOUND_S = 1.0
+
+
+def test_fence_unknown_peer_is_not_ok_but_stays_fenced():
+    initiator, target = create_connected_engine_pair(
+        "fence_unknown", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    assert not target.unfence_remote_engine(initiator.get_engine_desc().key)
+
+    # A key the engine never saw is most likely a wrong one, which leaves the real peer
+    # unfenced.
+    result = target.fence_remote_engine("fence_nobody")
+    assert isinstance(result, FenceResult)
+    assert result.supported and not result.peer_known and not result.ok
+    assert "fence_nobody" in result.message
+    assert result.endpoints_fenced == 0 and result.endpoints_failed == 0
+    # Nothing was cut, but the key is recorded: an engine connecting under it later is
+    # refused until it is unfenced.
+    assert target.unfence_remote_engine("fence_nobody")
+    assert not target.unfence_remote_engine("fence_nobody")
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_fence_reports_a_peer_it_cannot_place_as_not_cut(monkeypatch):
+    # A peer's XGMI mapping of our memory cannot be revoked, and dropping the peer from
+    # the address book does not revoke it either: only a peer known to sit on another
+    # node is sure to have no XGMI path into this engine.
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
+    config = IOEngineConfig(host="127.0.0.1", port=0)
+
+    def engine(key, node):
+        monkeypatch.setenv("MORI_NODE_ID", node)
+        e = IOEngine(key=key, config=config)
+        e.create_backend(BackendType.RDMA)
+        return e
+
+    receiver = engine("fence_xgmi_receiver", "node_a")
+    local_peer = engine("fence_xgmi_local", "node_a")
+    remote_peer = engine("fence_xgmi_remote", "node_b")
+    for peer in (local_peer, remote_peer):
+        receiver.register_remote_engine(peer.get_engine_desc())
+    receiver.register_torch_tensor(torch.zeros(1024, device="cuda:0"))
+    local_key = local_peer.get_engine_desc().key
+
+    assert not receiver.fence_remote_engine(local_key).ok
+    assert not receiver.fence_remote_engine("fence_xgmi_never_registered").ok
+    receiver.deregister_remote_engine(local_peer.get_engine_desc())
+    assert not receiver.fence_remote_engine(local_key).ok
+    result = receiver.fence_remote_engine(remote_peer.get_engine_desc().key)
+    assert result.ok, result.message
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_fence_blocks_writes_until_unfenced():
+    initiator, target = create_connected_engine_pair(
+        "fence_writer", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+    initiator_key = initiator.get_engine_desc().key
+
+    result = target.fence_remote_engine(initiator_key)
+    assert result.ok and result.peer_known, result.message
+    assert result.endpoints_fenced >= 1
+
+    target_tensor.zero_()
+    initiator_tensor.fill_(0x5A)
+    torch.cuda.synchronize()
+    assert _write_refused(initiator, initiator_mem, target_mem)
+    assert not target_tensor.any(), "a write from a fenced peer must not land"
+
+    assert target.unfence_remote_engine(initiator_key)
+    assert not target.unfence_remote_engine(initiator_key)
+    assert _write_eventually(initiator, initiator_mem, target_mem)
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_fencing_side_cannot_write_to_fenced_peer():
+    initiator, target = create_connected_engine_pair(
+        "fence_both_ways", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    # The fencing side writes into the peer too, so the fence has a session of its own to drop.
+    assert _write_and_wait(target, target_mem, initiator_mem).Succeeded()
+    initiator_key = initiator.get_engine_desc().key
+    assert target.fence_remote_engine(initiator_key).ok
+
+    initiator_tensor.zero_()
+    torch.cuda.synchronize()
+    assert _write_refused(target, target_mem, initiator_mem)
+    assert not initiator_tensor.any(), "a write to a fenced peer must not land"
+
+    assert target.unfence_remote_engine(initiator_key)
+    assert _write_and_wait(target, target_mem, initiator_mem).Succeeded()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_producer_retrying_while_fenced_gets_back_in_quickly():
+    # A connector keeps retrying while it is cut off. Refusals must not push its QP
+    # replacement into a backoff that it then waits out after the unfence.
+    initiator, target = create_connected_engine_pair(
+        "fence_retry", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    _, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+    initiator_key = initiator.get_engine_desc().key
+
+    assert target.fence_remote_engine(initiator_key).ok
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 3.0:
+        assert _write_refused(initiator, initiator_mem, target_mem)
+        time.sleep(0.05)
+
+    assert target.unfence_remote_engine(initiator_key)
+    secs = _seconds_until_write_lands(initiator, initiator_mem, target_mem)
+    assert secs is not None and secs < FENCE_RECOVERY_BOUND_S, secs
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_repeated_fences_recover_quickly():
+    # Each fence kills the producer's QPs shortly after they were replaced, which its QP
+    # replacement pacing reads as a failing path: unaided, recovery doubles every cycle up
+    # to 60 s. The unfence tells the producer, so every cycle recovers at once.
+    initiator, target = create_connected_engine_pair(
+        "fence_cycles", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    initiator_key = initiator.get_engine_desc().key
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+
+    for cycle in range(5):
+        assert target.fence_remote_engine(initiator_key).ok
+        for _ in range(3):
+            assert _write_refused(initiator, initiator_mem, target_mem)
+        assert target.unfence_remote_engine(initiator_key)
+
+        initiator_tensor.fill_(cycle + 1)
+        torch.cuda.synchronize()
+        secs = _seconds_until_write_lands(initiator, initiator_mem, target_mem)
+        assert secs is not None and secs < FENCE_RECOVERY_BOUND_S, (cycle, secs)
+        assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_restarted_peer_refused_until_unfenced():
+    initiator, target = create_connected_engine_pair(
+        "fence_restart", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    _, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+    initiator_key = initiator.get_engine_desc().key
+    assert target.fence_remote_engine(initiator_key).ok
+
+    # The producer dies while fenced and comes back under the same key.
+    del initiator, initiator_mem
+    gc.collect()
+    restarted = IOEngine(
+        key=initiator_key, config=IOEngineConfig(host="127.0.0.1", port=0)
+    )
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        restarted.create_backend(
+            BackendType.RDMA,
+            RdmaBackendConfig(
+                qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+            ),
+        )
+    restarted.register_remote_engine(target.get_engine_desc())
+    target.register_remote_engine(restarted.get_engine_desc())
+    src_tensor = torch.full((1, 64), 0x6B, dtype=torch.uint8, device="cuda:0")
+    src_mem = restarted.register_torch_tensor(src_tensor)
+
+    target_tensor.zero_()
+    torch.cuda.synchronize()
+    assert _write_refused(restarted, src_mem, target_mem)
+    assert not target_tensor.any(), "a peer restarted while fenced must not write"
+
+    assert target.unfence_remote_engine(initiator_key)
+    assert _write_and_wait(restarted, src_mem, target_mem).Succeeded()
+    assert torch.equal(src_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_sessions_racing_a_fence_recover_after_unfence():
+    # A session built while a fence lands can be cached over the QPs the fence cut. Unless
+    # the fence marks them failed, nothing replaces it: with notifications off there are no
+    # receive WRs to flush, so every transfer on it fails for good, even after the unfence.
+    initiator, target = create_connected_engine_pair(
+        "fence_race",
+        qp_per_transfer=1,
+        post_batch_size=-1,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
+    src_tensor = torch.full((64,), 0x2E, dtype=torch.uint8, device="cuda:1")
+    src_mem = target.register_torch_tensor(src_tensor)
+    initiator_key = initiator.get_engine_desc().key
+    regions = []
+
+    def write_each(mems):
+        for mem in mems:
+            try:
+                _write_and_wait(target, src_mem, mem)
+            except RuntimeError:
+                pass
+
+    # Each trial checks its regions before the next fence, which would purge a stuck
+    # session and hide it. A region's first write builds its session; the fence lands
+    # while those are being built.
+    for trial in range(100):
+        batch = [torch.zeros(64, dtype=torch.uint8, device="cuda:0") for _ in range(4)]
+        regions.extend(batch)
+        mems = [initiator.register_torch_tensor(t) for t in batch]
+        writer = threading.Thread(target=write_each, args=(mems,))
+        writer.start()
+        time.sleep(0.0003 * (trial % 4))
+        assert target.fence_remote_engine(initiator_key).ok
+        target.unfence_remote_engine(initiator_key)
+        writer.join()
+        stuck = [
+            i
+            for i, mem in enumerate(mems)
+            if not _write_eventually(target, src_mem, mem, budget_s=3.0)
+        ]
+        assert not stuck, f"trial {trial}: {len(stuck)} region(s) never recovered"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_fence_while_another_thread_waits():
+    # The connector shape: one thread waits on a stream of writes while another gives up
+    # on the producer and fences it.
+    initiator, target = create_connected_engine_pair(
+        "fence_threaded", qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    size = 32 << 20
+    _, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, size)
+    )
+    statuses = [
+        initiator.write(
+            initiator_mem, 0, target_mem, 0, size, initiator.allocate_transfer_uid()
+        )
+        for _ in range(128)
+    ]
+    waiter = threading.Thread(target=lambda: initiator.wait_all(statuses, 60000))
+    waiter.start()
+    time.sleep(0.02)
+
+    in_flight = sum(s.InProgress() for s in statuses)
+    assert target.fence_remote_engine(initiator.get_engine_desc().key).ok
+    waiter.join(timeout=90)
+    assert not waiter.is_alive(), "a waiter must not hang once its peer is fenced"
+    assert not any(s.InProgress() for s in statuses)
+    if in_flight:
+        assert any(s.Failed() for s in statuses)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_successful_writes_always_have_inbound_notification_under_pressure():
     """Regression for notify all-or-none behavior.
@@ -619,6 +990,50 @@ def test_successful_writes_always_have_inbound_notification_under_pressure():
                 )
 
         assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_batch_signals_before_the_next_batch_overflows_the_send_queue():
+    """A post_batch_size that does not divide the admission limit must not
+    leave a QP waiting on its own unsignaled WRs. max_send_wr=16 keeps 4 slots
+    for completion markers, so 12 WRs are admitted: the second batch of 8 fits
+    only after the first one completes, which needs a signaled WR."""
+    config = IOEngineConfig(host="127.0.0.1", port=0)
+    initiator = IOEngine(key="sq_batch_initiator", config=config)
+    target = IOEngine(key="sq_batch_target", config=config)
+    backend = RdmaBackendConfig(
+        qp_per_transfer=1,
+        post_batch_size=8,
+        num_worker_threads=1,
+        enable_notification=False,
+    )
+    backend.max_send_wr = 16
+    with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
+        initiator.create_backend(BackendType.RDMA, backend)
+        target.create_backend(BackendType.RDMA, backend)
+    initiator.register_remote_engine(target.get_engine_desc())
+    target.register_remote_engine(initiator.get_engine_desc())
+
+    num_wrs, size = 32, 64
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (2 * num_wrs * size,)
+    )
+    # Every other span, so no two requests merge: 4 batches of 8 WRs on one QP.
+    offsets = [2 * i * size for i in range(num_wrs)]
+    status = initiator.batch_write(
+        [initiator_mem],
+        [offsets],
+        [target_mem],
+        [offsets],
+        [[size] * num_wrs],
+        [initiator.allocate_transfer_uid()],
+    )[0]
+    wait_status(status)
+
+    assert status.Succeeded(), status.Message()
+    for offset in offsets:
+        span = slice(offset, offset + size)
+        assert torch.equal(initiator_tensor[span].cpu(), target_tensor[span].cpu())
 
 
 def test_no_backend():

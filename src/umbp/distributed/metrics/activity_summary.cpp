@@ -135,6 +135,17 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const uint64_t moves_failed = Delta(now.transitions.failed, before.transitions.failed);
   const uint64_t moves_retried = Delta(now.transitions.retried, before.transitions.retried);
   const uint64_t moves_dropped = Delta(now.transitions.dropped, before.transitions.dropped);
+  const auto per_medium = [](const std::map<std::string, uint64_t>& now_bytes,
+                             const std::map<std::string, uint64_t>& before_bytes) {
+    std::map<std::string, uint64_t> out;
+    for (const auto& [medium, bytes] : now_bytes) {
+      const auto it = before_bytes.find(medium);
+      out[medium] = Delta(bytes, it == before_bytes.end() ? 0 : it->second);
+    }
+    return out;
+  };
+  const auto move_reads = per_medium(now.transitions.read_bytes, before.transitions.read_bytes);
+  const auto move_writes = per_medium(now.transitions.write_bytes, before.transitions.write_bytes);
 
   const ReCacheActivity& rc_now = now.recache;
   const ReCacheActivity& rc_old = before.recache;
@@ -149,6 +160,15 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const uint64_t rc_fragmented = Delta(rc_now.fragmented, rc_old.fragmented);
   const uint64_t rc_dropped = rc_rejected + rc_queue_full + rc_alloc_failed + rc_install_failed;
 
+  const SingleFlightActivity& sf_now = now.single_flight;
+  const SingleFlightActivity& sf_old = before.single_flight;
+  const uint64_t sf_lead = Delta(sf_now.lead, sf_old.lead);
+  const uint64_t sf_joined = Delta(sf_now.joined, sf_old.joined);
+  const uint64_t sf_already = Delta(sf_now.already_local, sf_old.already_local);
+  const uint64_t sf_local = Delta(sf_now.served_local, sf_old.served_local);
+  const uint64_t sf_refetched = Delta(sf_now.refetched, sf_old.refetched);
+  const uint64_t sf_timed_out = Delta(sf_now.timed_out, sf_old.timed_out);
+
   // Adopt the new baseline only now that every delta above has been reduced to
   // a value: `before` aliases previous_, so assigning earlier would leave the
   // remaining reads pointing at the window that just ended.
@@ -161,7 +181,7 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const bool anything = Moved(total) || promoted != 0 || demoted != 0 || moves_failed != 0 ||
                         moves_retried != 0 || moves_dropped != 0 || rc_admitted != 0 ||
                         rc_dropped != 0 || rc_prefetched != 0 || rc_fragmented != 0 ||
-                        rc_already != 0;
+                        rc_already != 0 || sf_lead != 0 || sf_joined != 0 || sf_already != 0;
 
   std::vector<std::string> lines;
 
@@ -242,6 +262,21 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
     lines.emplace_back(buf.data());
   }
 
+  // ---- remote single-flight ----------------------------------------------
+  // joined - served_local is what concurrent readers still pulled themselves.
+  if (sf_lead != 0 || sf_joined != 0 || sf_already != 0) {
+    std::array<char, 256> buf{};
+    std::snprintf(
+        buf.data(), buf.size(),
+        "[UMBP]   remote single-flight: %llu led, %llu joined, %llu already local; "
+        "after the wait %llu local, %llu refetched (%llu timed out)",
+        static_cast<unsigned long long>(sf_lead), static_cast<unsigned long long>(sf_joined),
+        static_cast<unsigned long long>(sf_already), static_cast<unsigned long long>(sf_local),
+        static_cast<unsigned long long>(sf_refetched),
+        static_cast<unsigned long long>(sf_timed_out));
+    lines.emplace_back(buf.data());
+  }
+
   // ---- per tier ----------------------------------------------------------
   // A single tier is already fully described by the total line above, so it is
   // not repeated; with two or more, which tier absorbed the traffic is the
@@ -254,10 +289,15 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
       const double pct = d.capacity_bytes == 0 ? 0.0
                                                : 100.0 * static_cast<double>(d.used_bytes) /
                                                      static_cast<double>(d.capacity_bytes);
+      const auto move_read = move_reads.find(tier);
+      const auto move_write = move_writes.find(tier);
       std::snprintf(buf.data(), buf.size(),
-                    "[UMBP]   %s: offload %s load %s evict %s | resident %s/%s (%.0f%%) %llu keys",
+                    "[UMBP]   %s: offload %s load %s evict %s move-read %s move-write %s | "
+                    "resident %s/%s (%.0f%%) %llu keys",
                     tier.c_str(), FormatBytes(d.offload_bytes).c_str(),
                     FormatBytes(d.load_bytes).c_str(), FormatBytes(d.evict_bytes).c_str(),
+                    FormatBytes(move_read == move_reads.end() ? 0 : move_read->second).c_str(),
+                    FormatBytes(move_write == move_writes.end() ? 0 : move_write->second).c_str(),
                     used.c_str(), cap.c_str(), pct,
                     static_cast<unsigned long long>(d.resident_keys));
       lines.emplace_back(buf.data());

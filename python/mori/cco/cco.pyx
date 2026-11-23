@@ -245,6 +245,11 @@ cdef class DevComm:
     def per_rank_size(self):
         return self._dc.perRankSize
 
+    @property
+    def sdma_num_queue(self):
+        """SDMA queues per peer actually connected; 0 when SDMA is unavailable."""
+        return self._dc.sdma.sdmaNumQueue
+
     def __repr__(self):
         return (f"DevComm(rank={self.rank}, world_size={self.world_size}, "
                 f"lsa_size={self.lsa_size}, lsa_rank={self.lsa_rank})")

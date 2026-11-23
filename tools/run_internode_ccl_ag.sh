@@ -58,7 +58,9 @@ export MORI_HIER_CUDA_GRAPH=0
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT/python:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+# The installed mori, not python/: a node that only installed the wheel has no
+# built libraries there.
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 # Comma-separated -> space-separated argv for bench_ag_perf_w16.py's nargs='+'.
 read -r -a SIZES_ARR <<< "${SIZES_MB//,/ }"

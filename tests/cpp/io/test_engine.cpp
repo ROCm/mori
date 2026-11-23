@@ -19,12 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <hip/hip_runtime_api.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -45,6 +42,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -142,48 +140,17 @@ bool WaitInboundStatusWithTimeout(IOEngine* engine, const EngineKey& remoteKey, 
   return false;
 }
 
-int GetFreePort() {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
-
-  int opt = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = 0;
-  addr.sin_addr.s_addr = INADDR_ANY;
-
-  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  socklen_t len = sizeof(addr);
-  if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  int port = ntohs(addr.sin_port);
-
-  close(fd);
-  return port;
-}
-
 ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
   if (!RdmaBackend::HasActiveDevices()) {
     throw TestSkip("requires at least one active RDMA device");
   }
 
+  // Port 0 lets each backend bind its own ephemeral port. A port probed up front
+  // is only free until CreateBackend binds it, and two probes can return the same one.
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for initiator");
+  cfg.port = 0;
   auto initiator = std::make_unique<IOEngine>(prefix + "_initiator", cfg);
-
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for target");
   auto target = std::make_unique<IOEngine>(prefix + "_target", cfg);
 
   RdmaBackendConfig rdmaCfg{};
@@ -279,6 +246,56 @@ void CaseSubmissionLedgerFailAll() {
   // A CQE landing after FailAll must not resurrect the transfer as successful.
   Require(metaA->status.load() == nullptr, "FailAll should claim the status pointer");
   Require(statusA.Code() == StatusCode::ERR_RDMA_OP, "status must stay failed");
+}
+
+// A transfer striped over two QPs: one QP dies while the other still has its WRs on the
+// wire. The transfer must not report failed until the live QP's WRs finish, or a caller
+// freeing its buffers on that failure would let them keep moving data.
+void CaseTransferFailureWaitsForEveryQp() {
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger dead(kNotifPerQp);
+  SubmissionLedger live(kNotifPerQp);
+  std::atomic<int> sqDepthDead{2};
+  std::atomic<int> sqDepthLive{2};
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 701, 4);
+  dead.Insert(2, true, meta, 2);
+  const uint64_t liveId = live.Insert(2, true, meta, 2);
+
+  // The transfer still waits on the live QP, so this FailAll does not fail it yet.
+  Require(dead.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepthDead) == 0,
+          "FailAll should count only the transfers it turned terminal");
+  Require(status.InProgress(), "a failure must wait for the transfer's WRs on the live QP");
+
+  int credits = 0;
+  auto released = live.ReleaseByCqe(liveId, &sqDepthLive, &credits);
+  Require(released != nullptr, "the live QP's record should still be there");
+  released->Account(credits, StatusCode::SUCCESS, "success");
+  Require(status.Failed(), "once every WR is done, the transfer reports its failure");
+  Require(status.Message() == "qp died", "the failure, not the later success, is reported");
+
+  // A flush cascade is reported only when no root cause was seen.
+  TransferStatus cascaded;
+  cascaded.SetCode(StatusCode::IN_PROGRESS);
+  auto meta2 = std::make_shared<CqCallbackMeta>(&cascaded, 702, 3);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "retry exceeded");
+  meta2->Account(1, StatusCode::ERR_RDMA_OP, "flushed", /*rootCause=*/false);
+  Require(cascaded.Failed() && cascaded.Message() == "retry exceeded",
+          "the root cause should win over flushes on either side of it");
+
+  // A submission that gave up after posting part of the transfer: the unposted credits
+  // are accounted at once, the posted ones only by their completion.
+  TransferStatus partial;
+  partial.SetCode(StatusCode::IN_PROGRESS);
+  auto meta3 = std::make_shared<CqCallbackMeta>(&partial, 703, 5);
+  const int posted = 3;  // RdmaOpRet::postedCredits of the submission that gave up
+  meta3->Account(meta3->totalBatchSize - posted, StatusCode::ERR_RDMA_OP, "post failed");
+  Require(partial.InProgress(), "posted WRs keep the transfer in progress");
+  meta3->Account(3, StatusCode::SUCCESS, "success");
+  Require(partial.Failed() && partial.Message() == "post failed",
+          "the post failure is reported once the posted WRs complete");
 }
 
 void CaseSubmissionLedgerClosedAfterFailAll() {
@@ -1528,7 +1545,7 @@ void CaseSelectBackendReturnsNullForCrossNodeUnderXgmiOnly() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "cross-node transfer under XGMI-only fallback should return ERR_BAD_STATE; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "cross-node transfer under XGMI-only fallback should be rejected by route layer; got: " +
               status.Message());
 }
@@ -1581,7 +1598,7 @@ void CaseRdmaBackendCanHandleRejectsSentinelPortRemote() {
   Require(status.Code() == StatusCode::ERR_BAD_STATE,
           "RDMA backend must reject sentinel-port remote before Connect; got " +
               std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
-  Require(status.Message().find("No available backend") != std::string::npos,
+  Require(status.Message().find("No backend can handle") != std::string::npos,
           "sentinel-port remote should be rejected by route layer; got: " + status.Message());
 }
 
@@ -1931,6 +1948,7 @@ void CaseXgmiCrossEngineIpc() {
 
   HIP_RUNTIME_CHECK(hipSetDevice(0));
   HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   HIP_RUNTIME_CHECK(hipSetDevice(1));
   HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
@@ -1967,22 +1985,22 @@ void CaseXgmiCrossEngineIpc() {
 // we launch a subprocess with restricted HIP_VISIBLE_DEVICES.
 //
 // Protocol (via shared memory file in /dev/shm):
-//   1. Exporter (this process, GPU 0):  allocates GPU memory, registers it with
-//      an IOEngine to populate the IPC handle, writes a MemoryDesc blob to the
-//      shared file, and waits for the importer to signal completion.
-//   2. Importer (subprocess, HIP_VISIBLE_DEVICES=<last_gpu>):  reads the
-//      MemoryDesc, creates its own IOEngine, and does a Write from its local
-//      GPU to the exporter's memory.  The exporter's bus ID is NOT in the
-//      importer's localDeviceByBusId, so it must go through the hidden-device
-//      branch.
+//   1. Exporter (this process, GPU <exportDevice>):  allocates GPU memory,
+//      registers it with an IOEngine to populate the IPC handle, writes a
+//      MemoryDesc blob to the shared file, and waits for the importer to signal
+//      completion.
+//   2. Importer (subprocess, restricted HIP_VISIBLE_DEVICES that excludes the
+//      exporter's GPU):  reads the MemoryDesc, creates its own IOEngine, and
+//      does a Write from its local GPU <importerDevice> to the exporter's
+//      memory.  The exporter's bus ID is NOT in the importer's
+//      localDeviceByBusId, so it must go through the hidden-device branch.
 // --------------------------------------------------------------------------
-int RunHiddenDeviceImporter(const char* shmPath) {
+int RunHiddenDeviceImporter(const char* shmPath, int localDevice) {
   // This function runs in a subprocess with restricted HIP_VISIBLE_DEVICES.
-  // It only sees one GPU (the last physical GPU), while the exporter used GPU 0.
   SetLogLevel("info");
   int gpuCount = GetGpuCount();
-  if (gpuCount < 1) {
-    std::fprintf(stderr, "importer: no GPUs visible\n");
+  if (gpuCount <= localDevice) {
+    std::fprintf(stderr, "importer: device %d not visible (%d GPUs)\n", localDevice, gpuCount);
     return 1;
   }
 
@@ -2026,19 +2044,21 @@ int RunHiddenDeviceImporter(const char* shmPath) {
     char hostname[HOST_NAME_MAX];
     gethostname(hostname, HOST_NAME_MAX);
     remoteEngDesc.hostname = std::string(hostname);
-    remoteEngDesc.nodeId = remoteEngDesc.hostname;
+    // Match the node id the exporter's backend resolves (MORI_NODE_ID, then
+    // boot_id, then hostname), or IsSameNodeEngine rejects the peer.
+    remoteEngDesc.nodeId = mori::ResolveNodeId(remoteEngDesc.hostname);
   }
   remoteEngDesc.host = "127.0.0.1";
   remoteEngDesc.port = 0;
   remoteEngDesc.pid = 0;
   engine.RegisterRemoteEngine(remoteEngDesc);
 
-  // Allocate local memory on device 0 (importer's only visible GPU)
+  // Allocate local memory on the importer's chosen local device
   constexpr size_t kSize = 1024 * 1024;
-  auto localMem = RegisterGpuMemory(&engine, kSize, 0);
+  auto localMem = RegisterGpuMemory(&engine, kSize, localDevice);
 
   // Fill local source with 0xCD
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(localDevice));
   HIP_RUNTIME_CHECK(hipMemset(localMem.ptr, 0xCD, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
@@ -2074,16 +2094,18 @@ int RunHiddenDeviceImporter(const char* shmPath) {
   return 0;
 }
 
-void CaseXgmiHiddenDeviceSplitVisibility() {
-  int totalGpus = GetGpuCount();
-  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
-
+// Exports from physical GPU `exportDevice` in this process (which sees every
+// GPU) and imports from a subprocess that sees only `importerVisible`, writing
+// from that subprocess's local device `importerDevice`.
+void RunHiddenDeviceSplitVisibility(int exportDevice, const std::string& importerVisible,
+                                    int importerDevice) {
   // Create shared memory file for IPC
   std::string shmPath = "/dev/shm/mori_test_hidden_" + std::to_string(getpid());
   int shmFd = open(shmPath.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
   Require(shmFd >= 0, "failed to create shared memory file");
 
-  // Exporter: allocate on GPU 0, register, and serialize the descriptor
+  // Exporter: allocate on GPU exportDevice, register, and serialize the descriptor.
+  // RegisterGpuMemory leaves exportDevice current, as a per-rank process would.
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = 0;
@@ -2092,10 +2114,18 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   engine.CreateBackend(BackendType::XGMI, xgmiCfg);
 
   constexpr size_t kSize = 1024 * 1024;
-  auto exportMem = RegisterGpuMemory(&engine, kSize, 0);
+  auto exportMem = RegisterGpuMemory(&engine, kSize, exportDevice);
+
+  // RegisterMemory switches to device 0 to export the IPC handle; it must hand
+  // the caller's current device back.
+  int currentDevice = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&currentDevice));
+  Require(currentDevice == exportDevice, "RegisterMemory changed the current device from " +
+                                             std::to_string(exportDevice) + " to " +
+                                             std::to_string(currentDevice));
 
   // Clear export buffer
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(exportDevice));
   HIP_RUNTIME_CHECK(hipMemset(exportMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
@@ -2112,11 +2142,11 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   Require(len > 0, "failed to read /proc/self/exe");
   selfExe[len] = '\0';
 
-  // Launch importer subprocess with the LAST GPU only visible
-  // (so GPU 0's bus ID is NOT in the importer's localDeviceByBusId)
-  std::string visibleDevices = std::to_string(totalGpus - 1);
-  std::string cmd = "HIP_VISIBLE_DEVICES=" + visibleDevices + " " + std::string(selfExe) +
-                    " --hidden-device-importer " + shmPath + " 2>&1";
+  // Launch the importer subprocess with only importerVisible visible
+  // (so the exporter's bus ID is NOT in the importer's localDeviceByBusId)
+  std::string cmd = "HIP_VISIBLE_DEVICES=" + importerVisible + " " + std::string(selfExe) +
+                    " --hidden-device-importer " + shmPath + " " + std::to_string(importerDevice) +
+                    " 2>&1";
   int rc = system(cmd.c_str());
   int exitCode = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
   Require(exitCode == 0, "importer subprocess failed with exit code " + std::to_string(exitCode));
@@ -2131,9 +2161,9 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   unlink(shmPath.c_str());
   Require(std::string(doneBuf, 4) == "done", "importer did not signal completion");
 
-  // Verify the exporter's GPU 0 buffer now contains 0xCD (written by importer)
+  // Verify the exporter's buffer now contains 0xCD (written by importer)
   std::vector<uint8_t> hostBuf(kSize);
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(exportDevice));
   HIP_RUNTIME_CHECK(hipMemcpy(hostBuf.data(), exportMem.ptr, kSize, hipMemcpyDeviceToHost));
   bool allMatch = true;
   for (size_t i = 0; i < kSize; ++i) {
@@ -2143,6 +2173,61 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
     }
   }
   Require(allMatch, "hidden-device data verification failed: expected 0xCD in exporter buffer");
+}
+
+void CaseXgmiHiddenDeviceSplitVisibility() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  // Exporter on GPU 0, importer sees only the last GPU.
+  RunHiddenDeviceSplitVisibility(0, std::to_string(totalGpus - 1), 0);
+}
+
+// Regression: the exporter registers memory on a non-zero device that is also
+// the current device, and the importer sees fewer GPUs than that ordinal.
+// hipIpcGetMemHandle records the current ordinal in the handle, so before the
+// fix hipIpcOpenMemHandle failed with hipErrorInvalidValue and CreateSession
+// returned nullopt. This is prefill TP1 -> decode TP2 rank 1 on one node.
+void CaseXgmiHiddenDeviceExportFromNonZeroDevice() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(totalGpus - 1, "0", 0);
+}
+
+// Same as above, but the importer sees two GPUs and writes from its local
+// device 1, so the importer's own device is not ordinal 0 either.
+void CaseXgmiHiddenDeviceImporterNonZeroDevice() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 4) throw TestSkip("requires at least 4 GPUs");
+  RunHiddenDeviceSplitVisibility(totalGpus - 1, "0,1", 1);
+}
+
+// Regression: GPUs outside an XGMI hive (PCIe-only cards) all report KFD hive_id 0,
+// and hidden-device eligibility required a shared non-zero hive, so CreateSession
+// returned nullopt for every pair. This is prefill and decode on adjacent GPUs,
+// one GPU per process.
+void CaseXgmiHiddenDeviceAdjacentGpus() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(0, "1", 0);
+}
+
+// A hidden remote GPU that is neither in the local GPU's hive nor one of its KFD P2P
+// peers must still be rejected.
+void CaseXgmiHiddenDeviceRejectsUnknownPeer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_hidden_unknown_peer_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto local = RegisterGpuMemory(&engine, 4096, 0);
+  MemoryDesc remote = local.desc;
+  remote.deviceBusId = "0000:ff:1f.7";
+  Require(!engine.CreateSession(local.desc, remote).has_value(),
+          "CreateSession should fail for a hidden GPU that is not a P2P peer");
 }
 
 void CaseXgmiInboundNotificationIsUnsupported() {
@@ -2208,6 +2293,42 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
               ", msg='" + status.Message() + "'");
 }
 
+void CaseXgmiBoundedWaitReturnsOnCompletion() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_bounded_wait_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 64 * 1024 * 1024;
+  auto src = RegisterGpuMemory(&engine, kSize, 0);
+  auto dst = RegisterGpuMemory(&engine, kSize, 1);
+
+  // An XGMI status completes only when polled; a bounded wait must poll it rather than sleep to
+  // its deadline.
+  for (bool waitAll : {false, true}) {
+    TransferStatus status;
+    engine.Write(src.desc, 0, dst.desc, 0, kSize, &status, engine.AllocateTransferUniqueId());
+    auto start = std::chrono::steady_clock::now();
+    if (waitAll) {
+      engine.WaitAll({&status}, 10000);
+    } else {
+      status.WaitFor(10000);
+    }
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    const std::string how = waitAll ? "WaitAll(10000)" : "WaitFor(10000)";
+    Require(status.Succeeded(),
+            how + " transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
+                status.Message() + "'");
+    Require(ms < 2000, how + " returned after " + std::to_string(ms) + " ms for a 64 MiB copy");
+  }
+}
+
 struct TestCase {
   const char* name;
   std::function<void()> run;
@@ -2218,13 +2339,14 @@ struct TestCase {
 int main(int argc, char* argv[]) {
   // Subprocess entry point for hidden-device importer
   if (argc >= 3 && std::string(argv[1]) == "--hidden-device-importer") {
-    return RunHiddenDeviceImporter(argv[2]);
+    return RunHiddenDeviceImporter(argv[2], argc >= 4 ? std::atoi(argv[3]) : 0);
   }
 
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
+      {"transfer_failure_waits_for_every_qp", CaseTransferFailureWaitsForEveryQp},
       {"submission_ledger_closed_after_fail_all", CaseSubmissionLedgerClosedAfterFailAll},
       {"submission_ledger_notif_disabled", CaseSubmissionLedgerNotifDisabled},
       {"submission_ledger_post_commit_race", CaseSubmissionLedgerPostCommitRace},
@@ -2288,8 +2410,14 @@ int main(int argc, char* argv[]) {
       {"xgmi_visible_device_regression", CaseXgmiVisibleDeviceRegression},
       {"xgmi_cross_engine_ipc", CaseXgmiCrossEngineIpc},
       {"xgmi_hidden_device_split_visibility", CaseXgmiHiddenDeviceSplitVisibility},
+      {"xgmi_hidden_device_export_from_nonzero_device",
+       CaseXgmiHiddenDeviceExportFromNonZeroDevice},
+      {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
+      {"xgmi_hidden_device_adjacent_gpus", CaseXgmiHiddenDeviceAdjacentGpus},
+      {"xgmi_hidden_device_rejects_unknown_peer", CaseXgmiHiddenDeviceRejectsUnknownPeer},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"xgmi_bounded_wait_returns_on_completion", CaseXgmiBoundedWaitReturnsOnCompletion},
   };
 
   int passed = 0;

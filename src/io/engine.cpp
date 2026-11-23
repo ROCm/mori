@@ -36,11 +36,13 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/ras/ras.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/fabric/backend_impl.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-send roctx markers
+#include "src/io/sim/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 #ifdef MORI_USE_LIBFABRIC
 #include "src/io/ofi/backend_impl.hpp"
@@ -67,6 +69,28 @@ inline void LogTransferFailure(const std::shared_ptr<internal::IoCallDiagnostics
   } else {
     MORI_IO_ERROR(fmt, std::forward<Args>(args)...);
   }
+}
+
+std::string NoBackendReason(
+    const std::unordered_map<BackendType, std::unique_ptr<Backend>>& backends,
+    const MemoryDesc& local, const MemoryDesc& remote) {
+  if (backends.empty()) return "No backend created, create a backend first";
+  const char* location = local.loc == MemoryLocationType::GPU   ? "GPU"
+                         : local.loc == MemoryLocationType::CPU ? "CPU"
+                                                                : "Unknown";
+  std::string message = "No backend can handle local mem " + std::to_string(local.id) + " (" +
+                        location + " " + std::to_string(local.deviceId) + ") -> engine " +
+                        remote.engineKey + " mem " + std::to_string(remote.id) + ": ";
+  const char* separator = "";
+  for (auto type : {BackendType::XGMI, BackendType::FABRIC, BackendType::RDMA, BackendType::OFI,
+                    BackendType::TCP}) {
+    auto it = backends.find(type);
+    if (it == backends.end()) continue;
+    message +=
+        separator + sim::BackendTypeName(type) + ": " + it->second->RejectReason(local, remote);
+    separator = "; ";
+  }
+  return message;
 }
 
 std::string QueryDeviceBusId(int deviceId) {
@@ -182,12 +206,27 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.host = config.host;
   desc.port = config.port;
   desc.pid = static_cast<int>(getpid());
+  // RAS starts with the process's first engine. Built out, disabled, or failed to start, it
+  // returns nullptr and the engine advertises no RAS endpoint.
+  if (ras::RasRuntime* rt =
+          ras::RasRuntime::EnsureStarted({desc.nodeId, desc.hostname, desc.host, desc.pid})) {
+    ras::RasEndpoint ep = rt->Endpoint();
+    desc.ras = RasDesc{ep.host, ep.port, ep.token, ep.uuid.hi, ep.uuid.lo};
+    rt->Enqueue(ras::EngineRegistered{desc.key});
+  }
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
-IOEngine::~IOEngine() {}
+IOEngine::~IOEngine() {
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) rt->Enqueue(ras::EngineUnregistered{desc.key});
+}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
+  if (sim::IsEnabled()) {
+    CreateSimBackend(type, beConfig);
+    return;
+  }
+
   if (backends.find(type) != backends.end()) {
     MORI_IO_WARN("Backend type {} already exists, skip duplicate creation",
                  static_cast<uint32_t>(type));
@@ -280,13 +319,79 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
 #else
     throw std::runtime_error("MORI was built without libfabric support (MORI_USE_LIBFABRIC=OFF)");
 #endif
+  } else if (type == BackendType::TCP) {
+    throw std::runtime_error(
+        "TCP backend is only available in simulation mode (MORI_IO_SIM_ENABLE=1)");
   } else {
     assert(false && "not implemented");
   }
   MORI_IO_INFO("Create backend type {}", static_cast<uint32_t>(type));
 }
 
+void IOEngine::CreateSimBackend(BackendType requested, const BackendConfig& beConfig) {
+  BackendType type = sim::ResolveBackendType(requested);
+  if (type != BackendType::RDMA && type != BackendType::TCP && type != BackendType::XGMI) {
+    throw std::runtime_error("MORI_IO_SIM_ENABLE supports RDMA, TCP and XGMI backends, not " +
+                             sim::BackendTypeName(type));
+  }
+  if (backends.find(type) != backends.end()) {
+    MORI_IO_WARN("Simulated backend type {} already exists, skip duplicate creation",
+                 sim::BackendTypeName(type));
+    return;
+  }
+  // Both serve their control plane on the engine port, so one engine can only have one of them.
+  for (BackendType other : {BackendType::RDMA, BackendType::TCP}) {
+    if (type != BackendType::XGMI && other != type && backends.count(other) != 0) {
+      throw std::runtime_error("Simulated " + sim::BackendTypeName(type) +
+                               " cannot be added to an engine that has simulated " +
+                               sim::BackendTypeName(other) +
+                               "; use MORI_IO_SIM_BACKEND to choose the network instead");
+    }
+  }
+
+  std::optional<RdmaBackendConfig> rdmaConfig;
+  if (requested == BackendType::RDMA) {
+    rdmaConfig = ResolveRdmaBackendConfig(static_cast<const RdmaBackendConfig&>(beConfig));
+  }
+  bool enableNotification = rdmaConfig ? rdmaConfig->enableNotification : true;
+  auto backend = std::make_unique<SimBackend>(type, desc, config, enableNotification);
+
+  // RDMA timing depends on the QP and worker counts, so a catalog entry measured with other
+  // counts is only an approximation.
+  const sim::LinkProfile& profile = backend->Profile();
+  if (type == BackendType::RDMA && rdmaConfig &&
+      ((profile.measuredQpPerTransfer > 0 &&
+        profile.measuredQpPerTransfer != rdmaConfig->qpPerTransfer) ||
+       (profile.measuredNumWorkerThreads > 0 &&
+        profile.measuredNumWorkerThreads != rdmaConfig->numWorkerThreads))) {
+    MORI_IO_WARN(
+        "Simulated RDMA timing from {} was measured with qp_per_transfer={} num_worker_threads={}, "
+        "this engine uses {} and {}",
+        profile.source, profile.measuredQpPerTransfer, profile.measuredNumWorkerThreads,
+        rdmaConfig->qpPerTransfer, rdmaConfig->numWorkerThreads);
+  }
+
+  if (requested == BackendType::RDMA && type == BackendType::XGMI) {
+    // Same engine desc as the XGMI-only fallback taken on a host without RDMA devices.
+    desc.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+    config.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+  } else if (auto port = backend->GetListenPort(); port.has_value() && config.port == 0) {
+    desc.port = *port;
+    config.port = *port;
+  }
+
+  backends.insert({type, std::move(backend)});
+  InvalidateRouteCache();
+  CaptureBackendDesc(type);
+  MORI_IO_INFO("Create simulated backend type {} (requested {})", sim::BackendTypeName(type),
+               sim::BackendTypeName(requested));
+  if (type == BackendType::RDMA) EnsureXgmiBackendCreatedIfSupported();
+}
+
 bool IOEngine::SupportsXgmiBackendByP2P() const {
+  // Simulated GPUs on one node are all peers of each other.
+  if (sim::IsEnabled()) return true;
+
   int numDevices = 0;
   hipError_t err = hipGetDeviceCount(&numDevices);
   if (err != hipSuccess) {
@@ -345,8 +450,13 @@ void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
   }
 
   try {
-    XgmiBackendConfig xgmiConfig{};
-    auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+    std::unique_ptr<Backend> backend;
+    if (sim::IsEnabled()) {
+      backend = std::make_unique<SimBackend>(BackendType::XGMI, desc, config, false);
+    } else {
+      XgmiBackendConfig xgmiConfig{};
+      backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+    }
     backends.insert({BackendType::XGMI, std::move(backend)});
     InvalidateRouteCache();
     CaptureBackendDesc(BackendType::XGMI);
@@ -376,6 +486,11 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
     it.second->RegisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    const RasDesc& r = remote.ras;
+    rt->Enqueue(ras::PeerAdded{desc.key, remote.key, remote.nodeId, remote.hostname, remote.pid,
+                               ras::RasEndpoint{r.host, r.port, r.token, {r.uuidHi, r.uuidLo}}});
+  }
   MORI_IO_INFO("Register remote engine {} node_id {} hostname {}", remote.key.c_str(),
                remote.nodeId.c_str(), remote.hostname.c_str());
 }
@@ -385,7 +500,51 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
     it.second->DeregisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    rt->Enqueue(ras::PeerRemoved{desc.key, remote.key});
+  }
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
+}
+
+FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
+  FenceResult total;
+  std::string unsupported;
+  for (auto& it : backends) {
+    FenceResult part = it.second->FenceRemoteEngine(remote);
+    if (!part.supported) {
+      // Skipped: it has no path from the peer. One with a path it cannot cut (XGMI, OFI,
+      // fabric) reports it as a failed endpoint instead, which keeps the result not ok.
+      continue;
+    }
+    total.supported = true;
+    total.endpointsFenced += part.endpointsFenced;
+    total.endpointsFailed += part.endpointsFailed;
+    total.transfersFailed += part.transfersFailed;
+    total.peerKnown = total.peerKnown || part.peerKnown;
+    if (!part.message.empty()) {
+      if (!total.message.empty()) total.message += "; ";
+      total.message += part.message;
+    }
+  }
+  if (total.supported && !total.peerKnown) {
+    if (!total.message.empty()) total.message += "; ";
+    total.message += "no connection with engine " + remote +
+                     " was ever seen and it is not registered: is the key right?";
+  }
+  MORI_IO_INFO(
+      "Fence remote engine {}: supported={} known={} fenced={} failed={} transfers_failed={}",
+      remote.c_str(), total.supported, total.peerKnown, total.endpointsFenced,
+      total.endpointsFailed, total.transfersFailed);
+  return total;
+}
+
+bool IOEngine::UnfenceRemoteEngine(const EngineKey& remote) {
+  bool wasFenced = false;
+  for (auto& it : backends) {
+    wasFenced = it.second->UnfenceRemoteEngine(remote) || wasFenced;
+  }
+  MORI_IO_INFO("Unfence remote engine {}: was_fenced={}", remote.c_str(), wasFenced);
+  return wasFenced;
 }
 
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
@@ -394,7 +553,8 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
   if (loc == MemoryLocationType::GPU) {
-    memDesc.deviceBusId = QueryDeviceBusId(device);
+    memDesc.deviceBusId =
+        sim::IsEnabled() ? "sim:" + std::to_string(device) : QueryDeviceBusId(device);
   }
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
@@ -452,25 +612,27 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
 
   // Next prefer FABRIC: cross-node GPU pairs in the same scale-up domain (vPOD)
   // reachable over the UALink super-node fabric, which is faster than RDMA.
+  std::string fabricReason;
   auto fabricIt = backends.find(BackendType::FABRIC);
-  if (fabricIt != backends.end() && fabricIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::FABRIC);
-    return fabricIt->second.get();
+  if (fabricIt != backends.end()) {
+    fabricReason = fabricIt->second->RejectReason(local, remote);
+    if (fabricReason.empty()) {
+      UpdateRouteCache(routeKey, BackendType::FABRIC);
+      return fabricIt->second.get();
+    }
   }
 
-  auto rdmaIt = backends.find(BackendType::RDMA);
-  if (rdmaIt != backends.end() && rdmaIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::RDMA);
-    return rdmaIt->second.get();
+  for (auto type : {BackendType::RDMA, BackendType::OFI, BackendType::TCP}) {
+    auto it = backends.find(type);
+    if (it != backends.end() && it->second->CanHandle(local, remote)) {
+      UpdateRouteCache(routeKey, type);
+      if (!fabricReason.empty()) {
+        MORI_IO_INFO("FABRIC not used for local mem {} -> engine {} mem {}: {}; using {}", local.id,
+                     remote.engineKey, remote.id, fabricReason, sim::BackendTypeName(type));
+      }
+      return it->second.get();
+    }
   }
-
-#ifdef MORI_USE_LIBFABRIC
-  auto ofiIt = backends.find(BackendType::OFI);
-  if (ofiIt != backends.end() && ofiIt->second->CanHandle(local, remote)) {
-    UpdateRouteCache(routeKey, BackendType::OFI);
-    return ofiIt->second.get();
-  }
-#endif
 
   // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
   return nullptr;
@@ -495,15 +657,15 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
   return it->second;
 }
 
-#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
-  backend = SelectBackend(local, remote);                                     \
-  if (backend == nullptr) {                                                   \
-    if (status != nullptr) {                                                  \
-      status->Update(StatusCode::ERR_BAD_STATE,                               \
-                     "No available backend found, create backend first");     \
-    }                                                                         \
-    MORI_IO_ERROR("No available backend found, please create backend first"); \
-    return;                                                                   \
+#define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend) \
+  backend = SelectBackend(local, remote);                                 \
+  if (backend == nullptr) {                                               \
+    const std::string reason = NoBackendReason(backends, local, remote);  \
+    if (status != nullptr) {                                              \
+      status->Update(StatusCode::ERR_BAD_STATE, reason);                  \
+    }                                                                     \
+    MORI_IO_ERROR("{}", reason);                                          \
+    return;                                                               \
   }
 
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
@@ -598,6 +760,7 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
 
   Backend* backend = SelectBackend(local, remote);
   if (backend == nullptr) {
+    MORI_IO_WARN("{}", NoBackendReason(backends, local, remote));
     return std::nullopt;
   }
   sess.backendSess.reset(backend->CreateSession(local, remote));
@@ -610,15 +773,18 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
 
 void IOEngine::LoadScatterGatherModule(const std::string& hsacoPath) {
   auto it = backends.find(BackendType::XGMI);
-  if (it != backends.end()) {
-    static_cast<XgmiBackend*>(it->second.get())->LoadScatterGatherModule(hsacoPath);
+  if (it == backends.end()) return;
+  // A simulated XGMI backend has no kernels to load.
+  if (auto* xgmi = dynamic_cast<XgmiBackend*>(it->second.get())) {
+    xgmi->LoadScatterGatherModule(hsacoPath);
   }
 }
 
 void IOEngine::LoadFabricCopyModule(const std::string& hsacoPath) {
   auto it = backends.find(BackendType::FABRIC);
-  if (it != backends.end()) {
-    static_cast<FabricBackend*>(it->second.get())->LoadFabricCopyModule(hsacoPath);
+  if (it == backends.end()) return;
+  if (auto* fabric = dynamic_cast<FabricBackend*>(it->second.get())) {
+    fabric->LoadFabricCopyModule(hsacoPath);
   }
 }
 

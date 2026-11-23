@@ -20,6 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import ctypes
+import gc
+import weakref
 
 import pytest
 
@@ -72,8 +74,9 @@ class MockPageFirstKVCache:
         return bytes(ctypes.string_at(self._buffer_ptr + v_offset, self.element_size))
 
 
-def _make_client(dram_capacity_bytes=4 * 1024 * 1024, ssd_dir=None):
+def _make_client(dram_capacity_bytes=4 * 1024 * 1024, ssd_dir=None, kv_indexer=None):
     config = UMBPConfig()
+    config.kv_indexer = kv_indexer
     config.dram.capacity_bytes = dram_capacity_bytes
     config.ssd.enabled = ssd_dir is not None
     if ssd_dir is not None:
@@ -97,6 +100,59 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert bytes(out) == bytes(data)
 
     assert client.clear()
+
+
+def test_indexer_callback_preserves_write_apis():
+    parent, calls = 42, []
+
+    def metadata(keys):
+        calls.append(keys)
+        return [umbp.KvBlockMetadata(42, parent, 16, {1: ["key"]})]
+
+    client = _make_client(
+        kv_indexer=umbp.KvIndexerConfig(
+            "127.0.0.1:1", "shared", metadata_provider=metadata, timeout_ms=10
+        )
+    )
+    data = ctypes.create_string_buffer(b"value")
+    ptr, size = ctypes.addressof(data), len(data)
+    with pytest.raises(ValueError, match="cycle"):
+        client.put_from_ptr("key", ptr, size)
+    assert not client.exists("key")
+    parent = None
+    # An unavailable Indexer must not fail storage writes.
+    assert client.put_from_ptr("key", ptr, size)
+    assert client.batch_put_from_ptr(["key"], [ptr], [size]) == [True]
+    assert client.batch_put_from_ptr_with_depth(["key"], [ptr], [size], [0]) == [True]
+    assert client.batch_put_ranges_from_ptr(
+        ["key"], [size], [[ptr]], [[size]], [[0]]
+    ) == [True]
+    assert calls == [["key"]] * 5
+
+
+def test_bound_metadata_provider_does_not_retain_client_owner():
+    class Adapter:
+        def __init__(self):
+            self.client = _make_client(
+                kv_indexer=umbp.KvIndexerConfig(
+                    "127.0.0.1:1",
+                    "shared",
+                    self.metadata,
+                    timeout_ms=10,
+                )
+            )
+
+        def metadata(self, keys):
+            return [umbp.KvBlockMetadata(42, None, 16, {1: keys})]
+
+    adapter = Adapter()
+    client, ref = adapter.client, weakref.ref(adapter)
+    del adapter
+    gc.collect()
+    assert ref() is None
+    data = ctypes.create_string_buffer(b"value")
+    with pytest.raises(RuntimeError, match="owner was released"):
+        client.put_from_ptr("key", ctypes.addressof(data), len(data))
 
 
 def test_batch_put_get_ranges_round_trip_and_shape_failure():

@@ -22,11 +22,14 @@
 """Pytest wrapper for the ops-v2 (FlyDSL) EP8 dispatch/combine correctness test.
 
 The v2 op-layer test is a torchrun standalone script (``test_op.py``) driven by
-env vars, so this wrapper just launches it under torchrun on 8 GPUs for a few
+env vars, so this wrapper launches it under torchrun on 8 GPUs for a few
 representative modes and asserts every ``# OP-... PASS/FAIL`` line reports PASS.
+All the modes run in one launch (``test_op.py``'s CASES), one test per mode.
 It is the pytest-collectable counterpart to the v1 ``test_dispatch_combine_intranode.py``.
 """
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -51,6 +54,7 @@ def _arch():
 
 
 _IS_GFX950 = _arch().startswith("gfx95")  # fp4 (e2m1) is gfx950-only
+_IS_GFX125X = _arch().startswith("gfx125")
 
 
 def _run(extra_env, timeout=600):
@@ -97,70 +101,179 @@ _skip_fp4 = pytest.mark.skipif(not _IS_GFX950, reason="fp4 is gfx950-only")
 
 
 def _cases():
+    """(id, env) of every mode."""
     # dtype x combine (non-quant)
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "gather"}, id="bf16-gather")
-    yield pytest.param({"DTYPE": "bf16", "COMBINE": "scatter"}, id="bf16-scatter")
-    yield pytest.param({"DTYPE": "f32", "COMBINE": "gather"}, id="f32-gather")
-    yield pytest.param({"DTYPE": "f32", "COMBINE": "scatter"}, id="f32-scatter")
-    yield pytest.param(  # fp4 gather (tuned schedule), gfx950-only
-        {"DTYPE": "fp4", "COMBINE": "gather", "TUNED": 1},
-        id="fp4-gather",
-        marks=_skip_fp4,
-    )
+    yield "bf16-gather", {"DTYPE": "bf16", "COMBINE": "gather"}
+    yield "bf16-scatter", {"DTYPE": "bf16", "COMBINE": "scatter"}
+    yield "f32-gather", {"DTYPE": "f32", "COMBINE": "gather"}
+    yield "f32-scatter", {"DTYPE": "f32", "COMBINE": "scatter"}
+    # fp4 gather (tuned schedule), gfx950-only
+    yield "fp4-gather", {"DTYPE": "fp4", "COMBINE": "gather", "TUNED": 1}
     # plain fp8 token dtype (gather-only), any arch (fnuz on gfx942, OCP on gfx950)
-    yield pytest.param({"DTYPE": "fp8", "COMBINE": "gather"}, id="fp8-gather")
-    yield pytest.param(
-        {"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}, id="fp8-gather-tuned"
-    )
-    # quant paths (scatter-only, compress-on-write)
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "scatter", "QUANT": "fp8_direct_cast"},
-        id="bf16-scatter-fp8direct",
-    )
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "scatter", "QUANT": "fp8_blockwise"},
-        id="bf16-scatter-fp8blockwise",
-    )
-    # blockwise with INSCALE>fp8_max so amax exceeds the fp8 range -> exercises the
-    # per-block scaling branch (the plain case above never triggers it).
-    yield pytest.param(
-        {
+    yield "fp8-gather", {"DTYPE": "fp8", "COMBINE": "gather"}
+    yield "fp8-gather-tuned", {"DTYPE": "fp8", "COMBINE": "gather", "TUNED": 1}
+    # quant paths (scatter-only); bare fp8_blockwise is 1x128 off gfx125x
+    yield "bf16-scatter-fp8blockwise", {
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise",
+    }
+    # blockwise with INSCALE>fp8_max so amax exceeds the fp8 range
+    yield "bf16-scatter-fp8blockwise-scaled", {
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise",
+        "INSCALE": 200,
+    }
+    # each explicit fp8 format at unit scale, past the fp8 max and below its normals
+    for group in (32, 128):
+        for inscale in (1, 200, 0.001):
+            yield f"bf16-scatter-fp8-1x{group}-x{inscale:g}", {
+                "DTYPE": "bf16",
+                "COMBINE": "scatter",
+                "QUANT": f"fp8_blockwise_1x{group}",
+                "INSCALE": inscale,
+            }
+    # 1x32 groups 2^12 apart in magnitude: each must get its own scale
+    yield "bf16-scatter-fp8-1x32-spread", {
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x32",
+        "SPREAD": 6,
+    }
+    # the HIP backend's quantized scatter combine, every format at the three scales
+    for elem in ("fp8", "fp4"):
+        for group in (32, 128):
+            for inscale in (1, 200, 0.001):
+                yield f"hip-bf16-scatter-{elem}-1x{group}-x{inscale:g}", {
+                    "MORI_V2_KERNEL_BACKEND": "hip",
+                    "DTYPE": "bf16",
+                    "COMBINE": "scatter",
+                    "QUANT": f"{elem}_blockwise_1x{group}",
+                    "INSCALE": inscale,
+                }
+    yield "hip-bf16-scatter-fp8-1x32-spread", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x32",
+        "SPREAD": 6,
+    }
+    # hidden 2304 is not a multiple of the 512-element step: the partial last step
+    for elem in ("fp8", "fp4"):
+        for group in (32, 128):
+            yield f"hip-bf16-scatter-{elem}-1x{group}-h2304", {
+                "MORI_V2_KERNEL_BACKEND": "hip",
+                "DTYPE": "bf16",
+                "COMBINE": "scatter",
+                "QUANT": f"{elem}_blockwise_1x{group}",
+                "HIDDEN": 2304,
+            }
+    # a 1x128 block whose amax is under the scale's normal range (scale 1, finite)
+    for backend, elem in (("flydsl", "fp8"), ("hip", "fp8"), ("hip", "fp4")):
+        yield f"{backend}-bf16-scatter-{elem}-1x128-tiny", {
+            "MORI_V2_KERNEL_BACKEND": backend,
             "DTYPE": "bf16",
             "COMBINE": "scatter",
-            "QUANT": "fp8_blockwise",
-            "INSCALE": 200,
-        },
-        id="bf16-scatter-fp8blockwise-scaled",
-    )
+            "QUANT": f"{elem}_blockwise_1x128",
+            "TINY": 1,
+        }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}, id="bf16-gather-scales"
-    )
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "scatter", "SCALE_DIM": 32},
-        id="bf16-scatter-scales",
-    )
+    yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
+    yield "bf16-scatter-scales", {
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "SCALE_DIM": 32,
+    }
     # topk variations (topk=9 is the shared-experts-fusion / AccumNum=9 path)
     for k in (4, 9):
-        yield pytest.param(
-            {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}, id=f"bf16-gather-topk{k}"
-        )
+        yield f"bf16-gather-topk{k}", {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}
     # feature paths
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}, id="bf16-gather-tuned"
-    )
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}, id="bf16-gather-replay"
-    )
-    yield pytest.param(
-        {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}, id="bf16-stdmoe"
-    )
+    yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
+    yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
+    yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
 
 
-@pytest.mark.parametrize("env", list(_cases()))
-def test_dispatch_combine_v2_intranode(env):
-    rc, out = _run(env)
-    _assert_all_pass(rc, out)
+_CASES = dict(_cases())
+_GFX950_ONLY = {"fp4-gather"}
+
+# The gfx125x default backend is hip, which serves gather and the push quant combine
+# (test_op passes it no weights: it folds none), in bf16 / fp32, with no plain scatter,
+# no std_moe, no routing replay, and a quant hidden dim only in multiples of 1024
+# (hip_backend._unsupported). Those modes are the backend's answer there, not a
+# failure, so they are dropped from the launch as well as skipped: the modes all share
+# one launch, and an unserved one aborts it before the rest run. The quant types the
+# backend does not serve are dropped by _refused_quant below.
+_GFX125X_UNSERVED = {
+    c
+    for c, env in _CASES.items()
+    if _IS_GFX125X
+    and (
+        (env.get("COMBINE") == "scatter" and env.get("QUANT", "none") == "none")
+        or (env.get("QUANT", "none") != "none" and int(env.get("HIDDEN", 7168)) % 1024)
+        or env.get("DTYPE") == "fp8"
+        or env.get("STDMOE")
+        or env.get("REPLAY")
+    )
+}
+_skip_125x = pytest.mark.skip(reason="the gfx125x hip backend does not serve this mode")
+_MARKS = {
+    **{c: _skip_125x for c in _GFX125X_UNSERVED},
+    **{c: _skip_fp4 for c in _GFX950_ONLY},
+}
+
+
+def _refused_quant(case):
+    """The case's quant type when its backend refuses it on this arch."""
+    from mori.ops.dispatch_combine_v2 import supported_quant_types
+
+    env = _CASES[case]
+    quant = env.get("QUANT", "none")
+    served = supported_quant_types(env.get("MORI_V2_KERNEL_BACKEND"))
+    return None if quant in served else quant
+
+
+@pytest.fixture(scope="module")
+def case_output():
+    """{id: (output, finished)} for every mode this arch runs, from one launch."""
+    ids = [
+        c
+        for c in _CASES
+        if (_IS_GFX950 or c not in _GFX950_ONLY)
+        and c not in _GFX125X_UNSERVED
+        and not _refused_quant(c)
+    ]
+    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
+    parts = {c: ([], False) for c in ids}
+    current = None
+    for ln in out.splitlines():
+        m = re.search(r"# CASE (\d+)( DONE)?", ln)
+        if m:
+            current = ids[int(m.group(1))]
+            if m.group(2):
+                parts[current] = (parts[current][0], True)
+            continue
+        if current is not None:
+            parts[current][0].append(ln)
+    # A crash is the first unfinished mode's; if every mode finished, the last's.
+    unfinished = [c for c in ids if not parts[c][1]]
+    crashed = unfinished[0] if unfinished else (ids[-1] if rc != 0 else None)
+    return rc, out, crashed, {c: ("\n".join(t), done) for c, (t, done) in parts.items()}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [pytest.param(c, marks=_MARKS[c]) if c in _MARKS else c for c in _CASES],
+)
+def test_dispatch_combine_v2_intranode(case, case_output):
+    refused = _refused_quant(case)
+    if refused:
+        pytest.skip(f"quant_type={refused} is not served on this arch")
+    rc, out, crashed, parts = case_output
+    assert case != crashed, f"the launch failed in {case} (rc={rc}); output:\n{out}"
+    text, finished = parts[case]
+    assert finished, f"{case} did not run: the launch failed in {crashed} first"
+    _assert_all_pass(0, text)
 
 
 def test_op_lifecycle():

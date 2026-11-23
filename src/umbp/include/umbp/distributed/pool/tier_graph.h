@@ -41,8 +41,10 @@ namespace mori::umbp {
 
 uint64_t StablePlacementHash(std::string_view key);
 
+// `size` 0 means unknown, which no member's min_object_bytes rejects.
 std::vector<uint32_t> WeightedBackendOrder(const std::vector<LogicalTierBackendConfig>& members,
-                                           const BackendRegistry& backends, std::string_view key);
+                                           const BackendRegistry& backends, std::string_view key,
+                                           uint64_t size = 0);
 
 class LogicalTierGraph {
  public:
@@ -84,9 +86,11 @@ class LogicalTierGraph {
   bool AtOrAbove(TierIndex tier, double watermark) const;
   bool MemberAtOrAbove(uint32_t backend_id, double watermark) const;
 
-  std::vector<uint32_t> WeightedMemberOrder(TierIndex tier, std::string_view key) const;
-  std::vector<uint32_t> PutOrder(std::string_view key) const;
-  std::vector<uint32_t> PutOrderFromTier(std::string_view name, std::string_view key) const;
+  std::vector<uint32_t> WeightedMemberOrder(TierIndex tier, std::string_view key,
+                                            uint64_t size = 0) const;
+  std::vector<uint32_t> PutOrder(std::string_view key, uint64_t size = 0) const;
+  std::vector<uint32_t> PutOrderFromTier(std::string_view name, std::string_view key,
+                                         uint64_t size = 0) const;
   std::vector<uint32_t> TransitionTargetOrder(TierIndex source, std::string_view key) const;
   std::vector<uint32_t> PromoteTargetOrder(TierIndex source, std::string_view key) const;
   std::vector<uint32_t> ReadOrder() const;
@@ -99,8 +103,8 @@ class LogicalTierGraph {
 
   std::vector<TierIndex> ReachableTierOrder(TierIndex source, bool upstream,
                                             bool include_source) const;
-  std::vector<uint32_t> BackendOrder(const std::vector<TierIndex>& tiers,
-                                     std::string_view key) const;
+  std::vector<uint32_t> BackendOrder(const std::vector<TierIndex>& tiers, std::string_view key,
+                                     uint64_t size = 0) const;
 
   const BackendRegistry* backends_;
   std::vector<Node> nodes_;

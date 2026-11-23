@@ -7,6 +7,12 @@
 #             the target was told
 #   recovers  once the fault clears, a new transfer between the same engines succeeds
 #   alive     the process neither exits nor crashes
+#   stopped   (initiator-side faults) when the transfer reports an error, none of its
+#             data WRs can still run: each has completed or sits on a QP in ERR, so
+#             a caller that frees its buffers on that error frees nothing in use
+#   waits     (entries with waits: true) the call returns with the transfer still
+#             IN_PROGRESS: the fault hits after its data WRs are on the wire, and
+#             the caller may reuse its buffers once the transfer reports an error
 # The checks describe the behavior we want, not today's: a failing entry is an
 # open bug for a follow-up fix. "alive" covers both processes below.
 #
@@ -21,12 +27,21 @@
 #               omit for no fault
 #   transfer    write | read  (one 1 MiB transfer)
 #               batch         (BatchWrite of 2 non-adjacent segments over 2 QPs)
+#               large_then_small, small_then_large
+#                             (BatchWrite of a 256 MiB and a 4 KiB segment over 2
+#                              QPs, the named one posted first: a fault on the small
+#                              one lands while the large one is still on the wire)
+#               spread        (BatchWrite of 4 non-adjacent 60 MiB segments over 4
+#                              QPs; with MORI_IO_NUM_WORKER_THREADS=4 each is posted
+#                              by its own worker thread)
 #   notify      MORI notifications on: a SEND/RECV after the data tells the target
 #               (default false)
 #   warmup      clean transfers before the fault is armed; 0 arms it before the
 #               engines connect (default 0)
 #   side        initiator | target: the process the fault is armed in; the
 #               other one runs fault-free (default initiator)
+#   waits       the fault only hits after the data WRs are posted, so the
+#               transfer is held to the waits check (default false)
 #   known_bug   the open bug this entry is expected to fail on (see below)
 #   fails       with known_bug: the checks it fails today, comma-separated
 #
@@ -34,10 +49,13 @@
 # `fails` checks fail. The run fails on any other failed check (a new bug or a
 # regression), and on a known_bug entry whose `fails` checks now pass (XPASS):
 # the fix PR then deletes that entry's known_bug and fails lines.
-#   no-qp-rebuild           a QP in ERR is never rebuilt; later transfers flush
 #   no-completion-deadline  a lost CQE leaves the transfer IN_PROGRESS forever
 #   target-not-notified     the target can wait forever for a lost notification
 #   exit-on-post-recv-fail  a failed ibv_post_recv calls exit(-1)
+#   uncut-orphans           WRs a give-up can neither mark nor cut stay orphaned on a
+#                           live QP: no completion accounts them, so the transfer stays
+#                           IN_PROGRESS, and the degraded endpoint is never replaced, so
+#                           every later submission on it is rejected
 
 - id: none.write
   real_world: no fault (baseline)
@@ -56,11 +74,79 @@
   rule: post_send_fail:skip=1
   transfer: batch
 
+- id: post_send_fail.large_then_small
+  real_world: post fails on QP 2 while QP 1's large write is still on the wire
+  rule: post_send_fail:skip=1
+  transfer: large_then_small
+
+# Chunked into 4 MiB WRs posted 4 at a time, so when the ninth post fails both QPs hold
+# unsignaled WRs of the transfer with nothing behind them to report their completion.
+- id: post_send_fail.unsignaled_pending
+  real_world: a post fails while both QPs still hold unsignaled WRs of the transfer
+  rule: post_send_fail:skip=8
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# Every post after the eighth fails, the completion markers included: the QPs holding
+# pending unsignaled WRs are cut instead, so the transfer still ends, and the next one
+# gets new QPs.
+- id: post_send_fail.unsignaled_pending.no_marker
+  real_world: a post fails partway and the QP refuses the completion marker too
+  rule: post_send_fail:skip=8:count=0
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# As .no_marker, but the QPs that refuse the posts also refuse to be moved to Error, so
+# their pending unsignaled WRs cannot be cut either: the last resort parks them as
+# orphaned and marks the endpoint degraded.
+- id: post_send_fail.unsignaled_pending.no_cut
+  real_world: a post fails partway on a stuck QP that refuses both the marker and the cut
+  rule: qp_stuck:skip=8:count=0
+  transfer: large_then_small
+  env: MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+  known_bug: uncut-orphans
+  fails: ends, recovers
+
+# Worker threads: four workers each post one 60 MiB segment, in 64 WRs 4 at a time, on
+# their own QP, so their ~16 posts each interleave. The failing worker returns at once
+# and the others keep posting; the transfer may report the failure only once every
+# worker's WRs have stopped, and the posted credits come back summed over the workers.
+- id: post_send_fail.workers.one
+  real_world: one worker thread's post fails while the other workers' writes are on the wire
+  rule: post_send_fail:skip=20
+  transfer: spread
+  env: MORI_IO_NUM_WORKER_THREADS=4,MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
+# Every post after the twentieth fails, completion markers included, so each worker still
+# posting fails (none can have finished its ~16 posts by then: at least three do) and
+# the QPs holding its pending WRs are cut.
+- id: post_send_fail.workers.several
+  real_world: several worker threads' posts fail, and their QPs refuse completion markers
+  rule: post_send_fail:skip=20:count=0
+  transfer: spread
+  env: MORI_IO_NUM_WORKER_THREADS=4,MORI_IO_ENABLE_CHUNKING=1,MORI_IO_POST_BATCH_SIZE=4
+
 - id: post_send_fail.notify
   real_world: data posted, then the notification post fails
   rule: post_send_fail:skip=1
   transfer: write
   notify: true
+  waits: true
+
+- id: post_send_fail.notify.read
+  real_world: read posted, then the notification post fails
+  rule: post_send_fail:skip=1
+  transfer: read
+  notify: true
+  waits: true
+
+# The data goes out as one post per QP; the third post is the first notification.
+- id: post_send_fail.notify.batch
+  real_world: both QPs' data posted, then a notification post fails
+  rule: post_send_fail:skip=2
+  transfer: batch
+  notify: true
+  waits: true
 
 - id: post_recv_fail.connect
   real_world: pre-posting receives fails while connecting
@@ -88,58 +174,48 @@
   real_world: link down or peer gone during a write
   rule: cqe_error:op=write:value=retry_exc
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.retry_exc.mid_run
   real_world: same, after 10 good transfers
   rule: cqe_error:op=write:value=retry_exc
   transfer: write
   warmup: 10
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.read.retry_exc
   real_world: link down or peer gone during a read
   rule: cqe_error:op=read:value=retry_exc
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.rem_access
   real_world: "stale rkey: peer deregistered the memory"
   rule: cqe_error:op=write:value=rem_access
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.read.rem_op
   real_world: peer rejected the operation
   rule: cqe_error:op=read:value=rem_op
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.loc_prot
   real_world: local buffer deregistered under an in-flight write
   rule: cqe_error:op=write:value=loc_prot
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.fatal
   real_world: NIC internal error on one WR
   rule: cqe_error:op=write:value=fatal
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.batch.one_qp
   real_world: one of two QPs fails mid-batch
   rule: cqe_error:op=write
   transfer: batch
-  known_bug: no-qp-rebuild
-  fails: recovers
+
+# The small write completes first, so the error lands on it while the large one runs.
+- id: cqe_error.small_then_large
+  real_world: one QP fails while the other QP's large write is still on the wire
+  rule: cqe_error:op=write
+  transfer: small_then_large
 
 # Initiator side only: the injected error lands after the real SEND was
 # delivered, so the target is still told. cqe_drop.notify.recv covers the target side.
@@ -148,8 +224,6 @@
   rule: cqe_error:op=send:value=rnr_retry_exc
   transfer: write
   notify: true
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 # ---- Lost completion: the WR finishes but its CQE never arrives ----------------
 
@@ -189,27 +263,24 @@
   real_world: QP dies before the first write
   rule: qp_error
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.write.mid_run
   real_world: QP dies after 10 good transfers
   rule: qp_error
   transfer: write
   warmup: 10
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.read
   real_world: QP dies before a read
   rule: qp_error
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.batch.one_qp
   real_world: one of two QPs dies
   rule: qp_error
   transfer: batch
-  known_bug: no-qp-rebuild
-  fails: recovers
+
+- id: qp_error.small_then_large
+  real_world: one QP dies before its small write while the other QP's large write runs
+  rule: qp_error
+  transfer: small_then_large

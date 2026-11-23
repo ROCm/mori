@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -159,16 +160,112 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
-      : status(s), id(id_), totalBatchSize(n) {}
+      : status(s), id(id_), totalBatchSize(n) {
+    dataStatus.SetCode(StatusCode::IN_PROGRESS);
+  }
 
   // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
   // terminal update happens exactly once even though the CQ poller and the async
   // event monitor can both reach the same meta concurrently.
   std::atomic<TransferStatus*> status{nullptr};
   TransferUniqueId id{0};
+  // Credits (merged requests, or WRs when chunking) the transfer spans, across all its QPs.
   int totalBatchSize{0};
+  // Credits that can no longer touch memory: completed, flushed, retired with their dead
+  // QP, or never posted. Only Account() adds to it.
   std::atomic<uint32_t> finishedBatchSize{0};
   internal::IoCallDiagnostics diagnostics{};
+
+  // Accounts `credits` as finished with `code`. The status turns terminal only once every
+  // credit is accounted, and then reports the first failure (a root cause in preference
+  // to a flush), else success. So a failed status means no WR of the transfer can still
+  // move data: a caller may free or reuse its buffers then, which it could not if a
+  // failure on one QP were reported while the transfer's WRs on another were in flight.
+  // True if this call turned the status terminal.
+  bool Account(int credits, StatusCode code, const std::string& message, bool rootCause = true) {
+    if (code > StatusCode::ERR_BEGIN) {
+      std::lock_guard<std::mutex> lock(outcomeMu);
+      if (!hasFailure.load(std::memory_order_relaxed) || (rootCause && !failureIsRootCause)) {
+        failure = Outcome{code, message};
+        failureIsRootCause = rootCause;
+        hasFailure.store(true, std::memory_order_release);
+      }
+    }
+    const uint32_t before =
+        finishedBatchSize.fetch_add(static_cast<uint32_t>(credits), std::memory_order_acq_rel);
+    if (static_cast<int64_t>(before) + credits < totalBatchSize) return false;
+    TransferStatus* s = status.exchange(nullptr, std::memory_order_acq_rel);
+    if (s == nullptr) return false;
+    // The success path never takes the lock: no failure was recorded.
+    if (!hasFailure.load(std::memory_order_acquire)) {
+      ReportData(s, code, message);
+      return true;
+    }
+    Outcome report;
+    {
+      std::lock_guard<std::mutex> lock(outcomeMu);
+      report = failure;
+    }
+    ReportData(s, report.code, report.message);
+    return true;
+  }
+
+  // Set before the data WRs are posted when a notification SEND follows them. The
+  // data WRs and the notification post then finish independently, and whichever
+  // finishes last reports the transfer: a notification that cannot be posted never
+  // turns it terminal while its data WRs are still on the wire, and is never lost
+  // behind a SUCCESS the data already reported.
+  bool awaitsNotification{false};
+
+  // Reports the data WRs' outcome through `s`, the status the caller claimed.
+  void ReportData(TransferStatus* s, StatusCode code, const std::string& message) {
+    if (!awaitsNotification) {
+      s->Update(code, message);
+      return;
+    }
+    dataStatus.Update(code, message);
+    Finish(s, &dataOutcome, code, message);
+  }
+
+  // The data WRs' own outcome while the caller's status waits for the notification too;
+  // a notification fault staged in test builds waits for it.
+  TransferStatus dataStatus;
+
+  // Reports the notification post's outcome; `s` is the posting thread's own status.
+  void ReportNotification(TransferStatus* s, StatusCode code, const std::string& message) {
+    Finish(s, &notificationOutcome, code, message);
+  }
+
+ private:
+  struct Outcome {
+    StatusCode code{StatusCode::SUCCESS};
+    std::string message;
+  };
+
+  // A data failure wins over a notification failure; only both succeeding is SUCCESS.
+  void Finish(TransferStatus* s, Outcome* part, StatusCode code, const std::string& message) {
+    {
+      std::lock_guard<std::mutex> lock(outcomeMu);
+      *part = Outcome{code, message};
+    }
+    if (unfinishedParts.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    std::lock_guard<std::mutex> lock(outcomeMu);
+    const Outcome& report = dataOutcome.code <= StatusCode::ERR_BEGIN &&
+                                    notificationOutcome.code > StatusCode::ERR_BEGIN
+                                ? notificationOutcome
+                                : dataOutcome;
+    s->Update(report.code, report.message);
+  }
+
+  std::atomic<int> unfinishedParts{2};
+  std::mutex outcomeMu;  // guards the outcomes below
+  Outcome dataOutcome;
+  Outcome notificationOutcome;
+  // The first data failure Account() saw, a root cause in preference to a flush.
+  Outcome failure;
+  bool failureIsRootCause{false};
+  // Set once `failure` is; read without the lock so the success path never takes it.
+  std::atomic<bool> hasFailure{false};
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
@@ -273,14 +370,19 @@ class SubmissionLedger {
   std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
                                                int* outBatchSize);
 
-  // Recovery path: release only Orphaned records and keep Posted records.
+  // Recovery path, on an error completion from this QP: release only Orphaned records and
+  // keep Posted records. The QP is in error, so the orphaned WRs either completed before
+  // the failing one or are flushed without running; their credits are accounted as failed.
   int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
 
   bool HasOrphaned() const;
 
   // Terminal path: fail every record and erase them. Used when the QP or its CQ
-  // has died, so no CQE can ever arrive for the records left behind. Returns the
-  // number of transfers whose status this call moved to a failed state.
+  // has died, so no CQE can ever arrive for the records left behind, and none of
+  // their WRs can run any more. Their credits are accounted as failed; a transfer
+  // also spanning live QPs reports once its WRs there finish too. Returns the
+  // number of transfers this call failed, i.e. whose status it turned terminal (a
+  // transfer that still waits on another QP is counted by whoever finishes it).
   //
   // This also closes the ledger for good. Closing matters as much as failing: a
   // submitter that cleared the degraded check just before the event arrives is
@@ -332,6 +434,11 @@ using QpErrorHandler = std::function<void(const QpErrorEvent&)>;
 
 inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
 
+// Send-queue slots held back from normal admission for completion markers (see
+// SettlePendingWrs), so a full send queue cannot stop a submission that gives up from
+// making the WRs it already posted observable.
+inline constexpr int kCompletionMarkerSlots = 4;
+
 struct SqAdmissionEvent {
   alignas(4) std::atomic<uint32_t> epoch{0};
   std::atomic<uint32_t> waiters{0};
@@ -352,6 +459,10 @@ struct EpPair {
   std::shared_ptr<SubmissionLedger> ledger;
   // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<SqAdmissionEvent> sqAdmission;
+  // Send-queue slots above maxSqDepth that only completion markers may use: those the
+  // queue really has beyond admission (kCompletionMarkerSlots, or 0 when it is too small
+  // to spare them).
+  int markerSlots{0};
 };
 
 // Which endpoints a fatal async event takes down with it. A QP event hits one
@@ -386,6 +497,12 @@ struct RemoteEngineMeta {
 struct RdmaOpRet {
   StatusCode code{StatusCode::INIT};
   std::string message;
+  // Credits this submission handed to the NIC or settled itself; a submission that gives
+  // up partway accounts the rest of the transfer's credits as never sent.
+  int postedCredits{0};
+  // QPs this submission moved to Error to stop WRs it could not otherwise bound; the
+  // caller marks them failed so the next transfer replaces them.
+  std::vector<ibv_qp*> cutQps;
 
   bool Init() { return code == StatusCode::INIT; }
   bool InProgress() { return code == StatusCode::IN_PROGRESS; }
@@ -395,7 +512,8 @@ struct RdmaOpRet {
 
 void NotifySqStateChanged(const EpPair& ep);
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+// `dataStatus` holds the outcome of the transfer's data WRs (CqCallbackMeta::dataStatus).
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus, TransferUniqueId id);
 
 namespace detail {
 

@@ -35,7 +35,14 @@ result on every rank):
                  -> gather. gcnasm's "Direct LSA" shape: no staging, no copy
                  engine, and nothing to publish mid-kernel
     split-lsa    gemm -> LSA 2-stage all-reduce        (2 kernels)
+    split-rccl   gemm -> torch.distributed all_reduce / reduce_scatter_tensor
+                 over RCCL, i.e. what a serving stack runs when nothing is fused
     gemm-only    the GEMM alone, to size the ceiling
+
+``--collective rs`` stops every SDMA mode after the reduce (``rs_order`` /
+``fused_rs_order``), so ``output`` holds only this rank's row band of the sum:
+``[M/P, N]`` starting at row ``rank*M/P``. That is the reduce-scatter a
+sequence-parallel layer runs after its RowParallelLinear.
 
 ``split-*`` uses the *same* kernel as ``fused-sdma`` with the epilogue tail
 compiled out, so the two differ in one thing only. ``split-lsa`` is included
@@ -110,17 +117,28 @@ from mori.ops.gemm_ar import (
     preshuffle_a_scale,
     preshuffle_b,
 )
+from mori.ops.gemm_ar.kernels_fused_bf16 import compile_fused_gemm_scatter_bf16
 from mori.tensor_utils import from_gpu_ptr
+from mori.ops.gemm_ar.op import _PinnedLaunch
 
 VMM_SLACK = 512 * 1024 * 1024
-MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
+MODES = (
+    "gemm-only",
+    "split-sdma",
+    "fused-sdma",
+    "fused-lsa",
+    "split-lsa",
+    "split-rccl",
+)
 
 
 def _setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="cpu:gloo")
+        # nccl (RCCL here) only for the split-rccl baseline; its communicator is
+        # created on first use, so the other modes pay nothing for asking.
+        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
     rank, world_size = dist.get_rank(), dist.get_world_size()
     payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0)
@@ -174,6 +192,11 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
     (1.66e-3); the other three give 0.17-0.32.
     """
     g = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    if quant == "bf16":
+        # Kimi-K3's o_proj / shared experts: BF16 weights, no scales at all.
+        a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+        b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+        return a, b, None, None
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     if quant == "ptpc":
@@ -184,7 +207,7 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
         )
         return a, b, sa, sb
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         # DeepSeek-V4.1-Flash's dense form: A per-32-K, B per-32x32, both ue8m0.
         # Scales stay as exponent bytes all the way to the MFMA, which is what
         # the instruction's scale operand reads.
@@ -193,7 +216,9 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
         sb = _ue8m0_bytes((n // MXFP8_BK, kb), g)
         return a, b, sa.contiguous(), sb.contiguous()
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
+        raise ValueError(
+            f"quant must be ptpc, blockscale, mxfp8 or mxfp8_raw, got {quant!r}"
+        )
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
@@ -209,9 +234,11 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
 def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     """One rank's fp32 GEMM reference, matching ``make_operands``' quantisation."""
     af, bf = a.float(), b.float()
+    if quant == "bf16":
+        return af @ bf.T
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
         out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
         for i in range(a.shape[1] // MXFP8_BK):
@@ -282,12 +309,43 @@ def run(args) -> int:
             "--mode split-lsa has no fp8 gather leg (build_lsa_ar takes no "
             "gather_dtype); use split-sdma or fused-sdma for --gather-dtype fp8"
         )
+    rs = args.collective == "rs"
+    if rs and args.mode == "split-lsa":
+        raise SystemExit(
+            "--collective rs has no split-lsa form: build_lsa_ar is one kernel "
+            "with no point to stop at after the reduce"
+        )
+    if rs and args.gather_dtype == "fp8":
+        raise SystemExit(
+            "--collective rs has no gather leg, so --gather-dtype fp8 would be "
+            "silently ignored"
+        )
+    if rs and args.fuse_reduce_push:
+        raise SystemExit(
+            "--collective rs always runs the plain reduce (reduce_push feeds a "
+            "gather), so --fuse-reduce-push would be silently ignored"
+        )
+    if rs and args.scatter_dtype == "fp8":
+        raise SystemExit(
+            "--collective rs reduces a bf16 scatter only; GemmReduceScatterOp "
+            "has no fp8 scatter leg"
+        )
+    if args.mode == "split-rccl" and args.gather_dtype == "fp8":
+        raise SystemExit(
+            "--mode split-rccl moves bf16; --gather-dtype fp8 is SDMA only"
+        )
     local_rank, rank, world_size, uid = _setup_distributed()
+    if args.scatter_dtype == "fp8" and args.mode != "fused-sdma":
+        raise ValueError("FP8 scatter experiment is wired only through fused-sdma")
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
     # kernel already runs at ~254 with zero spill, so the tile has to halve.
     if not args.block_m:
         args.block_m = 128 if args.quant == "blockscale" else 256
+    if args.quant == "bf16" and args.mode == "fused-lsa":
+        raise ValueError(
+            "--quant bf16 supports gemm-only, split-sdma, fused-sdma, split-lsa"
+        )
     direct_lsa = args.mode == "fused-lsa"
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
@@ -321,7 +379,10 @@ def run(args) -> int:
     # when sweeping.
     DEFAULT_CHUNKS = 8
     chunks = args.chunks if args.chunks else DEFAULT_CHUNKS
-    if fused:
+    if args.chunk_bands:
+        bands = (args.m // world_size + args.block_m - 1) // args.block_m
+        chunks = (bands + args.chunk_bands - 1) // args.chunk_bands
+    elif fused:
         # Fall back rather than fail: chunks has to divide the M-tiles per
         # destination, which at small M can be fewer than 8.
         m_tiles_per_peer = max(
@@ -338,11 +399,13 @@ def run(args) -> int:
         gather_dtype=args.gather_dtype,
         gather_transport=args.gather_transport,
         gather_bands=args.gather_bands,
+        scatter_dtype=args.scatter_dtype,
     )
     cfg.validate()
 
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
-    b_shuf = preshuffle_b(b)
+    # The BF16 GEMM reads a plain row-major [N, K] B; only fp8's is preshuffled.
+    b_shuf = b if args.quant == "bf16" else preshuffle_b(b)
 
     vmm = max(4 * cfg.window_bytes + VMM_SLACK, VMM_SLACK)
     result = None
@@ -354,8 +417,25 @@ def run(args) -> int:
         # C *is* the all-reduce's input region: the GEMM writes its partial
         # straight into the symmetric window, which is the whole host-side change
         # the SDMA fusion needs.
-        c = from_gpu_ptr(mem.ptr + cfg.input_off, (args.m, args.n), torch.bfloat16)
+        c = from_gpu_ptr(
+            mem.ptr + (cfg.output_off if cfg.fp8_scatter else cfg.input_off),
+            (args.m, args.n),
+            torch.bfloat16,
+        )
         out = from_gpu_ptr(mem.ptr + cfg.output_off, (args.m, args.n), torch.bfloat16)
+        # What each collective leaves behind, and where. The SDMA reduce writes
+        # my band at output + rank*slice; RCCL wants an output tensor of its own.
+        band = slice(rank * cfg.slice_rows, (rank + 1) * cfg.slice_rows)
+        if args.mode == "split-rccl":
+            result_t = (
+                c
+                if not rs
+                else torch.empty(
+                    cfg.slice_rows, args.n, device="cuda", dtype=torch.bfloat16
+                )
+            )
+        else:
+            result_t = out[band] if rs else out
         torch.cuda.synchronize()
 
         reqs = CCODevCommRequirements()
@@ -366,33 +446,61 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        gemm = compile_fused_gemm_scatter(
-            cfg,
-            rank,
-            K=args.k,
-            BLOCK_M=args.block_m,
-            BLOCK_N=args.block_n,
-            b_preshuffled=True,
-            quant=args.quant,
-            sdma_queues=args.sdma_queues,
-            waves_per_eu=args.waves_per_eu,
-            xcd_swizzle=args.xcd_swizzle,
-            fuse=fused,
-            transport="lsa" if direct_lsa else "sdma",
-            swap_ab=args.swap_ab,
-            store_probe=args.store_probe,
-            permlane=args.permlane,
-            lane_transpose=args.lane_transpose,
-            hoist_scales=args.hoist_scales,
-            peer_uncached=args.peer_uncached,
-            direct_fence=args.direct_fence,
-            rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
-            n_stripe=args.n_stripe or None,
-            emit_put=not args.no_put,
-            atomic_order=args.atomic,
-        )
-        a_i8 = a.contiguous().view(torch.int8).view(-1)
-        b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
+        if args.quant == "bf16":
+            gemm = compile_fused_gemm_scatter_bf16(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                sdma_queues=args.sdma_queues,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                fuse=fused,
+                rotated=(
+                    None if args.tile_order == "auto" else args.tile_order == "rotated"
+                ),
+                n_stripe=args.n_stripe or None,
+                emit_put=not args.no_put,
+                atomic_order=args.atomic,
+            )
+        else:
+            gemm = compile_fused_gemm_scatter(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                b_preshuffled=True,
+                quant=args.quant,
+                sdma_queues=args.sdma_queues,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                fuse=fused,
+                transport="lsa" if direct_lsa else "sdma",
+                swap_ab=args.swap_ab,
+                store_probe=args.store_probe,
+                permlane=args.permlane,
+                lane_transpose=args.lane_transpose,
+                hoist_scales=args.hoist_scales,
+                peer_uncached=args.peer_uncached,
+                direct_fence=args.direct_fence,
+                rotated=(
+                    None if args.tile_order == "auto" else args.tile_order == "rotated"
+                ),
+                n_stripe=args.n_stripe or None,
+                emit_put=not args.no_put,
+                atomic_order=args.atomic,
+                chunk_bands=args.chunk_bands,
+                relaxed_rows=args.relaxed_rows,
+            )
+        if not args.raw_jit:
+            gemm = _PinnedLaunch(gemm)
+        # The BF16 kernel takes int16 views (an int8 one would describe twice
+        # as many bf16 elements as exist); fp8 takes int8.
+        op_view = torch.int16 if args.quant == "bf16" else torch.int8
+        a_i8 = a.contiguous().view(op_view).view(-1)
+        b_i8 = b_shuf.contiguous().view(op_view).view(-1)
         c_flat = c.view(-1)
 
         # The kernel indexes both scale buffers linearly, so hand it the
@@ -401,7 +509,10 @@ def run(args) -> int:
         # consumes), so its physical order is sa.t(); passing the 2-D
         # non-contiguous view through DLPack would give the kernel the wrong
         # strides.
-        if args.quant == "blockscale":
+        if args.quant == "bf16":
+            # Accepted and unread by the BF16 kernel; it keeps the fp8 signature.
+            sa_arg = sb_arg = torch.zeros(1, dtype=torch.int32, device="cuda")
+        elif args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
         elif args.quant == "mxfp8":
@@ -416,6 +527,10 @@ def run(args) -> int:
             # already a broadcast and there is nothing to pack.
             sa_arg = preshuffle_a_scale(sa)
             sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
+        elif args.quant == "mxfp8_raw":
+            # The quantiser's own row-major bytes; the kernel stages them
+            # through LDS.
+            sa_arg, sb_arg = sa.reshape(-1), sb.reshape(-1)
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -444,6 +559,10 @@ def run(args) -> int:
                 fuse_reduce_push=args.fuse_reduce_push,
                 publish=args.publish,
             )
+            if not args.raw_jit:
+                orders = ("order", "fused_order", "rs_order", "fused_rs_order")
+                for phase in {name for o in orders for name in parts[o]}:
+                    parts[phase] = _PinnedLaunch(parts[phase])
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
 
@@ -455,6 +574,13 @@ def run(args) -> int:
             if args.mode == "split-lsa":
                 lsa_ar(dc.ptr, win.handle, stream=stream)
                 return
+            if args.mode == "split-rccl":
+                # In place for the all-reduce: the GEMM rewrites c every call.
+                if rs:
+                    dist.reduce_scatter_tensor(result_t, c)
+                else:
+                    dist.all_reduce(c)
+                return
             # fused-sdma: the puts were issued from the epilogue, so only the
             # drain runs. fused-lsa: the epilogue already wrote into the peers,
             # so this is a pure cross-rank barrier (its quiet drains nothing).
@@ -462,7 +588,13 @@ def run(args) -> int:
             # parts["order"]/["fused_order"] rather than a literal list: the
             # fp8 gather inserts a quantise and a dequantise, and hardcoding the
             # three phases would skip them and all-reduce into zeros.
-            order = parts["fused_order" if fused else "order"]
+            order = parts[
+                (
+                    ("fused_rs_order" if fused else "rs_order")
+                    if rs
+                    else ("fused_order" if fused else "order")
+                )
+            ]
             parts[order[0]](dc.ptr, win.handle, stream=stream)
             if args.stop_after == "scatter":
                 return
@@ -502,7 +634,9 @@ def run(args) -> int:
             for r in range(world_size):
                 ar, br, sar, sbr = make_operands(r, args.m, args.n, args.k, args.quant)
                 acc += reference_partial(ar, br, sar, sbr, args.quant)
-            diff = (out.float() - acc).norm().item()
+            if rs:
+                acc = acc[band]
+            diff = (result_t.float() - acc).norm().item()
             denom = acc.norm().item()
             rel_l2 = diff / denom if denom else diff
             # fp8 inputs, so this is quantization error, not a collective error;
@@ -517,8 +651,16 @@ def run(args) -> int:
             # has to clear that, and is two-sided -- below 4e-2 says the kernel
             # is right (a broken one lands near 0.9), above 5e-3 says the fp8
             # wire was actually taken and not silently skipped.
-            if cfg.fp8_gather:
+            #
+            # split-rccl sits above the 3e-3 gate for a reason that is not an
+            # error: RCCL's ring adds the partials in bf16, rounding after every
+            # hop, where the SDMA reduce accumulates in fp32 and rounds once --
+            # 3.15e-3 against 2.37e-3 at [4096, 5120] K=2048 on 4 ranks. A
+            # corrupt band still lands near 1.0, far above its own gate.
+            if cfg.fp8_gather or cfg.fp8_scatter:
                 validated = 5e-3 < rel_l2 < 4e-2
+            elif args.mode == "split-rccl":
+                validated = rel_l2 < 6e-3
             else:
                 validated = rel_l2 < 3e-3
             if not validated:
@@ -542,6 +684,7 @@ def run(args) -> int:
         if rank == 0:
             result = {
                 "mode": args.mode,
+                "collective": args.collective,
                 "world_size": world_size,
                 "m": args.m,
                 "n": args.n,
@@ -550,6 +693,8 @@ def run(args) -> int:
                 "block_m": args.block_m,
                 "block_n": args.block_n,
                 "chunks": chunks if fused else None,
+                "chunk_bands": args.chunk_bands,
+                "relaxed_rows": args.relaxed_rows,
                 "tile_order": args.tile_order,
                 "swap_ab": args.swap_ab,
                 "permlane": args.permlane,
@@ -559,6 +704,7 @@ def run(args) -> int:
                 # fp8/lsa and an fp8/sdma run both say mode="fused-sdma", and a
                 # record separated from its command line cannot say which ran.
                 "gather_dtype": args.gather_dtype,
+                "scatter_dtype": args.scatter_dtype,
                 "gather_transport": args.gather_transport,
                 "fuse_quantize": args.fuse_quantize,
                 "fuse_reduce_push": args.fuse_reduce_push,
@@ -583,7 +729,8 @@ def run(args) -> int:
             }
             print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
             print(
-                f"[gemm_ar] mode={args.mode} m={args.m} n={args.n} k={args.k} "
+                f"[gemm_ar] mode={args.mode} collective={args.collective} "
+                f"m={args.m} n={args.n} k={args.k} "
                 f"max_rank_time={per_rank[max_rank]:.2f}us "
                 f"relL2={rel_l2:.2e} validated={validated}",
                 flush=True,
@@ -599,12 +746,19 @@ def run(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=MODES, default="fused-sdma")
+    p.add_argument(
+        "--collective",
+        choices=("ar", "rs"),
+        default="ar",
+        help="ar: every rank ends with the whole sum. rs: every rank ends with "
+        "its own row band of it, [M/P, N] -- the sequence-parallel reduce-scatter",
+    )
     p.add_argument("-m", type=int, default=4096)
     p.add_argument("-n", type=int, default=7168)
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale", "mxfp8"),
+        choices=("ptpc", "blockscale", "mxfp8", "mxfp8_raw", "bf16"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "
@@ -618,6 +772,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="0 = 256 for --quant ptpc, 128 for --quant blockscale",
     )
     p.add_argument("--block-n", type=int, default=256)
+    p.add_argument(
+        "--chunk-bands",
+        type=int,
+        default=0,
+        help="experimental fixed bands per PUT, allowing a short final chunk",
+    )
+    p.add_argument("--relaxed-rows", action="store_true")
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)
     p.add_argument(
@@ -769,6 +930,10 @@ def build_parser() -> argparse.ArgumentParser:
         "relL2 ~2.1e-2 against a bf16 wire that is exact.",
     )
     p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--scatter-dtype", choices=("bf16", "fp8"), default="bf16")
+    p.add_argument(
+        "--raw-jit", action="store_true", help="debug the unpinned JIT call path"
+    )
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")
     p.add_argument("--skip-validation", action="store_true")

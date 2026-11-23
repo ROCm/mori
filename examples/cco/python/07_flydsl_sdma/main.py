@@ -56,11 +56,12 @@ except ImportError:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, range_constexpr
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Int64, T
 
 from mori.cco import Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 import mori.cco.device.flydsl as cco
+from mori.cco.device.flydsl import buffer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read, F32  # noqa: E402
@@ -127,12 +128,10 @@ def _make_reduce_kernel(my_rank):
         w = cco.Window(win)
         # All reads are local memory — my own symmetric-window VA.
         src_rsrc = [
-            buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(w.lsa_ptr(my_rank, off))
-            )
+            buffer.create_buffer_resource_from_addr(fx.Int64(w.lsa_ptr(my_rank, off)))
             for off in src_offs
         ]
-        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        out_rsrc = buffer.create_buffer_resource_from_addr(
             fx.Int64(w.lsa_ptr(my_rank, OUT_OFF))
         )
         for pk in range(tid, NUM_PACKS, THREADS):
@@ -140,12 +139,10 @@ def _make_reduce_kernel(my_rank):
             acc = None
             for s in range_constexpr(len(src_rsrc)):
                 v = fx.Vector(
-                    buffer_ops.buffer_load(
-                        src_rsrc[s], elem_off, vec_width=4, dtype=T.f32
-                    )
+                    buffer.buffer_load(src_rsrc[s], elem_off, vec_width=4, dtype=T.f32)
                 )
                 acc = v if acc is None else acc + v
-            buffer_ops.buffer_store(acc, out_rsrc, elem_off)
+            buffer.buffer_store(acc, out_rsrc, elem_off)
 
     @flyc.jit
     def run(win: Int64, stream=fx.Stream(None)):

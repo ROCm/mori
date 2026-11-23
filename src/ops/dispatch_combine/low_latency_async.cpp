@@ -95,7 +95,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
 
     index_t destTokOffset = SendBufSlotOffset(config, destPe, destTokId);
 
-    uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+    uint8_t* stagingPtr = args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
     size_t stagingTokOffset = destTokOffset * xferBytes;
     core::WarpCopy<uint8_t, 4>(
         stagingPtr + stagingTokOffset,
@@ -200,7 +200,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
 
     index_t srcTokId = entryId / config.numExpertPerToken;
 
-    uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+    uint8_t* stagingPtr = args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
     uint8_t* dst = stagingPtr + destTokOffset * xferBytes;
 
     // Each sub-warp copies its portion of hidden bytes
@@ -245,21 +245,43 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSendTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * xferBytes;
       size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * xferBytes;
-      if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0)) {
-        shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
-                                    args.interNodeTokBufs.staging, localOffset,
-                                    thisChunkTokenNum * xferBytes, destPe, qpId);
+
+      if (laneId != 0) continue;
+
+      if (isSdmaPeer) {
+        // The SDMA backend does not implement put-with-signal, so keep the
+        // put + explicit-signal path: post the payload here, and RecvTransfer
+        // waits for its completion before publishing the signal separately.
+        if (myPe != destPe && thisChunkTokenNum > 0) {
+          shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
+                                      args.interNodeTokBufs.dispatchStaging, localOffset,
+                                      thisChunkTokenNum * xferBytes, destPe, qpId);
+        }
+      } else {
+        size_t signalOffset = (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t);
+        uint64_t signalValue = static_cast<uint64_t>(tokenNum + 1);
+        if (thisChunkTokenNum <= 0 || myPe == destPe) {
+          // Empty chunks and self peers need no remote payload transfer, but the
+          // receiver still waits for a signal on every QP.
+          shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj, signalOffset, signalValue,
+                                            destPe, qpId);
+        } else {
+          // put-with-signal makes the payload visible to the receiver before the
+          // signal, without an intervening quiet.
+          shmem::ShmemPutMemNbiSignalThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
+                                            args.interNodeTokBufs.dispatchStaging, localOffset,
+                                            thisChunkTokenNum * xferBytes, args.recvTokenNumMemObj,
+                                            signalOffset, signalValue, core::atomicType::AMO_SET,
+                                            destPe, qpId);
+        }
       }
-      // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
-      // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-      //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-      //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
     }
   }
 
@@ -277,15 +299,13 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0) {
-        if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
-          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-              destPe, args.interNodeTokBufs.dispatchInp);
-        } else {
-          shmem::ShmemQuietThread(destPe, qpId);
-        }
+      if (laneId == 0 && isSdmaPeer) {
+        // Complete the SDMA payload transfer before publishing its readiness signal.
         int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.interNodeTokBufs.dispatchInp);
         shmem::ShmemPutUint64ImmNbiThread(args.recvTokenNumMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
                                           static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
@@ -301,6 +321,12 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
           recvTokenNums + destPe * config.numQpPerPe + laneId, 0);
     }
   }
+
+  // Incoming signals do not guarantee completion of our outgoing RDMA transfers,
+  // yet no drain is needed here. Combine sends from `staging`, so it never touches
+  // the in-flight `dispatchStaging` payload, and the next dispatch reuses
+  // dispatchStaging only after the current combine has received all peer signals,
+  // which implies peers have already consumed this dispatch payload.
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -346,7 +372,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
   // Copy data — multiple warps cooperate per token
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.interNodeTokBufs.dispatchInp->template GetAs<uint8_t*>()
-                            : args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+                            : args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
   stagingPtr += SendBufSlotOffset(config, destPe, 0) * xferBytes;
 
   int peWarps = blocksPerPe * warpNum;
@@ -419,16 +445,13 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 /*                                EpCombineLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t tokHiddenBytes = hiddenDim * sizeof(T);
 
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -439,8 +462,7 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     stagingTokId = __shfl(stagingTokId, 0);
     if constexpr (UseFp8BlockwiseQuant) {
       // Blockwise-FP8 (E4M3) combine: per-128-elem block max-scale, staged as [fp8 token | f32
-      // scales]. Accurate fp8 combine for the AsyncLL path (matches intranode blockwise), unlike
-      // the lossy direct-cast. Only instantiated for bf16 T.
+      // scales]. Matches intranode blockwise. Only instantiated for bf16 T.
       if constexpr (std::is_same_v<T, hip_bfloat16>) {
         const int _sd = args.fp8BlockwiseCombineScaleDim;
         const size_t _slotB =
@@ -451,10 +473,6 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
             reinterpret_cast<float*>(_slot + hiddenDim * sizeof(core::CombineInternalFp8)),
             args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, _sd);
       }
-    } else if constexpr (UseFp8DirectCast) {
-      core::WarpCastBf16ToCombineInternalFp8<T>(
-          reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokHiddenBytes),
-          args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, laneId);
     } else {
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokId * tokHiddenBytes,
@@ -467,22 +485,21 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 /*                              EpCombineLowLatencyAsyncSendTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  size_t tokHiddenBytes = hiddenDim * sizeof(T);
   if constexpr (UseFp8BlockwiseQuant)
     tokHiddenBytes = hiddenDim * sizeof(core::CombineInternalFp8) +
                      (size_t)args.fp8BlockwiseCombineScaleDim * sizeof(float);
+  uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       int tokenNum = 0;
       if (laneId == 0) {
@@ -495,15 +512,34 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokHiddenBytes;
       size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * tokHiddenBytes;
-      if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0))
-        shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.combineInp, remoteOffset,
-                                    args.interNodeTokBufs.staging, localOffset,
-                                    thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
-      // if (laneId == 0)
-      // shmem::ShmemQuietThread(destPe, qpId);
-      // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-      //     args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe,
-      //     qpId);
+
+      if (laneId != 0) continue;
+
+      if (isSdmaPeer) {
+        // The SDMA backend does not implement put-with-signal, so keep the
+        // put + explicit-signal path: post the payload here, and RecvTransfer
+        // waits for its completion before publishing the signal separately.
+        if (myPe != destPe && thisChunkTokenNum > 0) {
+          shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.combineInp, remoteOffset,
+                                      args.interNodeTokBufs.staging, localOffset,
+                                      thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
+        }
+      } else {
+        size_t signalOffset = (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t);
+        if (thisChunkTokenNum <= 0 || myPe == destPe) {
+          // Empty chunks and self peers need no remote payload transfer, but the
+          // receiver still waits for a signal on every QP.
+          shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj, signalOffset,
+                                            barrierFlag, destPe, qpId);
+        } else {
+          // Put-with-signal makes the payload visible to the receiver before the
+          // signal, without an intervening quiet.
+          shmem::ShmemPutMemNbiSignalThread(
+              args.interNodeTokBufs.combineInp, remoteOffset, args.interNodeTokBufs.staging,
+              localOffset, thisChunkTokenNum * tokHiddenBytes, args.crossDeviceBarrierMemObj,
+              signalOffset, barrierFlag, core::atomicType::AMO_SET, destPe, qpId);
+        }
+      }
     }
   }
 }
@@ -512,60 +548,61 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 /*                              EpCombineLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  (void)sizeof(TokT);
+  uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0) {
-        if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
-          shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
-              destPe, args.interNodeTokBufs.combineInp);
-        } else {
-          shmem::ShmemQuietThread(destPe, qpId);
-        }
-        uint64_t flag = args.crossDeviceBarrierFlag[0];
+      if (laneId == 0 && isSdmaPeer) {
+        // Complete the SDMA payload transfer before publishing its readiness signal.
+        shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
+            destPe, args.interNodeTokBufs.combineInp);
         shmem::ShmemPutUint64ImmNbiThread(args.crossDeviceBarrierMemObj,
                                           (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-                                          flag, destPe, qpId);
+                                          barrierFlag, destPe, qpId);
       }
     }
   }
 
   for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-    uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
     for (int i = 0; i < config.numQpPerPe; i++) {
       shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
                                             destPe * config.numQpPerPe + i,
                                         barrierFlag);
     }
   }
+
+  // Incoming signals do not guarantee completion of our outgoing RDMA transfers,
+  // yet no drain is needed here:
+  //  - Reuse: the next dispatch uses the separate `dispatchStaging` buffer. The
+  //    next combine reuses `staging` only after that dispatch receives all peer
+  //    signals, which implies peers have consumed the current combine payload.
+  //  - Teardown: E2E inference is assumed to complete collective communication
+  //    before ~EpDispatchCombineHandle() frees `staging`, which implies peers
+  //    have consumed the current combine payload.
+  // In both cases the outgoing RDMA transfers complete before `staging`
+  // is reused or freed.
 }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                EpCombineLowLatencyAsyncRecvCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant = false>
+template <typename T, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
 
   extern __shared__ char sharedMem[];
-  TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
   // Blockwise-FP8 combine: per-expert block-scale pointer array, laid right after srcPtrs.
   float** srcScalePtrs = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
                          warpId * config.numExpertPerToken;
@@ -583,15 +620,14 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
         index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
         index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
 
-        TokT* stagingPtr = (destPe != myPe)
-                               ? args.interNodeTokBufs.combineInp->template GetAs<TokT*>()
-                               : args.interNodeTokBufs.staging->template GetAs<TokT*>();
+        T* stagingPtr = (destPe != myPe) ? args.interNodeTokBufs.combineInp->template GetAs<T*>()
+                                         : args.interNodeTokBufs.staging->template GetAs<T*>();
         if (destPe < npes) {
           if constexpr (UseFp8BlockwiseQuant) {
             const size_t _slotB = hiddenDim * sizeof(core::CombineInternalFp8) +
                                   (size_t)args.fp8BlockwiseCombineScaleDim * sizeof(float);
             uint8_t* _base = reinterpret_cast<uint8_t*>(stagingPtr) + (size_t)destTokId * _slotB;
-            srcPtrs[j] = reinterpret_cast<TokT*>(_base + hiddenDimOffset);
+            srcPtrs[j] = reinterpret_cast<T*>(_base + hiddenDimOffset);
             float* _sc =
                 reinterpret_cast<float*>(_base + hiddenDim * sizeof(core::CombineInternalFp8));
             srcScalePtrs[j] = (_sc[0] < 0.0f) ? _sc : nullptr;
@@ -638,10 +674,6 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
                 outPtr, _S, _SC, _an, hiddenDimOffset, hiddenDimSize, hiddenDim,
                 args.fp8BlockwiseCombineScaleDim);
         }
-      } else if constexpr (UseFp8DirectCast) {
-        core::WarpAccumCombineInternalFp8ToBf16(outPtr,
-                                                reinterpret_cast<const TokT* const*>(srcPtrs),
-                                                config.numExpertPerToken, laneId, hiddenDimSize);
       } else {
         core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
       }

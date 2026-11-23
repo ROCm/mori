@@ -64,15 +64,19 @@ NUM_ELEMS = 256
 NBYTES = NUM_ELEMS * 4
 BLOCK = 256
 PER_RANK_VMM = 128 * 1024 * 1024
+SDMA_QUEUE_COUNT = 2
 
 SEND_OFF = 0
 LSA_RECV_OFF = SEND_OFF + NBYTES
 SDMA_RECV_OFF = LSA_RECV_OFF + 2 * NBYTES
 SDMA_GET_OFF = SDMA_RECV_OFF + 2 * NBYTES
-GDA_RECV_OFF = SDMA_GET_OFF + NBYTES
+SDMA_PTR_RECV_OFF = SDMA_GET_OFF + NBYTES
+SDMA_MATRIX_OFF = SDMA_PTR_RECV_OFF + NBYTES
+GDA_RECV_OFF = SDMA_MATRIX_OFF + NBYTES
 GDA_GET_OFF = GDA_RECV_OFF + 2 * NBYTES
 GDA_VALUE_OFF = GDA_GET_OFF + NBYTES
 WINDOW_BYTES = GDA_VALUE_OFF + 8
+GDA_BATCH_DOORBELLS = (cco.GdaDoorbell.DEFERRED, cco.GdaDoorbell.CALLER_ORDERED)
 
 _H2D, _D2H = 1, 2
 _TRUE_VALUES = {"1", "on", "true", "yes"}
@@ -207,6 +211,112 @@ def sdma_get_kernel(
         coop=cco.CoopScope.BLOCK,
     )
     cco.Sdma.quiet(dev_comm, peer, coop=cco.CoopScope.BLOCK)
+
+
+@triton.jit
+def sdma_put_ptr_kernel(
+    dev_comm,
+    window,
+    peer: tl.constexpr,
+    source: tl.constexpr,
+    num_queues: tl.constexpr,
+    dst_off: tl.constexpr,
+    src_off: tl.constexpr,
+    nbytes: tl.constexpr,
+    out,
+    out_slots,
+    n_elements: tl.constexpr,
+    block: tl.constexpr,
+):
+    my_lsa_rank = cco.DevComm.lsa_rank(dev_comm)
+    dst = cco.Window.lsa_ptr(window, peer, dst_off)
+    src = cco.Window.lsa_ptr(window, my_lsa_rank, src_off)
+    cco.Sdma.put_ptr(dev_comm, peer, dst, src, nbytes, 0, remote_signal=True)
+
+    # `source` puts into us the same way; its signal says the payload landed.
+    slot_addr = cco.Sdma.signal_slot(dev_comm, source, 0)
+    slot = slot_addr.to(tl.pointer_type(tl.uint64), bitcast=True)
+    while tl.atomic_add(slot, 0, sem="acquire", scope="sys") < 1:
+        pass
+    offs = tl.arange(0, block)
+    mask = offs < n_elements
+    recv_addr = cco.Window.lsa_ptr(window, my_lsa_rank, dst_off)
+    recv = recv_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
+    tl.store(out + offs, tl.load(recv + offs, mask=mask, volatile=True), mask=mask)
+
+    tl.store(out_slots + 0, slot_addr)
+    tl.store(out_slots + 1, cco.Sdma.signal_slot(dev_comm, source, num_queues))
+    tl.store(out_slots + 2, cco.Sdma.signal_slot(dev_comm, -1, 0))
+    cco.Sdma.quiet_queue(dev_comm, peer, 0)
+
+
+@triton.jit
+def sdma_signal_matrix_kernel(
+    dev_comm,
+    window,
+    peer: tl.constexpr,
+    source: tl.constexpr,
+    dst_off: tl.constexpr,
+    src_off: tl.constexpr,
+    nbytes: tl.constexpr,
+    op: tl.constexpr,
+    local_signal: tl.constexpr,
+    remote_signal: tl.constexpr,
+    signal_per_copy: tl.constexpr,
+    expected_from_source,
+):
+    # op: 0 = put_ptr, 1 = get_ptr, 2 = window put. Every lane of the one wave
+    # posts (thread scope), so per-copy signals count lanes, the default one.
+    my_lsa_rank = cco.DevComm.lsa_rank(dev_comm)
+    if op == 0:
+        cco.Sdma.put_ptr(
+            dev_comm,
+            peer,
+            cco.Window.lsa_ptr(window, peer, dst_off),
+            cco.Window.lsa_ptr(window, my_lsa_rank, src_off),
+            nbytes,
+            0,
+            local_signal=local_signal,
+            remote_signal=remote_signal,
+            signal_per_copy=signal_per_copy,
+        )
+    elif op == 1:
+        cco.Sdma.get_ptr(
+            dev_comm,
+            peer,
+            cco.Window.lsa_ptr(window, my_lsa_rank, dst_off),
+            cco.Window.lsa_ptr(window, peer, src_off),
+            nbytes,
+            0,
+            local_signal=local_signal,
+            remote_signal=remote_signal,
+            signal_per_copy=signal_per_copy,
+        )
+    else:
+        cco.Sdma.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off,
+            window,
+            src_off,
+            nbytes,
+            0,
+            local_signal=local_signal,
+            remote_signal=remote_signal,
+            signal_per_copy=signal_per_copy,
+        )
+    cco.Sdma.quiet_queue(dev_comm, peer, 0)
+    if remote_signal:
+        cco.Sdma.wait_signal(dev_comm, source, 0, expected_from_source)
+
+
+@triton.jit
+def sdma_signal_read_kernel(dev_comm, out, world: tl.constexpr):
+    for s in tl.static_range(world):
+        slot = cco.Sdma.signal_slot(dev_comm, s, 0)
+        ptr = slot.to(tl.pointer_type(tl.uint64), bitcast=True)
+        tl.store(out + s, tl.atomic_add(ptr, 0, sem="acquire", scope="sys"))
 
 
 @triton.jit
@@ -463,6 +573,74 @@ def gda_signal_variant_kernel(
 
 
 @triton.jit
+def gda_defer_kernel(
+    dev_comm,
+    window,
+    peer: tl.constexpr,
+    dst_off: tl.constexpr,
+    src_off: tl.constexpr,
+    nbytes: tl.constexpr,
+    chunks: tl.constexpr,
+    team: tl.constexpr,
+    signal_id: tl.constexpr,
+    doorbell: tl.constexpr,
+):
+    # Deferred (or caller-ordered) puts ring nothing; that namespace's
+    # flush_async rings for all of them at once and wait drains the CQ. Then an
+    # Immediate signal on the same, now idle, QP tells the peer.
+    chunk: tl.constexpr = nbytes // chunks
+    # A runtime QP context, as a kernel spreading chunks would pick.
+    qp = tl.program_id(0)
+    if doorbell == cco.GdaDoorbell.DEFERRED:
+        for c in tl.static_range(chunks):
+            cco.GdaDeferred.put(
+                dev_comm,
+                peer,
+                window,
+                dst_off + c * chunk,
+                window,
+                src_off + c * chunk,
+                chunk,
+                ctx=qp,
+                coop=cco.CoopScope.BLOCK,
+                team=team,
+            )
+        request = cco.GdaDeferred.flush_async(
+            dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
+        )
+    else:
+        for c in tl.static_range(chunks):
+            cco.GdaCallerOrdered.put(
+                dev_comm,
+                peer,
+                window,
+                dst_off + c * chunk,
+                window,
+                src_off + c * chunk,
+                chunk,
+                ctx=qp,
+                coop=cco.CoopScope.BLOCK,
+                team=team,
+            )
+        # Thread 0 posted every chunk and flushes, so the posts precede the flush.
+        request = cco.GdaCallerOrdered.flush_async(
+            dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
+        )
+    cco.Gda.wait(dev_comm, request, coop=cco.CoopScope.BLOCK)
+    cco.Gda.signal(
+        dev_comm,
+        peer,
+        signal_op=cco.SignalOp.INC,
+        signal_id=signal_id,
+        ctx=qp,
+        coop=cco.CoopScope.BLOCK,
+        team=team,
+    )
+    cco.Gda.flush_peer(dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team)
+    cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK)
+
+
+@triton.jit
 def gda_reset_signal_kernel(
     dev_comm,
     signal_id: tl.constexpr,
@@ -577,7 +755,111 @@ def test_sdma(comm, dc, win, rank, world_size, extern_libs):
     )
     torch.cuda.synchronize()
     check_payload(win, SDMA_GET_OFF, peer, "SDMA get")
+
+    # put_ptr signals only the receiver, so this kernel is also the reader: it
+    # returns what it saw once the signal arrived, not what is there later.
+    comm.barrier()
+    out = torch.zeros(NUM_ELEMS, dtype=torch.int32, device="cuda")
+    out_slots = torch.zeros(3, dtype=torch.uint64, device="cuda")
+    sdma_put_ptr_kernel[(1,)](
+        dc.ptr,
+        win.handle,
+        peer=peer,
+        source=source,
+        num_queues=SDMA_QUEUE_COUNT,
+        dst_off=SDMA_PTR_RECV_OFF,
+        src_off=SEND_OFF,
+        nbytes=NBYTES,
+        out=out,
+        out_slots=out_slots,
+        n_elements=NUM_ELEMS,
+        block=BLOCK,
+        extern_libs=extern_libs,
+        num_warps=1,
+    )
+    torch.cuda.synchronize()
+    comm.barrier()
+    got = out.view(torch.uint32).cpu().tolist()
+    assert got == expected_payload(source), "SDMA put_ptr: payload not there at signal"
+    slot_addr, past_queues, negative_rank = out_slots.cpu().tolist()
+    assert slot_addr != 0, "SDMA signal_slot: null for a valid (source, queue)"
+    assert past_queues == 0, "SDMA signal_slot: queue past the last one not rejected"
+    assert negative_rank == 0, "SDMA signal_slot: negative rank not rejected"
+    # One signal per group of a wave's lanes sharing the queue: this is one
+    # wave, so one signal, however many of its lanes posted. The poll above
+    # relies on that too -- with more waves it could return before the others'
+    # copies landed.
+    signals = read_u64(slot_addr)
+    assert signals == 1, f"SDMA put_ptr: {signals} signals, expected 1"
+
+    test_sdma_signal_matrix(comm, dc, win, rank, world_size, extern_libs)
     print(f"[rank {rank}] SDMA PASS", flush=True)
+
+
+def test_sdma_signal_matrix(comm, dc, win, rank, world_size, extern_libs):
+    """Each signal lands where C++ says, as many times as it says, for
+    put_ptr / get_ptr / window put: local_signal bumps our slot for ourselves,
+    remote_signal the peer's slot for us (we wait on our source's)."""
+    peer = (rank + 1) % world_size
+    source = (rank - 1 + world_size) % world_size
+    lanes = torch.cuda.get_device_properties(0).warp_size
+    counts = torch.zeros(world_size, dtype=torch.uint64, device="cuda")
+
+    def read_counts():
+        sdma_signal_read_kernel[(1,)](
+            dc.ptr, counts, world=world_size, extern_libs=extern_libs, num_warps=1
+        )
+        torch.cuda.synchronize()
+        return counts.cpu().tolist()
+
+    for op, op_name in enumerate(("put_ptr", "get_ptr", "put")):
+        for local_signal in (False, True):
+            for remote_signal in (False, True):
+                for signal_per_copy in (False, True):
+                    label = (
+                        f"SDMA {op_name} local={local_signal} remote={remote_signal} "
+                        f"per_copy={signal_per_copy}"
+                    )
+                    per_signal = lanes if signal_per_copy else 1
+                    zero(win.local_ptr + SDMA_MATRIX_OFF, NBYTES)
+                    comm.barrier()
+                    before = read_counts()
+                    comm.barrier()
+                    expected_from_source = before[source] + per_signal
+                    sdma_signal_matrix_kernel[(1,)](
+                        dc.ptr,
+                        win.handle,
+                        peer=peer,
+                        source=source,
+                        dst_off=SDMA_MATRIX_OFF,
+                        src_off=SEND_OFF,
+                        nbytes=NBYTES,
+                        op=op,
+                        local_signal=local_signal,
+                        remote_signal=remote_signal,
+                        signal_per_copy=signal_per_copy,
+                        expected_from_source=expected_from_source,
+                        extern_libs=extern_libs,
+                        num_warps=1,
+                    )
+                    torch.cuda.synchronize()
+                    comm.barrier()
+                    after = read_counts()
+                    got_local = after[rank] - before[rank]
+                    got_remote = after[source] - before[source]
+                    want_local = per_signal if local_signal else 0
+                    want_remote = per_signal if remote_signal else 0
+                    assert (got_local, got_remote) == (want_local, want_remote), (
+                        f"{label}: local/remote signals {got_local}/{got_remote}, "
+                        f"expected {want_local}/{want_remote}"
+                    )
+                    # put lands our source's payload here; get fetches our peer's.
+                    check_payload(
+                        win,
+                        SDMA_MATRIX_OFF,
+                        peer if op == 1 else source,
+                        label,
+                    )
 
 
 def test_gda(comm, dc, win, rank, world_size, extern_libs):
@@ -641,6 +923,25 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
                 signal_id=1,
                 signal_value=1 if signal_op == 1 else 3,
                 out=compile_out,
+                grid=(1,),
+                extern_libs=extern_libs,
+                num_warps=1,
+            )
+    # Deferred and caller-ordered puts, flush_async and wait, and a runtime ctx,
+    # for both teams.
+    for doorbell in GDA_BATCH_DOORBELLS:
+        for team in (cco.Team.WORLD, cco.Team.GDA):
+            gda_defer_kernel.warmup(
+                dc.ptr,
+                win.handle,
+                peer=peer,
+                dst_off=dst_off,
+                src_off=SEND_OFF,
+                nbytes=NBYTES,
+                chunks=4,
+                team=team,
+                signal_id=1,
+                doorbell=doorbell,
                 grid=(1,),
                 extern_libs=extern_libs,
                 num_warps=1,
@@ -747,6 +1048,36 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
     torch.cuda.synchronize()
     comm.barrier()
     assert read_u64(win.local_ptr + GDA_VALUE_OFF) == source + 0xCC00
+
+    # Deferred and caller-ordered doorbells + flush_async / wait, with peer
+    # numbered in each team. On a FULL connection the GDA team is the world, so
+    # both reach the same peer.
+    for doorbell in GDA_BATCH_DOORBELLS:
+        for team in (cco.Team.WORLD, cco.Team.GDA):
+            zero(win.local_ptr + GDA_RECV_OFF, 2 * NBYTES)
+            comm.barrier()
+            gda_defer_kernel[(1,)](
+                dc.ptr,
+                win.handle,
+                peer=peer,
+                dst_off=dst_off,
+                src_off=SEND_OFF,
+                nbytes=NBYTES,
+                chunks=4,
+                team=team,
+                signal_id=1,
+                doorbell=doorbell,
+                extern_libs=extern_libs,
+                num_warps=1,
+            )
+            torch.cuda.synchronize()
+            comm.barrier()
+            check_payload(
+                win,
+                GDA_RECV_OFF + source * NBYTES,
+                source,
+                f"GDA batched put doorbell={doorbell} team={team}",
+            )
     print(f"[rank {rank}] GDA PASS", flush=True)
 
 
@@ -787,7 +1118,7 @@ def main():
             reqs.gda_context_count = 1 if gda_enabled else 0
             reqs.gda_signal_count = world_size if gda_enabled else 0
             reqs.gda_counter_count = 0
-            reqs.sdma_queue_count = 2 if sdma_enabled else 0
+            reqs.sdma_queue_count = SDMA_QUEUE_COUNT if sdma_enabled else 0
             dc = comm.create_dev_comm(reqs)
 
             comm.barrier()

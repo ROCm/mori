@@ -52,15 +52,19 @@ namespace v2 {
 // Cfg *and* reaches the source, through Render(kCfg) and
 // __launch_bounds__(EpBlockThreads(kCfg)) -- so a geometry sweep really is a
 // hipcc sweep. Here geometry is in the Cfg (KernelSpec::Geometry needs it, and
-// the plan reports it) but is NOT rendered: only kernelCfg and dtype reach the
-// TU. Two cfgs differing only in geometry therefore render identical text, land
-// in the same content-addressed cache entry, and cost no extra compile. v1
+// the plan reports it) but is NOT rendered: kernelCfg, dtype and the AsyncLL
+// protocol mode reach the TU. Two cfgs differing only in geometry render
+// identical text, land in the same content-addressed cache entry, and cost no extra compile. v1
 // retunes blocks and warps per token count, so that difference is the point.
 // ---------------------------------------------------------------------------
 struct EpInterNodeCfg {
   // ---- rendered: this is the specialisation ----
   EpInterNodeKernelCfg kernelCfg{};
   EpInterNodeDType dtype{EpInterNodeDType::Bf16};
+  // Host-only protocol selection, rendered as defines by the AsyncLL specs.
+  // 0 = legacy, 1 = early notification, 2 = early notification + fused CTA recv.
+  // Bare plans stay legacy; callers must explicitly choose a single-node SDMA mode.
+  int asyncLlMode{0};
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -74,6 +78,12 @@ struct EpInterNodeCfg {
   // cross-compiling.
   int mpCount{64};
   int waveSize{64};
+  // Grid ceiling for the fused receive copies (asyncLlMode 2), resolved by
+  // MakeEpInterNodeCfg; 0 everywhere else. A fused copy waits for its peers
+  // inside every CTA, so its whole grid stays resident for the wait. Spanning
+  // the device, that can leave no room for the send pass another stream must
+  // run before any peer's wait can end -- a cross-rank deadlock.
+  int asyncLlFusedRecvCtas{0};
 };
 
 template <typename Self, typename Visit>
@@ -81,21 +91,23 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
 #define MORI_FIELD(x) visit(#x, cfg.x, defaults.x)
   MORI_FIELD(kernelCfg);
   MORI_FIELD(dtype);
+  MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
   MORI_FIELD(waveSize);
+  MORI_FIELD(asyncLlFusedRecvCtas);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 7, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 9, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
-// text: RenderSource renders kernelCfg alone, because geometry must not enter
-// the cache key. Rendered here anyway so `info` reports what the host actually
-// resolved, geometry included.
+// text: RenderSource renders the kernel specialisation (and AsyncLL mode), not
+// geometry. Rendered here anyway so `info` reports what the host actually
+// resolved, including the geometry and protocol mode.
 inline std::string Render(const EpInterNodeCfg& cfg) {
   const EpInterNodeCfg defaults{};
   mori::jit::v2::Fields fields;
@@ -168,14 +180,21 @@ struct EpInterNodeRequest {
   int maxTotalRecvTokens = 0;
   int gpuPerNode = 8;
   int numQpPerPe = 1;
+  int numQpToDrain = 0;
   EpQuantType quantType = EpQuantType::None;
   // specialisation
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
+  // Applied to the ordinary Combine pass only; see EpInterNodeKernelCfg.
+  bool combineLoadFirst = false;
+  // AsyncLL only; the host resolves transport/env policy before constructing a plan.
+  int asyncLlMode = 0;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
   int rdmaBlockNum = 0;
   int mpCount = 0;
+  // asyncLlMode 2 only; 0 = half the device (mpCount / 2).
+  int asyncLlFusedRecvCtas = 0;
 };
 
 template <typename Self, typename Visit>
@@ -192,17 +211,21 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(maxTotalRecvTokens);
   MORI_FIELD(gpuPerNode);
   MORI_FIELD(numQpPerPe);
+  MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
+  MORI_FIELD(combineLoadFirst);
+  MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
+  MORI_FIELD(asyncLlFusedRecvCtas);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 17,
+    EpInterNodeRequest, 21,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();
@@ -222,10 +245,22 @@ enum class EpInterNodeKernel {
   CombineAll,
 };
 
+// Which family is being built. AsyncLL shares this Request, this Cfg and this
+// factory with the internode kernels, but it is a different set of kernels, and
+// one host-side check does not carry over: the wave64 requirement below belongs
+// to DispatchInterNodeSend, which AsyncLL does not run. Told rather than
+// inferred from EpInterNodeKernel, because AsyncLL passes Dispatch there purely
+// to satisfy a non-optional parameter and never reads the geometry it picks.
+enum class EpInterNodeFamily {
+  InterNode,
+  AsyncLL,
+};
+
 // Geometry rules differ per pass, so the Request -> Cfg step is told which pass
 // it is building for -- the same reason MakeEpCfg takes EpKernelKind.
 EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& request,
-                                  EpInterNodeKernel kind);
+                                  EpInterNodeKernel kind,
+                                  EpInterNodeFamily family = EpInterNodeFamily::InterNode);
 
 // Rendering, naming and geometry are shared by all eight Specs. Exposed so a
 // test can exercise them per kernel without going through eight class names.

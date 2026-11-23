@@ -36,6 +36,10 @@ namespace mori::umbp {
 // wants the same cache-bypass behavior.  Honors UMBP_DRAM_NT_COPY=0.
 void HostCopyBlock(void* dst, const void* src, size_t size);
 
+// Shared by real and simulated copies; respects the existing environment knobs.
+int LocalCopyThreadLimit(const char* env_name);
+int LocalCopyThreads(size_t total_bytes, size_t copy_count);
+
 // Declare that copies issued on THIS thread are not on anyone's critical path,
 // so LocalCopyEngine::Submit should run them on the calling thread instead of
 // fanning them out.

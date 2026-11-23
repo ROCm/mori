@@ -22,6 +22,7 @@
 //
 // Multi-drive SSD tier: keys spread across N directories (one per drive), read
 // back from whichever drive holds them, and batch IO runs on all drives at once.
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -201,6 +202,56 @@ void test_batch_write_read_across_shards() {
   std::cout << "PASSED" << std::endl;
 }
 
+// Sub-object reads (design-ssd-ranged-io.md D1a) reach the drive holding each key.
+void test_ranged_read_across_shards() {
+  std::cout << "test_ranged_read_across_shards... ";
+  auto cfg = MakeConfig(MakeDirs("ranged", 4), 128ULL * 1024 * 1024);
+  auto backend = MakeFileSsdBackend(cfg);
+  auto* sharded = dynamic_cast<ShardedSsdTier*>(backend.get());
+  assert(sharded != nullptr);
+  assert(backend->Capabilities().ranged_read);
+
+  constexpr int kKeys = 64;
+  constexpr size_t kSize = 16384;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("rk" + std::to_string(i));
+    std::vector<char> p(kSize);
+    for (size_t b = 0; b < kSize; ++b) p[b] = static_cast<char>((b * 7 + b / 251 + i * 13) & 0xff);
+    payloads.push_back(std::move(p));
+    sizes.push_back(kSize);
+  }
+  for (auto& p : payloads) srcs.push_back(p.data());
+  for (bool ok : backend->BatchWrite(keys, srcs, sizes)) assert(ok);
+  for (const auto& cap : sharded->PerShardCapacity()) assert(cap.first > 0);
+
+  // Two windows per key, neither at the start, plus one key no drive holds.
+  keys.push_back("rk-missing");
+  std::vector<std::vector<char>> head(keys.size(), std::vector<char>(1000, 0));
+  std::vector<std::vector<char>> tail(keys.size(), std::vector<char>(300, 0));
+  std::vector<std::vector<uintptr_t>> dsts;
+  std::vector<std::vector<size_t>> lens;
+  std::vector<std::vector<size_t>> offs;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    dsts.push_back(
+        {reinterpret_cast<uintptr_t>(head[i].data()), reinterpret_cast<uintptr_t>(tail[i].data())});
+    lens.push_back({1000, 300});
+    offs.push_back({4096, kSize - 300});
+  }
+  auto read = backend->ReadBatchRangesIntoPtr(keys, dsts, lens, offs);
+  assert(read.size() == keys.size());
+  for (int i = 0; i < kKeys; ++i) {
+    assert(read[i]);
+    assert(std::equal(head[i].begin(), head[i].end(), payloads[i].begin() + 4096));
+    assert(std::equal(tail[i].begin(), tail[i].end(), payloads[i].begin() + (kSize - 300)));
+  }
+  assert(!read[kKeys]);
+  std::cout << "PASSED" << std::endl;
+}
+
 // Per-key results come back from one worker per drive at once.  They used to
 // be written straight into a std::vector<bool>, whose elements share machine
 // words: two drives finishing together could each rewrite the word holding the
@@ -342,6 +393,7 @@ int main() {
   test_balanced_placement_and_readback();
   test_rewrite_stays_on_same_shard();
   test_batch_write_read_across_shards();
+  test_ranged_read_across_shards();
   test_parallel_drives_never_lose_a_result();
   test_missing_keys();
   test_evict_and_clear();

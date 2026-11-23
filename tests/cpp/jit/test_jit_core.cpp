@@ -28,16 +28,23 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "mori/jit/v2/compiler.hpp"
+#include "mori/jit/v2/plan_api.hpp"
 #include "mori/jit/v2/render.hpp"
 #include "mori/jit/v2/toolchain.hpp"
 #include "mori/jit/v2/util.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_asyncll_spec.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
@@ -149,6 +156,15 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.useWeights = false;
   differs(c, "useWeights");
+  c = base;
+  c.callTokMax = 64;
+  differs(c, "callTokMax");
+  c = base;
+  c.ll128 = true;
+  differs(c, "ll128");
+  c = base;
+  c.ll128CombineOnly = true;
+  differs(c, "ll128CombineOnly");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
@@ -168,6 +184,64 @@ TEST(Geometry, CombineSharedMemCoversOnePointerArrayPerWarp) {
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8 * 2);
   c.useWeights = false;  // srcPtrs only
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8);
+}
+
+TEST(Geometry, WorkgroupLdsOverTheLimitIsRefused) {
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 0, 327680, 327680));
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 48, 327680, 0));  // limit unknown
+  try {
+    CheckWorkgroupLds("k", 48, 327680, 327680);
+    FAIL() << "48 B over the limit was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("48 B static + 327680 B dynamic"), std::string::npos)
+        << e.what();
+  }
+}
+
+TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
+  EpCfg c;
+  c.worldSize = 4;
+  c.numExpertPerToken = 6;
+  c.waveSize = 32;
+  c.warpPerBlock = 16;
+  // 5120 used to take the metadata slab too: 16 x 2 x 10240 B, all of the LDS.
+  const std::pair<int, int> want[] = {
+      {4096, 262144}, {5120, 163840}, {6144, 196608}, {7168, 229376}};
+  for (const auto& [hidden, bytes] : want) {
+    c.hiddenDim = hidden;
+    EXPECT_EQ(EpDispatch1250xLdsBytes(c), bytes) << hidden;
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+}
+
+// ROCm/mori#951: a fixed 16-warp dispatch default asks 458752 B of a 327680 B
+// workgroup at fp32 7168, which the launch accepts and then never schedules. The
+// bound is the slab a row takes, not the dtype: bf16 at 10240 hits it too.
+TEST(Geometry, Dispatch1250xDefaultWarpsFitTheSlabs) {
+  EpRequest req;
+  const struct {
+    int hidden;
+    EpDType dtype;
+    int warps;
+  } want[] = {
+      {7168, EpDType::Bf16, 16}, {7168, EpDType::Fp32, 8},  {10240, EpDType::Bf16, 8},
+      {10240, EpDType::Fp32, 4}, {4096, EpDType::Fp32, 16}, {7168, EpDType::Fp8, 16},
+  };
+  for (const auto& w : want) {
+    req.hiddenDim = w.hidden;
+    req.dtype = w.dtype;
+    const EpCfg c = MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch);
+    EXPECT_EQ(c.warpPerBlock, w.warps) << w.hidden << " dtype " << static_cast<int>(w.dtype);
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+  // Only the arch with the LDS slabs, and only dispatch.
+  req.hiddenDim = 7168;
+  req.dtype = EpDType::Fp32;
+  EXPECT_EQ(MakeEpCfg("gfx950", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Combine).warpPerBlock, 8);
+  // A geometry the caller pinned is its own.
+  req.warpPerBlock = 16;
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch).warpPerBlock, 16);
 }
 
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
@@ -211,6 +285,80 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   c = ok;
   c.warpPerBlock = 64;  // 64 * 64 > 1024 threads
   EXPECT_FALSE(EpCfgIsValid(c));
+}
+
+// --------------------------------------------------------------------------
+// Sizes a caller allocates. Pinned to what hip_backend's Python mirrors computed
+// before C++ owned them: a change here moves an arena region or the staging.
+// --------------------------------------------------------------------------
+
+namespace {
+// hidden 7168, topk 8, 128 tokens per rank, bf16 combine, wave32 (gfx1250).
+EpCfg PushCfg(int worldSize, bool fp8, bool f32Scale) {
+  EpCfg c;
+  c.worldSize = worldSize;
+  c.waveSize = 32;
+  c.combineFp4 = !fp8;
+  c.combineFp8 = fp8;
+  c.combineFp4F32Scale = f32Scale;
+  return c;
+}
+}  // namespace
+
+TEST(Sizes, StagingMatchesThePinnedLayout) {
+  EpCfg c;
+  c.worldSize = 8;
+  c.maxRecv = 4096;
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpStagingTotalBytes(c), 12746752u);
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpStagingTotalBytes(c), 4358144u);
+  c.worldSize = 32;
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpStagingTotalBytes(c), 50987008u);
+  c.worldSize = 1;
+  c.maxRecv = 7;
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpStagingTotalBytes(c), 5248u);
+}
+
+TEST(Sizes, PushWireRowsAndLanding) {
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, false, false)), 3840);  // 3584 + 224 scales
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, false, true)), 3840);   // f32 per 128
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, true, false)), 7424);   // 7168 + 224
+  EXPECT_EQ(EpCombinePushLandRows(PushCfg(8, false, false)), 128 * 8);
+  EXPECT_EQ(EpCombinePushLandRows(PushCfg(4, false, false)), 128 * 4);  // min(ws, topk)
+  EXPECT_EQ(EpCombinePushLandOff(PushCfg(8, false, false)), 8u * 128 * 7168 * 2);
+}
+
+TEST(Sizes, OutTokCarriesTheLandingAndTheRowFlags) {
+  EpCfg pull;
+  EXPECT_EQ(EpRegionOutTokBytes(pull), 14680064u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, false, false)), 18620416u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, true, false)), 22290432u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(4, false, false)), 9310208u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(2, false, false)), 4653056u);  // < 4 ranks: no flags
+  // No overlapped reduce, so no flags; the Python mirror reserved them anyway.
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, false, true)), 18620416u - 1024 * 8);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(64, false, false)), 121380864u - 1024 * 8);
+}
+
+TEST(Sizes, RegionsFollowTheRecvCapacity) {
+  EpCfg c;  // ws 8, 128 tok/rank -> 1024 slots, topk 8
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpRegionTokOffBytes(c), 4u);
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 256u + 8 * 8 * 4);
+  EXPECT_EQ(EpRegionRecvNumBytes(c), 2u * 8 * 4);
+  EXPECT_EQ(EpRegionRecvToSrcBytes(c), 1024u * 4);
+  EXPECT_EQ(EpRegionOutIdxBytes(c), 1024u * 8 * 4);
+  EXPECT_EQ(EpRegionOutWtsBytes(c), 1024u * 8 * 4);
+  EXPECT_EQ(EpRegionDispOutBytes(c), 1024u * 7168 * 2);
+  EXPECT_EQ(EpRegionXdbBytes(c), 8u * 8);
+  EXPECT_EQ(EpRegionOutScalesBytes(c), 1024u * 256);  // padded to 128 B
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpRegionOutScalesBytes(c), 0u);
+  c.worldSize = 16;
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 4u);
 }
 
 TEST(Sha256, KnownVectors) {
@@ -460,4 +608,353 @@ TEST(Nic, ArchAndNicAreIndependentComponents) {
     }
   }
   EXPECT_EQ(digests.size(), 6u);
+}
+
+// --------------------------------------------------------------------------
+// AsyncLL protocol selection is part of a plan, not a mutable process-wide
+// codegen switch. These tests render and hash only; no GPU/compiler is invoked.
+// --------------------------------------------------------------------------
+
+namespace {
+EpInterNodeCfg AsyncLLCfgForMode(int mode) {
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = mode;
+  return MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                            EpInterNodeFamily::AsyncLL);
+}
+
+struct ScopedEnvValue {
+  ScopedEnvValue(const char* name, const char* value) : name_(name) {
+    const char* previous = std::getenv(name);
+    present_ = previous != nullptr;
+    if (previous) previous_ = previous;
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnvValue() {
+    if (present_) {
+      ::setenv(name_.c_str(), previous_.c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+  std::string name_;
+  std::string previous_;
+  bool present_ = false;
+};
+}  // namespace
+
+TEST(AsyncLLMode, BareRequestDefaultsToLegacyAndSchemaIncludesMode) {
+  EXPECT_EQ(EpInterNodeRequest{}.asyncLlMode, 0);
+  EXPECT_EQ(EpInterNodeCfg{}.asyncLlMode, 0);
+  EXPECT_EQ(AsyncLLCfgForMode(0).asyncLlMode, 0);
+  EXPECT_NE(EpInterNodeRequestSchema().find("asyncLlMode:i32=0"), std::string::npos);
+}
+
+TEST(AsyncLLMode, FactoryPreservesModeWithoutChangingDeviceConfiguration) {
+  const auto legacy = AsyncLLCfgForMode(0);
+  for (int mode : {0, 1, 2}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlMode, mode);
+    EXPECT_EQ(Render(cfg.kernelCfg), Render(legacy.kernelCfg));
+    EXPECT_NE(Describe(cfg).find("asyncLlMode=" + std::to_string(mode) + "\n"), std::string::npos);
+    if (mode != 0) {
+      EXPECT_NE(Render(cfg).find(".asyncLlMode=" + std::to_string(mode)), std::string::npos);
+      EXPECT_FALSE(cfg == legacy);
+    }
+  }
+}
+
+TEST(AsyncLLMode, FactoryRejectsInvalidAndIncompatibleModes) {
+  for (int mode : {-1, 3}) EXPECT_THROW(AsyncLLCfgForMode(mode), std::runtime_error);
+
+  EpInterNodeRequest request;
+  for (int mode : {1, 2}) {
+    request.asyncLlMode = mode;
+    EXPECT_THROW(MakeEpInterNodeCfg("gfx942", request, EpInterNodeKernel::Dispatch),
+                 std::runtime_error);
+    request.worldSize = 16;
+    EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                    EpInterNodeFamily::AsyncLL),
+                 std::runtime_error);
+    request.worldSize = 8;
+  }
+  request.worldSize = 16;
+  request.asyncLlMode = 0;
+  EXPECT_NO_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                     EpInterNodeFamily::AsyncLL));
+}
+
+TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
+  const auto kinds = {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy};
+  // Only the fused mode resolves a ceiling, and only its receive copies use it.
+  for (int mode : {0, 1}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, 0);
+    for (const auto kind : kinds) {
+      EXPECT_EQ(EpAsyncLLGeometry(cfg, kind).gridX, static_cast<unsigned>(cfg.mpCount));
+    }
+  }
+  const auto fused = AsyncLLCfgForMode(2);
+  EXPECT_EQ(fused.asyncLlFusedRecvCtas, fused.mpCount / 2);
+  for (const auto kind : kinds) {
+    EXPECT_EQ(EpAsyncLLGeometry(fused, kind).gridX, static_cast<unsigned>(fused.mpCount / 2));
+  }
+  EXPECT_EQ(EpAsyncLLGeometry(fused, EpAsyncLLKernel::CombineSendCopy).gridX,
+            static_cast<unsigned>(fused.mpCount));
+
+  // An explicit ceiling is aligned down to worldSize and never widens the grid.
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = 2;
+  for (const auto& [ctas, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
+    request.asyncLlFusedRecvCtas = ctas;
+    const auto cfg = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, ctas);
+    EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvCopy).gridX,
+              static_cast<unsigned>(grid));
+  }
+
+  request.asyncLlFusedRecvCtas = -1;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlMode = 1;
+  request.asyncLlFusedRecvCtas = 16;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+}
+
+TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
+  for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
+    const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"
+                                                                       : "EpCombineAsyncLLRecvCopy";
+    for (int mode : {0, 1, 2}) {
+      const auto cfg = AsyncLLCfgForMode(mode);
+      const std::string entry = EpAsyncLLEntryName(cfg, kind);
+      const std::string source = EpAsyncLLRenderSource(cfg, kind);
+      EXPECT_NE(source.find("#define MORI_ASYNCLL_EARLY_NOTIFY " + std::to_string(mode > 0)),
+                std::string::npos);
+      EXPECT_NE(source.find("#define MORI_ASYNCLL_FUSED_RECV " + std::to_string(mode == 2)),
+                std::string::npos);
+      const std::string macro =
+          mode == 2 ? "MORI_EP_INTERNODE_CCO_ENTRY(" : "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
+      const std::string body = stem + (mode == 2 ? "Fused_body" : "_body");
+      EXPECT_NE(source.find(macro + entry + ", " + body + ")"), std::string::npos);
+    }
+  }
+}
+
+TEST(AsyncLLMode, RendererRejectsUnsafeHandBuiltConfigurations) {
+  for (int mode : {-1, 3}) {
+    auto cfg = AsyncLLCfgForMode(0);
+    cfg.asyncLlMode = mode;
+    EXPECT_THROW(EpAsyncLLRenderSource(cfg, EpAsyncLLKernel::DispatchRecvCopy), std::runtime_error);
+  }
+  for (int mode : {1, 2}) {
+    auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_THROW(EpInterNodeRenderSource(cfg, EpInterNodeKernel::Dispatch), std::runtime_error);
+    for (const auto kind :
+         {EpAsyncLLKernel::DispatchSendCopyLsa, EpAsyncLLKernel::DispatchSendTransferLsa,
+          EpAsyncLLKernel::DispatchRecvTransferLsa, EpAsyncLLKernel::CombineSendTransferLsa,
+          EpAsyncLLKernel::CombineRecvTransferLsa}) {
+      EXPECT_THROW(EpAsyncLLRenderSource(cfg, kind), std::runtime_error);
+    }
+    cfg.kernelCfg.worldSize = 8;
+    EXPECT_THROW(EpAsyncLLRenderSource(cfg, EpAsyncLLKernel::DispatchRecvCopy), std::runtime_error);
+  }
+}
+
+TEST(AsyncLLMode, ProtocolForksCacheButGeometryDoesNot) {
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
+    std::set<std::string> keys;
+    for (int mode : {0, 1, 2}) {
+      auto cfg = AsyncLLCfgForMode(mode);
+      const auto source = EpAsyncLLRenderSource(cfg, kind);
+      // Deliberately hold the name constant: the generated source must carry
+      // the mode even independently of the profile-facing entry-name prefix.
+      keys.insert(Compiler::Instance().CacheDirFor("asyncll_mode_test", source, {}));
+      cfg.mpCount *= 2;
+      cfg.warpPerBlock *= 2;
+      EXPECT_EQ(EpAsyncLLRenderSource(cfg, kind), source);
+    }
+    EXPECT_EQ(keys.size(), 3u);
+  }
+}
+
+TEST(AsyncLLMode, ExistingPlanIsUnaffectedByEnvironmentChanges) {
+  for (int mode : {0, 1, 2}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    const auto kind = EpAsyncLLKernel::DispatchRecvCopy;
+    const auto entry = EpAsyncLLEntryName(cfg, kind);
+    const auto source = EpAsyncLLRenderSource(cfg, kind);
+    for (const char* value : {"0", "1"}) {
+      ScopedEnvValue early("MORI_ASYNCLL_EARLY_NOTIFY", value);
+      ScopedEnvValue fused("MORI_ASYNCLL_FUSED_RECV", value);
+      EXPECT_EQ(EpAsyncLLEntryName(cfg, kind), entry);
+      EXPECT_EQ(EpAsyncLLRenderSource(cfg, kind), source);
+    }
+  }
+}
+
+#if MORI_JIT_HAS_FIELD_COUNT
+TEST(AsyncLLMode, HostCfgAndRequestFieldCountsMatchTheirVisitors) {
+  const EpInterNodeCfg cfg;
+  size_t cfgFields = 0;
+  VisitFields(cfg, cfg, [&cfgFields](const char*, const auto&, const auto&) { ++cfgFields; });
+  EXPECT_EQ(FieldCount<EpInterNodeCfg>(), cfgFields);
+  const EpInterNodeRequest request;
+  size_t requestFields = 0;
+  VisitFields(request, request,
+              [&requestFields](const char*, const auto&, const auto&) { ++requestFields; });
+  EXPECT_EQ(FieldCount<EpInterNodeRequest>(), requestFields);
+}
+#endif
+
+// --------------------------------------------------------------------------
+// describe: a plan's info for a request, without compiling it.
+// --------------------------------------------------------------------------
+
+namespace {
+std::map<std::string, std::string> ParseInfo(const std::string& text) {
+  std::map<std::string, std::string> kv;
+  std::istringstream in(text);
+  for (std::string line; std::getline(in, line);) {
+    const auto eq = line.find('=');
+    if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
+  }
+  return kv;
+}
+
+std::string DescribePlan(const char* kernel, std::vector<std::pair<const char*, long long>> req) {
+  std::vector<const char*> names;
+  std::vector<long long> values;
+  for (const auto& [n, v] : req) {
+    names.push_back(n);
+    values.push_back(v);
+  }
+  const auto* vt = mori::jit::v2::FindPlan(kernel);
+  EXPECT_NE(vt, nullptr) << kernel;
+  return vt->describe(FieldBag(names.data(), values.data(), static_cast<int>(names.size())));
+}
+}  // namespace
+
+TEST(Describe, ReportsTheSizesWithoutCompiling) {
+  // The toolchain has no hipcc, so anything that compiled would fail here.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "ionic"));
+  auto d = ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}));
+  EpCfg c;
+  c.scaleBytes = 224;
+  c.aggReserve = true;
+  EXPECT_EQ(d["stagingBytes"], std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_EQ(d["scaleStride"], "256");
+  EXPECT_EQ(d["region.dispOut"], std::to_string(EpRegionDispOutBytes(c)));
+  EXPECT_EQ(d["region.outTok"], "0");  // combine's
+  EXPECT_EQ(d["cacheDir"], "");
+
+  auto k = ParseInfo(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+  EXPECT_EQ(k["region.dispOut"], "0");  // dispatch's
+  EXPECT_EQ(k["region.outTok"], std::to_string(EpRegionOutTokBytes(PushCfg(8, false, false))));
+  EXPECT_EQ(k["pushWireBytes"], "3840");
+  EXPECT_EQ(k["gridX"], k["blockNum"]);
+}
+
+TEST(Describe, StagingIsZeroWhereTheDispatchDoesNotStage) {
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {}))["stagingBytes"], "0");
+}
+
+TEST(Describe, FailsWhereCreateWould) {
+  // The push combine is gfx125x only; RenderSource rejects it, compiled or not.
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
+}
+
+// --------------------------------------------------------------------------
+// arch= retargets one plan call and is gone when it returns.
+// --------------------------------------------------------------------------
+
+extern "C" const char* mori_jit_plan_describe(const char*, const char*, const char* const*,
+                                              const long long*, int);
+
+namespace {
+std::string CacheDirNow() {
+  return Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;", {});
+}
+}  // namespace
+
+TEST(Arch, ScopedArchRetargetsOnlyItsScope) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  const std::string base = CacheDirNow();
+  {
+    ScopedArch scope("gfx1250");
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+    EXPECT_EQ(ActiveArchSource(), "arch=");
+    EXPECT_NE(CacheDirNow().find("/gfx1250_mlx5/"), std::string::npos);
+    {
+      ScopedArch keep(nullptr);
+      EXPECT_EQ(ActiveArch(), "gfx1250");
+    }
+    {
+      ScopedArch inner("gfx942");
+      EXPECT_EQ(ActiveArch(), "gfx942");
+    }
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+  }
+  EXPECT_EQ(ActiveArch(), "gfx950");
+  EXPECT_EQ(CacheDirNow(), base);
+}
+
+TEST(Arch, ScopedArchIsThreadLocal) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  ScopedArch scope("gfx1250");
+  std::string seen;
+  std::thread([&seen] { seen = ActiveArch(); }).join();
+  EXPECT_EQ(seen, "gfx950");
+}
+
+TEST(Arch, DescribeArchDoesNotOutliveTheCall) {
+  // Two arch= in a row used to throw "toolchain already resolved", and the first
+  // one stuck: every later plan in the process compiled for it.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  const char* text = mori_jit_plan_describe("ep_dispatch", "gfx942", nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_EQ(ParseInfo(text)["stagingBytes"], "0");
+  ASSERT_NE(mori_jit_plan_describe("ep_dispatch", "gfx950", nullptr, nullptr, 0), nullptr)
+      << PlanError();
+  EXPECT_EQ(ActiveArch(), "gfx1250");
+  text = mori_jit_plan_describe("ep_dispatch", nullptr, nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_NE(ParseInfo(text)["stagingBytes"], "0");
+}
+
+// --------------------------------------------------------------------------
+// gfx1250-strict is a gfx125x target of its own.
+// --------------------------------------------------------------------------
+
+TEST(Gfx1250Strict, RoutesLikeGfx1250) {
+  EXPECT_EQ(mori::jit::v2::WaveSizeForArch("gfx1250-strict"), 32);
+  ToolchainOverride guard(FakeToolchain("gfx1250-strict", "ionic"));
+  const EpCfg cfg;
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::RenderSource(cfg).find("ep_intranode_1250x.hpp"),
+            std::string::npos);
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(cfg).find("_tdm"), std::string::npos);
+  EpCfg c;
+  c.scaleBytes = 224;
+  c.aggReserve = true;
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}))["stagingBytes"],
+            std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_NO_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+}
+
+TEST(Gfx1250Strict, HasItsOwnCacheEntries) {
+  EXPECT_EQ(fs::path(CacheDirWith("gfx1250-strict", "ionic")).parent_path().filename(),
+            "gfx1250-strict_ionic");
+  EXPECT_NE(fs::path(CacheDirWith("gfx1250-strict", "ionic")).filename(),
+            fs::path(CacheDirWith("gfx1250", "ionic")).filename());
 }

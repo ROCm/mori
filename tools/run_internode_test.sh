@@ -3,13 +3,13 @@
 #
 # Usage:
 #   run_internode_test.sh --rank <0|1> --master-addr <ip> --ifname <nic> \
-#                         --cmd <bench|stress|test|test_sentinel> --max-tokens <N> \
+#                         --cmd <bench|stress|stress_accuracy|test|test_sentinel> --max-tokens <N> \
 #                         [--master-port <port>] [--kernel-type <see below>] \
 #                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
 #                         [--max-recv-total-tokens <N>] [--sentinel-pattern <p>] \
 #                         [--rounds <N>] [--spawn <N>] [--nproc-per-node <N>] \
-#                         [--entry <path>]
+#                         [--entry <path>] [-- <entry flags>...]
 #
 # The optional shape/dtype flags are pass-throughs to the harness, which already
 # accepts all of them; they are listed here so the cross-node leg can cover the
@@ -24,11 +24,12 @@
 # which made the v2 entry die in argparse whenever a caller omitted it.
 #
 # --entry selects which driver torchrun runs, defaulting to the shmem AOT harness.
-# The v2 CCO entry takes a SUBSET of the same CLI: --cmd is only test|bench|tuning
-# (no test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
-# against v1's v1|v1_ll|async_ll (they are different kernels, not a renaming), and
-# it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
-# only entry that takes --rounds and --spawn.
+# The v2 CCO entry's CLI only partly overlaps v1's: --cmd is only
+# test|bench|tuning|stress (no test_sentinel/stress_accuracy/sweep_bench/profile),
+# --kernel-type is auto|v2|v2_ll|asyncll against v1's v0|v1|v1_ll|async_ll (they
+# are different kernels, not a renaming), and it accepts neither
+# --max-recv-total-tokens nor --sentinel-pattern. It is the only entry that takes
+# --rounds and --spawn.
 #
 # --spawn selects the v2 entry's process topology and has to be reachable from
 # here, because the two ways of getting 8 ranks per node are mutually exclusive:
@@ -60,6 +61,7 @@ SENTINEL_PATTERN=""
 ROUNDS=""
 SPAWN=""
 NPROC_PER_NODE=1
+PASSTHROUGH=()
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
 while [[ $# -gt 0 ]]; do
@@ -83,7 +85,12 @@ while [[ $# -gt 0 ]]; do
     --entry)            ENTRY="$2";                 shift 2 ;;
     --rounds)           ROUNDS="$2";                shift 2 ;;
     --spawn)            SPAWN="$2";                 shift 2 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    # Everything after `--` goes to the entry verbatim. The named flags above
+    # are the ones this script parses, and some only one entry accepts (see the
+    # header). Any other entry flag (the v2 tuning knobs, say) goes after `--`,
+    # so it needs no line here and no change to this parser.
+    --)                 shift; PASSTHROUGH=("$@");  break ;;
+    *) echo "Unknown option: $1 (use -- to forward entry-specific flags)"; exit 1 ;;
   esac
 done
 
@@ -126,4 +133,5 @@ exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --cmd "$CMD" \
   --num-qp "$NUM_QP" \
   --max-tokens "$MAX_TOKENS" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" \
+  "${PASSTHROUGH[@]}"

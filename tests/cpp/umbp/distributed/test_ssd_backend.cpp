@@ -169,6 +169,10 @@ class SsdBackendTest : public ::testing::Test {
     return v;
   }
 
+  uint64_t PagesInUse() {
+    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE)["staging_pages_in_use"];
+  }
+
   SsdBackendTest() {
     engine_.AddEngine(std::make_unique<LocalCopyEngine>());
     engine_.AddEngine(std::make_unique<PosixEngine>());
@@ -378,6 +382,19 @@ TEST_F(SsdBackendTest, DsV4SizedObjectRoundTripsWith64KiBPages) {
   EXPECT_EQ(readback, payload);
 }
 
+// BatchTouch reaches the SSD tier for the keys it holds, and moves no bytes.
+TEST_F(SsdBackendTest, TouchCountsTheKeysTheTierHolds) {
+  SsdBackend* backend = Start();
+  ASSERT_TRUE(backend->OwnsEvictionOrder());
+  ASSERT_TRUE(Put(backend, "key-a", Payload(4096, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(4096, 2)));
+
+  EXPECT_EQ(backend->Touch({"key-a", "missing", "key-b"}), 2u);
+  EXPECT_EQ(backend->Touch({}), 0u);
+  EXPECT_EQ(PagesInUse(), 0u) << "a touch staged something";
+  EXPECT_FALSE(backend->Contains("missing"));
+}
+
 TEST_F(SsdBackendTest, GetOfAnUnknownKeyMisses) {
   SsdBackend* backend = Start();
   auto resolved = backend->BatchResolve({"never-written"}, false);
@@ -444,6 +461,23 @@ TEST_F(SsdBackendTest, AbortReturnsTheStagingPage) {
 
   auto after = backend->BatchAllocate({AllocateRequest{"key-b", 1024}});
   EXPECT_EQ(after[0].outcome, AllocateOutcome::kSuccessAllocated);
+}
+
+// A full arena fails puts with NO_SPACE, and nothing else on the peer reports
+// it: this counter (plus a sampled WARN) is the trace, and the reader-side
+// staging_slot_full_reject does not move.
+TEST_F(SsdBackendTest, APutRefusedForAFullArenaIsCounted) {
+  SsdBackend* backend = Start(/*staging_pages=*/1);
+  auto held = backend->BatchAllocate({AllocateRequest{"key-a", 1024}});
+  ASSERT_EQ(held[0].outcome, AllocateOutcome::kSuccessAllocated);
+
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 1024}})[0].outcome,
+              AllocateOutcome::kFailedNoSpace);
+  }
+  auto events = Samples(*backend, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL);
+  EXPECT_EQ(events["staging_put_full_reject"], 3u);
+  EXPECT_EQ(events["staging_slot_full_reject"], 0u);
 }
 
 TEST_F(SsdBackendTest, AbortIsIdempotent) {
@@ -585,10 +619,8 @@ TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
   EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
 
-  // The first two-page reservation was returned when the second could not fit:
-  // all three pages not held by blocker are available to one writer.
-  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
-  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  // The first two-page reservation was returned when the second could not fit.
+  EXPECT_EQ(PagesInUse(), 1u);
 }
 
 TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
@@ -663,6 +695,143 @@ TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
   std::this_thread::sleep_for(std::chrono::milliseconds{350});
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kSuccessAllocated);
+}
+
+// The #749 window on SSD: a remote reader's lease lapses and its staging page
+// is handed to another key.  The key is still on the drive, so only the lease
+// can answer whether the page the reader copied from still held it.
+TEST_F(SsdBackendTest, StillHoldsTracksTheStagingLeaseNotTheDrive) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto first = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(first[0].found);
+  const uint64_t gen = first[0].generation;
+  ASSERT_NE(gen, 0u) << "SSD must stamp its staged copies";
+  EXPECT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen)
+      << "a shared lease is one copy";
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{true});
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{false});
+
+  // The only page now holds key-b: the bytes a stale key-a reader would get.
+  const auto other = backend->BatchResolve({"key-b"}, false);
+  ASSERT_TRUE(other[0].found);
+  EXPECT_EQ(other[0].pages[0].page_index, first[0].pages[0].page_index);
+  EXPECT_NE(other[0].generation, gen);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  const auto again = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(again[0].found);
+  EXPECT_NE(again[0].generation, gen) << "a re-stage is a new copy";
+  EXPECT_EQ(backend->BatchStillHolds({"key-a", "key-a"}, {gen, again[0].generation}),
+            (std::vector<bool>{false, true}));
+
+  backend->ClearLocal();
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {again[0].generation}), std::vector<bool>{false});
+}
+
+// The other half of #749: a staging span stayed claimed for the whole read
+// lease however fast the read was.  A remote reader that reports back
+// (ValidateReads with release) ends its lease there and then.  The leases here
+// are a minute long, so only the report can free the one staging page.
+TEST_F(SsdBackendTest, ARemoteReaderThatReportsBackFreesItsStagingAtOnce) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto first = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(first[0].found);
+  const uint64_t gen = first[0].generation;
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "the only staging page is leased to key-a's reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true})
+      << "the copy was still in place when the reader finished";
+
+  // No reaper sweep and no wait: the span search that finds no room takes it.
+  const auto other = backend->BatchResolve({"key-b"}, false);
+  ASSERT_TRUE(other[0].found);
+  EXPECT_EQ(other[0].pages[0].page_index, first[0].pages[0].page_index);
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{false});
+}
+
+// A lease is shared by every remote reader of the key, and a key asked twice
+// in one batch is two answers.  The span goes back only when all are done.
+TEST_F(SsdBackendTest, ASharedStagingLeaseWaitsForItsLastRemoteReader) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto twice = backend->BatchResolve({"key-a", "key-a"}, false);
+  ASSERT_TRUE(twice[0].found);
+  ASSERT_TRUE(twice[1].found);
+  const uint64_t gen = twice[0].generation;
+  ASSERT_EQ(twice[1].generation, gen);
+  ASSERT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen) << "a second reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a", "key-a"}, {gen, gen}),
+            (std::vector<bool>{true, true}));
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "freed under the second reader";
+
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
+}
+
+// A report that names another copy ends nothing, and one that arrives when no
+// remote reader is counted leaves the count at zero for the next reader.
+TEST_F(SsdBackendTest, AStrayFinishDoesNotEndAnotherReadersLease) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const uint64_t gen = backend->BatchResolve({"key-a"}, false)[0].generation;
+  ASSERT_NE(gen, 0u);
+  EXPECT_EQ(backend->BatchFinishReads({"key-a", "key-b"}, {gen + 1, gen}),
+            (std::vector<bool>{false, false}))
+      << "not this copy; no lease at all";
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "a finish for another generation ended this lease";
+
+  {
+    // A local hold keeps the span staged whatever the timer says, so the lease
+    // below stays the same copy while its remote readers come and go.
+    const auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+    ASSERT_TRUE(local[0].found);
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true})
+        << "still the same copy, with no remote reader left to count out";
+    ASSERT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen) << "a new remote reader";
+  }
+  EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+      << "the extra finish counted the new reader out in advance";
+  EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
+}
+
+// A local reader holds its bytes by refcount (#762); a remote reader's report
+// ends the timer, not that hold.
+TEST_F(SsdBackendTest, ALocalHoldOutlivesTheRemoteReadersReport) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto remote = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(remote[0].found);
+  {
+    const auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+    ASSERT_TRUE(local[0].found);
+    EXPECT_EQ(backend->BatchFinishReads({"key-a"}, {remote[0].generation}),
+              std::vector<bool>{true});
+    EXPECT_EQ(backend->BatchResolve({"key-b"}, false)[0].outcome, ResolveOutcome::kBusy)
+        << "freed under a local reader";
+  }
+  EXPECT_TRUE(backend->BatchResolve({"key-b"}, false)[0].found);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +911,21 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   offers = backend->EvictionCandidates(10);
   for (const auto& offer : offers) EXPECT_NE(offer.key, "b");
   EXPECT_EQ(offers.size(), 2u);
+}
+
+// A client loads what its lookup found seconds later; evicting it in between fails the load.
+TEST_F(SsdBackendTest, PoolLookupRenewsTheKeysEvictionOrder) {
+  SsdBackend* ssd = Start();
+  ASSERT_TRUE(Put(ssd, "a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(ssd, "b", Payload(1024, 2)));
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("ssd", std::move(backend_)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  ASSERT_TRUE(pool.BatchContains({"a"})[0]);
+  const auto offers = ssd->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 2u);
+  EXPECT_EQ(offers[0].key, "b");
 }
 
 TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
@@ -865,7 +1049,8 @@ TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
   ASSERT_EQ(1u, commit.size());
   ASSERT_TRUE(commit[0].success);
 
-  auto resolved = backend.BatchResolve({"k/gds"}, /*include_descs=*/false);
+  auto resolved = backend.BatchResolve({"k/gds"}, /*include_descs=*/false,
+                                       /*allow_file_refs=*/true, ResolveReader::kLocal);
   ASSERT_EQ(1u, resolved.size());
   ASSERT_TRUE(resolved[0].found);
   if (!resolved[0].file_ref.IsFile()) {
@@ -896,6 +1081,228 @@ TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
   fs::remove_all(dir);
 }
 #endif  // UMBP_ENABLE_GDS
+
+// ---------------------------------------------------------------------------
+//  Extent-scoped staging (design-ssd-ranged-io.md D1b).  These assert the
+//  DEVICE read size: a whole-object stage hands back the right bytes too.
+// ---------------------------------------------------------------------------
+
+// Aperiodic, so a window staged at the wrong 4 KiB boundary cannot match.
+std::vector<char> Aperiodic(size_t n) {
+  std::vector<char> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    v[i] = static_cast<char>(((i * 131) ^ (i >> 8) ^ (i >> 16) ^ (i / 4093)) & 0xff);
+  }
+  return v;
+}
+
+class SsdBackendExtentTest : public SsdBackendTest {
+ protected:
+  static constexpr size_t kObject = 1 << 20;  // 16 staging pages
+
+  uint64_t DeviceReadBytes() {
+    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL)["device_read"];
+  }
+
+  std::vector<ResolvedEntry> ResolveExtents(const std::vector<std::string>& keys,
+                                            const std::vector<ObjectExtent>& extents,
+                                            ResolveReader reader = ResolveReader::kLocal) {
+    return backend_->BatchResolve(keys, /*include_descs=*/false, /*allow_file_refs=*/false, reader,
+                                  &extents);
+  }
+
+  // The first `n` bytes the entry's pages hold (a staging span is contiguous).
+  std::vector<char> Staged(const ResolvedEntry& entry, size_t n) {
+    std::vector<char> out(n, 0);
+    TransferItem item;
+    item.src = backend_->BufferRef(entry.pages[0].buffer_index);
+    item.src_offset = static_cast<uint64_t>(entry.pages[0].page_index) * kPageSize;
+    item.dst = TransferRef::HostBytes(out.data(), out.size());
+    item.size = n;
+    std::vector<size_t> failed;
+    EXPECT_TRUE(engine_.Transfer({item}, &failed));
+    return out;
+  }
+
+  static std::vector<char> Slice(const std::vector<char>& v, size_t off, size_t n) {
+    return std::vector<char>(v.begin() + off, v.begin() + off + n);
+  }
+};
+
+// A window of a 1 MiB object, widened to 4 KiB, is all that comes off the drive.
+TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  auto got = ResolveExtents({"k"}, {ObjectExtent{300000, 100000}});
+  ASSERT_EQ(got.size(), 1u);
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].size, kObject) << "size stays the OBJECT's";
+  EXPECT_EQ(got[0].covered_offset, 299008u);  // 300000 down to 4 KiB
+  EXPECT_EQ(got[0].covered_size, 102400u);    // 400000 up to 4 KiB, minus the start
+  EXPECT_EQ(got[0].pages.size(), 2u);
+  EXPECT_EQ(DeviceReadBytes() - before, 102400u) << "the drive read the whole object";
+  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(object, 299008, 102400));
+  EXPECT_EQ(Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL)["extent_stage"], 1u);
+
+  EXPECT_EQ(PagesInUse(), 2u);
+  got.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u) << "an extent stage goes back with its last hold";
+}
+
+// A dropped extent hold frees its span at the next resolve, not at the next reaper sweep.
+TEST_F(SsdBackendExtentTest, ADroppedHoldFreesItsSpanWithoutTheReaper) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "a", Aperiodic(kObject)));
+  ASSERT_TRUE(Put(backend_.get(), "b", Aperiodic(kObject)));
+  ASSERT_TRUE(ResolveExtents({"a"}, {ObjectExtent{0, 4096}})[0].found);  // hold dropped here
+  auto held = ResolveExtents({"b"}, {ObjectExtent{0, 4096}});
+  ASSERT_TRUE(held[0].found);
+  EXPECT_EQ(PagesInUse(), 1u);
+}
+
+// A Clear must not hand a span to the next reader while a local reader copies out of it.
+TEST_F(SsdBackendExtentTest, ClearKeepsSpansALocalReaderHolds) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "a", Aperiodic(kObject)));
+  ASSERT_TRUE(Put(backend_.get(), "b", Aperiodic(kObject)));
+  auto whole = backend_->BatchResolve({"a"}, false, false, ResolveReader::kLocal);
+  auto window = ResolveExtents({"b"}, {ObjectExtent{0, 4096}});
+  ASSERT_TRUE(whole[0].found);
+  ASSERT_TRUE(window[0].found);
+  ASSERT_EQ(PagesInUse(), 17u);
+
+  backend_->ClearLocal();
+  EXPECT_EQ(PagesInUse(), 17u);
+  whole.clear();
+  window.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// The last window of an object that is not a 4 KiB multiple stops at its end.
+TEST_F(SsdBackendExtentTest, TailWindowIsClampedToTheObject) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  constexpr size_t kOdd = 1000000;
+  const auto object = Aperiodic(kOdd);
+  ASSERT_TRUE(Put(backend_.get(), "odd", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"odd"}, {ObjectExtent{998000, 2000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_offset, 995328u);
+  EXPECT_EQ(got[0].covered_size, kOdd - 995328u);
+  EXPECT_EQ(DeviceReadBytes() - before, kOdd - 995328u);
+  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(object, 995328, kOdd - 995328));
+}
+
+// Identical windows in one call share a read; different ones of the same key do not.
+TEST_F(SsdBackendExtentTest, WindowsOfOneKeyShareAReadOnlyWhenIdentical) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  auto got = ResolveExtents({"k", "k", "k"}, {ObjectExtent{0, 65536}, ObjectExtent{0, 65536},
+                                              ObjectExtent{720896, 65536}});
+  for (const auto& entry : got) ASSERT_TRUE(entry.found);
+  EXPECT_EQ(got[0].hold, got[1].hold);
+  EXPECT_NE(got[0].hold, got[2].hold);
+  EXPECT_EQ(got[2].covered_offset, 720896u);
+  EXPECT_EQ(DeviceReadBytes() - before, 2u * 65536);
+  EXPECT_EQ(Staged(got[1], 65536), Slice(object, 0, 65536));
+  EXPECT_EQ(Staged(got[2], 65536), Slice(object, 720896, 65536));
+  got.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// Local readers of one window across calls (the TP ranks) share one staged copy.
+TEST_F(SsdBackendExtentTest, LocalReadersOfOneWindowShareOneStage) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  std::vector<std::vector<ResolvedEntry>> got(4);
+  std::vector<std::thread> readers;
+  for (auto& out : got) {
+    readers.emplace_back([this, &out] { out = ResolveExtents({"k"}, {ObjectExtent{0, 65536}}); });
+  }
+  for (auto& reader : readers) reader.join();
+  for (const auto& out : got) {
+    ASSERT_TRUE(out[0].found);
+    EXPECT_EQ(out[0].pages, got[0][0].pages);
+  }
+  EXPECT_EQ(DeviceReadBytes() - before, 65536u);
+  EXPECT_EQ(Staged(got[3][0], 65536), Slice(object, 0, 65536));
+  got.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// A whole-object lease already staged covers any window: no second read.
+TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+
+  const auto whole = backend_->BatchResolve({"k"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(whole[0].found);
+  EXPECT_EQ(whole[0].covered_size, 0u);
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{500000, 1000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u) << "served from the whole-object lease";
+  EXPECT_EQ(got[0].hold, whole[0].hold);
+  EXPECT_EQ(DeviceReadBytes(), before);
+}
+
+// A staged tier move is counted by the pool, so device_read stays loads only.
+TEST_F(SsdBackendExtentTest, StagedMigrationReadIsNotADeviceRead) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "k", Aperiodic(kObject)));
+  const uint64_t before = DeviceReadBytes();
+
+  ResolvedEntry moved;
+  ASSERT_TRUE(backend_->AcquireMigrationRead("k", &moved, /*allow_file_ref=*/false));
+  EXPECT_FALSE(moved.pages.empty()) << "staged, not a file ref";
+  backend_->ReleaseMigrationRead("k");
+  EXPECT_EQ(DeviceReadBytes(), before);
+}
+
+// A remote reader's extent does not travel on the wire (D2): it stages whole.
+TEST_F(SsdBackendExtentTest, RemoteReaderStagesTheWholeObject) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{0, 4096}}, ResolveReader::kRemote);
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u);
+  EXPECT_EQ(DeviceReadBytes() - before, kObject);
+  EXPECT_EQ(Staged(got[0], kObject), object);
+}
+
+// UMBP_SSD_EXTENT_STAGING=0 restores whole-object staging.
+TEST_F(SsdBackendExtentTest, KillSwitchRestoresWholeObjectStaging) {
+  ASSERT_EQ(setenv("UMBP_SSD_EXTENT_STAGING", "0", 1), 0);
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  unsetenv("UMBP_SSD_EXTENT_STAGING");  // read once, at Init
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{300000, 100000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u);
+  EXPECT_EQ(DeviceReadBytes() - before, kObject);
+}
 
 }  // namespace
 }  // namespace mori::umbp

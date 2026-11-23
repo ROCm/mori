@@ -69,18 +69,22 @@ TEST(FlatYaml, ParsesEntriesCommentsAndQuotes) {
 TEST(FlatYaml, EmptyInputIsEmptyList) { EXPECT_TRUE(Parse("# only a comment\n\n").empty()); }
 
 TEST(FlatYaml, TypedGetters) {
-  FlatMap m = Parse("- on: true\n  off: false\n  n: -7\n  s: x\n")[0];
+  FlatMap m = Parse("- on: true\n  off: false\n  n: -7\n  f: 2.5\n  s: x\n")[0];
   EXPECT_TRUE(mori::yaml::GetBool(m, "on", false, "w"));
   EXPECT_FALSE(mori::yaml::GetBool(m, "off", true, "w"));
   EXPECT_TRUE(mori::yaml::GetBool(m, "missing", true, "w"));
   EXPECT_EQ(mori::yaml::GetInt(m, "n", 0, "w"), -7);
   EXPECT_EQ(mori::yaml::GetInt(m, "missing", 5, "w"), 5);
+  EXPECT_DOUBLE_EQ(mori::yaml::GetDouble(m, "f", 0, "w"), 2.5);
+  EXPECT_DOUBLE_EQ(mori::yaml::GetDouble(m, "n", 0, "w"), -7);
+  EXPECT_DOUBLE_EQ(mori::yaml::GetDouble(m, "missing", 1.5, "w"), 1.5);
   EXPECT_EQ(mori::yaml::GetString(m, "s"), "x");
   EXPECT_EQ(mori::yaml::GetString(m, "missing", "d"), "d");
   EXPECT_THROW(mori::yaml::GetBool(m, "s", false, "w"), std::runtime_error);
   EXPECT_THROW(mori::yaml::GetInt(m, "s", 0, "w"), std::runtime_error);
-  EXPECT_THROW(mori::yaml::CheckKeys(m, {"on", "off", "n"}, "w"), std::runtime_error);
-  EXPECT_NO_THROW(mori::yaml::CheckKeys(m, {"on", "off", "n", "s"}, "w"));
+  EXPECT_THROW(mori::yaml::GetDouble(m, "s", 0, "w"), std::runtime_error);
+  EXPECT_THROW(mori::yaml::CheckKeys(m, {"on", "off", "n", "f"}, "w"), std::runtime_error);
+  EXPECT_NO_THROW(mori::yaml::CheckKeys(m, {"on", "off", "n", "f", "s"}, "w"));
 }
 
 TEST(FlatYaml, RejectsAnythingOutsideTheSubsetWithLineNumber) {

@@ -34,6 +34,12 @@ The two probes differ in kind: `buffer_ops` is a submodule, so its absence is a
 ModuleNotFoundError and anything else means a broken install that must surface
 as itself. `vector` is only a name in `flydsl.expr` — which is already imported
 below, so by then a plain ImportError can only mean the name is gone.
+
+`mori.cco.device.flydsl.buffer` is the other buffer shim and, unlike this one,
+honours `cache_modifier` on 0.3+. EPv2 keeps its own for now: it also bridges
+`vector` and `T`, and honouring EPv2's `cache_modifier` (nt on the scatter
+combine's stage-3 loads) would change its 0.3+ codegen, which needs a perf check
+first.
 """
 import inspect
 import logging

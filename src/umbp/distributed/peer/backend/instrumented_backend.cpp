@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -161,6 +162,15 @@ std::vector<CommitResult> InstrumentedBackend::BatchCommit(const std::vector<Com
     }
   }
   if (bytes > 0) ops_[kCommit].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) {
+    auto callback = std::atomic_load(&change_hook_);
+    if (callback && *callback) {
+      std::vector<std::string> keys;
+      keys.reserve(reqs.size());
+      for (const auto& req : reqs) keys.push_back(req.key);
+      (*callback)(keys);
+    }
+  }
   return out;
 }
 
@@ -175,23 +185,31 @@ std::vector<bool> InstrumentedBackend::BatchAbort(const std::vector<uint64_t>& s
   return out;
 }
 
-std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                             bool include_descs,
-                                                             bool allow_file_refs,
-                                                             ResolveReader reader) {
+std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(
+    const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs,
+    ResolveReader reader, const std::vector<ObjectExtent>* extents) {
   ops_[kResolve].batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<ResolvedEntry> out;
   {
     ScopedNanos timer(ops_[kResolve].nanos);
-    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader);
+    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
   }
   uint64_t bytes = 0;
-  for (const ResolvedEntry& r : out) {
+  for (size_t i = 0; i < out.size(); ++i) {
+    const ResolvedEntry& r = out[i];
     switch (EffectiveResolveOutcome(r)) {
-      case ResolveOutcome::kFound:
+      case ResolveOutcome::kFound: {
         Add(kResolve, kOk, 1);
-        bytes += r.size;
+        // Count what the reader touches, so a DRAM slice is not charged the whole object.
+        const ObjectExtent* e =
+            extents != nullptr && i < extents->size() ? &(*extents)[i] : nullptr;
+        if (e != nullptr && e->length != 0) {
+          bytes += e->offset < r.size ? std::min(e->length, r.size - e->offset) : 0;
+        } else {
+          bytes += r.covered_size != 0 ? r.covered_size : r.size;
+        }
         break;
+      }
       case ResolveOutcome::kMissing:
         Add(kResolve, kMiss, 1);
         break;
@@ -225,6 +243,7 @@ std::vector<EvictResult> InstrumentedBackend::Evict(const std::vector<std::strin
     }
   }
   if (bytes > 0) ops_[kEvict].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) NotifyChange(keys);
   return out;
 }
 

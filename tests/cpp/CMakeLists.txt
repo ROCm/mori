@@ -36,6 +36,12 @@ target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_flat_yaml PRIVATE gtest_main)
 add_test(NAME flat_yaml COMMAND test_flat_yaml)
 
+# PCI topology over a sysfs tree built on disk; needs no hardware.
+add_executable(test_topology_pci application/test_topology_pci.cpp)
+target_include_directories(test_topology_pci PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_topology_pci PRIVATE mori_application gtest_main)
+add_test(NAME topology_pci COMMAND test_topology_pci)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -54,7 +60,17 @@ target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
 # reintroduce a link-time dependency on a host without RDMA installed.
 target_link_libraries(test_transport_ibverbs mori_application mori_ibv_shim)
 
+# Pure host planner: no HIP runtime, IO library, or GPU required.
+add_executable(test_fabric_copy_plan io/test_fabric_copy_plan.cpp
+               ${CMAKE_SOURCE_DIR}/src/io/fabric/copy_plan.cpp)
+target_include_directories(test_fabric_copy_plan PRIVATE ${CMAKE_SOURCE_DIR})
+add_test(NAME fabric_copy_plan COMMAND test_fabric_copy_plan)
+
 if(BUILD_IO)
+  add_executable(test_fabric_batch_copy io/test_fabric_batch_copy.cpp)
+  target_link_libraries(test_fabric_batch_copy PRIVATE mori_io)
+  # Deliberately not a ctest: requires a JIT-produced hsaco and fabric GPUs.
+
   add_executable(test_protocol io/test_protocol.cpp)
 
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR}/include)
@@ -96,8 +112,19 @@ if(BUILD_IO)
       test_fault_injection
       PRIVATE
         MORI_IO_FAULT_CATALOG_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog/ibverbs.yaml"
+        MORI_IO_FAULT_CATALOG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog"
     )
     target_link_libraries(test_fault_injection mori_application mori_io)
+
+    # CPU-only regression checks with provider stand-ins; no libibverbs link.
+    add_executable(test_fault_injector io/test_fault_injector.cpp
+                   ${CMAKE_SOURCE_DIR}/src/io/rdma/fault_injector.cpp)
+    target_include_directories(test_fault_injector PRIVATE ${CMAKE_SOURCE_DIR}
+                               ${CMAKE_SOURCE_DIR}/include
+                               ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+    target_compile_definitions(test_fault_injector PRIVATE MORI_IO_FAULT_INJECTION
+                                                          MSGPACK_NO_BOOST)
+    target_link_libraries(test_fault_injector mori_logging hip::host)
   endif()
 
   add_executable(test_peer_failure io/test_peer_failure.cpp)
@@ -105,6 +132,18 @@ if(BUILD_IO)
   target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_peer_failure mori_application mori_io)
+
+  add_executable(test_fence io/test_fence.cpp)
+
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fence mori_application mori_io)
+
+  add_executable(test_fence_xnode io/test_fence_xnode.cpp)
+
+  target_include_directories(test_fence_xnode PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_fence_xnode PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fence_xnode mori_application mori_io)
 
   add_executable(test_topology application/test_topology.cpp)
 
@@ -160,6 +199,8 @@ endif()
 if(BUILD_METRICS)
   add_subdirectory(metrics)
 endif()
+
+add_subdirectory(ras)
 
 # JIT v2 — always built: mori_jit is host-only and needs no hipcc.
 add_subdirectory(jit)

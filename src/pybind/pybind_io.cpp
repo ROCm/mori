@@ -34,10 +34,17 @@ namespace io {
 // Forward-declared here to avoid pulling internal backend headers into pybind.
 void* FabricMalloc(size_t size, int device);
 void FabricFree(void* ptr);
+namespace sim {
+// Defined in src/io/sim/backend_impl.cpp.
+bool IsEnabled();
+std::map<std::string, double> ProfileValues(BackendType type);
+}  // namespace sim
 }  // namespace io
 
 void RegisterMoriIo(pybind11::module_& m) {
   m.def("set_log_level", &mori::io::SetLogLevel);
+  m.def("io_sim_enabled", &mori::io::sim::IsEnabled);
+  m.def("io_sim_profile", &mori::io::sim::ProfileValues, py::arg("backend_type"));
 
   py::enum_<mori::io::BackendType>(m, "BackendType")
       .value("Unknown", mori::io::BackendType::Unknown)
@@ -87,6 +94,16 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("device_name", &mori::io::PeerFailureEvent::deviceName)
       .def_readonly("detail", &mori::io::PeerFailureEvent::detail);
 
+  py::class_<mori::io::FenceResult>(m, "FenceResult")
+      .def(py::init<>())
+      .def_readonly("supported", &mori::io::FenceResult::supported)
+      .def_readonly("endpoints_fenced", &mori::io::FenceResult::endpointsFenced)
+      .def_readonly("endpoints_failed", &mori::io::FenceResult::endpointsFailed)
+      .def_readonly("transfers_failed", &mori::io::FenceResult::transfersFailed)
+      .def_readonly("peer_known", &mori::io::FenceResult::peerKnown)
+      .def_readonly("message", &mori::io::FenceResult::message)
+      .def_property_readonly("ok", &mori::io::FenceResult::Ok);
+
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
@@ -116,6 +133,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
       .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
       .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
+
+  py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
+      .def(py::init<>());
 
   py::class_<mori::io::FabricBackendConfig, mori::io::BackendConfig>(m, "FabricBackendConfig")
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
@@ -257,6 +277,10 @@ void RegisterMoriIo(pybind11::module_& m) {
             return event;
           },
           py::call_guard<py::gil_scoped_release>())
+      .def("FenceRemoteEngine", &mori::io::IOEngine::FenceRemoteEngine,
+           py::call_guard<py::gil_scoped_release>())
+      .def("UnfenceRemoteEngine", &mori::io::IOEngine::UnfenceRemoteEngine,
+           py::call_guard<py::gil_scoped_release>())
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())
       .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,

@@ -28,6 +28,8 @@
 
 namespace mori::umbp {
 
+bool HostRegistrationEnabled();
+
 // The size of the pieces a HostTierRegistration registers, and so the
 // alignment of the boundaries no single copy of registered memory may cross:
 // hipMemcpy rejects a host range spanning two registrations, and a gather

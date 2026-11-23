@@ -247,6 +247,457 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
 
 
 # --------------------------------------------------------------------------
+# Sizes: a plan reports what it binds (EpRegion*, EpStagingTotalBytes), and
+# describe() reports it before the plan exists, so a caller sizes nothing by hand
+# --------------------------------------------------------------------------
+
+_SMALL = dict(
+    world_size=1,
+    hidden_dim=1024,
+    max_tok_per_rank=64,
+    num_expert_per_rank=4,
+    num_expert_per_token=4,
+    max_recv=64,
+)
+
+
+def test_describe_reports_what_the_plan_would_without_building_it():
+    for cls in (cb.EpDispatchPlan, cb.EpCombinePlan):
+        described = cls.describe(**_SMALL)
+        p = cls(**_SMALL)
+        built = p.info
+        p.close()
+        assert described.pop("cacheDir") == ""
+        built.pop("cacheDir")
+        assert described == built
+
+
+def test_describe_rejects_what_the_constructor_rejects():
+    with pytest.raises(TypeError, match="unknown argument"):
+        cb.EpDispatchPlan.describe(world_size=1, bogus=1)
+    with pytest.raises(RuntimeError, match="inconsistent config"):
+        cb.EpDispatchPlan.describe(hidden_dim=7)
+
+
+def _device_arch():
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def _built_for(plan):
+    """The arch a plan compiled for: its cache directory is <root>/<arch>_<nic>[_ccqe]/<entry>."""
+    return plan.info["cacheDir"].split("/")[-2].split("_", 1)[0]
+
+
+def test_describe_arch_applies_to_that_call_only():
+    # Every arch, one after another, then a plan with none: each arch= is gone
+    # when its call returns, so the plan is built for the device.
+    for arch in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        cb.EpDispatchPlan.describe(arch=arch, **_SMALL)
+    p = cb.EpDispatchPlan(**_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
+def test_create_for_another_arch_fails_before_compiling():
+    other = "gfx950" if _device_arch() == "gfx942" else "gfx942"
+    with pytest.raises(RuntimeError, match=f"building for {other} \\(set by arch=\\)"):
+        cb.EpDispatchPlan(arch=other, **_SMALL)
+    p = cb.EpDispatchPlan(arch=_device_arch(), **_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
+def test_every_arena_region_is_reported_in_args_order():
+    stems = [
+        n[3].lower() + n[4:]
+        for n in cb.EpDispatchPlan._arg_names
+        if n.startswith("off") and n[3:4].isupper()
+    ]
+    for cls in (cb.EpDispatchPlan, cb.EpCombinePlan):
+        info = cls.describe()
+        assert [k[len("region.") :] for k in info if k.startswith("region.")] == stems
+
+
+_CARD_KW = dict(world_size=8, max_tok_per_rank=512, max_recv=4096, warp_per_block=16)
+
+
+def _without_card_dedup(info):
+    return {
+        k: v
+        for k, v in info.items()
+        if k not in ("cardDedup", "region.fwdMap", "cfgText")
+    }
+
+
+def test_card_dedup_adds_a_forward_map_and_nothing_else():
+    off = cb.EpDispatchPlan.describe(**_CARD_KW)
+    if not off["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="cardDedup needs gfx125x"):
+            cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+        return
+    on = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+    assert (off["cardDedup"], off["region.fwdMap"]) == (False, 0)
+    assert (on["cardDedup"], on["region.fwdMap"]) == (True, 4096 * 4)
+    assert _without_card_dedup(on) == _without_card_dedup(off)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .cardDedup=true}"
+    comb = cb.EpCombinePlan.describe(**_CARD_KW, card_dedup=True)
+    assert (comb["cardDedup"], comb["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(world_size=7),
+        dict(warp_per_block=8),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=16),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=4, max_recv=2048),
+        dict(card_pull_blocks=65),
+    ],
+)
+def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardDedup needs"):
+        cb.EpDispatchPlan.describe(**dict(_CARD_KW, card_dedup=True, **kw))
+
+
+def test_card_pull_blocks_run_past_the_senders_and_add_two_words():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    serial = cb.EpDispatchPlan.describe(**kw)
+    ovl = cb.EpDispatchPlan.describe(**kw, card_pull_blocks=16)
+    assert (serial["blockNum"], serial["gridX"]) == (64, 64)
+    assert (ovl["blockNum"], ovl["gridX"]) == (64, 80)
+    assert ovl["region.fwdMap"] == serial["region.fwdMap"] + 64
+
+
+def test_card_fwd_mark_changes_the_cfg_only_without_pull_blocks():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    plain = cb.EpDispatchPlan.describe(**kw)
+    mark = cb.EpDispatchPlan.describe(**kw, card_fwd_mark=True)
+    assert (plain["cardFwdMark"], mark["cardFwdMark"]) == (False, True)
+    assert mark["cfgText"] == plain["cfgText"][:-1] + ", .cardFwdMark=true}"
+    for k in ("cardFwdMark", "cfgText"):
+        plain.pop(k), mark.pop(k)
+    assert mark == plain
+    ovl = dict(kw, card_pull_blocks=16)
+    assert cb.EpDispatchPlan.describe(
+        **ovl, card_fwd_mark=True
+    ) == cb.EpDispatchPlan.describe(**ovl)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(card_pull_blocks=16),
+        dict(card_fwd_mark=True),
+        dict(card_combine=True),
+    ],
+)
+def test_card_dedup_knobs_need_card_dedup(kw):
+    with pytest.raises(RuntimeError, match="need cardDedup"):
+        cb.EpDispatchPlan.describe(**_CARD_KW, **kw)
+
+
+_LL128_KW = dict(world_size=8, max_tok_per_rank=128, max_recv=1024, ll128=True)
+
+
+def test_ll128_card_dedup_changes_the_ll128_dispatch_cfg_and_nothing_else():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("ll128 is gfx125x only")
+    off = cb.EpDispatchPlan.describe(**_LL128_KW)
+    on = cb.EpDispatchPlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert (off["ll128Dedup"], on["ll128Dedup"]) == (False, True)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .ll128Dedup=true}"
+    for k in ("ll128Dedup", "cfgText"):
+        off.pop(k), on.pop(k)
+    assert on == off
+    comb = cb.EpCombinePlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert comb == cb.EpCombinePlan.describe(**_LL128_KW)
+    for kw in (dict(ll128=False), dict(world_size=7)):
+        with pytest.raises(
+            RuntimeError, match="ll128Dedup is the ll128 dispatch's cardDedup"
+        ):
+            cb.EpDispatchPlan.describe(**dict(_LL128_KW, **kw), ll128_dedup=True)
+
+
+_CARD_COMB_KW = dict(_CARD_KW, combine_bf16_push=True)
+
+
+def _up128(n):
+    return (n + 127) // 128 * 128
+
+
+def test_card_combine_lays_out_the_reverse_map_and_flags():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    rev = _up128(4096 * 4 + 64)
+    size = _up128(_up128(rev + 4096 * 4) + 4096 * 8)
+    disp = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True, card_combine=True)
+    assert (disp["cardCombine"], disp["region.fwdMap"]) == (True, size)
+    fold = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert (fold["cardDedup"], fold["cardCombine"], fold["region.fwdMap"]) == (
+        False,
+        True,
+        size,
+    )
+    plain = cb.EpCombinePlan.describe(**_CARD_COMB_KW)
+    assert (plain["cardCombine"], plain["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(combine_bf16_push=False),
+        dict(combine_bf16_push=False, combine_fp4=True, combine_fp4_f32_scale=True),
+        dict(combine_bf16_push=False, combine_fp8=True, warp_per_block=8),
+        dict(world_size=4),
+        dict(warp_per_block=8),
+        dict(warp_per_block=24),
+        dict(block_num=1),
+    ],
+)
+def test_card_combine_takes_a_push_combine_on_16_warps(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardCombine needs"):
+        cb.EpCombinePlan.describe(**{**_CARD_COMB_KW, "card_combine": True, **kw})
+
+
+@pytest.mark.parametrize("quant", ["combine_fp8", "combine_fp4"])
+def test_card_combine_folds_the_quantized_push_too(quant):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    kw = {**_CARD_KW, quant: True}
+    fold = cb.EpCombinePlan.describe(**kw, card_combine=True)
+    plain = cb.EpCombinePlan.describe(**kw)
+    assert (plain["cardCombine"], fold["cardCombine"]) == (False, True)
+    bf16 = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert fold["region.fwdMap"] == bf16["region.fwdMap"]
+    assert fold["cfgText"] == plain["cfgText"][:-1] + ", .cardCombine=true}"
+
+
+def test_card_dedup_takes_an_fp4_dispatch_past_its_packed_paths():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, hidden_dim=3584, dtype="fp4x2")
+    on = cb.EpDispatchPlan.describe(**kw, card_dedup=True, card_pull_blocks=8)
+    assert (on["cardDedup"], on["gridX"]) == (True, on["blockNum"] + 8)
+
+
+def _reference_regions(
+    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
+):
+    """hip_backend._regions as it was before the plans reported sizes."""
+    cap = ws * max_tok
+    out_tok = cap * comb_tok
+    if push:
+        q, bits, sb = {"fp4": (32, 4, 1), "fp4b": (128, 4, 4), "fp8": (32, 8, 1)}[push]
+        wire = (hidden * bits // 8 + hidden // q * sb + 127) // 128 * 128
+        rows = max_tok * min(ws, topk)
+        out_tok += rows * wire
+        if push != "fp4b" and 4 <= ws <= wave:
+            out_tok += rows * 8
+    regions = [
+        ("tok_off", 256 + 4 * ws * ws if gfx125x and ws <= 8 else 4),
+        ("recv_num", 2 * ws * 4),
+        ("recv_to_src_token", cap * 4),
+        ("out_idx", cap * topk * 4),
+        ("out_wts", cap * topk * 4),
+        ("disp_out", cap * disp_tok),
+        ("out_tok", out_tok),
+        ("cross_device_barrier", ws * 8),
+    ]
+    if scale:
+        regions.append(("out_scales", cap * ((scale + 127) // 128 * 128)))
+    return regions
+
+
+@pytest.mark.parametrize("ws", [1, 2, 4, 8])
+@pytest.mark.parametrize("topk", [4, 8])
+@pytest.mark.parametrize(
+    "dispatch,scale,push",
+    [
+        ("bf16", 0, None),
+        ("fp8", 224, None),
+        ("fp4x2", 32, None),
+        ("fp32", 0, None),
+        ("fp4x2", 32, "fp4"),
+        ("fp4x2", 32, "fp4b"),
+        ("fp8", 224, "fp8"),
+    ],
+)
+def test_arena_regions_match_the_layout_the_op_used_to_build(
+    ws, topk, dispatch, scale, push
+):
+    from mori.ops.dispatch_combine_v2.hip_backend import _REGIONS
+
+    hidden, max_tok = 7168, 128
+    common = dict(
+        world_size=ws,
+        max_tok_per_rank=max_tok,
+        num_expert_per_rank=8,
+        num_expert_per_token=topk,
+        max_recv=ws * max_tok,
+    )
+    disp_hidden = hidden // 2 if dispatch == "fp4x2" else hidden
+    d = cb.EpDispatchPlan.describe(
+        **common, hidden_dim=disp_hidden, dtype=dispatch, scale_bytes=scale
+    )
+    comb = {"fp4": dict(combine_fp4=1), "fp8": dict(combine_fp8=1)}.get(push, {})
+    if push == "fp4b":
+        comb = dict(combine_fp4=1, combine_fp4_f32_scale=1)
+    if push and not d["sharedBytes"]:
+        pytest.skip("the push combine is gfx125x only")
+    c = cb.EpCombinePlan.describe(**common, hidden_dim=hidden, dtype="bf16", **comb)
+    elem = {"bf16": 2, "fp32": 4, "fp8": 1, "fp4x2": 1}[dispatch]
+    want = _reference_regions(
+        ws,
+        hidden,
+        max_tok,
+        topk,
+        disp_hidden * elem,
+        hidden * 2,
+        scale,
+        push,
+        d["waveSize"],
+        bool(d["sharedBytes"]),
+    )
+    assert cb.arena_regions(d, c, region_names=_REGIONS) == want
+
+
+def test_staging_bytes_come_from_the_kernel_layout():
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    d = cb.EpDispatchPlan.describe(
+        world_size=8, max_tok_per_rank=512, max_recv=4096, scale_bytes=224
+    )
+    # Only the gfx125x dispatch stages.
+    want = 6455296 if d["sharedBytes"] else 0
+    assert d["stagingBytes"] == ep_staging_bytes(8, 4096, 224) == want
+
+
+def test_scale_stride_matches_the_plan():
+    # scale_stride_bytes() stays for callers that size without a plan.
+    from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
+
+    for scale, stride in (
+        (0, 0),
+        (4, 128),
+        (32, 128),
+        (224, 256),
+        (256, 256),
+        (260, 384),
+    ):
+        info = cb.EpDispatchPlan.describe(scale_bytes=scale)
+        assert info["scaleStride"] == scale_stride_bytes(scale) == stride
+
+
+_PUSH_KW = {
+    "fp4_blockwise": dict(combine_fp4=1),
+    "fp4_blockwise_fp32": dict(combine_fp4=1, combine_fp4_f32_scale=1),
+    "fp8_blockwise": dict(combine_fp8=1),
+}
+
+
+@pytest.mark.parametrize("quant", sorted(_PUSH_KW))
+@pytest.mark.parametrize("ws", [2, 4, 8])
+def test_push_compat_sizes_match_the_cpp_layout(quant, ws):
+    # push_wire_nbytes()/push_land_rows() stay for callers that size without a
+    # plan (aiter): describe()'s values, which Sizes.PushWireRowsAndLanding pins
+    # in C++.
+    from types import SimpleNamespace
+
+    from mori.ops.dispatch_combine_v2.hip_backend import (
+        push_land_rows,
+        push_wire_nbytes,
+    )
+
+    cfg = SimpleNamespace(
+        hidden_dim=7168,
+        quant_type=quant,
+        max_num_inp_token_per_rank=128,
+        world_size=ws,
+        num_experts_per_token=8,
+    )
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        # The push combine is gfx125x only, and so are the sizes of it.
+        with pytest.raises(RuntimeError, match="gfx125x only"):
+            push_wire_nbytes(cfg)
+        return
+    assert push_wire_nbytes(cfg) == (7424 if quant == "fp8_blockwise" else 3840)
+    assert push_land_rows(cfg) == 128 * min(ws, 8)
+    info = cb.EpCombinePlan.describe(
+        world_size=ws, max_tok_per_rank=128, hidden_dim=7168, **_PUSH_KW[quant]
+    )
+    assert info["pushWireBytes"] == push_wire_nbytes(cfg)
+    assert info["pushLandRows"] == push_land_rows(cfg)
+
+
+class _SizedArena:
+    handle = 0xDEAD0000
+
+    def __init__(self, sizes):
+        self.sizes = sizes
+
+    def offset(self, name):
+        if name not in self.sizes:
+            raise KeyError(name)  # as SymmArena does for a region it lacks
+        return 0
+
+    def size(self, name):
+        return self.sizes[name]
+
+
+def _small_regions():
+    # Every plan the arena serves: dispatch and combine each size part of it.
+    return dict(
+        cb.arena_regions(
+            cb.EpDispatchPlan.describe(**_SMALL), cb.EpCombinePlan.describe(**_SMALL)
+        )
+    )
+
+
+def test_an_arena_too_small_for_the_plan_is_refused():
+    sizes = _small_regions()
+    cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes)).close()
+    short = dict(sizes, dispOut=sizes["dispOut"] - 1)
+    with pytest.raises(ValueError, match="'dispOut'"):
+        cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(short))
+
+
+def test_an_arena_without_size_is_bound_with_a_warning():
+    class Unsized:
+        handle = _SizedArena.handle
+        offset = _SizedArena.offset
+
+        def __init__(self, sizes):
+            self.sizes = sizes
+
+    with pytest.warns(FutureWarning, match="no size"):
+        cb.EpDispatchPlan(**_SMALL, arena=Unsized(_small_regions())).close()
+
+
+def test_a_region_the_other_kernel_sizes_is_not_checked():
+    # dispatch does not size outTok (combine does), so a dispatch-only caller may
+    # bind it to a region of any size -- aiter binds it to its own comb_inp.
+    d = cb.EpDispatchPlan.describe(**_SMALL)
+    assert "outTok" not in dict(cb.arena_regions(d))
+    sizes = _small_regions()
+    cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(dict(sizes, outTok=0))).close()
+
+
+def test_one_plans_regions_do_not_make_an_arena_it_can_bind():
+    # A dispatch-only arena lacks outTok, which the dispatch args still bind.
+    sizes = dict(cb.arena_regions(cb.EpDispatchPlan.describe(**_SMALL)))
+    with pytest.raises(KeyError):
+        cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes))
+
+
+# --------------------------------------------------------------------------
 # aggReserve: the blocks meet in a module global of the kernel, so the caller
 # allocates and binds nothing for it
 # --------------------------------------------------------------------------
@@ -261,13 +712,6 @@ def test_agg_reserve_is_the_default_and_takes_no_argument():
     assert "resState" not in cb.EpDispatchPlan._arg_names
 
 
-def test_per_block_reservation_follows_the_slot_word():
-    # The slot word outside the cco window: every block reserves its own.
-    p = _plan(tok_off_ext=1)
-    assert not p.info.get("aggReserve")
-    p.close()
-
-
 # --------------------------------------------------------------------------
 # The gfx1250 dispatch staging buffer: the caller sizes it, so the size has to
 # be the one the kernel lays out
@@ -275,19 +719,20 @@ def test_per_block_reservation_follows_the_slot_word():
 
 
 def test_staging_bytes_matches_the_device_layout():
-    # ep_staging_bytes() hand-mirrors EpStagingTotalBytes (ep_cfg.hpp): six
-    # sub-arrays, each rounded up to EpScaleAlign. EpArgs carries the base but no
-    # length, so the kernel cannot bounds-check what it was given -- a mirror that
-    # drifts low is not an error but a silent write past the end of a torch tensor,
-    # into whatever the caching allocator handed out next. The numbers below come
-    # from EpStagingTotalBytes and are the only thing holding the mirror to it; if
-    # the layout moves, re-derive them there rather than pasting whatever this
-    # function starts returning.
+    # EpStagingTotalBytes (ep_cfg.hpp): six sub-arrays, each rounded up to
+    # EpScaleAlign. EpArgs carries the base but no length, so the kernel cannot
+    # bounds-check what it was given -- a size that drifts low is not an error but
+    # a silent write past the end of a torch tensor, into whatever the caching
+    # allocator handed out next. If the layout moves, re-derive these from it
+    # rather than pasting whatever ep_staging_bytes() starts returning.
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
-    assert ep_staging_bytes(8, 4096, 224) == 12746752
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        pytest.skip("only the gfx125x dispatch stages")
+    assert ep_staging_bytes(8, 4096, 224) == 6455296
     assert ep_staging_bytes(8, 4096, 0) == 4358144
-    assert ep_staging_bytes(32, 4096, 224) == 50987008
+    assert ep_staging_bytes(32, 4096, 224) == 19529728
+    assert ep_staging_bytes(2, 600, 224, 300) == 690944
     # max_recv not a multiple of 32 is the only shape among realistic configs
     # where a sub-array size is not already a multiple of 128, so it is the only
     # case that exercises the mirror's rounding at all.
@@ -303,7 +748,7 @@ def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
 
     assert ep_staging_bytes(8, 0, 224, 512) == ep_staging_bytes(8, 8 * 512, 224)
     # A resolved cap wins over the fallback, as EpMaxRecv's ternary does.
-    assert ep_staging_bytes(8, 4096, 224, 1) == ep_staging_bytes(8, 4096, 224)
+    assert ep_staging_bytes(8, 4096, 0, 1) == ep_staging_bytes(8, 4096, 0)
     # Neither spelling given is the case that used to return a short buffer in
     # silence; there is no size to compute, so it cannot be a return value.
     with pytest.raises(ValueError, match="max_tok_per_rank"):
@@ -324,13 +769,13 @@ def launched(monkeypatch):
 
 def _shared_bytes(monkeypatch, n):
     # The staging decision on any arch: the gfx125x dispatch is the one with
-    # dynamic LDS, so faking it runs the fallback where CI runs.
+    # dynamic LDS and a staging size, so faking both runs the fallback where CI runs.
     real = cb._EpDispatchJitPlan.info.fget
-    monkeypatch.setattr(
-        cb.EpDispatchPlan,
-        "info",
-        property(lambda self: {**real(self), "sharedBytes": n}),
-    )
+
+    def info(self):
+        return {**real(self), "sharedBytes": n, "stagingBytes": 1 << 16 if n else 0}
+
+    monkeypatch.setattr(cb.EpDispatchPlan, "info", property(info))
 
 
 @pytest.fixture
@@ -353,8 +798,6 @@ def test_a_dispatch_that_does_not_stage_binds_nothing(launched, no_staging):
 
 
 def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-
     p = _plan()
     assert not cb._FALLBACK_STAGING  # nothing until a launch needs it
     with pytest.warns(FutureWarning, match="staging_base is not bound") as warned:
@@ -362,10 +805,7 @@ def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
     assert warned[0].filename == __file__  # the caller's line, not mori's
     buf = p._fallback_staging
     assert p._buf.stagingBase == buf.data_ptr()
-    info = p.info
-    assert buf.numel() == ep_staging_bytes(
-        info["worldSize"], info["maxRecv"], info["scaleBytes"], info["maxTokPerRank"]
-    )
+    assert buf.numel() == p.info["stagingBytes"]
     # Settled to an address: later launches reuse the cached struct untouched.
     assert p._defaults["stagingBase"] == buf.data_ptr()
     assert "stagingBase" not in p._dyn_defs
@@ -406,14 +846,52 @@ def test_a_bound_staging_base_is_left_alone(launched, stages, as_tensor):
     import warnings
 
     p = _plan()
-    staging = torch.zeros(4096, dtype=torch.uint8, device="cuda")
-    # An address, as mori's op layer and aiter bind it, or the tensor itself.
+    staging = torch.zeros(p.info["stagingBytes"], dtype=torch.uint8, device="cuda")
+    # An address, as aiter binds it, or the tensor itself, as mori's op layer does.
     p.bind(staging_base=staging if as_tensor else staging.data_ptr())
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
         p.launch()
     assert p._buf.stagingBase == staging.data_ptr()
     assert not cb._FALLBACK_STAGING
+    p.close()
+
+
+def test_a_staging_tensor_is_checked_against_the_plan(launched, stages):
+    p = _plan()
+    need = p.info["stagingBytes"]
+    with pytest.raises(ValueError, match="stagingBytes"):
+        p.bind(staging_base=torch.zeros(need - 128, dtype=torch.uint8, device="cuda"))
+    buf = torch.zeros(need + 1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="128 B aligned"):
+        p.bind(staging_base=buf[1:])
+    pool = torch.zeros(need * 2, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="stagingBytes"):
+        p.bind(staging_base=pool[: need - 128])  # short, however large its pool
+    p.bind(staging_base=buf)
+    # Held, and bound by address so the launch struct caches it.
+    assert p._staging is buf
+    assert p._defaults["stagingBase"] == buf.data_ptr()
+    p.bind(staging_base=1 << 20)  # an int is taken on trust
+    assert p._defaults["stagingBase"] == 1 << 20
+    p.close()
+    assert p._staging is None
+
+
+def test_a_staging_tensor_off_the_plans_device_is_refused(launched, stages):
+    p = _plan()
+    with pytest.raises(ValueError, match="launches on"):
+        p.bind(staging_base=torch.zeros(p.info["stagingBytes"], dtype=torch.uint8))
+    assert p._staging is None
+    p.close()
+
+
+def test_a_failed_bind_holds_no_staging(launched, stages):
+    p = _plan()
+    buf = torch.zeros(p.info["stagingBytes"], dtype=torch.uint8, device="cuda")
+    with pytest.raises(TypeError, match="no_such_arg"):
+        p.bind(staging_base=buf, no_such_arg=1)
+    assert p._staging is None
     p.close()
 
 
@@ -527,3 +1005,43 @@ def test_a_group_compares_defaults_by_the_address_launch_writes(launched, stages
     cb.plan_api.make_launch_group([a, b])
     for p in (a, b, other):
         p.close()
+
+
+_SCATTER_KW = dict(
+    world_size=8,
+    hidden_dim=7168,
+    max_tok_per_rank=128,
+    max_recv=1024,
+    num_expert_per_token=8,
+)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+def test_scatter_combine_lands_one_quantized_row_per_source_token(group, fp4):
+    from mori.jit.core import _target_arch
+
+    arch = _target_arch()
+    kw = dict(_SCATTER_KW, combine_scatter_q_group=group, combine_scatter_fp4=fp4)
+    if arch.startswith("gfx125") or (fp4 and not arch.startswith("gfx950")):
+        with pytest.raises(RuntimeError, match="combineScatter"):
+            cb.EpCombinePlan.describe(**kw)
+        return
+    info = cb.EpCombinePlan.describe(**kw)
+    payload = 7168 // 2 if fp4 else 7168
+    scales = 7168 // 32 if group == 32 else 7168 // 128 * 4
+    assert info["scatterRowBytes"] == _up128(payload + scales + 4 * 8)
+    # every (source rank, source token) pair has its own landing row
+    assert info["region.outTok"] == info["scatterLandOff"] + 8 * 128 * (
+        info["scatterRowBytes"]
+    )
+    assert (info["combineScatterQGroup"], info["combineScatterFp4"]) == (group, fp4)
+
+
+def test_scatter_combine_refuses_a_push_beside_it():
+    with pytest.raises(RuntimeError, match="combineScatter"):
+        cb.EpCombinePlan.describe(
+            **_SCATTER_KW, combine_scatter_q_group=128, combine_bf16_push=True
+        )
+    with pytest.raises(RuntimeError, match="needs combineScatterQGroup"):
+        cb.EpCombinePlan.describe(**_SCATTER_KW, combine_scatter_fp4=True)
