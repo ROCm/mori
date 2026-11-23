@@ -84,6 +84,17 @@ class MemoryApi {
  public:
   virtual ~MemoryApi() = default;
   virtual bool SupportsFabric() const { return false; }
+  // The kind of exported memory a peer L1 server may read from this server's
+  // pools, or nullptr when a peer cannot read it at all. "hip_fabric": a
+  // FABRIC descriptor, which another tray can map. "hip_ipc": a HIP IPC
+  // handle, which only another process on the same host can open.
+  virtual const char* PeerKind() const { return SupportsFabric() ? "hip_fabric" : nullptr; }
+  // How many bytes the view a peer's `handle` names covers; false with `error`
+  // when this memory cannot import such a handle at all. Asked once per handle
+  // before anything is mapped, and every region read through the handle is
+  // then checked against it. A handle that carries no length (HIP IPC) reports
+  // UINT64_MAX: only the owner server knows its pool's bounds.
+  virtual bool PeerViewBytes(const std::string& handle, uint64_t* bytes, std::string* error) const;
   // Allocate `bytes` zero-filled on `device` and export it for another process.
   virtual bool Allocate(int device, uint64_t bytes, void** base, ExportedMemory* exported,
                         std::string* error) = 0;

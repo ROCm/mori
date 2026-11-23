@@ -234,6 +234,11 @@ class FabricMemoryApi final : public MemoryApi {
   }
 
   bool SupportsFabric() const override { return true; }
+  const char* PeerKind() const override { return "hip_fabric"; }
+  bool PeerViewBytes(const std::string& handle, uint64_t* bytes,
+                     std::string* error) const override {
+    return GetFabricViewBytes(handle, bytes, error);
+  }
 
   bool Allocate(int, uint64_t, void**, ExportedMemory*, std::string* error) override {
     *error = "native FABRIC L1 requires externally allocated KV HBM";

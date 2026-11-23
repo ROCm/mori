@@ -491,6 +491,22 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
   bool Synchronize(int device, std::string* error) override {
     return inner_->Synchronize(device, error);
   }
+  const char* PeerKind() const override { return inner_->PeerKind(); }
+  bool PeerViewBytes(const std::string& handle, uint64_t* bytes,
+                     std::string* error) const override {
+    return inner_->PeerViewBytes(handle, bytes, error);
+  }
+  // A read from a peer server's pool stays on the plain copy path. Its source
+  // was mapped on the destination device (so the fragment names that device as
+  // its source), which is not what a plan's source device means to the copy
+  // engine; a copy between two pools of this server never has that shape.
+  l1::CopyOutcome CopyBatchTracked(int dst_device,
+                                   const std::vector<Fragment>& fragments) override {
+    for (const Fragment& f : fragments) {
+      if (f.src_device == dst_device) return inner_->CopyBatchTracked(dst_device, fragments);
+    }
+    return l1::MemoryApi::CopyBatchTracked(dst_device, fragments);
+  }
 
   bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
                  std::string* error) override {
@@ -639,6 +655,23 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // L1 block pools ride the same socket. Registering costs nothing: no GPU
     // context or memory exists until an engine attaches a pool.
     l1_manager_ = std::make_shared<l1::PoolManager>(MakeL1MemoryApi());
+    // UMBP_L1_PEERS: comma-separated addresses of other L1 servers whose pools
+    // this one may read from when a fetch cannot be completed locally (and
+    // which may read from this one's, when they list it). On one host the
+    // address is the other server's Unix socket and the bytes move through the
+    // engine's HIP IPC handle.
+    if (const char* raw = std::getenv("UMBP_L1_PEERS"); raw != nullptr && *raw != '\0') {
+      std::vector<std::shared_ptr<l1::PeerApi>> peers;
+      std::string list(raw);
+      size_t start = 0;
+      while (start <= list.size()) {
+        const size_t end = std::min(list.find(',', start), list.size());
+        if (end > start) peers.push_back(l1::MakeL1Peer(list.substr(start, end - start)));
+        start = end + 1;
+      }
+      l1_manager_->ConfigurePeers(std::move(peers));
+      MORI_UMBP_INFO("[StandaloneServer] L1 peers: {}", list);
+    }
     l1_service_ = l1::MakeL1PoolService(l1_manager_);
     builder.RegisterService(l1_service_.get());
     mode_t old_umask = umask(0077);

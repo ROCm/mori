@@ -24,6 +24,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -33,6 +34,18 @@
 namespace mori::umbp::l1 {
 
 namespace {
+
+// UMBP_L1_DEVICE_OFFSET: added to the device ordinal an engine attaches with.
+// An engine numbers the GPUs it was given from 0; a server that sees more GPUs
+// than its engine (two servers on one host, each able to read the other's
+// pools) needs the engine's ordinals moved to where those GPUs really are.
+int AttachDeviceOffset() {
+  static const int offset = [] {
+    const char* raw = std::getenv("UMBP_L1_DEVICE_OFFSET");
+    return raw != nullptr ? std::atoi(raw) : 0;
+  }();
+  return offset;
+}
 
 namespace pb = ::umbp::l1;
 
@@ -58,8 +71,9 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
                       pb::AttachResponse* response) override {
     ExternalMemory external{request->external_handle(), request->external_offset(),
                             request->external_kind()};
-    AttachResult result = manager_->Attach(request->pool_id(), request->group(), request->device(),
-                                           request->bytes(), external);
+    AttachResult result =
+        manager_->Attach(request->pool_id(), request->group(),
+                         request->device() + AttachDeviceOffset(), request->bytes(), external);
     SetStatus(result.status, response);
     response->set_handle_kind(result.memory.kind);
     response->set_handle(result.memory.handle);
@@ -312,7 +326,8 @@ class L1Peer final : public PeerApi {
       const uint32_t index = region.handle_index();
       if (index > static_cast<uint32_t>(response.handles_size()) ||
           (index != 0 && !region.handle().empty()) || (index == 0 && region.handle().empty())) {
-        return {Status::Error("native L1 read has an invalid handle reference"), result.incarnation};
+        return {Status::Error("native L1 read has an invalid handle reference"),
+                result.incarnation};
       }
       const uint32_t handle = index ? indices[index - 1] : intern(region.handle());
       result.regions.push_back(PeerReadRegion{handle, region.offset(), region.bytes()});

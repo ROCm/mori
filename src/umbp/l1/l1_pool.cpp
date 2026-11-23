@@ -123,6 +123,20 @@ class HipMemoryApi final : public MemoryApi {
     (void)hipFree(base);
   }
 
+  // An engine's HIP IPC handle can be opened by any process on this host, so
+  // an L1 server here can read a pool another server on the same host adopted.
+  const char* PeerKind() const override { return "hip_ipc"; }
+
+  bool PeerViewBytes(const std::string& handle, uint64_t* bytes,
+                     std::string* error) const override {
+    if (handle.size() != sizeof(hipIpcMemHandle_t::reserved)) {
+      *error = "peer region is not a hip_ipc handle";
+      return false;
+    }
+    *bytes = UINT64_MAX;  // the handle names an allocation, not its length
+    return true;
+  }
+
   bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
               std::string* error) override {
     hipIpcMemHandle_t ipc;
@@ -304,6 +318,13 @@ bool MemoryApi::CopyBatch(int dst_device, const std::vector<Fragment>& fragments
 std::shared_ptr<MemoryApi> MakeHipMemoryApi() { return std::make_shared<HipMemoryApi>(); }
 std::shared_ptr<MemoryApi> MakeHostMemoryApi() { return std::make_shared<HostMemoryApi>(); }
 
+bool MemoryApi::PeerViewBytes(const std::string& handle, uint64_t* bytes,
+                              std::string* error) const {
+  if (SupportsFabric()) return GetFabricViewBytes(handle, bytes, error);
+  *error = "this memory cannot be read by a peer";
+  return false;
+}
+
 CopyOutcome MemoryApi::CopyBatchTracked(int device, const std::vector<Fragment>& fragments) {
   std::string error;
   if (CopyBatch(device, fragments, &error)) return {true, true, {}};
@@ -328,6 +349,9 @@ uint32_t EnvCount(const char* name, uint32_t fallback) {
 // One line per this many evictions of a pool: how much it evicts and how much
 // of that another pool still holds.
 constexpr uint64_t kEvictionLogEvery = 16384;
+
+// What an adopted pool's memory is when the engine named no kind.
+const std::string kHipIpcKind = "hip_ipc";
 
 std::string NewIncarnation() {
   std::random_device random;
@@ -1222,8 +1246,8 @@ std::vector<PoolStats> PoolManager::Stats() const {
 void PoolManager::ConfigurePeers(std::vector<std::shared_ptr<PeerApi>> peers) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!pools_.empty()) throw std::logic_error("configure peers before attaching pools");
-  if (!peers.empty() && !api_->SupportsFabric()) {
-    throw std::invalid_argument("native L1 peers require direct FABRIC memory");
+  if (!peers.empty() && api_->PeerKind() == nullptr) {
+    throw std::invalid_argument("native L1 peers require memory a peer can read");
   }
   if (peers.size() > 8 ||
       std::any_of(peers.begin(), peers.end(), [](const auto& p) { return p == nullptr; })) {
@@ -1240,8 +1264,13 @@ const PoolManager::Holder* PoolManager::PeerSourceLocked(const std::string& grou
   if (found == g->second.holders.end()) return nullptr;
   for (const Holder& h : found->second) {
     const Pool& p = *h.pool;
-    if (p.bound && !p.quarantined && p.external_kind == "hip_fabric" &&
-        p.slots[h.slot].writers == 0 && Readable(p, p.slots[h.slot]))
+    // Only memory the engine exported can be handed to a peer, and only as the
+    // kind this server's memory reads: an adopted pool without a kind is a HIP
+    // IPC handle.
+    const char* kind = api_->PeerKind();
+    const std::string& pool_kind = p.external_kind.empty() ? kHipIpcKind : p.external_kind;
+    if (p.bound && !p.quarantined && kind != nullptr && !p.external_handle.empty() &&
+        pool_kind == kind && p.slots[h.slot].writers == 0 && Readable(p, p.slots[h.slot]))
       return &h;
   }
   return nullptr;
@@ -1437,8 +1466,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   for (; reserved < best.available; ++reserved) {
     const uint32_t id = options.dst_slots[leading + reserved];
     if (id >= pool->slots.size() || pool->slots[id].state != SlotState::kHeld ||
-        pool->slots[id].has_key ||
-        pool->slots[id].writers != 0 || pool->slots[id].pins != 0 ||
+        pool->slots[id].has_key || pool->slots[id].writers != 0 || pool->slots[id].pins != 0 ||
         !Fillable(*pool, pool->slots[id]))
       break;
     ++pool->slots[id].writers;
@@ -1479,13 +1507,13 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
         }
         View& view = views[region.handle_index];
         const std::string& handle = read.handles[region.handle_index];
-        // Decode once per descriptor for range checks, not once per region.
-        if (view.bytes == 0 && !GetFabricViewBytes(handle, &view.bytes, &error)) {
+        // Ask once per descriptor for range checks, not once per region.
+        if (view.bytes == 0 && !api_->PeerViewBytes(handle, &view.bytes, &error)) {
           valid = false;
           break;
         }
         if (region.offset > view.bytes || region.bytes > view.bytes - region.offset) {
-          error = "native L1 pool range exceeds the exported FABRIC view";
+          error = "native L1 pool range exceeds the peer's exported view";
           valid = false;
           break;
         }
@@ -1559,8 +1587,8 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     pool->fetched_in_slots += read.available;
     pool->fetched_in_bytes += bytes;
     pool->copy_micros += micros;
-    MORI_UMBP_INFO("[L1Peer] fabric completed pool={} owner={} operation={} slots={} bytes={}",
-                   pool_id, best.incarnation, operation, read.available, bytes);
+    MORI_UMBP_INFO("[L1Peer] {} read completed pool={} owner={} operation={} slots={} bytes={}",
+                   api_->PeerKind(), pool_id, best.incarnation, operation, read.available, bytes);
   }
   --pool->busy;
   idle_.notify_all();
