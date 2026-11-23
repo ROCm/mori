@@ -482,13 +482,13 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 # of its own so an engine process can load the client without the rest of the
 # distributed stack (mori_io, the master/peer protos).
 add_library(umbp_l1 STATIC ${UMBP_L1_PROTO_SRCS} ${UMBP_L1_GRPC_SRCS} l1/l1_pool.cpp
-                           l1/l1_service.cpp)
+                           l1/l1_service.cpp l1/l1_fabric.cpp)
 set_target_properties(umbp_l1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   umbp_l1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
                  ${_PROTOBUF_INCLUDE_DIR})
 target_include_directories(umbp_l1 BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
-target_link_libraries(umbp_l1 PUBLIC mori_logging hip::host ${_PROTOBUF_LIBS}
+target_link_libraries(umbp_l1 PUBLIC mori_logging hip::host mori_fabric_helpers ${_PROTOBUF_LIBS}
                                      ${_GRPCPP_LIB})
 target_compile_features(umbp_l1 PUBLIC cxx_std_17)
 target_link_libraries(umbp_common PUBLIC umbp_l1)
@@ -520,6 +520,13 @@ if(BUILD_UMBP_L1_PYTHON)
   target_include_directories(mori_umbp_l1 PRIVATE ${Python_INCLUDE_DIRS}
                                                   ${_UMBP_L1_PYBIND11_INCLUDE})
   target_link_libraries(mori_umbp_l1 PRIVATE umbp_l1)
+  # Hide definitions from the static L1/fabric libraries as well as the pybind
+  # object. An application's older libmori_io may export identically named
+  # helpers with incompatible C++ layouts (for example ReadVpodKey).
+  # PyInit_mori_umbp_l1 lives in the module object and remains exported.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(mori_umbp_l1 PRIVATE LINKER:--exclude-libs,ALL)
+  endif()
 endif()
 
 # ---------- Optional hipfile GDS transfer engine -----------------------------

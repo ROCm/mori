@@ -37,11 +37,16 @@ namespace mori::umbp::l1 {
 // so a host server registers it without seeing the generated types.
 std::unique_ptr<grpc::Service> MakeL1PoolService(std::shared_ptr<PoolManager> manager);
 
+// Static peer connection. No directory/index service or payload staging is
+// involved; the peer returns pinned HBM descriptors for the local copy path.
+std::shared_ptr<PeerApi> MakeL1Peer(const std::string& address);
+
 // A gRPC server hosting only the L1 pool service. umbp_standalone_server hosts
 // the service itself; this is for tests and tools.
 class L1Server {
  public:
-  L1Server(const std::string& address, std::shared_ptr<MemoryApi> api);
+  L1Server(const std::string& address, std::shared_ptr<MemoryApi> api,
+           const std::vector<std::string>& peers = {});
   ~L1Server();
 
   L1Server(const L1Server&) = delete;

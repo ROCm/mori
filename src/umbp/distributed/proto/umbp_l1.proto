@@ -37,6 +37,16 @@ service UMBPL1Pool {
   // Release the pool and its memory.
   rpc Detach(PoolRequest) returns (StatusResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Native L1 peer control. These RPCs carry metadata only: payload bytes
+  // move directly between the exported HBM allocation and destination HBM.
+  rpc PeerProbe(PeerProbeRequest) returns (PeerProbeResponse);
+  // Atomically pin the longest readable prefix before exporting its regions.
+  // A retry with the same operation id and request is idempotent.
+  rpc AcquireRead(AcquireReadRequest) returns (AcquireReadResponse);
+  // Explicit release after every submitted device read has drained. Reads
+  // are never freed by a lease timeout; an unreachable reader retains pins.
+  rpc ReleaseRead(ReleaseReadRequest) returns (StatusResponse);
 }
 
 message StatusResponse {
@@ -46,6 +56,9 @@ message StatusResponse {
 
 message PoolRequest {
   string pool_id = 1;
+  // Detach: reject a replacement service incarnation. An empty successor
+  // pool table is not proof that reads from the previous owner have drained.
+  string expected_incarnation = 2;
 }
 
 message AttachRequest {
@@ -60,6 +73,9 @@ message AttachRequest {
   // neither zeroed nor freed by the server; detaching only unmaps it.
   bytes external_handle = 5;
   uint64 external_offset = 6;
+  // Empty preserves the original HIP IPC import. "hip_fabric" adopts a
+  // fabric-exportable allocation for direct cross-tray reads.
+  string external_kind = 7;
 }
 
 message AttachResponse {
@@ -71,6 +87,8 @@ message AttachResponse {
   uint64 bytes = 5;
   // False when an existing pool with the same shape was returned.
   bool created = 6;
+  // Required for adopting hip_fabric memory. Echoed by a safe Detach.
+  string owner_incarnation = 7;
 }
 
 // Slot i of a region occupies [offset + i * unit_bytes, offset + (i+1) * unit_bytes).
@@ -164,6 +182,57 @@ message FetchResponse {
   uint64 copy_micros = 7;
   // probe_only: the leading keys some pool of the group could supply.
   uint32 available = 8;
+  // A copy may still be writing the caller's dst_slots. The owner must keep
+  // every supplied destination held and must not publish, reuse, or free it.
+  // RPC failure on a non-probe Fetch has the same semantics client-side.
+  bool completion_unknown = 9;
+}
+
+message PeerProbeRequest {
+  string group = 1;
+  repeated bytes keys = 2;
+  // Shape of one slot, in region order; offsets/slot counts may differ.
+  repeated uint64 unit_bytes = 3 [packed = true];
+}
+
+message PeerProbeResponse {
+  bool ok = 1;
+  string error = 2;
+  // Changes on every owner process start; AcquireRead must echo it.
+  string incarnation = 3;
+  uint32 available = 4;
+}
+
+message AcquireReadRequest {
+  string operation_id = 1;
+  string expected_incarnation = 2;
+  string group = 3;
+  repeated bytes keys = 4;
+  repeated uint64 unit_bytes = 5 [packed = true];
+}
+
+message PeerReadRegion {
+  // Opaque hip_fabric descriptor, not a pointer or a local device ordinal.
+  bytes handle = 1;
+  uint64 offset = 2;
+  uint64 bytes = 3;
+}
+
+message AcquireReadResponse {
+  bool ok = 1;
+  string error = 2;
+  string incarnation = 3;
+  uint32 available = 4;
+  // Key-major, then region-major; exactly available * unit_bytes.size().
+  repeated PeerReadRegion regions = 5;
+}
+
+message ReleaseReadRequest {
+  string operation_id = 1;
+  string expected_incarnation = 2;
+  // True only after completion is known, or when no device copy was issued.
+  // False must never release pins. Repeated successful releases are safe.
+  bool drained = 3;
 }
 
 message StatsRequest {}

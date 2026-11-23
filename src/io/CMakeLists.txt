@@ -10,10 +10,43 @@ set(MORI_IO_SOURCES
     sim/backend_impl.cpp
     xgmi/backend_impl.cpp
     xgmi/hip_resource_pool.cpp
-    fabric/copy_plan.cpp
     fabric/backend_impl.cpp
-    fabric/vpod_topology.cpp
     fabric/torch_allocator.cpp)
+
+# Native L1 reuses the FABRIC copy planner and topology checks without loading
+# the IO engine, RDMA or the distributed pool/tier stack.
+add_library(mori_fabric_helpers STATIC fabric/copy_plan.cpp fabric/vpod_topology.cpp)
+set_source_files_properties(fabric/copy_plan.cpp fabric/vpod_topology.cpp PROPERTIES LANGUAGE CXX)
+set_target_properties(mori_fabric_helpers PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mori_fabric_helpers PUBLIC ${CMAKE_SOURCE_DIR}/include
+                                                     ${CMAKE_SOURCE_DIR})
+target_link_libraries(mori_fabric_helpers PUBLIC hip::host mori_logging)
+target_compile_features(mori_fabric_helpers PUBLIC cxx_std_17)
+
+# Explicit AOT target for the lightweight native L1 server, which does not load
+# the Python mori-io JIT. Only building this target compiles a device module.
+find_program(_MORI_FABRIC_HIPCC NAMES hipcc HINTS "${ROCM_PATH}/bin")
+if(NOT _MORI_FABRIC_HIPCC)
+  # Keep ordinary host/library builds usable without hipcc. An explicitly
+  # requested kernel build will report the missing compiler.
+  set(_MORI_FABRIC_HIPCC hipcc)
+endif()
+set(_MORI_FABRIC_ARCH_FLAGS "")
+foreach(_arch IN LISTS GPU_TARGETS)
+  list(APPEND _MORI_FABRIC_ARCH_FLAGS "--offload-arch=${_arch}")
+endforeach()
+set(_MORI_FABRIC_HSACO "${CMAKE_BINARY_DIR}/lib/fabric_copy.hsaco")
+add_custom_command(
+  OUTPUT "${_MORI_FABRIC_HSACO}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/lib"
+  COMMAND
+    ${_MORI_FABRIC_HIPCC} --genco ${_MORI_FABRIC_ARCH_FLAGS} -std=c++17 -O2
+    -D__HIP_PLATFORM_AMD__ -I${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/fabric_copy.hip -o ${_MORI_FABRIC_HSACO}
+  DEPENDS kernels/fabric_copy.hip kernels/fabric_copy_abi.hpp
+  COMMENT "Compiling direct FABRIC copy kernel"
+  VERBATIM)
+add_custom_target(mori_fabric_copy_kernel DEPENDS "${_MORI_FABRIC_HSACO}")
 
 set_source_files_properties(${MORI_IO_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(mori_io SHARED ${MORI_IO_SOURCES})
@@ -24,7 +57,7 @@ target_include_directories(
   mori_io PUBLIC ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
 # libibverbs is loaded at runtime via dlopen; embed the shim (hidden visibility)
 # so mori_io's own ibv_* references resolve without linking libibverbs.
-target_link_libraries(mori_io mori_application hip::host mori_logging
+target_link_libraries(mori_io mori_application hip::host mori_logging mori_fabric_helpers
                       mori_ibv_shim)
 # With BUILD_RAS=OFF, include/mori/ras/ras.hpp compiles every RAS call in engine.cpp away.
 if(BUILD_RAS)

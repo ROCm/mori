@@ -472,6 +472,16 @@ target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
 target_compile_features(test_l1_pool PRIVATE cxx_std_17)
 add_test(NAME test_l1_pool COMMAND test_l1_pool)
 
+add_executable(test_l1_peer test_l1_peer.cpp)
+target_link_libraries(test_l1_peer PRIVATE umbp_l1 GTest::gtest_main)
+target_compile_features(test_l1_peer PRIVATE cxx_std_17)
+add_test(NAME test_l1_peer COMMAND test_l1_peer)
+
+add_executable(test_l1_peer_rpc test_l1_peer_rpc.cpp)
+target_link_libraries(test_l1_peer_rpc PRIVATE umbp_l1 GTest::gtest_main)
+target_compile_features(test_l1_peer_rpc PRIVATE cxx_std_17)
+add_test(NAME test_l1_peer_rpc COMMAND test_l1_peer_rpc)
+
 add_executable(test_page_backend test_page_backend.cpp)
 target_link_libraries(test_page_backend PRIVATE umbp_common
                                                 GTest::gtest_main)

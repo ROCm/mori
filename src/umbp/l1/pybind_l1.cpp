@@ -32,12 +32,18 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/l1/l1_fabric.h"
 #include "umbp/l1/l1_service.h"
 
 namespace py = pybind11;
 using namespace mori::umbp::l1;
 
 namespace {
+
+class FetchInDoubtError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 void Check(const Status& status) {
   if (!status.ok) throw std::runtime_error(status.error);
@@ -56,14 +62,17 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
   m.attr("OP_HOLD") = static_cast<uint32_t>(OpKind::kHold);
   m.attr("OP_RELEASE") = static_cast<uint32_t>(OpKind::kRelease);
   m.attr("OP_PUBLISH") = static_cast<uint32_t>(OpKind::kPublish);
+  m.attr("NATIVE_L1_FABRIC_VERSION") = 1;
+  py::register_exception<FetchInDoubtError>(m, "FetchInDoubtError", PyExc_RuntimeError);
 
   py::class_<L1Client>(m, "L1Client")
       .def(py::init<const std::string&>(), py::arg("address"))
       .def(
           "attach",
           [](L1Client& client, const std::string& pool_id, const std::string& group, int device,
-             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset) {
-            ExternalMemory external{std::string(external_handle), external_offset};
+             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset,
+             const std::string& external_kind) {
+            ExternalMemory external{std::string(external_handle), external_offset, external_kind};
             AttachResult result;
             {
               py::gil_scoped_release release;
@@ -75,10 +84,12 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           },
           py::arg("pool_id"), py::arg("group"), py::arg("device"), py::arg("bytes"),
           py::arg("external_handle") = py::bytes(), py::arg("external_offset") = 0,
+          py::arg("external_kind") = "",
           "Create or re-attach a pool. Returns (handle_kind, handle, bytes, created). With "
           "`external_handle` (a hip_ipc handle of the caller's allocation; on the host test "
           "server, its 8-byte address) the pool adopts that memory at `external_offset` "
-          "instead of allocating: the server neither zeroes nor frees it.")
+          "instead of allocating: the server neither zeroes nor frees it. FABRIC callers "
+          "pass external_kind='hip_fabric' and an export_fabric_memory descriptor.")
       .def(
           "bind_layout",
           [](L1Client& client, const std::string& pool_id, uint32_t num_slots,
@@ -179,6 +190,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
               py::gil_scoped_release release;
               result = client.Fetch(pool_id, keys, options);
             }
+            if (result.completion_unknown) throw FetchInDoubtError(result.status.error);
             Check(result.status);
             return py::make_tuple(result.slots, BytesList(result.evicted_keys), result.copied_slots,
                                   result.copied_bytes, result.copy_micros, result.available);
@@ -247,4 +259,33 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
            }),
            py::arg("address"))
       .def("ok", &L1Server::ok);
+
+  m.def(
+      "export_fabric_memory",
+      [](uintptr_t ptr, uint64_t bytes, int device) {
+        ExportedMemory exported;
+        std::string error;
+        bool ok;
+        {
+          py::gil_scoped_release release;
+          ok = ExportFabricMemory(device, reinterpret_cast<void*>(ptr), bytes, &exported, &error);
+        }
+        if (!ok) throw std::runtime_error(error);
+        return py::bytes(exported.handle);
+      },
+      py::arg("ptr"), py::arg("bytes"), py::arg("device"),
+      "Export native HBM allocated with mori.io.make_fabric_mem_pool; caller retains ownership.");
+
+  m.def(
+      "start_fabric_server",
+      [](const std::string& address, const std::vector<std::string>& peers,
+         const std::string& kernel_path) {
+        py::gil_scoped_release release;
+        auto server = std::make_unique<L1Server>(address, MakeFabricMemoryApi(kernel_path), peers);
+        if (!server->ok()) throw std::runtime_error("could not start native L1 FABRIC server");
+        return server;
+      },
+      py::arg("address"), py::arg("peers") = std::vector<std::string>{},
+      py::arg("kernel_path") = "",
+      "Start the L1-only FABRIC service; retain the returned server for its lifetime.");
 }

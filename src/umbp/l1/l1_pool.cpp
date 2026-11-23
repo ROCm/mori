@@ -28,10 +28,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/l1/l1_fabric.h"
 
 namespace mori::umbp::l1 {
 
@@ -301,6 +304,17 @@ bool MemoryApi::CopyBatch(int dst_device, const std::vector<Fragment>& fragments
 std::shared_ptr<MemoryApi> MakeHipMemoryApi() { return std::make_shared<HipMemoryApi>(); }
 std::shared_ptr<MemoryApi> MakeHostMemoryApi() { return std::make_shared<HostMemoryApi>(); }
 
+CopyOutcome MemoryApi::CopyBatchTracked(int device, const std::vector<Fragment>& fragments) {
+  std::string error;
+  if (CopyBatch(device, fragments, &error)) return {true, true, {}};
+  // CopyBatch can fail after earlier submissions. A successful drain, not the
+  // error itself, is what authorizes the caller to release pins and reuse slots.
+  std::string drain_error;
+  const bool drained = Synchronize(device, &drain_error);
+  if (!drained) error += "; drain failed: " + drain_error;
+  return {false, drained, error};
+}
+
 namespace {
 
 uint32_t EnvCount(const char* name, uint32_t fallback) {
@@ -315,9 +329,28 @@ uint32_t EnvCount(const char* name, uint32_t fallback) {
 // of that another pool still holds.
 constexpr uint64_t kEvictionLogEvery = 16384;
 
+std::string NewIncarnation() {
+  std::random_device random;
+  std::string id;
+  for (int i = 0; i < 4; ++i) id += std::to_string(random()) + "-";
+  return id;
+}
+constexpr size_t kPeerKeys = 128;
+constexpr size_t kPeerRegions = 64;
+// Receipts/tombstones are not expired. Bound their memory instead of allowing a
+// late Acquire to resurrect a released operation. Restart only after draining.
+constexpr size_t kPeerReceipts = 65536;
+bool ValidPeerShape(const std::vector<std::string>& keys, const std::vector<uint64_t>& units) {
+  return keys.size() <= kPeerKeys && !units.empty() && units.size() <= kPeerRegions &&
+         std::all_of(units.begin(), units.end(), [](uint64_t n) { return n != 0; }) &&
+         std::all_of(keys.begin(), keys.end(),
+                     [](const std::string& k) { return !k.empty() && k.size() <= 1024; });
+}
+
 }  // namespace
 
-PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api)) {
+PoolManager::PoolManager(std::shared_ptr<MemoryApi> api)
+    : api_(std::move(api)), incarnation_(NewIncarnation()) {
   SetEvictionPolicy(EnvCount("UMBP_L1_KEEP_COPIES", 0));
 }
 
@@ -384,8 +417,22 @@ void PoolManager::HolderUsedLocked(Pool* pool, uint32_t slot) {
 
 PoolManager::~PoolManager() {
   std::lock_guard<std::mutex> lock(mutex_);
+  bool retained = false;
   for (auto& entry : pools_) {
-    api_->Free(entry.second->device, entry.second->base, entry.second->bytes);
+    Pool& pool = *entry.second;
+    if (pool.busy != 0 || pool.quarantined) {
+      retained = true;
+      continue;  // No completion proof: do not unmap memory still used by a peer.
+    }
+    if (pool.external)
+      api_->Unimport(pool.device, pool.mapped);
+    else
+      api_->Free(pool.device, pool.base, pool.bytes);
+  }
+  if (retained) {
+    // Deliberately retain the mappings on graceful shutdown. Forced process or
+    // GPU teardown requires coordinated peer shutdown; no automatic recovery.
+    (void)new std::shared_ptr<MemoryApi>(api_);
   }
   pools_.clear();
 }
@@ -431,7 +478,7 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
 bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
                                  bool settled_only) {
   for (auto it = pool->vacant.begin(); it != pool->vacant.end(); ++it) {
-    if (pool->slots[*it].pins != 0) continue;
+    if (pool->slots[*it].pins != 0 || pool->slots[*it].writers != 0) continue;
     if (settled_only && !Fillable(*pool, pool->slots[*it])) continue;
     *slot = *it;
     pool->vacant.erase(it);
@@ -439,7 +486,7 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
   }
   if (evicted == nullptr) return false;
   const auto takeable = [&](const Slot& s) {
-    return s.pins == 0 && (!settled_only || Fillable(*pool, s));
+    return s.pins == 0 && s.writers == 0 && (!settled_only || Fillable(*pool, s));
   };
   const auto group = groups_.find(pool->group);
   // How many pools of the group hold `s`'s key, this one included.
@@ -514,14 +561,39 @@ bool PoolManager::HasPinnedFreeLocked(const Pool* pool) const {
   return false;
 }
 
-void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) {
-  const std::string pool_id = pool->id;
-  idle_.wait(lock, [&] {
+Status PoolManager::WaitIdleLocked(std::unique_lock<std::mutex>& lock, const std::string& pool_id,
+                                   const char* operation) {
+  // A peer may disappear while holding a read grant. Never strand a control
+  // RPC indefinitely and never interpret a timeout as permission to unmap.
+  Pool* original = FindLocked(pool_id);
+  const uint64_t generation = original != nullptr ? original->generation : 0;
+  const bool ready = idle_.wait_for(lock, kPinnedWait, [&] {
     Pool* p = FindLocked(pool_id);
-    return p == nullptr || p->busy == 0;
+    return p == nullptr || p->generation != generation || p->quarantined || p->busy == 0;
   });
+  Pool* pool = FindLocked(pool_id);
+  if (pool != nullptr && pool->generation != generation) {
+    return Status::Error(std::string(operation) + ": pool " + pool_id +
+                         " was replaced while waiting; the replacement was not modified");
+  }
+  if (pool != nullptr && pool->quarantined) {
+    return Status::Error(std::string(operation) + ": pool " + pool_id +
+                         " is quarantined; retain the allocation until coordinated peer drain");
+  }
+  if (!ready) {
+    return Status::Error(std::string(operation) + ": pool " + pool_id +
+                         " still has in-flight reads or writes; retain its allocation and retry "
+                         "only after the peer completes and releases its read");
+  }
+  return {};
+}
+
+Status PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) {
+  const std::string pool_id = pool->id;
+  Status idle = WaitIdleLocked(lock, pool_id, "detach");
+  if (!idle.ok) return idle;
   pool = FindLocked(pool_id);
-  if (pool == nullptr) return;
+  if (pool == nullptr) return {};
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
   if (pool->external) {
     api_->Unimport(pool->device, pool->mapped);
@@ -532,12 +604,29 @@ void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) 
                  pool_id, pool->device, pool->bytes, pool->external ? " (adopted, unmapped)" : "",
                  pool->evicted, pool->evicted_spare);
   pools_.erase(pool_id);
+  return {};
 }
 
 AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& group, int device,
                                  uint64_t bytes, const ExternalMemory& external) {
   const bool adopt = !external.handle.empty();
   AttachResult result;
+  result.incarnation = incarnation_;
+  if (external.kind == "hip_fabric") {
+    std::string error;
+    if (!api_->SupportsFabric() || !IsFabricHandle(external.handle) ||
+        !ValidateFabricRange(external.handle, external.offset, bytes, &error)) {
+      result.status = Status::Error("invalid FABRIC attachment: " + error);
+      return result;
+    }
+  } else if (!external.kind.empty() && external.kind != "hip_ipc") {
+    result.status = Status::Error("unknown external memory kind");
+    return result;
+  }
+  if (api_->SupportsFabric() && external.kind != "hip_fabric") {
+    result.status = Status::Error("FABRIC L1 only adopts exported native HBM");
+    return result;
+  }
   if (pool_id.empty() || bytes == 0 || device < 0) {
     result.status = Status::Error("attach needs a pool id, a device and a non-zero size");
     return result;
@@ -548,14 +637,26 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
     return result;
   }
   if (Pool* existing = FindLocked(pool_id)) {
+    if (existing->quarantined) {
+      result.status = Status::Error("pool is quarantined after an unconfirmed copy");
+      return result;
+    }
     if (existing->group == group && existing->device == device && existing->bytes == bytes &&
-        existing->external == adopt && existing->external_handle == external.handle) {
+        existing->external == adopt && existing->external_handle == external.handle &&
+        existing->external_kind == external.kind && existing->external_offset == external.offset) {
       result.memory = existing->exported;
       result.bytes = existing->bytes;
       result.created = false;
       return result;
     }
-    DestroyLocked(lock, existing);
+    // Reserve the id before the wait releases mutex_: a second Attach must
+    // not race this replacement and publish a different allocation under it.
+    attaching_.insert(pool_id);
+    result.status = DestroyLocked(lock, existing);
+    if (!result.status.ok) {
+      attaching_.erase(pool_id);
+      return result;
+    }
   }
   // The allocation zero-fills hundreds of GB; do it without the lock so pools
   // already serving are not stalled behind it.
@@ -578,6 +679,7 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   }
   auto pool = std::make_unique<Pool>();
   pool->id = pool_id;
+  pool->generation = ++next_pool_;
   pool->group = group;
   pool->device = device;
   pool->base = base;
@@ -586,6 +688,8 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   pool->external = adopt;
   pool->mapped = mapped;
   pool->external_handle = external.handle;
+  pool->external_kind = external.kind;
+  pool->external_offset = external.offset;
   pools_[pool_id] = std::move(pool);
   MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}{}", pool_id, group, device,
                  bytes, adopt ? " (adopted from its owner)" : "");
@@ -602,16 +706,33 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
   std::unique_lock<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
+  if (pool->quarantined) return Status::Error("pool is quarantined");
+  if (pool->bound && SameLayout(pool->layout, layout)) return Status{};
+  if (pool->bound) {
+    // Wait before validating allocation bounds or group compatibility: those
+    // facts may change while the mutex is released by the wait.
+    Status idle = WaitIdleLocked(lock, pool_id, "bind layout");
+    if (!idle.ok) return idle;
+    pool = FindLocked(pool_id);
+    if (pool == nullptr) return Status::Error("pool " + pool_id + " was detached");
+  }
   std::vector<uint64_t> units;
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
   for (const Region& region : layout.regions) {
-    if (region.unit_bytes == 0 ||
-        region.offset + static_cast<uint64_t>(layout.num_slots) * region.unit_bytes > pool->bytes) {
+    if (region.unit_bytes == 0 || region.offset > pool->bytes ||
+        layout.num_slots > (pool->bytes - region.offset) / region.unit_bytes) {
       return Status::Error("a region does not fit in pool " + pool_id);
     }
     units.push_back(region.unit_bytes);
+    spans.emplace_back(region.offset,
+                       region.offset + uint64_t{layout.num_slots} * region.unit_bytes);
   }
-  if (pool->bound && SameLayout(pool->layout, layout)) return Status{};
-
+  std::sort(spans.begin(), spans.end());
+  for (size_t i = 1; i < spans.size(); ++i) {
+    if (spans[i].first < spans[i - 1].second) {
+      return Status::Error("layout regions overlap in pool " + pool_id);
+    }
+  }
   Group& group = groups_[pool->group];
   if (group.has_layout && group.unit_bytes != units) {
     for (const auto& entry : pools_) {
@@ -622,15 +743,7 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
       }
     }
   }
-  if (pool->bound) {
-    idle_.wait(lock, [&] {
-      Pool* p = FindLocked(pool_id);
-      return p == nullptr || p->busy == 0;
-    });
-    pool = FindLocked(pool_id);
-    if (pool == nullptr) return Status::Error("pool " + pool_id + " was detached");
-    ResetSlotsLocked(pool);
-  }
+  if (pool->bound) ResetSlotsLocked(pool);
   Group& current = groups_[pool->group];
   current.has_layout = true;
   current.unit_bytes = std::move(units);
@@ -646,12 +759,10 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
 OpenResult PoolManager::Open(const std::string& pool_id) {
   OpenResult result;
   std::unique_lock<std::mutex> lock(mutex_);
-  idle_.wait(lock, [&] {
-    Pool* p = FindLocked(pool_id);
-    return p == nullptr || p->busy == 0;
-  });
+  result.status = WaitIdleLocked(lock, pool_id, "open");
+  if (!result.status.ok) return result;
   Pool* pool = FindLocked(pool_id);
-  if (pool == nullptr || !pool->bound) {
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
     result.status = Status::Error("pool " + pool_id + " is not attached and bound");
     return result;
   }
@@ -666,10 +777,11 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
   AllocateResult result;
   std::unique_lock<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
-  if (pool == nullptr || !pool->bound) {
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
     result.status = Status::Error("pool " + pool_id + " is not attached and bound");
     return result;
   }
+  ++pool->busy;  // Retain partial grants/layout while waiting on pinned slots.
   const auto deadline = std::chrono::steady_clock::now() + kPinnedWait;
   while (result.slots.size() < count) {
     uint32_t slot = 0;
@@ -685,11 +797,15 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
     if (!HasPinnedFreeLocked(pool)) break;
     if (idle_.wait_until(lock, deadline) == std::cv_status::timeout) break;
     pool = FindLocked(pool_id);
-    if (pool == nullptr || !pool->bound) {
+    if (pool == nullptr || !pool->bound || pool->quarantined) {
       result.status = Status::Error("pool " + pool_id + " was detached");
+      if (pool != nullptr) --pool->busy;
+      idle_.notify_all();
       return result;
     }
   }
+  --pool->busy;
+  idle_.notify_all();
   return result;
 }
 
@@ -706,8 +822,20 @@ Status PoolManager::Commit(const std::string& pool_id, uint64_t committed) {
 Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp) {
   std::lock_guard<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
-  if (pool == nullptr || !pool->bound) {
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
     return Status::Error("pool " + pool_id + " is not attached and bound");
+  }
+  // Reject a whole batch before mutating it if it would reuse an in-flight
+  // destination or change bytes pinned by another tray.
+  for (const Op& op : ops) {
+    if (op.slot >= pool->slots.size()) continue;
+    const Slot& slot = pool->slots[op.slot];
+    // Hold of cached content is a read-only prefix claim. Reuse for different
+    // content must go through Allocate, which excludes pinned slots.
+    if (slot.writers != 0 ||
+        (slot.pins != 0 && op.kind == OpKind::kPublish && (!slot.has_key || slot.key != op.key))) {
+      return Status::Error("apply would reuse a slot with an in-flight copy");
+    }
   }
   for (size_t i = 0; i < ops.size(); ++i) {
     const Op& op = ops[i];
@@ -721,6 +849,7 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
       case OpKind::kHold:
         if (s.state == SlotState::kHeld) break;
         if (s.state == SlotState::kFilling) return fail("hold of a slot being filled");
+        if (s.pins != 0 && !s.has_key) return fail("reuse of a slot pinned by a reader");
         if (s.state == SlotState::kCached) {
           UncacheLocked(pool, op.slot);
           HolderUsedLocked(pool, op.slot);
@@ -746,6 +875,7 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
         if (s.state != SlotState::kHeld) return fail("publish of a slot that is not held");
         if (op.key.empty()) return fail("publish without a key");
         if (s.has_key && s.key == op.key) break;
+        if (s.pins != 0) return fail("change of content pinned by a reader");
         UnindexLocked(pool, op.slot);
         auto previous = pool->index.find(op.key);
         if (previous != pool->index.end()) {
@@ -777,12 +907,13 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
   return Status{};
 }
 
-FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
-                               const FetchOptions& options) {
+FetchResult PoolManager::FetchLocal(const std::string& pool_id,
+                                    const std::vector<std::string>& keys,
+                                    const FetchOptions& options) {
   FetchResult result;
   std::unique_lock<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
-  if (pool == nullptr || !pool->bound) {
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
     result.status = Status::Error("pool " + pool_id + " is not attached and bound");
     return result;
   }
@@ -793,7 +924,9 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     if (holders == group.holders.end()) return nullptr;
     for (const Holder& h : holders->second) {
       // Not this pool, and not a slot its owner may still be writing.
-      if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) return &h;
+      if (h.pool != pool && !h.pool->quarantined && h.pool->slots[h.slot].writers == 0 &&
+          Readable(*h.pool, h.pool->slots[h.slot]))
+        return &h;
     }
     return nullptr;
   };
@@ -810,6 +943,9 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     result.status = Status::Error("fetch into pool " + pool_id + ": fewer slots than keys");
     return result;
   }
+  // Retain the allocation and its layout through the settle wait as well as
+  // the unlocked copy, including calls with only local hits or no copy steps.
+  ++pool->busy;
   if (into) {
     // A regranted slot may still have its owner's writes in flight. They land
     // within a forward or two, and the owner's next Commit says so: wait for
@@ -818,15 +954,17 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     const auto settle_deadline = std::chrono::steady_clock::now() + kSettleWait;
     idle_.wait_until(lock, settle_deadline, [&] {
       pool = FindLocked(pool_id);
-      if (pool == nullptr || !pool->bound) return true;
+      if (pool == nullptr || !pool->bound || pool->quarantined) return true;
       for (size_t i = 0; i < keys.size(); ++i) {
         const uint32_t dst = options.dst_slots[i];
         if (dst < pool->slots.size() && !Fillable(*pool, pool->slots[dst])) return false;
       }
       return true;
     });
-    if (pool == nullptr || !pool->bound) {
+    if (pool == nullptr || !pool->bound || pool->quarantined) {
       result.status = Status::Error("pool " + pool_id + " was detached");
+      if (pool != nullptr) --pool->busy;
+      idle_.notify_all();
       return result;
     }
   }
@@ -840,14 +978,16 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     const std::string& key = keys[i];
     if (into) {
       const uint32_t dst = options.dst_slots[i];
-      if (dst >= pool->slots.size() || pool->slots[dst].state != SlotState::kHeld) {
+      if (dst >= pool->slots.size() || pool->slots[dst].state != SlotState::kHeld ||
+          pool->slots[dst].has_key) {
         result.status = Status::Error("fetch into pool " + pool_id + ": slot " +
-                                      std::to_string(dst) + " is not held by its owner");
+                                      std::to_string(dst) + " is not an unindexed held slot");
         break;
       }
       const Holder* source = source_of(key);
       if (source == nullptr) break;
-      if (!Fillable(*pool, pool->slots[dst])) {
+      if (pool->slots[dst].pins != 0 || pool->slots[dst].writers != 0 ||
+          !Fillable(*pool, pool->slots[dst])) {
         // Allocate may regrant a slot before its owner's writes complete:
         // owner-local reuse is ordered on that stream, but this copy is not.
         // Stop at the landed prefix; the caller still holds every destination.
@@ -856,12 +996,13 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       ++source->pool->slots[source->slot].pins;
       ++source->pool->busy;
       ++pool->busy;
+      ++pool->slots[dst].writers;
       steps.push_back(CopyStep{source->pool, source->slot, dst, i});
       result.slots.push_back(dst);
       continue;
     }
     auto local = pool->index.find(key);
-    if (local != pool->index.end()) {
+    if (local != pool->index.end() && pool->slots[local->second].writers == 0) {
       // Pinned so a later destination in this same call cannot evict it.
       ++pool->slots[local->second].pins;
       local_pins.push_back(local->second);
@@ -873,7 +1014,8 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     if (holders != group.holders.end()) {
       for (const Holder& h : holders->second) {
         // Not this pool, and not a slot its owner may still be writing.
-        if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) {
+        if (h.pool != pool && !h.pool->quarantined && h.pool->slots[h.slot].writers == 0 &&
+            Readable(*h.pool, h.pool->slots[h.slot])) {
           source = &h;
           break;
         }
@@ -899,6 +1041,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   std::vector<MemoryApi::Fragment> fragments;
   size_t run_start = 0;
   bool failed = false;
+  bool drained = true;
   while (run_start < steps.size()) {
     size_t run_end = run_start + 1;
     while (run_end < steps.size() && steps[run_end].src == steps[run_start].src &&
@@ -924,7 +1067,17 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   // One batch for the whole call, landed before it returns: nothing is
   // handed to the requester before then.
   if (!fragments.empty()) {
-    failed = !api_->CopyBatch(pool->device, fragments, &copy_error);
+    CopyOutcome outcome;
+    try {
+      outcome = api_->CopyBatchTracked(pool->device, fragments);
+    } catch (const std::exception& e) {
+      outcome = {false, false, e.what()};
+    } catch (...) {
+      outcome = {false, false, "copy backend threw without a completion proof"};
+    }
+    failed = !outcome.ok;
+    drained = outcome.drained;
+    copy_error = outcome.error;
     if (failed) result.copied_bytes = 0;
     std::fill(copied.begin(), copied.end(), !failed);
   }
@@ -932,6 +1085,16 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
                                                  std::chrono::steady_clock::now() - started)
                                                  .count());
   lock.lock();
+
+  if (!drained) {
+    pool->quarantined = true;
+    result.completion_unknown = true;
+    result.status = Status::Error("copy completion unknown: " + copy_error);
+    result.slots.clear();
+    // Keep every source pin, destination writer and pool busy reference.
+    idle_.notify_all();
+    return result;
+  }
 
   // Commit: a copied slot becomes cached content of this pool.
   size_t valid_keys = result.slots.size();
@@ -945,6 +1108,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     const std::string& key = keys[step.key_index];
     const bool usable = copied[i] && step.key_index < valid_keys;
     if (into) {
+      --d.writers;
       // The caller's slot, which it publishes itself: only the count moves.
       if (usable) {
         ++step.src->served_out_slots;
@@ -990,6 +1154,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     }
   }
   for (uint32_t slot : local_pins) --pool->slots[slot].pins;
+  --pool->busy;
   result.slots.resize(valid_keys);
   pool->fetched_in_bytes += result.copied_bytes;
   pool->copy_micros += result.copy_micros;
@@ -1013,12 +1178,10 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
 
 Status PoolManager::Clear(const std::string& pool_id) {
   std::unique_lock<std::mutex> lock(mutex_);
-  idle_.wait(lock, [&] {
-    Pool* p = FindLocked(pool_id);
-    return p == nullptr || p->busy == 0;
-  });
+  Status idle = WaitIdleLocked(lock, pool_id, "clear");
+  if (!idle.ok) return idle;
   Pool* pool = FindLocked(pool_id);
-  if (pool == nullptr || !pool->bound) {
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
     return Status::Error("pool " + pool_id + " is not attached and bound");
   }
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) {
@@ -1035,10 +1198,13 @@ Status PoolManager::Clear(const std::string& pool_id) {
 
 Status PoolManager::Detach(const std::string& pool_id) {
   std::unique_lock<std::mutex> lock(mutex_);
+  if (attaching_.count(pool_id) != 0) {
+    return Status::Error("detach: pool attachment is in progress; retain the allocation");
+  }
   Pool* pool = FindLocked(pool_id);
   if (pool == nullptr) return Status{};
-  DestroyLocked(lock, pool);
-  return Status{};
+  if (pool->quarantined) return Status::Error("pool is quarantined; completion is unknown");
+  return DestroyLocked(lock, pool);
 }
 
 std::vector<PoolStats> PoolManager::Stats() const {
@@ -1066,6 +1232,325 @@ std::vector<PoolStats> PoolManager::Stats() const {
   std::sort(out.begin(), out.end(),
             [](const PoolStats& a, const PoolStats& b) { return a.pool_id < b.pool_id; });
   return out;
+}
+
+void PoolManager::ConfigurePeers(std::vector<std::shared_ptr<PeerApi>> peers) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!pools_.empty()) throw std::logic_error("configure peers before attaching pools");
+  if (!peers.empty() && !api_->SupportsFabric()) {
+    throw std::invalid_argument("native L1 peers require direct FABRIC memory");
+  }
+  if (peers.size() > 8 ||
+      std::any_of(peers.begin(), peers.end(), [](const auto& p) { return p == nullptr; })) {
+    throw std::invalid_argument("invalid native L1 peer list");
+  }
+  peers_ = std::move(peers);
+}
+
+const PoolManager::Holder* PoolManager::PeerSourceLocked(const std::string& group,
+                                                         const std::string& key) {
+  auto g = groups_.find(group);
+  if (g == groups_.end()) return nullptr;
+  auto found = g->second.holders.find(key);
+  if (found == g->second.holders.end()) return nullptr;
+  for (const Holder& h : found->second) {
+    const Pool& p = *h.pool;
+    if (p.bound && !p.quarantined && p.external_kind == "hip_fabric" &&
+        p.slots[h.slot].writers == 0 && Readable(p, p.slots[h.slot]))
+      return &h;
+  }
+  return nullptr;
+}
+
+PeerProbeResult PoolManager::Probe(const std::string& group, const std::vector<std::string>& keys,
+                                   const std::vector<uint64_t>& unit_bytes) {
+  PeerProbeResult result;
+  result.incarnation = incarnation_;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!ValidPeerShape(keys, unit_bytes)) {
+    result.status = Status::Error("invalid or oversized native L1 peer request");
+    return result;
+  }
+  auto g = groups_.find(group);
+  if (g == groups_.end()) return result;
+  if (g->second.unit_bytes != unit_bytes) {
+    result.status = Status::Error("native L1 peer layout does not match group");
+    return result;
+  }
+  for (const std::string& key : keys) {
+    if (PeerSourceLocked(group, key) == nullptr) break;
+    ++result.available;
+  }
+  return result;
+}
+
+PeerReadResult PoolManager::AcquireRead(const PeerReadRequest& request) {
+  PeerReadResult result;
+  result.incarnation = incarnation_;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (request.expected_incarnation != incarnation_ || request.operation_id.empty() ||
+      request.operation_id.size() > 256 || !ValidPeerShape(request.keys, request.unit_bytes)) {
+    result.status = Status::Error("invalid native L1 read or stale owner incarnation");
+    return result;
+  }
+  auto old = read_grants_.find(request.operation_id);
+  if (old != read_grants_.end()) {
+    const ReadGrant& grant = old->second;
+    if (grant.released) {
+      result.status = Status::Error("native L1 read operation was already released");
+      return result;
+    }
+    if (grant.request.group != request.group || grant.request.keys != request.keys ||
+        grant.request.unit_bytes != request.unit_bytes) {
+      result.status = Status::Error("native L1 operation id reused for a different request");
+      return result;
+    }
+    return grant.result;
+  }
+  if (read_grants_.size() >= kPeerReceipts) {
+    result.status = Status::Error("native L1 read receipt budget exhausted; drain before restart");
+    return result;
+  }
+  ReadGrant grant;
+  grant.request = request;
+  auto group = groups_.find(request.group);
+  if (group != groups_.end() && group->second.unit_bytes != request.unit_bytes) {
+    result.status = Status::Error("native L1 peer layout does not match group");
+    return result;
+  }
+  // Lookup and pin occur under the same mutex; Probe was only a hint. Pool
+  // replacement/rebinding waits on busy, so this grant needs no cached locator.
+  for (const std::string& key : request.keys) {
+    const Holder* source = PeerSourceLocked(request.group, key);
+    if (source == nullptr) break;
+    const Pool& p = *source->pool;
+    for (const Region& r : p.layout.regions) {
+      grant.result.regions.push_back(PeerReadRegion{
+          p.external_handle, p.external_offset + r.offset + uint64_t{source->slot} * r.unit_bytes,
+          r.unit_bytes});
+    }
+    ++source->pool->slots[source->slot].pins;
+    ++source->pool->busy;
+    grant.sources.push_back(*source);
+    ++result.available;
+  }
+  result.regions = std::move(grant.result.regions);
+  grant.result = result;
+  read_grants_.emplace(request.operation_id, std::move(grant));
+  return result;
+}
+
+Status PoolManager::ReleaseRead(const std::string& operation_id,
+                                const std::string& expected_incarnation, bool drained) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (expected_incarnation != incarnation_ || operation_id.empty() || operation_id.size() > 256 ||
+      !drained) {
+    return Status::Error("read release requires matching owner and confirmed drain");
+  }
+  auto found = read_grants_.find(operation_id);
+  if (found == read_grants_.end()) {
+    // Release may beat a delayed Acquire whose reply was lost. Close the id
+    // before acknowledging; it may never acquire pins after this response.
+    if (read_grants_.size() >= kPeerReceipts) {
+      return Status::Error("native L1 read receipt budget exhausted");
+    }
+    ReadGrant closed;
+    closed.released = true;
+    read_grants_.emplace(operation_id, std::move(closed));
+    return {};
+  }
+  ReadGrant& grant = found->second;
+  if (grant.released) return {};
+  for (const Holder& source : grant.sources) {
+    --source.pool->slots[source.slot].pins;
+    --source.pool->busy;
+  }
+  grant = ReadGrant{};
+  grant.released = true;
+  idle_.notify_all();
+  return {};
+}
+
+FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
+                               const FetchOptions& options) {
+  // Reject overlapping caller destinations before either local or remote work.
+  if (!options.probe_only && !options.dst_slots.empty()) {
+    std::unordered_set<uint32_t> unique;
+    if (options.dst_slots.size() < keys.size()) {
+      FetchResult bad;
+      bad.status = Status::Error("fewer destination slots than keys");
+      return bad;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (!unique.insert(options.dst_slots[i]).second) {
+        FetchResult bad;
+        bad.status = Status::Error("overlapping native L1 destination slots");
+        return bad;
+      }
+    }
+  }
+  std::unique_lock<std::mutex> lock(mutex_);
+  // Snapshot configuration under the same lock as ConfigurePeers.
+  const auto peers = peers_;
+  if (peers.empty() || (!options.probe_only && options.dst_slots.empty()) || keys.empty()) {
+    lock.unlock();
+    return FetchLocal(pool_id, keys, options);
+  }
+  Pool* pool = FindLocked(pool_id);
+  if (pool == nullptr || !pool->bound || pool->quarantined) {
+    FetchResult bad;
+    bad.status = Status::Error("native L1 pool is unavailable or quarantined");
+    return bad;
+  }
+  const std::string group = pool->group;
+  const std::vector<uint64_t> units = groups_[group].unit_bytes;
+  ++pool->busy;  // Protect destination allocation/layout across local work and RPC.
+  lock.unlock();
+  FetchResult result = FetchLocal(pool_id, keys, options);
+  size_t leading = options.probe_only ? result.available : result.slots.size();
+  auto finish = [&] {
+    std::lock_guard<std::mutex> done(mutex_);
+    --pool->busy;
+    idle_.notify_all();
+  };
+  if (!result.status.ok || leading == keys.size()) {
+    finish();
+    return result;
+  }
+  const size_t count = std::min(kPeerKeys, keys.size() - leading);
+  std::vector<std::string> suffix(keys.begin() + leading, keys.begin() + leading + count);
+  if (!ValidPeerShape(suffix, units)) {
+    finish();
+    return result;
+  }
+  // Use one peer per suffix. No metadata cache: resolve and pin again for every
+  // Fetch, preserving owner-local timestamp semantics across different hosts.
+  std::shared_ptr<PeerApi> chosen;
+  PeerProbeResult best;
+  for (const auto& peer : peers) {
+    PeerProbeResult probe = peer->Probe(group, suffix, units);
+    if (probe.status.ok && !probe.incarnation.empty() && probe.available <= count &&
+        probe.available > best.available) {
+      chosen = peer;
+      best = std::move(probe);
+    }
+  }
+  if (!chosen) {
+    finish();
+    return result;
+  }
+  if (options.probe_only) {
+    result.available += best.available;
+    finish();
+    return result;
+  }
+  lock.lock();
+  size_t reserved = 0;
+  for (; reserved < best.available; ++reserved) {
+    const uint32_t id = options.dst_slots[leading + reserved];
+    if (id >= pool->slots.size() || pool->slots[id].state != SlotState::kHeld ||
+        pool->slots[id].has_key ||
+        pool->slots[id].writers != 0 || pool->slots[id].pins != 0 ||
+        !Fillable(*pool, pool->slots[id]))
+      break;
+    ++pool->slots[id].writers;
+  }
+  const std::string operation = incarnation_ + std::to_string(++next_read_);
+  lock.unlock();
+  if (reserved == 0) {
+    finish();
+    return result;
+  }
+  suffix.resize(reserved);
+  PeerReadRequest request{operation, best.incarnation, group, suffix, units};
+  PeerReadResult read = chosen->AcquireRead(request);
+  std::vector<void*> mappings;
+  std::vector<MemoryApi::Fragment> fragments;
+  std::string error;
+  bool valid = read.status.ok && read.incarnation == best.incarnation &&
+               read.available <= reserved && read.regions.size() == read.available * units.size();
+  uint64_t bytes = 0;
+  if (valid) {
+    // Descriptor imports are reused within this call only. Mapping a descriptor
+    // creates an address view, not a payload allocation/copy or a staging pool.
+    std::unordered_map<std::string, void*> bases;
+    for (size_t i = 0; i < read.regions.size(); ++i) {
+      const PeerReadRegion& region = read.regions[i];
+      if (region.bytes != units[i % units.size()] ||
+          !ValidateFabricRange(region.handle, region.offset, region.bytes, &error)) {
+        valid = false;
+        break;
+      }
+      auto entry = bases.find(region.handle);
+      if (entry == bases.end()) {
+        void* base = nullptr;
+        void* mapped = nullptr;
+        if (!api_->Import(pool->device, region.handle, 0, &base, &mapped, &error)) {
+          valid = false;
+          break;
+        }
+        mappings.push_back(mapped);
+        entry = bases.emplace(region.handle, base).first;
+      }
+      const uint32_t dst = options.dst_slots[leading + i / units.size()];
+      const Region& layout = pool->layout.regions[i % units.size()];
+      fragments.push_back(MemoryApi::Fragment{
+          static_cast<char*>(pool->base) + layout.offset + uint64_t{dst} * layout.unit_bytes,
+          static_cast<const char*>(entry->second) + region.offset, region.bytes, pool->device});
+      bytes += region.bytes;
+    }
+  }
+  const auto started = std::chrono::steady_clock::now();
+  CopyOutcome outcome{false, true, "remote read unavailable: " + error};
+  if (valid) {
+    try {
+      outcome = api_->CopyBatchTracked(pool->device, fragments);
+    } catch (const std::exception& e) {
+      outcome = {false, false, e.what()};
+    } catch (...) {
+      outcome = {false, false, "copy backend threw without a completion proof"};
+    }
+  }
+  const auto micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - started)
+                                                .count());
+  if (!outcome.drained) {
+    lock.lock();
+    pool->quarantined = true;
+    result.status = Status::Error("FABRIC copy completion unknown: " + outcome.error);
+    result.completion_unknown = true;
+    result.slots.clear();
+    // Keep the remote source pin, mappings, destination writers and busy guard.
+    // No fallback or recomputation into these destinations is permitted.
+    idle_.notify_all();
+    return result;
+  }
+  for (void* mapped : mappings) api_->Unimport(pool->device, mapped);
+  // Even a lost Acquire reply can have pinned an owner slot. No submission or
+  // confirmed drain makes a release safe; owner tombstones fence delayed RPCs.
+  Status release = chosen->ReleaseRead(operation, best.incarnation, true);
+  if (!release.ok) {
+    MORI_UMBP_WARN(
+        "[L1Peer] release unconfirmed operation={} owner={} error={}; source stays pinned",
+        operation, best.incarnation, release.error);
+  }
+  lock.lock();
+  for (size_t i = 0; i < reserved; ++i) --pool->slots[options.dst_slots[leading + i]].writers;
+  if (outcome.ok) {
+    for (size_t i = 0; i < read.available; ++i)
+      result.slots.push_back(options.dst_slots[leading + i]);
+    result.copied_slots += read.available;
+    result.copied_bytes += bytes;
+    result.copy_micros += micros;
+    pool->fetched_in_slots += read.available;
+    pool->fetched_in_bytes += bytes;
+    pool->copy_micros += micros;
+    MORI_UMBP_INFO("[L1Peer] fabric completed pool={} owner={} operation={} slots={} bytes={}",
+                   pool_id, best.incarnation, operation, read.available, bytes);
+  }
+  --pool->busy;
+  idle_.notify_all();
+  return result;
 }
 
 }  // namespace mori::umbp::l1
