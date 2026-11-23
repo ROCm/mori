@@ -826,14 +826,12 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
+    const size_t piece = HostRegistrationChunkBytes();
     for (size_t i = 0; i < plan.sizes.size();) {
-      size_t coalesced = plan.sizes[i];
-      size_t j = i + 1;
-      while (j < plan.sizes.size() && plan.src_offsets[j] == plan.src_offsets[i] + coalesced &&
-             plan.dst_offsets[j] == plan.dst_offsets[i] + coalesced) {
-        coalesced += plan.sizes[j];
-        ++j;
-      }
+      // Never across a host registration piece: the builder split there, and a
+      // merged call fails with "invalid argument" (CoalescedRunEnd).
+      size_t coalesced = 0;
+      const size_t j = CoalescedRunEnd(plan, i, piece, &coalesced);
       err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
       plan_bytes += coalesced;
