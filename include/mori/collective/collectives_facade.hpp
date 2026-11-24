@@ -382,8 +382,11 @@ class CollectivesFacade {
   // push (sliced SDMA reduce-scatter + pipelined broadcast) or pull (two-shot:
   // reduce-scatter pull then all-gather pull, no SDMA). `dt`/`op` select the
   // element type and reduction; F32/BF16/F16/S32/S64/U8 support all four ops.
+  // `isAsync` is currently a no-op placeholder (unlike the other Run* entry
+  // points, it is not yet wired to an async start/done split).
   hipError_t RunAllReduce(const void* input, void* output, size_t numElems,
-                          DataType dt, ReduceOpKind op, hipStream_t stream);
+                          DataType dt, ReduceOpKind op, hipStream_t stream,
+                          bool isAsync = false);
 
   // All-gather: input is this PE's single shard (symmetric heap), output is the
   // gathered npes*chunk buffer (symmetric heap). Pure byte movement (element type
@@ -427,10 +430,14 @@ class CollectivesFacade {
   hipError_t RunBarrier(hipStream_t stream);
 
   // Point-to-point send: push numBytes from sendBuf to PE `peer`. Dummy no-op.
-  hipError_t RunSend(const void* sendBuf, size_t numBytes, int peer, hipStream_t stream);
+  // `isAsync` is currently a no-op placeholder.
+  hipError_t RunSend(const void* sendBuf, size_t numBytes, int peer, hipStream_t stream,
+                     bool isAsync = false);
 
   // Point-to-point recv: receive numBytes into recvBuf from PE `peer`. Dummy no-op.
-  hipError_t RunRecv(void* recvBuf, size_t numBytes, int peer, hipStream_t stream);
+  // `isAsync` is currently a no-op placeholder.
+  hipError_t RunRecv(void* recvBuf, size_t numBytes, int peer, hipStream_t stream,
+                     bool isAsync = false);
 
   // Collective-permute: send my buffer to each target PE, recv from srcPe
   // (srcPe < 0 means no source). v1: dstPes.size() <= 1. SetReduceMode() selects

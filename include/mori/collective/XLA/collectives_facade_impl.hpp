@@ -350,7 +350,8 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
 // Enum entry point: dispatch (dt, op) to allReduceImpl for F32/BF16/F16/S32/S64/U8
 // and all four reduction ops.
 hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size_t numElems,
-                                           DataType dt, ReduceOpKind op, hipStream_t stream) {
+                                           DataType dt, ReduceOpKind op, hipStream_t stream,
+                                           bool /*isAsync*/) {
   auto go = [&](auto typeTag) {
     using T = decltype(typeTag);
     return detail::DispatchReduceOp<T>(op, [&](auto reduceOp) {
@@ -537,13 +538,15 @@ hipError_t CollectivesFacade::RunBarrier(hipStream_t stream) {
 }
 
 hipError_t CollectivesFacade::RunSend(const void* /*sendBuf*/, size_t /*numBytes*/,
-                                      int /*peer*/, hipStream_t /*stream*/) {
+                                      int /*peer*/, hipStream_t /*stream*/,
+                                      bool /*isAsync*/) {
   // TODO: dummy placeholder; real P2P send push kernel goes here.
   return hipErrorNotSupported;
 }
 
 hipError_t CollectivesFacade::RunRecv(void* /*recvBuf*/, size_t /*numBytes*/,
-                                      int /*peer*/, hipStream_t /*stream*/) {
+                                      int /*peer*/, hipStream_t /*stream*/,
+                                      bool /*isAsync*/) {
   // TODO: dummy placeholder; real P2P recv kernel goes here.
   return hipErrorNotSupported;
 }
@@ -674,7 +677,7 @@ hipError_t CollectivesFacade::RunReduceScatter(const void*, void*, size_t, DataT
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunAllReduce(const void*, void*, size_t, DataType, ReduceOpKind,
-                                           hipStream_t) {
+                                           hipStream_t, bool) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunAllGather(const void*, void*, size_t, hipStream_t, bool) {
@@ -685,10 +688,10 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector&, size_t, hipStrea
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunBarrier(hipStream_t) { return hipErrorNotSupported; }
-hipError_t CollectivesFacade::RunSend(const void*, size_t, int, hipStream_t) {
+hipError_t CollectivesFacade::RunSend(const void*, size_t, int, hipStream_t, bool) {
   return hipErrorNotSupported;
 }
-hipError_t CollectivesFacade::RunRecv(void*, size_t, int, hipStream_t) {
+hipError_t CollectivesFacade::RunRecv(void*, size_t, int, hipStream_t, bool) {
   return hipErrorNotSupported;
 }
 hipError_t CollectivesFacade::RunCollectivePermute(const void*, void*, size_t, int,
