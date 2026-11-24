@@ -178,10 +178,10 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
      * ones, so it may be called from divergent code (a branch, a single
      * lane): the first executing lane claims the lines of all of them with
      * one fetch-add and waits for credit, then each executing lane stores
-     * its own message, in lane order. Lanes on the two sides of a branch,
-     * which the compiler treats as concurrent threads, claim disjoint lines
-     * through the device-memory atomic; nothing else of the handle needs to
-     * agree across lanes. Always returns true.
+     * its own message, in lane order, before the call returns. Lanes on the
+     * two sides of a branch, which the compiler treats as concurrent threads,
+     * claim disjoint lines through the device-memory atomic; nothing else of
+     * the handle needs to agree across lanes. Always returns true.
      */
     template <typename T>
     __device__ bool push_active_lanes(const T& message, uint32_t bytes, uint32_t metadata) {
@@ -226,6 +226,9 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
       }
       detail::write_lane_message(chunks, log2_capacity, base + c.prefix, message, bytes, metadata,
                                  c.lines);
+      // Compiler fence: keeps the stores in this call. Sunk past a branch's join, they
+      // would follow the other arm's claim and credit wait, which may wait on them.
+      if constexpr (!kFullWave) __builtin_amdgcn_wave_barrier();
       return true;
 #endif
     }
