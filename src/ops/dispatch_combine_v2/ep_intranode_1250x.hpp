@@ -6381,8 +6381,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       constexpr int _qOutVB = 16;
       constexpr int _qV = _qOutVB / (int)sizeof(T);
       constexpr int _qVB = _qV * (int)sizeof(TokT);
-      using _QVecT = core::VecTypeT<_qVB>;
-      using _QOutVecT = core::VecTypeT<_qOutVB>;
+      using _QVecT = typename core::VecTypeSelector<_qVB>::dataType;
+      using _QOutVecT = typename core::VecTypeSelector<_qOutVB>::dataType;
       constexpr bool _qCvtPk =
           std::is_same_v<TokT, hip_bfloat16> && std::is_same_v<T, hip_bfloat16>;
       const int _qnv = (_qPart / _qV) * _qV;
@@ -6581,8 +6581,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           constexpr int _cOutVB = 16;
           constexpr int _cV = _cOutVB / (int)sizeof(T);
           constexpr int _cVB = _cV * (int)sizeof(TokT);
-          using _CVecT = core::VecTypeT<_cVB>;
-          using _COutVecT = core::VecTypeT<_cOutVB>;
+          using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
+          using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
           const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
                                ((hiddenDimOffset % (size_t)_cV) == 0) && ((_rowStride % _cV) == 0);
           const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;

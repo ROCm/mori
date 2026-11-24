@@ -58,11 +58,11 @@ using CombineInternalFp8 = uint8_t;
 // Use typedef here since otherwise alignment attribute is lost.
 typedef uint32_t VecU32x4 __attribute__((ext_vector_type(4), aligned(8)));
 
-// VecU32x4 is declared aligned(8) on purpose. A 16-byte vector access lowers to 
-// a single global/flat *_dwordx4, which the hardware executes correctly at any 
-// byte alignment; the attribute only sets the alignment the compiler is allowed 
-// to assume. load<16>/store<16> must not assume 16: EP buffers are only 8-byte 
-// aligned, and the shmem put/get byte-offset paths pass pointers aligned to as 
+// VecU32x4 is declared aligned(8) on purpose. A 16-byte vector access lowers to
+// a single global/flat *_dwordx4, which the hardware executes correctly at any
+// byte alignment; the attribute only sets the alignment the compiler is allowed
+// to assume. load<16>/store<16> must not assume 16: EP buffers are only 8-byte
+// aligned, and the shmem put/get byte-offset paths pass pointers aligned to as
 // little as 1 byte.
 namespace detail {
 template <int VecBytes>
@@ -93,6 +93,38 @@ struct VecTypeS<16> {
 
 template <int VecBytes>
 using VecTypeT = typename detail::VecTypeS<VecBytes>::type;
+
+// Legacy vector-type selector kept only for ep_intranode_1250x.hpp. That file
+// does not use load<16>/store<16>; it dereferences 16-byte vectors directly
+// (*reinterpret_cast<VecT*>) and reads them element by element through unions,
+// so only the 16-byte type identity matters: it must stay ulong2, because
+// element-wise reads of VecTypeT<16> (VecU32x4) spill on gfx125x. That
+// gfx125x-only path is not covered by CI; migrate it to VecTypeT in a follow-up
+// once it can be checked on gfx1250, then drop this.
+template <int VecBytes>
+struct VecTypeSelector {
+  using dataType = void;
+};
+template <>
+struct VecTypeSelector<1> {
+  using dataType = uint8_t;
+};
+template <>
+struct VecTypeSelector<2> {
+  using dataType = uint16_t;
+};
+template <>
+struct VecTypeSelector<4> {
+  using dataType = uint32_t;
+};
+template <>
+struct VecTypeSelector<8> {
+  using dataType = uint64_t;
+};
+template <>
+struct VecTypeSelector<16> {
+  using dataType = ulong2;
+};
 
 template <typename T>
 using AccumFp32T = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
