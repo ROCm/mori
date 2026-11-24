@@ -101,6 +101,52 @@ from mega_moe_gemm2_with_sdma import (
 
 __all__ = ["compile_gemm2_8wave_sdma"]
 
+#: Plan-free section table in LDS (``plan_free=True``), int32 words: ``REC[expert][pe]`` =
+#: {rows for pe in all sections before the expert's normal section, exclusive pe-prefix of the
+#: normal section's counts, the normal section's count for pe, -}; ``PE[pe]`` = {group rows from
+#: pe, exclusive pe-prefix of them, avail, send_base, n_send, -, -, -}; ``MISC`` = {pair expert a,
+#: pair expert b, pair enabled, SBM-padded group section, members, -, -, -}.
+PF_REC_W = 4
+PF_PE_W = 8
+PF_MISC_W = 8
+
+
+@flyc.jit
+def _spin_ge_from(addr_i64, cur0, val):
+    """Spin until the system-scope i32 at ``addr_i64`` reaches ``val``; ``cur0`` is a first
+    reading already loaded. Relaxed loads, no acquire (an acquire is a whole-L2 invalidate)."""
+    cur = fx.Int32(cur0)
+    while cur < fx.Int32(val):
+        rocdl.s_sleep(1)
+        cur = fx.Int32(comm_ops.load_i32_global_system(addr_i64))
+    return cur
+
+
+def _st_i32(addr_i64, idx, v):
+    """``((int32*)addr_i64)[idx] = v``. Stores go through these helpers: a subscript store whose target
+    names a kernel closure variable inside control flow makes FlyDSL's AST rewriter treat that name as
+    a local of the enclosing function."""
+    global_typed_ptr(addr_i64, T.i32)[idx] = fx.Int32(v)
+
+
+def _st_lds_i32(base_i32, idx, v):
+    lds_typed_ptr(base_i32, T.i32)[idx] = fx.Int32(v)
+
+
+def opaque_i64(v):
+    """``v`` (wave-uniform i64) through an identity the compiler cannot see through, so an
+    address derived from a kernel argument is formed where it is used instead of being hoisted
+    out of the persistent loop (and kept live across the K loop)."""
+    return fx.Int64(
+        _llvm.inline_asm(
+            res=T.i64,
+            operands_=[fx.Int64(v).ir_value()],
+            asm_string="s_mov_b64 $0, $1",
+            constraints="=s,s",
+            has_side_effects=True,
+        )
+    )
+
 BLOCK_M = 256
 BLOCK_N = 256
 BLOCK_K = 128
@@ -423,17 +469,52 @@ def compile_gemm2_8wave_sdma(
     grid_ctas: int,
     comb_bytes: int,
     waves_per_eu: int = 2,
+    plan_free: bool = False,
+    total_segments: int = 0,
+    inv_pipe: bool = False,
 ):
     """Build the launcher of the 8-wave GEMM2 + SDMA comm kernel.
 
     ``layout``: the ``mega_moe_gemm2_with_sdma.ArenaLayout`` of the cco window; ``chunk_tiles``: sort
     tiles per shipped chunk; ``grid_ctas``: one per CU, workgroup 0 being the comm
     workgroup; ``comb_bytes``: size of a rank's ``comb_inp`` (rows past the end of ``S``).
+
+    ``plan_free``: no plan kernel runs before this one. Every workgroup builds the section table
+    of aiter's compact layout (``total_segments`` = bigcnt's row length) in LDS in its prologue;
+    the epilogue computes ``out_row`` in closed form, and the comm workgroup the offsets, the
+    chunk bounds, the inverse map for the inv push, this rank's own inv entries, the overflow
+    count and the cdone reset. The plan's outputs are not read, so their argument slots carry
+    the plan-free inputs: ``out_row`` = bigcnt, ``tile_base`` = fanout_pair_config, ``cursor`` =
+    stage1 epoch parity, ``idx_send`` = int32 counters [overflow rows, layout mismatches].
+
+    ``inv_pipe`` (plan-free only): when a peer's comm wave pushes its inv entries. ``False``: all of
+    them before the first put. ``True``: chunk c+1's entries after chunk c's put, chunk 0's before
+    the first chunk is ready. Either way every entry is complete before the signal-carrying put (and
+    before the flag), and none is written before the peer has consumed the last call.
     """
     assert K % 256 == 0 and N % BLOCK_N == 0, f"K={K} needs % 256, N={N} % {BLOCK_N}"
     assert 256 % SBM == 0, f"SBM={SBM} must divide 256"
     assert npes <= 8, "the comm workgroup has one wave per peer"
     assert layout.row_bytes == N + N // 32
+    plan_free = bool(plan_free)
+    TE = npes * experts
+    TS = total_segments
+    if plan_free:
+        # A comm wave spins on every chunk before the comm workgroup resets cdone.
+        assert npes >= 2, "plan_free needs a peer"
+        assert experts <= 64, "the section table holds one expert per lane"
+        assert TS == TE + npes, f"bigcnt rows hold {TS} segments, expected {TE + npes}"
+    inv_pipe = bool(inv_pipe)
+    assert plan_free or not inv_pipe, "inv_pipe needs plan_free"
+    PF_REC = 0
+    PF_PE = experts * npes * PF_REC_W
+    PF_MISC = PF_PE + npes * PF_PE_W
+    pf_bytes = (PF_MISC + PF_MISC_W) * 4 if plan_free else 0
+    send_rows = layout.send_rows
+    # Window offsets from the start of S (the ``send_base`` argument is my window's S).
+    rel_done = layout.off_done - layout.off_s
+    rel_counter = layout.off_counter - layout.off_s
+    rel_inv = layout.off_inv - layout.off_s
 
     K_ITERS = K // BLOCK_K
     N_TILES_A = BLOCK_M // 64
@@ -457,11 +538,15 @@ def compile_gemm2_8wave_sdma(
     log2_max_tok = max_tok.bit_length() - 1
 
     epi_bytes = 128 * 256 + 128 * 8 + 3 * 256 * 4 + 4 * 64 * 4
-    assert 4 * (a_lds_size + b_lds_size) + epi_bytes <= LDS_LIMIT_BYTES
+    assert 4 * (a_lds_size + b_lds_size) + epi_bytes + pf_bytes <= LDS_LIMIT_BYTES
+    if plan_free:
+        # WG 0 keeps one start-of-expert array per wave in a main-loop buffer it never uses.
+        assert 8 * 64 * 4 <= a_lds_size
 
     kname = (
         f"mega_moe_gemm2_8wave_sdma_n{N}_k{K}_e{experts}_t{topk}_p{npes}_m{max_tok}_s{SBM}"
         f"_s{layout.send_rows}r{layout.recv_rows}_ct{chunk_tiles}_g{grid_ctas}_r{rank}"
+        f"{'_pf' if plan_free else ''}{'_ip' if inv_pipe else ''}"
     )
 
     @fx.struct
@@ -483,6 +568,8 @@ def compile_gemm2_8wave_sdma(
         E_src: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]  # packed srcmap word per tile row
         E_wts: fx.Array[fx.Float8E4M3FN, 256 * 4, 16]  # routing weight per tile row
         E_tab: fx.Array[fx.Float8E4M3FN, 4 * 64 * 4, 16]  # the tile table
+        if plan_free:
+            E_pf: fx.Array[fx.Float8E4M3FN, pf_bytes, 16]  # the section table
 
     @flyc.kernel(name=kname, known_block_size=[512, 1, 1])
     def kernel(
@@ -526,6 +613,243 @@ def compile_gemm2_8wave_sdma(
                 wave_id // fx.Int32(4),
                 wave_id % fx.Int32(4),
             )
+
+        # --- Plan-free: the section table of aiter's compact layout ---------------------
+        # Per local expert j: [group section G_j if j is a member of my rank's fanout pair |
+        # normal section N_j], each ordered by source pe and padded to SBM. For pe:
+        # cnt(G_j) = bigcnt[pe][TE + rank], cnt(N_j) = bigcnt[pe][rank*E + j].
+
+        def pf_ld(idx):
+            return fx.Int32(lds_typed_ptr(lds_addr(lds.E_pf), T.i32)[idx])
+
+        def pf_st(idx, v):
+            _st_lds_i32(lds_addr(lds.E_pf), idx, v)
+
+        def pf_vec4(word):
+            """Four int32 of the section table from word ``word`` (16-byte aligned)."""
+            return Vec(
+                lds_vec_load(
+                    lds_addr(lds.E_pf),
+                    word * fx.Int32(4),
+                    Vec.make_type(4, fx.Int32),
+                    fx.Int32,
+                    align=16,
+                )
+            )
+
+        def pf_issue():
+            """The table's loads, issued together: one bigcnt count per thread (wave = pe,
+            lane = local expert), the pe's group count, the pair entries of both parities and
+            the parity (no dependent load)."""
+            tid = fx.Int32(fx.thread_idx.x)
+            wave = tid // fx.Int32(64)
+            lane = tid % fx.Int32(64)
+            okp = wave < fx.Int32(npes)
+            okj = lane < fx.Int32(experts)
+            pe = okp.select(wave, fx.Int32(0))
+            j = okj.select(lane, fx.Int32(0))
+            bc = global_typed_ptr(out_row, T.i32)  # plan-free: bigcnt
+            cnt = fx.Int32(bc[pe * fx.Int32(TS) + fx.Int32(rank * experts) + j])
+            gcol = fx.Int32(bc[pe * fx.Int32(TS) + fx.Int32(TE + rank)])
+            par = fx.Int32(comm_ops.load_i32_system(cursor, fx.Int32(0)))  # parity
+            pc0 = fx.Int32(comm_ops.load_i32_system(tile_base, fx.Int32(rank)))  # pair_cfg
+            pc1 = fx.Int32(comm_ops.load_i32_system(tile_base, fx.Int32(npes + rank)))
+            return okp, okj, wave, lane, cnt, gcol, par, pc0, pc1
+
+        def pair_of(par, pc0, pc1):
+            """(enabled, a, b, members) of a fanout_pair_config entry at the stage1 parity (0/1)."""
+            packed = (par == fx.Int32(0)).select(pc0, pc1)
+            enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
+            a = packed & fx.Int32(0xFF)
+            b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
+            nmem = enabled.select((a == b).select(fx.Int32(1), fx.Int32(2)), fx.Int32(0))
+            return enabled, a, b, nmem
+
+        def pf_write(ld):
+            """Pass 1 (wave = pe, lane = expert): rows for pe before each normal section, the
+            counts, n_send, the pair. Needs an LDS barrier before ``pf_prefix``."""
+            okp, okj, wave, lane, cnt, gcol, par, pc0, pc1 = ld
+            cnt = (okp & okj).select(cnt, fx.Int32(0))
+            gcol = okp.select(gcol, fx.Int32(0))
+            enabled, a, b, nmem = pair_of(par, pc0, pc1)
+            # members m <= j: G_m (m <= j) all come before N_j
+            le = (a <= lane).select(fx.Int32(1), fx.Int32(0)) + (
+                (b <= lane) & (b != a)
+            ).select(fx.Int32(1), fx.Int32(0))
+            nle = enabled.select(le, fx.Int32(0))
+            incl = _wave_inclusive_scan_i32(cnt, lane)
+            cum_n = incl - cnt + nle * gcol
+            tot = fx.Int32(
+                rocdl.readfirstlane(
+                    T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(63 * 4), incl))
+                )
+            )
+            rec = fx.Int32(PF_REC) + (lane * fx.Int32(npes) + wave) * fx.Int32(PF_REC_W)
+            if okp & okj:
+                pf_st(rec, cum_n)
+                pf_st(rec + fx.Int32(2), cnt)
+            if okp & (lane == fx.Int32(0)):
+                pe_w = fx.Int32(PF_PE) + wave * fx.Int32(PF_PE_W)
+                pf_st(pe_w, gcol)
+                pf_st(pe_w + fx.Int32(4), tot + nmem * gcol)
+            if (wave == fx.Int32(0)) & (lane == fx.Int32(0)):
+                pf_st(fx.Int32(PF_MISC), a)
+                pf_st(fx.Int32(PF_MISC + 1), b)
+                pf_st(fx.Int32(PF_MISC + 2), enabled.select(fx.Int32(1), fx.Int32(0)))
+                pf_st(fx.Int32(PF_MISC + 4), nmem)
+
+        def pf_prefix():
+            """Pass 2: exclusive prefixes over pe (normal sections, group section, n_send ->
+            send_base), avail, the padded group section. Needs an LDS barrier after."""
+            tid = fx.Int32(fx.thread_idx.x)
+            if tid < fx.Int32(experts):
+                run = fx.Int32(0)
+                for q in range_constexpr(npes):
+                    i = fx.Int32(PF_REC) + (tid * fx.Int32(npes) + fx.Int32(q)) * fx.Int32(
+                        PF_REC_W
+                    )
+                    c = pf_ld(i + fx.Int32(2))
+                    pf_st(i + fx.Int32(1), run)
+                    run = run + c
+            if tid == fx.Int32(64):
+                g = fx.Int32(0)
+                s = fx.Int32(0)
+                for q in range_constexpr(npes):
+                    base = PF_PE + q * PF_PE_W
+                    gc = pf_ld(fx.Int32(base))
+                    ns = pf_ld(fx.Int32(base + 4))
+                    room = fx.Int32(send_rows) - s
+                    room = (room > fx.Int32(0)).select(room, fx.Int32(0))
+                    pf_st(fx.Int32(base + 1), g)
+                    pf_st(fx.Int32(base + 2), (ns < room).select(ns, room))
+                    pf_st(fx.Int32(base + 3), s)
+                    g = g + gc
+                    s = s + ns
+                pf_st(
+                    fx.Int32(PF_MISC + 3),
+                    (g + fx.Int32(SBM - 1)) // fx.Int32(SBM) * fx.Int32(SBM),
+                )
+
+        def pf_misc():
+            """(enabled, a, b, gpad), wave-uniform."""
+            m = pf_vec4(fx.Int32(PF_MISC))
+            return fx.Int32(m[2]) != fx.Int32(0), fx.Int32(m[0]), fx.Int32(m[1]), fx.Int32(m[3])
+
+        def pf_out_row(packed, grow, in_tile, row_base, lane_id):
+            """out_row of the row at sorted position ``grow`` with srcmap word ``packed``, in
+            closed form; and 1 for a valid row outside its predicted run (else 0)."""
+            # The tile's expert: the segment that holds row_base (one ballot over the tile table).
+            tabp = lds_typed_ptr(lds_addr(lds.E_tab), T.i32)
+            start_l = fx.Int32(tabp[lane_id]) * fx.Int32(SBM)
+            seg_l = fx.Int32(tabp[fx.Int32(64) + lane_id])
+            hit = (
+                (lane_id < fx.Int32(experts))
+                & (start_l <= row_base)
+                & (row_base < start_l + seg_l)
+            )
+            mask = fx.Int64(rocdl.ballot(T.i64, hit))
+            e = fx.Int32(fx.math.ctpop(mask - fx.Int64(1)))
+            e = (e < fx.Int32(experts)).select(e, fx.Int32(0))
+            seg0 = fx.Int32(
+                rocdl.readfirstlane(
+                    T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, e * fx.Int32(4), start_l))
+                )
+            )
+            enabled, a, b, gpad = pf_misc()
+            mem = enabled & ((e == a) | (e == b))
+            # The row: section, offset in its (section, pe) run, place in my run for pe.
+            t = packed & fx.Int32(0x00FFFFFF)
+            s = packed.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+            pe = t >> fx.Int32(log2_max_tok)
+            valid = (
+                in_tile
+                & (t < fx.Int32(recv_cap))
+                & (s < fx.Int32(topk))
+                & (pe < fx.Int32(npes))
+            )
+            pes = valid.select(pe, fx.Int32(0))
+            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + pes) * fx.Int32(PF_REC_W))
+            per = pf_vec4(fx.Int32(PF_PE) + pes * fx.Int32(PF_PE_W))
+            cum_n, pfx_n, cnt_n = fx.Int32(rec[0]), fx.Int32(rec[1]), fx.Int32(rec[2])
+            gcol, pfx_g = fx.Int32(per[0]), fx.Int32(per[1])
+            avail, sbase = fx.Int32(per[2]), fx.Int32(per[3])
+            rel = grow - seg0
+            is_g = mem & (rel < gpad)
+            off = is_g.select(rel - pfx_g, rel - mem.select(gpad, fx.Int32(0)) - pfx_n)
+            cnt = is_g.select(gcol, cnt_n)
+            cum = is_g.select(cum_n - gcol, cum_n)
+            inside = valid & (off >= fx.Int32(0)) & (off < cnt)
+            place = cum + off
+            fits = inside & (place < avail)
+            orow = fits.select(
+                sbase + place, inside.select(fx.Int32(OUT_ROW_P2P), fx.Int32(-1))
+            )
+            bad = valid.select(inside.select(fx.Int32(0), fx.Int32(1)), fx.Int32(0))
+            return orow, bad
+
+        def pf_peer_vals(p):
+            """Wave-uniform per-pe values: (gcol, pfx_g, avail, send_base, n_send)."""
+            v = pf_vec4(fx.Int32(PF_PE) + p * fx.Int32(PF_PE_W))
+            return (
+                fx.Int32(v[0]),
+                fx.Int32(v[1]),
+                fx.Int32(v[2]),
+                fx.Int32(v[3]),
+                pf_ld(fx.Int32(PF_PE + 4) + p * fx.Int32(PF_PE_W)),
+            )
+
+        def pf_tile_base(t, p, total_tiles, pv):
+            """tile_base[t][p] of the plan in closed form: rows for p in sort tiles < t, capped
+            by avail (per lane; ``t`` may differ per lane)."""
+            gcol_p, pfx_g_p, avail_p, _, nsend_p = pv
+            tabp = lds_typed_ptr(lds_addr(lds.E_tab), T.i32)
+            # The expert whose segment holds tile t: the last one starting at or before it.
+            lo = fx.Int32(0)
+            for step in (32, 16, 8, 4, 2, 1):
+                if const_expr(step < experts):
+                    cand = lo + fx.Int32(step)
+                    okc = cand < fx.Int32(experts)
+                    v = fx.Int32(tabp[okc.select(cand, fx.Int32(0))])
+                    lo = (okc & (v <= t)).select(cand, lo)
+            e = lo
+            rel = t * fx.Int32(SBM) - fx.Int32(tabp[e]) * fx.Int32(SBM)
+            enabled, a, b, gpad = pf_misc()
+            mem = enabled & ((e == a) | (e == b))
+            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W))
+            cum_n, pfx_n, cnt_n = fx.Int32(rec[0]), fx.Int32(rec[1]), fx.Int32(rec[2])
+
+            def clamp(x, hi):
+                x = (x > fx.Int32(0)).select(x, fx.Int32(0))
+                return (x < hi).select(x, hi)
+
+            tb_g = cum_n - gcol_p + clamp(rel - pfx_g_p, gcol_p)
+            tb_n = cum_n + clamp(rel - mem.select(gpad, fx.Int32(0)) - pfx_n, cnt_n)
+            tb = (mem & (rel < gpad)).select(tb_g, tb_n)
+            tb = (tb < avail_p).select(tb, avail_p)
+            capped = (nsend_p < avail_p).select(nsend_p, avail_p)
+            return (t >= total_tiles).select(capped, tb)
+
+        def pf_row_of_place(j, p, st_p, pv):
+            """Sorted position of the row at place ``j`` of my run for ``p`` (per lane): the
+            inverse of the closed form. ``st_p``: LDS array of each expert's first place for p."""
+            gcol_p, pfx_g_p = pv[0], pv[1]
+            stp = lds_typed_ptr(st_p, T.i32)
+            lo = fx.Int32(0)
+            for step in (32, 16, 8, 4, 2, 1):
+                if const_expr(step < experts):
+                    cand = lo + fx.Int32(step)
+                    okc = cand < fx.Int32(experts)
+                    v = fx.Int32(stp[okc.select(cand, fx.Int32(0))])
+                    lo = (okc & (v <= j)).select(cand, lo)
+            e = lo
+            seg0 = fx.Int32(lds_typed_ptr(lds_addr(lds.E_tab), T.i32)[e]) * fx.Int32(SBM)
+            enabled, a, b, gpad = pf_misc()
+            mem = enabled & ((e == a) | (e == b))
+            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W))
+            cum_n, pfx_n = fx.Int32(rec[0]), fx.Int32(rec[1])
+            g_grp = seg0 + pfx_g_p + j - (cum_n - gcol_p)
+            g_nrm = seg0 + mem.select(gpad, fx.Int32(0)) + pfx_n + j - cum_n
+            return (mem & (j < cum_n)).select(g_grp, g_nrm)
 
         def process_tile(block_m, block_n, tab_lds):
             _, lane_id, wave_id, wave_m, wave_n = lane_ids()
@@ -718,6 +1042,25 @@ def compile_gemm2_8wave_sdma(
                 lds_addr(lds.E_wts),
             )
             stage_lds, scale_lds = lds_addr(lds.E_stage), lds_addr(lds.E_scale)
+            if const_expr(plan_free):
+                # The S guard (the plan's spin, moved here): S is rewritten below, so every
+                # peer must have consumed the last call (done[pe] >= my counter), which with
+                # the copy engine's FIFO means my last call's puts have finished reading S.
+                # Relaxed system-scope loads of my own window, in flight with the row
+                # descriptors' loads; later epilogues pass at once.
+                g_lane = (tid < fx.Int32(npes)) & (tid != fx.Int32(rank))
+                win_s = fx.Int64(send_base)
+                done_a = (
+                    win_s
+                    + opaque_i64(fx.Int64(rel_done))
+                    + fx.Int64(g_lane.select(tid, fx.Int32(0))) * fx.Int64(4)
+                )
+                done_v = fx.Int32(comm_ops.load_i32_global_system(done_a))
+                consumed = fx.Int32(
+                    comm_ops.load_i32_global_system(
+                        win_s + opaque_i64(fx.Int64(rel_counter))
+                    )
+                )
 
             # Row descriptors of the tile: out_row, srcmap word, weight.
             row = tid % fx.Int32(256)
@@ -726,15 +1069,26 @@ def compile_gemm2_8wave_sdma(
             sm_idx = global_typed_ptr(trb, T.i32)[
                 grow // fx.Int32(SBM)
             ] + grow % fx.Int32(SBM)
-            orow = in_tile.select(
-                fx.Int32(global_typed_ptr(out_row, T.i32)[grow]), fx.Int32(-1)
-            )
-            packed = fx.Int32(global_typed_ptr(stids, T.i32)[sm_idx])
-            weight = fx.Float32(global_typed_ptr(sweights, T.f32)[sm_idx])
+            if const_expr(plan_free):
+                packed = fx.Int32(global_typed_ptr(stids, T.i32)[sm_idx])
+                weight = fx.Float32(global_typed_ptr(sweights, T.f32)[sm_idx])
+                orow, bad = pf_out_row(packed, grow, in_tile, row_base, lane_id)
+                # Impossible under aiter's compact layout; the host raises on the count.
+                if (bad != fx.Int32(0)) & (block_n == fx.Int32(0)):
+                    comm_ops.atomic_add_agent(fx.Int64(idx_send) + fx.Int64(4), fx.Int32(1))
+            else:
+                orow = in_tile.select(
+                    fx.Int32(global_typed_ptr(out_row, T.i32)[grow]), fx.Int32(-1)
+                )
+                packed = fx.Int32(global_typed_ptr(stids, T.i32)[sm_idx])
+                weight = fx.Float32(global_typed_ptr(sweights, T.f32)[sm_idx])
             if tid < fx.Int32(256):
                 lds_typed_ptr(orow_lds, T.i32)[row] = orow
                 lds_typed_ptr(src_lds, T.i32)[row] = packed
                 lds_typed_ptr(wts_lds, T.f32)[row] = weight
+            if const_expr(plan_free):
+                if g_lane:
+                    _spin_ge_from(done_a, done_v, consumed)
             lds_barrier()
 
             send = create_buffer_resource_from_addr(
@@ -1008,12 +1362,274 @@ def compile_gemm2_8wave_sdma(
                         )
                     publish_flag(w, peer, phase, layout=lay, rank=rank)
 
+        def pf_land_off(p, lane, par):
+            """Rows the ranks below me other than ``p`` send ``p`` (where my run lands in its R),
+            as the plan's offsets: lane = expert, dst-major loads, one wave sum."""
+            okj = lane < fx.Int32(experts)
+            j = okj.select(lane, fx.Int32(0))
+            bc = global_typed_ptr(out_row, T.i32)  # plan-free: bigcnt
+            acc = fx.Int32(0)
+            for dst in range_constexpr(rank):
+                v = fx.Int32(bc[p * fx.Int32(TS) + fx.Int32(dst * experts) + j])
+                acc = acc + (okj & (p != fx.Int32(dst))).select(v, fx.Int32(0))
+            # dst's fanout-pair rows: one per member for every group token p sent dst
+            okd = (lane < fx.Int32(rank)) & (lane != p)
+            d = okd.select(lane, fx.Int32(0))
+            pc0 = fx.Int32(comm_ops.load_i32_system(tile_base, d))
+            pc1 = fx.Int32(comm_ops.load_i32_system(tile_base, fx.Int32(npes) + d))
+            _, _, _, mem_d = pair_of(par, pc0, pc1)
+            gv = fx.Int32(bc[p * fx.Int32(TS) + fx.Int32(TE) + d])
+            acc = acc + okd.select(mem_d * gv, fx.Int32(0))
+            incl = _wave_inclusive_scan_i32(acc, lane)
+            return fx.Int32(
+                rocdl.readfirstlane(
+                    T.i32, fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(63 * 4), incl))
+                )
+            )
+
+        def pf_push(p, lo, hi, pv, st_p, inv_base, value0, sbase_p):
+            """inv[slot] = value0 + place for every place in [lo, hi) of my run for ``p``, the
+            slot read from the srcmap word of the row at that place (the inverse map)."""
+            lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
+            for base in range(lo, hi, fx.Int32(64 * PUSH_U)):
+                ok, js, gs = [], [], []
+                for u in range_constexpr(PUSH_U):
+                    j = base + fx.Int32(u * 64) + lane
+                    in_run = j < hi
+                    jj = in_run.select(j, fx.Int32(0))
+                    ok.append(in_run)
+                    js.append(jj)
+                    gs.append(pf_row_of_place(jj, p, st_p, pv))
+                sms = [
+                    fx.Int32(global_typed_ptr(trb, T.i32)[g // fx.Int32(SBM)])
+                    + g % fx.Int32(SBM)
+                    for g in gs
+                ]
+                words = [fx.Int32(global_typed_ptr(stids, T.i32)[sm]) for sm in sms]
+                for u in range_constexpr(PUSH_U):
+                    wd = words[u]
+                    slot = (wd & fx.Int32(max_tok - 1)) * fx.Int32(topk) + (
+                        wd.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+                    )
+                    if ok[u]:
+                        comm_ops.store_i32_global_system_monotonic(
+                            inv_base + fx.Int64(slot) * fx.Int64(4), value0 + js[u]
+                        )
+
+        def comm_role_pf():
+            """Plan-free comm workgroup: the plan's offsets, chunk bounds and inverse map in
+            closed form from the section table; wave p < npes serves peer p (wave ``rank``
+            fills this rank's own inv entries); then the overflow count and the cdone reset."""
+            tid = fx.Int32(fx.thread_idx.x)
+            lane = tid % fx.Int32(64)
+            wave = fx.Int32(rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
+            is_lane0 = lane == fx.Int32(0)
+            queue = fx.Int32(0)  # one SDMA channel per peer
+            lay = layout
+            tab_lds = lds_addr(lds.E_tab)
+            ld = pf_issue()
+            values, _ = tile_table(tile_end, lane, SBM=SBM, experts=experts)
+            tile_table_to_lds(values, tab_lds, lane)
+            pf_write(ld)
+            lds_barrier()
+            pf_prefix()
+            lds_barrier()
+            par = ld[6]
+            total_tiles = (
+                global_typed_ptr(num_valid, T.i32)[0] + fx.Int32(SBM - 1)
+            ) // fx.Int32(SBM)
+            n_chunks = (total_tiles + fx.Int32(chunk_tiles - 1)) // fx.Int32(chunk_tiles)
+            # Rows past the end of S go through the P2P fallback; count them as the plan did.
+            if tid == fx.Int32(0):
+                over = fx.Int32(0)
+                for q in range_constexpr(npes):
+                    _, _, av, _, ns = pf_peer_vals(fx.Int32(q))
+                    d = ns - av
+                    over = over + (d > fx.Int32(0)).select(d, fx.Int32(0))
+                if over > fx.Int32(0):
+                    comm_ops.atomic_add_agent(fx.Int64(idx_send), over)
+            if wave < fx.Int32(npes):
+                p = wave
+                pv = pf_peer_vals(p)
+                gcol_p, _, avail_p, sbase_p, nsend_p = pv
+                cnt_p = (nsend_p < avail_p).select(nsend_p, avail_p)
+                land_p = pf_land_off(p, lane, par)
+                # Each expert's first place for p (the inverse search), in a main-loop
+                # buffer this workgroup never uses, one array per wave.
+                st_p = lds_addr(lds.A_lds_cur_0) + wave * fx.Int32(64 * 4)
+                enabled, a, b, _ = pf_misc()
+                okj = lane < fx.Int32(experts)
+                cum_l = pf_ld(
+                    fx.Int32(PF_REC)
+                    + (okj.select(lane, fx.Int32(0)) * fx.Int32(npes) + p)
+                    * fx.Int32(PF_REC_W)
+                )
+                mem_l = enabled & ((lane == a) | (lane == b))
+                _st_lds_i32(
+                    st_p,
+                    lane,
+                    okj.select(cum_l - mem_l.select(gcol_p, fx.Int32(0)), fx.Int32(0x7FFFFFFF)),
+                )
+                if p != fx.Int32(rank):
+                    w = cco.Window(win)
+                    sdma = cco.DevComm(dev_comm).sdma()
+                    rsrc_counter = create_buffer_resource_from_addr(
+                        fx.Int64(w.lsa_ptr(rank, lay.off_counter))
+                    )
+                    # Read-only here: the combine advances it after the call.
+                    phase = fx.Int32(
+                        buffer_load(rsrc_counter, 0, vec_width=1, dtype=T.i32)
+                    ) + fx.Int32(1)
+                    # Do not overwrite the peer's landing rows or inv before it has read the last call's.
+                    if is_lane0:
+                        sdma_wait_consumed(w, p, phase, layout=lay, rank=rank)
+                    if const_expr(not inv_pipe):
+                        # inv entries go out while the GEMM computes its first chunk; they must be
+                        # visible before any put or signal of mine, hence the vmcnt wait.
+                        pf_push(
+                            p,
+                            fx.Int32(0),
+                            cnt_p,
+                            pv,
+                            st_p,
+                            fx.Int64(w.lsa_ptr(p, lay.off_inv)),
+                            fx.Int32(send_rows) + land_p,
+                            sbase_p,
+                        )
+                        rocdl.s_waitcnt(vmcnt=0)
+                    else:
+                        # The entries go out between the puts instead. The peer reads them only
+                        # after my flag and my signal, and every entry is complete before both:
+                        # the vmcnt wait before the signal-carrying put (the put also waits
+                        # before its doorbell) and the flag's release.
+                        inv_p = fx.Int64(w.lsa_ptr(p, lay.off_inv))
+                        land0 = fx.Int32(send_rows) + land_p
+                        # Chunk 0's entries while the GEMM computes chunk 0.
+                        t1_0 = (total_tiles < fx.Int32(chunk_tiles)).select(
+                            total_tiles, fx.Int32(chunk_tiles)
+                        )
+                        pf_push(
+                            p,
+                            fx.Int32(0),
+                            pf_tile_base(t1_0, p, total_tiles, pv),
+                            pv,
+                            st_p,
+                            inv_p,
+                            land0,
+                            sbase_p,
+                        )
+                    last = n_chunks - fx.Int32(1)
+                    for c in range(fx.Int32(0), n_chunks, fx.Int32(1)):
+                        ci = fx.Int32(c)
+                        t0 = ci * fx.Int32(chunk_tiles)
+                        t1 = t0 + fx.Int32(chunk_tiles)
+                        t1 = (t1 < total_tiles).select(t1, total_tiles)
+                        # The chunk's bounds come from LDS: ready before its spin ends.
+                        lo = pf_tile_base(t0, p, total_tiles, pv)
+                        hi = pf_tile_base(t1, p, total_tiles, pv)
+                        # Every (sort tile, N-block) of this chunk has stored.
+                        if is_lane0:
+                            comm_ops.spin_until_ge_i32_agent(
+                                fx.Int64(cdone) + fx.Int64(ci) * fx.Int64(CDONE_STRIDE * 4),
+                                (t1 - t0) * n_blocks,
+                            )
+                        comm_ops.fence_agent_acquire()
+                        if const_expr(inv_pipe):
+                            is_last = ci == last
+                            if is_last:
+                                # Every inv entry of this call is complete.
+                                rocdl.s_waitcnt(vmcnt=0)
+                        if (hi > lo) & is_lane0:
+                            # The last chunk's put carries the completion signal.
+                            if ci == last:
+                                sdma_put_run(
+                                    sdma,
+                                    win,
+                                    p,
+                                    queue,
+                                    layout=lay,
+                                    send_base=sbase_p,
+                                    land_off=land_p,
+                                    lo=lo,
+                                    hi=hi,
+                                    cco=cco,
+                                    remote_signal=True,
+                                )
+                            else:
+                                sdma_put_run(
+                                    sdma,
+                                    win,
+                                    p,
+                                    queue,
+                                    layout=lay,
+                                    send_base=sbase_p,
+                                    land_off=land_p,
+                                    lo=lo,
+                                    hi=hi,
+                                    cco=cco,
+                                )
+                        if const_expr(inv_pipe):
+                            # The next chunk's entries while the copy engine moves this one
+                            # (none after the last chunk).
+                            t2 = t1 + fx.Int32(chunk_tiles)
+                            t2 = (t2 < total_tiles).select(t2, total_tiles)
+                            pf_push(
+                                p,
+                                hi,
+                                pf_tile_base(t2, p, total_tiles, pv),
+                                pv,
+                                st_p,
+                                inv_p,
+                                land0,
+                                sbase_p,
+                            )
+                    if const_expr(inv_pipe):
+                        # Before the signal-only put below (no chunk put carried the signal).
+                        rocdl.s_waitcnt(vmcnt=0)
+                    if is_lane0:
+                        t_last = last * fx.Int32(chunk_tiles)
+                        t_last = (t_last > fx.Int32(0)).select(t_last, fx.Int32(0))
+                        lo_l = pf_tile_base(t_last, p, total_tiles, pv)
+                        hi_l = pf_tile_base(total_tiles, p, total_tiles, pv)
+                        # A peer whose last chunk was empty (or with no chunks) still needs the signal.
+                        if (n_chunks <= fx.Int32(0)) | (hi_l <= lo_l):
+                            sdma_signal_peer(
+                                sdma, win, p, queue, layout=lay, rank=rank, cco=cco
+                            )
+                        publish_flag(w, p, phase, layout=lay, rank=rank)
+                else:
+                    # My own run stays in S; the combine finds its rows through inv (what the
+                    # plan wrote). Its last readers ran before this kernel (stream order).
+                    pf_push(
+                        p,
+                        fx.Int32(0),
+                        cnt_p,
+                        pv,
+                        st_p,
+                        fx.Int64(send_base) + fx.Int64(rel_inv),
+                        sbase_p,
+                        sbase_p,
+                    )
+            # Every comm wave has passed every chunk's spin, so every increment of this call
+            # has landed: zero this call's counters for the next one (the plan zeroed them at
+            # the start of each call; the kernel boundary orders these stores before them).
+            fx.barrier()
+            for c in range(tid, n_chunks, fx.Int32(512)):
+                _st_i32(fx.Int64(cdone), fx.Int32(c) * fx.Int32(CDONE_STRIDE), fx.Int32(0))
+
         def gemm_role():
             tab_lds = lds_addr(lds.E_tab)
             lane = fx.thread_idx.x % fx.Int32(64)
+            if const_expr(plan_free):
+                ld = pf_issue()
             values, n_tiles = tile_table(tile_end, lane, SBM=SBM, experts=experts)
             tile_table_to_lds(values, tab_lds, lane)
+            if const_expr(plan_free):
+                pf_write(ld)
             lds_barrier()
+            if const_expr(plan_free):
+                pf_prefix()
+                lds_barrier()
             for w in range(
                 fx.Int32(fx.block_idx.x) - fx.Int32(1),
                 n_tiles * n_blocks,
@@ -1023,7 +1639,10 @@ def compile_gemm2_8wave_sdma(
                 process_tile(w // n_blocks, w % n_blocks, tab_lds)
 
         if fx.Int32(fx.block_idx.x) == fx.Int32(0):
-            comm_role()
+            if const_expr(plan_free):
+                comm_role_pf()
+            else:
+                comm_role()
         else:
             gemm_role()
 

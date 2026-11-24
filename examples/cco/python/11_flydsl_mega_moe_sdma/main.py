@@ -207,6 +207,9 @@ def _make_sdma(moe, args, chunk_tiles, gemm2="aiter"):
         send_slack=args.send_slack,
         signal_mode=args.signal_mode,
         gemm2=gemm2,
+        plan_free=args.plan_free,
+        inv_pipe=args.inv_pipe,
+        combine_opt=args.combine_opt,
     )
 
 
@@ -464,7 +467,11 @@ def run_bench(args, rank, world, device):
         for g2, ct in [(g2, ct) for g2 in gemm2_list for ct in chunk_list]:
             sc.set_gemm2(g2)
             sc.set_chunk_tiles(ct)
-            label = f"SDMA {g2} GEMM2 CT={ct}"
+            label = f"SDMA {g2} GEMM2 CT={ct}{' plan-free' if sc._pf_active() else ''}"
+            if sc._pf_active() and sc.inv_pipe:
+                label += " inv-pipe"
+            if not sc.combine_opt:
+                label += " plain-combine"
             out = sc.run(bs, config).clone()
             torch.cuda.synchronize()
             rel = _rel_l2(out, ref)
@@ -543,6 +550,27 @@ def _parse_args():
         help="GEMM2 kernel: aiter (aiter's GEMM2 main loop with comm workgroups) or "
         "8wave (8-wave 256x256 persistent GEMM2; fp8, remote, one queue). bench takes "
         "a list, e.g. aiter,8wave",
+    )
+    common.add_argument(
+        "--plan-free",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --gemm2 8wave: no plan kernel; GEMM2 places every row in closed form "
+        "from aiter's gathered counts (MegaMoESdma(plan_free=...))",
+    )
+    common.add_argument(
+        "--inv-pipe",
+        action="store_true",
+        help="with --gemm2 8wave and plan-free: push the peers' inv entries between the puts "
+        "instead of all before the first one; pays only where the transfer bounds the call "
+        "(MegaMoESdma(inv_pipe=True))",
+    )
+    common.add_argument(
+        "--combine-opt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="combine with the inv slots loaded once, write-through resets and no per-block "
+        "release, done stores relaxed after one system release (MegaMoESdma(combine_opt=...))",
     )
     common.add_argument(
         "--quant",
