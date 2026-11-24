@@ -516,6 +516,37 @@ TEST_P(RedisStoreTest, ExpireStaleFlipsAndWipesBlocks) {
   EXPECT_EQ(rec->status, ClientStatus::EXPIRED);
 }
 
+// Same contract as the in-memory store: a keepalive or delta from an EXPIRED
+// node is UNKNOWN, so the client re-registers and full-syncs; a full sync
+// carries every location and revives the node.
+TEST_P(RedisStoreTest, ExpiredNodeRevivesOnlyOnFullSync) {
+  ASSERT_TRUE(store_->RegisterClient(MakeReg("n1"), now_, 30s));
+  ASSERT_EQ(
+      store_
+          ->ApplyHeartbeat("n1", 1, now_, {}, {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, false)
+          .status,
+      HeartbeatResult::APPLIED);
+  ASSERT_EQ(store_->ExpireStaleClients(now_ + 10s).size(), 1u);
+
+  EXPECT_EQ(store_->ApplyHeartbeat("n1", 0, now_ + 40s, {}, {}, false).status,
+            HeartbeatResult::UNKNOWN);  // keepalive
+  EXPECT_EQ(store_
+                ->ApplyHeartbeat("n1", 2, now_ + 40s, {},
+                                 {{KvEvent::Kind::ADD, "k2", TierType::DRAM, 1}}, false)
+                .status,
+            HeartbeatResult::UNKNOWN);
+  EXPECT_FALSE(store_->IsClientAlive("n1"));
+  EXPECT_FALSE(store_->BatchExistsBlock({"k2"})[0]);
+
+  EXPECT_EQ(store_
+                ->ApplyHeartbeat("n1", 2, now_ + 40s, {},
+                                 {{KvEvent::Kind::ADD, "k", TierType::DRAM, 1}}, true)
+                .status,
+            HeartbeatResult::APPLIED);
+  EXPECT_TRUE(store_->IsClientAlive("n1"));
+  EXPECT_TRUE(store_->BatchExistsBlock({"k"})[0]);
+}
+
 // ---------------------------------------------------------------------
 // Cross-shard coverage: with block_shards=16 the keys below spread over
 // multiple shards, so these exercise the per-shard fan-out + scatter-merge and
