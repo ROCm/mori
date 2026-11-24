@@ -299,7 +299,10 @@ def _cases():
     yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
     # The hip backend's gather path; OP-LEC runs in every case. No TUNED here: it
     # injects FlyDSL's table, and hip resolves its own.
-    hip = {"MORI_V2_KERNEL_BACKEND": "hip", "COMBINE": "gather"}
+    # LL_DISPATCH=0 pins the portable body: these cases were written for it, and
+    # the library default is automatic, which would quietly run the LL body instead
+    # at every token count this suite sweeps.
+    hip = {"MORI_V2_KERNEL_BACKEND": "hip", "COMBINE": "gather", "LL_DISPATCH": 0}
     yield "hip-bf16-gather", dict(hip, DTYPE="bf16")
     yield "hip-bf16-gather-scales-ragged", dict(
         hip, DTYPE="bf16", SCALE_DIM=32, RAGGED=1, NOSELF=1
@@ -325,6 +328,12 @@ def _cases():
     # a case that forgot the backend would error rather than pass without having
     # run the body under test.
     ll = dict(hip, LL_DISPATCH=1, DTYPE="bf16")
+    # The default itself: no LL_DISPATCH at all, so the schedule picks per bucket.
+    yield "ll-bf16-auto-default", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "COMBINE": "gather",
+        "DTYPE": "bf16",
+    }
     # topk sets the dedup loop's trip count and how many destinations a copy warp
     # fans to; 16 is past the fixed unroll of 8 that v1 stopped at.
     for k in (8, 9, 16):

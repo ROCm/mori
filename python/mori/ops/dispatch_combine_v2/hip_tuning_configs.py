@@ -798,6 +798,55 @@ class ScheduleEntry(NamedTuple):
     combine: KernelConfig
 
 
+# Largest call, in tokens a rank, that the LL dispatch serves when nothing asks
+# for it explicitly. Measured against the portable body on 8x MI300X and 8x
+# MI355X over 19 shape x dtype combinations (hidden 2048-7168, topk 4-9, bf16 /
+# fp8 / fp4): at 512 tokens a rank and below the LL body is faster on every one
+# of them, worst case +0.1%, while above 2048 three of them regress by 1-11%.
+# The edge is the measurement, not a guess; move it only with another one.
+_LL_AUTO_MAX_TOKENS = 512
+
+
+def _ll_auto_ok(cfg) -> bool:
+    """Whether the automatic rule may put the LL body in a bucket.
+
+    Explicit ll_dispatch=True refuses a config it cannot run, which is right: the
+    caller asked for the body by name. Automatic selection must do the opposite and
+    fall back to the portable body without a word, since the caller asked for a
+    dispatch, not for this one. So every condition MakeEpCfg would throw on is
+    checked here first.
+    """
+    if getattr(cfg, "is_internode", False) or getattr(cfg, "async_ll", False):
+        return False
+    arch = _gpu.arch_name()
+    if not arch or is_gfx125x_arch(arch):
+        return False
+    # Lane p of the routing warp owns destination p, so the world fits in a wave.
+    if cfg.world_size > 64:
+        return False
+    # EpDispatchLLBody drops no slot, so a capped receive would write past maxRecv.
+    if cfg.effective_max_recv < cfg.world_size * cfg.max_num_inp_token_per_rank:
+        return False
+    return True
+
+
+def _ll_mode(cfg):
+    """(on, cap): whether any bucket is LL, and the largest that may be.
+
+    ll_dispatch is three-valued. True is the explicit opt-in and covers the whole
+    schedule unless ll_dispatch_max_tokens narrows it. False is never. None, the
+    default, is automatic: the small-token buckets only, and only where the body
+    can actually run.
+    """
+    flag = getattr(cfg, "ll_dispatch", None)
+    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
+    if flag is False:
+        return False, None
+    if flag is True:
+        return True, cap
+    return _ll_auto_ok(cfg), cap if cap is not None else _LL_AUTO_MAX_TOKENS
+
+
 def _split_at_ll_cap(cfg, rows):
     """Make ll_dispatch_max_tokens a bucket edge, as internode_schedule() does for
     its own crossover.
@@ -807,10 +856,8 @@ def _split_at_ll_cap(cfg, rows):
     below a finite cap. Splitting it keeps the geometry identical on both sides --
     only the body differs -- so the pair costs one extra kernel, not a re-tune.
     """
-    if not getattr(cfg, "ll_dispatch", False):
-        return rows
-    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
-    if cap is None:
+    on, cap = _ll_mode(cfg)
+    if not on or cap is None:
         return rows
     out = []
     for row in rows:
@@ -830,9 +877,9 @@ def _ll_bucket(cfg, ceiling) -> bool:
     kernel_config() picks by the call's token count -- the intranode counterpart of
     internode_auto_ll_max_tokens.
     """
-    if not getattr(cfg, "ll_dispatch", False):
+    on, cap = _ll_mode(cfg)
+    if not on:
         return False
-    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
     if cap is None:
         return True
     # An open-ended bucket reaches past any finite cap.

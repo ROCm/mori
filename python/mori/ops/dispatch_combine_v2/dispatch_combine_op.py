@@ -292,13 +292,17 @@ class EpDispatchCombineConfig:
     # from the v1 IntraNodeLL dispatch. gfx942 / gfx950, one node, hip backend; the
     # combine is unchanged. The warp split is derived from hidden_dim at compile time,
     # so leave warp_num_per_block None unless you are sweeping it.
-    ll_dispatch: bool = False
-    # Largest call, in tokens a rank, that the LL body serves. None (the default)
-    # means every bucket is LL, which is what ll_dispatch alone has always meant.
-    # A number makes the schedule hold both bodies and pick by the call's token
-    # count: the LL body wins on every shape measured up to 512 tokens a rank and
-    # regresses on a few above 2048, so 512 is the edge the data supports. The
-    # intranode counterpart of internode_auto_ll_max_tokens.
+    # None (the default) is automatic: the hip backend builds the LL body for the
+    # schedule buckets at or below ll_dispatch_max_tokens and the portable body
+    # above, and falls back silently wherever the LL body cannot run. True asks for
+    # it by name and refuses such a config instead. False never builds it.
+    ll_dispatch: bool | None = None
+    # Largest call, in tokens a rank, that the LL body serves. Under ll_dispatch
+    # None this defaults to the measured edge (hip_tuning_configs._LL_AUTO_MAX_TOKENS,
+    # 512); under ll_dispatch True, None means the whole schedule, which is what the
+    # explicit opt-in has always meant. Either way a number makes the schedule hold
+    # both bodies and pick by the call's token count -- the intranode counterpart of
+    # internode_auto_ll_max_tokens.
     ll_dispatch_max_tokens: int | None = None
     # Receive layout of async_ll over "sdma" on one node: "compact" (default),
     # "segmented" or "auto".

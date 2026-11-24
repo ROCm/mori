@@ -1289,7 +1289,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
-        if cfg.ll_dispatch and (cfg.async_ll or cfg.is_internode or self._is1250):
+        if cfg.ll_dispatch is True and (
+            cfg.async_ll or cfg.is_internode or self._is1250
+        ):
             return (
                 "ll_dispatch (the portable wave64 intranode dispatch: gfx942 / gfx950, "
                 "one node, not async_ll)",
