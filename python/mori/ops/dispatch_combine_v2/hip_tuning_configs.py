@@ -799,12 +799,23 @@ class ScheduleEntry(NamedTuple):
 
 
 # Largest call, in tokens a rank, that the LL dispatch serves when nothing asks
-# for it explicitly. Measured against the portable body on 8x MI300X and 8x
-# MI355X over 19 shape x dtype combinations (hidden 2048-7168, topk 4-9, bf16 /
-# fp8 / fp4): at 512 tokens a rank and below the LL body is faster on every one
-# of them, worst case +0.1%, while above 2048 three of them regress by 1-11%.
-# The edge is the measurement, not a guess; move it only with another one.
-_LL_AUTO_MAX_TOKENS = 512
+# for it explicitly. None = no ceiling: the LL body is the intranode hip dispatch,
+# and EpDispatchBody serves only what the LL body cannot (see _ll_auto_ok).
+#
+# What that accepts. Measured against the portable body on 8x MI300X and 8x MI355X
+# over 19 shape x dtype combinations (hidden 2048-7168, topk 4-9, bf16 / fp8 /
+# fp4): at 512 tokens a rank and below the LL body is faster on every one of them,
+# worst case +0.1%. Above 2048 three of them are slower -- hidden 2048 top-4 bf16
+# by 7-11%, fp4 at hidden 5120 by 5%, gpt-oss hidden 2880 by 1% -- and with no
+# ceiling those calls now take the LL body anyway. Setting this to 512 restores
+# the measured-best split; it is one value.
+#
+# Those numbers were also taken against a portable body that compiles to 5
+# waves/SIMD where the LL body gets 8, because its peer stores fall back to
+# flat_store_dwordx4 (EpPeer builds its pointer from an integer, so the compiler
+# cannot see address space 1). That is a property of the codegen, not of either
+# algorithm, and fixing it would move the comparison.
+_LL_AUTO_MAX_TOKENS = None
 
 
 def _ll_auto_ok(cfg) -> bool:
