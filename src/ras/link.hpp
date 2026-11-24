@@ -144,6 +144,10 @@ class LinkManager {
     size_t inStart{0};
     std::vector<uint8_t> out;
     size_t outStart{0};
+    // Timing belongs to one connection: the peer's clock can move while the link is down, so
+    // a reconnect starts with no samples.
+    HeartbeatTracker heartbeat;
+    bool timingLogged{false};  // this connection's first sample has been logged
   };
 
   struct Link {
@@ -165,8 +169,6 @@ class LinkManager {
     uint64_t nextHeartbeatNs{0};
     uint64_t lastRxNs{0};
     uint64_t refusedSinceNs{0};  // the first of the reconnects refused in a row, or 0
-    HeartbeatTracker heartbeat;
-    bool timingLogged{false};  // the first timing sample has been logged
     uint64_t connectAttempts{0};
     uint64_t connects{0};
     uint64_t disconnects{0};

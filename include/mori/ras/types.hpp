@@ -213,6 +213,7 @@ struct LinkInfo {
   uint64_t acksSent{0};
   uint64_t acksReceived{0};
   int64_t lastRxAgeMs{-1};  // since the last message from the peer; -1 if none
+  // Timing comes only from the current connection, so a link that is down has none.
   bool hasTiming{false};
   int64_t rttNs{0};          // latest round-trip time
   int64_t offsetNs{0};       // best clock-offset estimate: peer wall clock minus ours

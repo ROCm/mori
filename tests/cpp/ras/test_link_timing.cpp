@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <random>
 #include <vector>
@@ -240,6 +241,35 @@ TEST(RasLinkTiming, ImpossibleSamplesAreDiscarded) {
   // The heartbeat was used up, so a second ACK for it doesn't match.
   EXPECT_FALSE(t.OnAck({hb.sendMonoNs, 10, 0}, 2000, 0).has_value());
   EXPECT_EQ(t.Unmatched(), 1u);
+}
+
+// The hold and the peer's wall clock come off the wire. At the top of the range, the slack,
+// the plausibility check, and the bound once overflowed int64_t, which a UBSan build reports.
+TEST(RasLinkTiming, ExtremeValuesOffTheWireAreSafe) {
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  constexpr uint64_t kMaxU = static_cast<uint64_t>(kMax);
+  for (uint64_t hold : {kMaxU, kMaxU - 1, kMaxU - 1999, kMaxU - 2000, kMaxU + 1,
+                        std::numeric_limits<uint64_t>::max()}) {
+    EXPECT_FALSE(ComputeTiming(1000, 2000, 0, hold, kMax).has_value()) << hold;
+  }
+  // A hold that the round trip does cover, and a round trip at the top of the range.
+  std::optional<TimingSample> s = ComputeTiming(0, kMaxU, 0, kMaxU, 0);
+  ASSERT_TRUE(s.has_value());
+  EXPECT_EQ(s->rttNs, 0);
+  EXPECT_GT(s->errorBoundNs, 0);
+  s = ComputeTiming(0, kMaxU, 0, 0, 0);
+  ASSERT_TRUE(s.has_value());
+  EXPECT_EQ(s->rttNs, kMax);
+  EXPECT_EQ(s->errorBoundNs, kMax / 2 + 1 + 4);
+  // Wall clocks at opposite ends of the range: an offset that doesn't fit is no sample.
+  EXPECT_FALSE(ComputeTiming(0, 1000, -kMax, 0, kMax).has_value());
+
+  // The same through the tracker, as a peer's ACK on a live link.
+  HeartbeatTracker t;
+  mori::ras::proto::Heartbeat hb = t.Next(1000, 0);
+  EXPECT_FALSE(t.OnAck({hb.sendMonoNs, kMaxU, kMax}, 2000, 0).has_value());
+  EXPECT_EQ(t.Impossible(), 1u);
+  EXPECT_EQ(t.Last(), nullptr);
 }
 
 TEST(RasLinkTiming, BestPicksTheSmallestBoundInTheWindow) {

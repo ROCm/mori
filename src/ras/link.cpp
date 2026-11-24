@@ -885,9 +885,9 @@ bool LinkManager::OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint6
           },
           [&](const proto::HeartbeatAck& ack) {
             ++l.acksReceived;
-            std::optional<TimingSample> s = l.heartbeat.OnAck(ack, rxMonoNs, rxWallNs);
-            if (s && !l.timingLogged) {
-              l.timingLogged = true;
+            std::optional<TimingSample> s = c->heartbeat.OnAck(ack, rxMonoNs, rxWallNs);
+            if (s && !c->timingLogged) {
+              c->timingLogged = true;
               RAS_LOG_INFO(
                   "RAS link to runtime {} ({}): round trip {} us, clock offset {} us +- {} us",
                   l.peer.ToString(), l.peerHostname, s->rttNs / 1000, s->offsetNs / 1000,
@@ -1141,7 +1141,8 @@ void LinkManager::ScheduleConnect(Link& l, uint64_t now, bool immediate) {
 }
 
 void LinkManager::SendHeartbeat(Link& l, uint64_t now) {
-  proto::Heartbeat hb = l.heartbeat.Next(now, Degraded() != 0 ? proto::kHeartbeatFlagDegraded : 0);
+  proto::Heartbeat hb =
+      l.conn->heartbeat.Next(now, Degraded() != 0 ? proto::kHeartbeatFlagDegraded : 0);
   if (Send(l.conn, hb)) ++l.heartbeatsSent;
   l.nextHeartbeatNs = now + opts_.config.HeartbeatNs();
 }
@@ -1177,8 +1178,10 @@ LinkInfo LinkManager::Describe(const Link& l, uint64_t now) const {
   i.acksSent = l.acksSent;
   i.acksReceived = l.acksReceived;
   i.lastRxAgeMs = l.lastRxNs != 0 ? static_cast<int64_t>((now - l.lastRxNs) / kMs) : -1;
-  if (const TimingSample* last = l.heartbeat.Last()) {
-    const TimingSample* best = l.heartbeat.Best();
+  const HeartbeatTracker* timing =
+      l.conn != nullptr && l.conn->phase == Phase::kEstablished ? &l.conn->heartbeat : nullptr;
+  if (const TimingSample* last = timing != nullptr ? timing->Last() : nullptr) {
+    const TimingSample* best = timing->Best();
     i.hasTiming = true;
     i.rttNs = last->rttNs;
     i.offsetNs = best->offsetNs;

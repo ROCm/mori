@@ -32,11 +32,15 @@ constexpr int64_t kInt64Max = std::numeric_limits<int64_t>::max();
 // Integer halving in the offset formula and in the timestamps themselves.
 constexpr int64_t kRoundingSlackNs = 4;
 
-// How far a hold of `holdNs`, measured on the peer's clock, can be off on ours.
+// How far a hold of `holdNs`, measured on the peer's clock, can be off on ours, rounded up.
+// It divides before rounding: the hold comes off the wire, and adding first can overflow.
 int64_t RateSlack(int64_t holdNs) {
   constexpr int64_t kPerNs = static_cast<int64_t>(1 / kMaxRateError);  // 2000 for 500 ppm
-  return (holdNs + kPerNs - 1) / kPerNs;
+  return holdNs / kPerNs + (holdNs % kPerNs != 0 ? 1 : 0);
 }
+
+// Half of `x` >= 0, rounded up, without the overflow of (x + 1) / 2 at the top of the range.
+int64_t HalfUp(int64_t x) { return x / 2 + x % 2; }
 
 }  // namespace
 
@@ -51,7 +55,7 @@ std::optional<TimingSample> ComputeTiming(uint64_t sendMonoNs, uint64_t recvMono
   int64_t elapsed = static_cast<int64_t>(elapsedU);
   int64_t hold = static_cast<int64_t>(holdNs);
   int64_t slack = RateSlack(hold);
-  if (hold > elapsed + slack) return std::nullopt;
+  if (hold - slack > elapsed) return std::nullopt;  // held longer than the whole round trip
   int64_t rtt = std::max<int64_t>(elapsed - hold, 0);
 
   __int128 offset = static_cast<__int128>(peerSendWallNs) - hold / 2 -
@@ -61,7 +65,7 @@ std::optional<TimingSample> ComputeTiming(uint64_t sendMonoNs, uint64_t recvMono
   TimingSample s;
   s.rttNs = rtt;
   s.offsetNs = static_cast<int64_t>(offset);
-  s.errorBoundNs = (rtt + 1) / 2 + (slack + 1) / 2 + kRoundingSlackNs;
+  s.errorBoundNs = HalfUp(rtt) + HalfUp(slack) + kRoundingSlackNs;
   s.atMonoNs = recvMonoNs;
   return s;
 }

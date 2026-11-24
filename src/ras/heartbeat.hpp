@@ -68,6 +68,7 @@ struct TimingSample {
 
 // One sample from the four timestamps. nullopt if they're impossible: the ACK arrived before
 // the heartbeat left, or the peer claims to have held it longer than the whole round trip.
+// The hold and the peer's wall clock come off the wire, so every input is safe, however large.
 std::optional<TimingSample> ComputeTiming(uint64_t sendMonoNs, uint64_t recvMonoNs,
                                           int64_t recvWallNs, uint64_t holdNs,
                                           int64_t peerSendWallNs);
