@@ -380,9 +380,8 @@ def compile_gemm1_sdma(
         raise ValueError("a_dbuf: 0, or 1 with kpipe 1")
     if kunroll not in (1, 2) or (kunroll != 1 and kpipe != 1):
         raise ValueError("kunroll: 1, or 2 with kpipe 1")
-    if trace and ready_first and not (pipe_weights and async_a_copy and mfma_amajor):
-        raise ValueError("a ready_first trace build splits the tile: pipe_weights + async_a_copy "
-                         "+ mfma_amajor only")
+    # the tile split (``do_tile_split``) only covers this config; aiter turns it off at small batches
+    split_ok = bool(pipe_weights and async_a_copy and mfma_amajor)
     if gate_arena:
         if lds_pool_bytes < layout_lds_words(gate_arena) * 4:
             raise ValueError("the LDS pool is too small to lend the layout its words")
@@ -559,10 +558,12 @@ def compile_gemm1_sdma(
         def run_tile_rf(m_tile, n_tile, item):
             """``ready_first``: m-tile ``m_tile`` (from the ready queue) is ready, nothing to
             wait for. The trace build runs the same tile split (``tile_hoist.do_tile_split``):
-            per item ``[0]`` start, ``[1]`` K loop starts, ``[3]`` K loop done, ``[2]`` done."""
+            per item ``[0]`` start, ``[1]`` K loop starts, ``[3]`` K loop done, ``[2]`` done.
+            A config the split does not cover (``split_ok`` false) traces the item's start twice
+            around aiter's ``do_tile``."""
             slot0 = (item < fx.Int32(TRACE_ITEMS)).select(fx.Int32(8) + item * fx.Int32(TRACE_SLOTS), fx.Int32(TRACE_STRIDE - TRACE_SLOTS))
             stamp(trace_buf, slot0)
-            if const_expr(trace):
+            if const_expr(trace and split_ok):
                 do_tile_split(
                     m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                     a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
@@ -578,6 +579,8 @@ def compile_gemm1_sdma(
                     trace_buf, fx.Int32(0), False, 1,
                 )
             else:
+                stamp(trace_buf, slot0 + fx.Int32(1))
+                stamp_mt(trace_buf, slot0 + fx.Int32(3))
                 do_tile(
                     m_tile, n_wave_base + n_tile * fx.Int32(tile_n), sched.expert_of(m_tile), sched,
                     a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf, a_scale_lds,
@@ -1009,14 +1012,22 @@ def compile_gemm1_sdma(
                             wr(HB_M, fx.Int32(0))
                             wr(HB_OK, fx.Int32(0))
                         fx.barrier()
-                        raw = hp_rows(rd(HA_TIB))
-                        hp_stage_store(hp_issue(raw, hp_sa_rows(rd(HA_TIB))))
-                        raw = raw + [fx.Int32(0)] * (4 - n_rounds)
-                        r0 = raw[0]
-                        r1 = raw[1]
-                        r2 = raw[2]
-                        r3 = raw[3]
                         tk = rd(HA_T)
+                        r0 = fx.Int32(0)
+                        r1 = fx.Int32(0)
+                        r2 = fx.Int32(0)
+                        r3 = fx.Int32(0)
+                        # a dead first ticket (``tk >= total_work``): ``resolve()`` returned the m-tile 0
+                        # placeholder without waiting for the ready queue, so m-tile 0's window rows may
+                        # not have landed (or may not exist). The loop below does not run: gather nothing.
+                        if tk < total_work:
+                            raw0 = hp_rows(rd(HA_TIB))
+                            hp_stage_store(hp_issue(raw0, hp_sa_rows(rd(HA_TIB))))
+                            raw0 = raw0 + [fx.Int32(0)] * (4 - n_rounds)
+                            r0 = raw0[0]
+                            r1 = raw0[1]
+                            r2 = raw0[2]
+                            r3 = raw0[3]
                         item = fx.Int32(0)
                         tacc = fx.Int64(0)
                         while tk < total_work:
@@ -1197,6 +1208,8 @@ def run_gemm1_sdma(out, window, w, scale_w, tile_row_base, tile_input_base, expe
         kwargs.pop("epi_remat", None)
     elif kwargs.get("ready_first") and not prep.sched_on:
         raise ValueError("ready_first needs Stage1SdmaPrepare(sched=True) (arm zeroes its counters)")
+    elif kwargs.get("xcd_order") and not prep.xcd_on:
+        raise ValueError("xcd_order needs Stage1SdmaPrepare(sched=True, xcd_order=True) (the XCD lists)")
     fz = dict(fuse or {})
     if prep is not None:
         fz.setdefault("sched", prep.sched.data_ptr())

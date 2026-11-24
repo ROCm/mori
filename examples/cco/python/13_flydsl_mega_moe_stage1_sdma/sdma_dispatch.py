@@ -1858,6 +1858,7 @@ class Stage1SdmaPrepare:
         head_rows=0,
         sched=False,
         no_plan=False,
+        xcd_order=False,
     ):
         import torch
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
@@ -1918,11 +1919,15 @@ class Stage1SdmaPrepare:
         # ``sched`` (``ready_first``): the tile scheduler's words (``SCH_*``; ``arm`` zeroes the
         # counters, the ready queue behind them needs none)
         self.sched_on = bool(sched)
-        # then (``xcd_order``) the 8 per-XCD lists: ``sched_xcd_base``
+        # ``xcd_order`` (with ``sched``): the 8 per-XCD lists behind the ready queue
+        # (``sched_xcd_base``), and their heads and tails in ``arm``'s memset. Without it ``sched``
+        # is the ready queue only, as before.
+        self.xcd_on = bool(sched and xcd_order)
         assert sched_tiles_max(a) == (a.max_routes + 15) // 16 + self.epr
-        self.sched = torch.zeros(
-            sched_xcd_base(a) + SCH_XZERO + 8 * sched_xcd_cap(a), **i32
-        )
+        n_sched = SCH_RQ + sched_tiles_max(a)
+        if self.xcd_on:
+            n_sched = sched_xcd_base(a) + SCH_XZERO + 8 * sched_xcd_cap(a)
+        self.sched = torch.zeros(n_sched, **i32)
         n_lgroups = (LAYOUT_BLOCKS + BAR_GROUP - 1) // BAR_GROUP
         self.lbar = torch.zeros(2 * (n_lgroups + 1) * BAR_STRIDE, **i32)
         # The gated GEMM1 runs the layout in its ``n_cu - 1`` compute workgroups. A barrier
@@ -2142,8 +2147,9 @@ class Stage1SdmaPrepare:
         if self.sched_on:
             # head, ready-queue tail, layout-done: a capturable memset like the rest of ``arm``
             self.sched[:SCH_ZERO].zero_()
-            xb = sched_xcd_base(self.arena)
-            self.sched[xb : xb + SCH_XZERO].zero_()  # the XCD lists' heads and tails
+            if self.xcd_on:
+                xb = sched_xcd_base(self.arena)
+                self.sched[xb : xb + SCH_XZERO].zero_()  # the XCD lists' heads and tails
         # a device tensor keeps this capturable in a CUDA graph (no host copy)
         if not isinstance(chunks_from, torch.Tensor):
             chunks_from = torch.as_tensor(
