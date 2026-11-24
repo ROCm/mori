@@ -51,6 +51,8 @@ class PeerServiceServer {
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
+  // Register before Start; the borrowed service must outlive Stop().
+  void SetPrefetchService(grpc::Service& service) { prefetch_service_ = &service; }
   void Stop();
   uint16_t BoundPort() const { return bound_port_; }
 
@@ -62,6 +64,7 @@ class PeerServiceServer {
   std::vector<uint8_t> engine_desc_bytes_;
 
   std::unique_ptr<grpc::Server> server_;
+  grpc::Service* prefetch_service_ = nullptr;
   uint16_t bound_port_ = 0;
 
   class UMBPPeerServiceImpl;

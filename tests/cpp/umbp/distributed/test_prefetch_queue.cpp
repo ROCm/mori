@@ -51,6 +51,13 @@ struct Gate {
   }
 };
 
+bool WaitTask(PrefetchQueue& queue, const std::string& id) {
+  const auto deadline = PrefetchQueue::Clock::now() + 2s;
+  while (!PrefetchTerminal(queue.Status(id).state) && PrefetchQueue::Clock::now() < deadline)
+    std::this_thread::sleep_for(1ms);
+  return PrefetchTerminal(queue.Status(id).state);
+}
+
 TEST(PrefetchQueue, ExpiredQueuedRequestDoesNotStartIo) {
   Gate io;
   std::atomic<int> calls{0};
@@ -65,7 +72,8 @@ TEST(PrefetchQueue, ExpiredQueuedRequestDoesNotStartIo) {
   std::this_thread::sleep_for(20ms);
   EXPECT_EQ(queue.Status("expired").state, PrefetchState::kExpired);
   io.Release();
-  EXPECT_TRUE(queue.WaitForKeys({"expired"}, 2s));
+  ASSERT_TRUE(WaitTask(queue, "active"));
+  EXPECT_TRUE(queue.WaitForKeys({"expired"}, 0ms));
   EXPECT_EQ(calls, 1);
   EXPECT_EQ(queue.Status("active").state, PrefetchState::kReady);
   EXPECT_EQ(queue.Status("expired").state, PrefetchState::kExpired);
@@ -93,7 +101,7 @@ TEST(PrefetchQueue, ClearDrainsRealIoAndResumesAdmission) {
   EXPECT_EQ(queue.Status("active").state, PrefetchState::kFailed);
   queue.Resume();
   ASSERT_TRUE(queue.Submit({"new"}, {}, "new").accepted);
-  EXPECT_TRUE(queue.WaitForKeys({"new"}, 2s));
+  ASSERT_TRUE(WaitTask(queue, "new"));
   EXPECT_EQ(queue.Status("new").state, PrefetchState::kReady);
   queue.Stop();
   EXPECT_FALSE(queue.Submit({"stopped"}).accepted);
@@ -105,13 +113,13 @@ TEST(PrefetchQueue, CompletedHistoryDoesNotBlockAdmission) {
   for (int i = 0; i < 1024; ++i) {
     const auto id = std::to_string(i);
     ASSERT_TRUE(queue.Submit({"key"}, {}, id).accepted);
-    ASSERT_TRUE(queue.WaitForKeys({"key"}, 2s));
+    ASSERT_TRUE(WaitTask(queue, id));
     ASSERT_EQ(queue.Status(id).state, PrefetchState::kReady);
   }
   EXPECT_TRUE(queue.Submit({"key"}, {}, "1023").accepted);  // Retained IDs remain idempotent.
   ASSERT_TRUE(queue.Submit({"key"}, {}, "next").accepted);
   EXPECT_EQ(queue.Status("0").state, PrefetchState::kUnknown);
-  ASSERT_TRUE(queue.WaitForKeys({"key"}, 2s));
+  ASSERT_TRUE(WaitTask(queue, "next"));
   EXPECT_TRUE(queue.Submit({"key"}, {}, {}, false).accepted);  // Engine hint.
   queue.PauseAndDrain();
   queue.Resume();
@@ -132,7 +140,91 @@ TEST(PrefetchQueue, FullQueueKeepsUnfinishedRequests) {
   EXPECT_EQ(queue.Status("1023").state, PrefetchState::kQueued);
   EXPECT_TRUE(queue.Submit({"key"}, {}, "1023").accepted);
   io.Release();
-  EXPECT_TRUE(queue.WaitForKeys({"key"}, 2s));
+  ASSERT_TRUE(WaitTask(queue, "1023"));
+}
+
+TEST(PrefetchQueue, ReadsWaitOnlyForTheCurrentlyExecutingBatch) {
+  Gate first, later;
+  PrefetchQueue* executor = nullptr;
+  PrefetchQueue queue([&](const auto& keys, auto, auto) {
+    executor->BeginKeys({keys.front()});
+    first.Block();
+    executor->EndKeys();
+    executor->BeginKeys({keys.back()});
+    later.Block();
+    executor->EndKeys();
+    return std::vector<bool>(keys.size(), true);
+  });
+  executor = &queue;
+  ASSERT_TRUE(queue.Submit({"first", "later"}, {}, "task").accepted);
+  ASSERT_TRUE(first.Wait());
+  ASSERT_TRUE(queue.Submit({"queued"}, {}, "queued").accepted);
+  EXPECT_FALSE(queue.HasRunningKeys({"later", "queued"}));
+  EXPECT_TRUE(queue.WaitForKeys({"later", "queued"}, 0ms));
+  EXPECT_FALSE(queue.WaitForKeys({"first"}, 1ms));
+  EXPECT_EQ(queue.Status("task").state, PrefetchState::kRunning);
+  auto read = std::async(std::launch::async, [&] { return queue.WaitForKeys({"first"}, 2s); });
+  EXPECT_EQ(read.wait_for(20ms), std::future_status::timeout);
+  first.Release();
+  ASSERT_TRUE(later.Wait());
+  ASSERT_EQ(read.wait_for(2s), std::future_status::ready);
+  EXPECT_TRUE(read.get());
+  EXPECT_TRUE(queue.WaitForKeys({"first"}, 0ms));
+  EXPECT_EQ(queue.Status("task").state, PrefetchState::kRunning);
+  later.Release();
+  ASSERT_TRUE(WaitTask(queue, "queued"));
+}
+
+TEST(PrefetchQueue, AReadDoesNotJoinALaterExecutionOfTheSameKey) {
+  Gate first, later;
+  std::atomic<int> calls{0};
+  PrefetchQueue* executor = nullptr;
+  PrefetchQueue queue([&](const auto& keys, auto, auto) {
+    executor->BeginKeys(keys);
+    (++calls == 1 ? first : later).Block();
+    executor->EndKeys();
+    return std::vector<bool>(keys.size(), true);
+  });
+  executor = &queue;
+  ASSERT_TRUE(queue.Submit({"key"}, {}, "first").accepted);
+  ASSERT_TRUE(first.Wait());
+  ASSERT_TRUE(queue.Submit({"key"}, {}, "later").accepted);
+  auto read = std::async(std::launch::async, [&] { return queue.WaitForKeys({"key"}, 2s); });
+  EXPECT_EQ(read.wait_for(20ms), std::future_status::timeout);
+  first.Release();
+  ASSERT_TRUE(later.Wait());
+  ASSERT_EQ(read.wait_for(2s), std::future_status::ready);
+  EXPECT_TRUE(read.get());
+  EXPECT_TRUE(queue.HasRunningKeys({"key"}));
+  EXPECT_FALSE(queue.WaitForKeys({"key"}, 1ms));
+  later.Release();
+  ASSERT_TRUE(WaitTask(queue, "later"));
+}
+
+TEST(PrefetchQueue, LegacyHintsFilterSplitAndDeduplicatePendingKeys) {
+  Gate io;
+  std::atomic<int> calls{0};
+  PrefetchQueue queue([&](const auto& keys, auto, auto) {
+    ++calls;
+    EXPECT_LE(keys.size(), 4096u);
+    io.Block();
+    return std::vector<bool>(keys.size(), true);
+  });
+  std::vector<std::string> keys{"", std::string(4097, 'x')};
+  for (size_t i = 0; i < 4100; ++i) keys.push_back(std::to_string(i));
+  keys.push_back("0");
+  EXPECT_FALSE(queue.Submit(keys).accepted);
+  EXPECT_FALSE(queue.Submit({"valid", ""}).accepted);
+  EXPECT_EQ(queue.SubmitHint(keys), 4100u);
+  ASSERT_TRUE(io.Wait());
+  EXPECT_EQ(queue.SubmitHint(keys), 0u);
+  EXPECT_EQ(queue.SubmitHint({"new", "new", "0", ""}), 1u);
+  ASSERT_TRUE(queue.Submit({"barrier"}, {}, "barrier").accepted);
+  io.Release();
+  ASSERT_TRUE(WaitTask(queue, "barrier"));
+  EXPECT_EQ(calls, 4);
+  queue.Stop();
+  EXPECT_EQ(queue.SubmitHint({"stopped"}), 0u);
 }
 
 }  // namespace

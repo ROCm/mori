@@ -22,6 +22,7 @@
 #include "umbp/common/prefetch_queue.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace mori::umbp {
 
@@ -62,6 +63,34 @@ PrefetchSubmitResult PrefetchQueue::Submit(const std::vector<std::string>& keys,
       options.timeout > std::chrono::minutes(5) || options.lease_ttl > std::chrono::minutes(5))
     return {false, id, "invalid prefetch duration"};
   std::lock_guard<std::mutex> lock(mutex_);
+  return SubmitLocked(keys, options, std::move(id), retain);
+}
+
+size_t PrefetchQueue::SubmitHint(const std::vector<std::string>& keys) {
+  size_t admitted = 0;
+  std::unordered_set<std::string> seen;
+  auto next = keys.begin();
+  while (next != keys.end()) {
+    std::vector<std::string> batch;
+    while (next != keys.end() && batch.size() < 4096) {
+      const auto& key = *next++;
+      if (!key.empty() && key.size() <= 4096 && seen.insert(key).second) batch.push_back(key);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    batch.erase(std::remove_if(batch.begin(), batch.end(),
+                               [&](const auto& key) { return pending_keys_.count(key); }),
+                batch.end());
+    if (!batch.empty()) {
+      if (!SubmitLocked(batch, {}, {}, false).accepted) break;
+      admitted += batch.size();
+    }
+  }
+  return admitted;
+}
+
+PrefetchSubmitResult PrefetchQueue::SubmitLocked(const std::vector<std::string>& keys,
+                                                 PrefetchOptions options, std::string id,
+                                                 bool retain) {
   PruneLocked();
   if (paused_ || stopped_) return {false, id, "prefetch is stopped or clearing"};
   const auto now = Clock::now();
@@ -154,6 +183,7 @@ void PrefetchQueue::FinishLocked(Task& task, std::vector<bool> ok) {
   status.total_latency_us = us(now - task.submitted);
   task.finished = now;
   task.done = true;
+  if (task.started != Clock::time_point{}) running_keys_.clear();
   for (const auto& key : task.keys) {
     const auto it = pending_keys_.find(key);
     if (--it->second == 0) pending_keys_.erase(it);
@@ -187,12 +217,40 @@ void PrefetchQueue::Run() {
   }
 }
 
+void PrefetchQueue::BeginKeys(const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  running_keys_.clear();
+  ++execution_token_;
+  if (!paused_ && !stopped_)
+    for (const auto& key : keys) running_keys_[key] = execution_token_;
+  cv_.notify_all();
+}
+
+void PrefetchQueue::EndKeys() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  running_keys_.clear();
+  cv_.notify_all();
+}
+
+bool PrefetchQueue::HasRunningKeys(const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return std::any_of(keys.begin(), keys.end(),
+                     [&](const auto& key) { return running_keys_.count(key); });
+}
+
 bool PrefetchQueue::WaitForKeys(const std::vector<std::string>& keys,
                                 std::chrono::milliseconds timeout) {
   std::unique_lock<std::mutex> lock(mutex_);
+  std::vector<std::pair<std::string, uint64_t>> running;
+  for (const auto& key : keys) {
+    const auto it = running_keys_.find(key);
+    if (it != running_keys_.end()) running.push_back(*it);
+  }
   return cv_.wait_for(lock, timeout, [&] {
-    return paused_ || stopped_ || std::none_of(keys.begin(), keys.end(), [&](const auto& key) {
-             return pending_keys_.count(key);
+    return paused_ || stopped_ ||
+           std::none_of(running.begin(), running.end(), [&](const auto& key) {
+             const auto it = running_keys_.find(key.first);
+             return it != running_keys_.end() && it->second == key.second;
            });
   });
 }

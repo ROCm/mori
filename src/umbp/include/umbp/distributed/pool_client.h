@@ -59,6 +59,7 @@ class WorkloadTraceRecorder;
 }
 
 class PeerServiceServer;
+class PrefetchService;
 class PeerPool;
 class KvIndexerReporter;
 
@@ -381,6 +382,7 @@ class PoolClient {
   TierType medium_ = TierType::DRAM;
 
   std::unique_ptr<PeerServiceServer> peer_service_;
+  std::unique_ptr<PrefetchService> prefetch_service_;
 
   // The one byte-moving path (design doc §4).  PoolClient owns the engine;
   // backends receive it narrowed to MemoryRegistrar at Init, so they can
@@ -640,12 +642,13 @@ class PoolClient {
   // re-cache admission policy, rechecks local residency when executed, and is
   // bounded and silent on failure. It never runs on, and never
   // blocks, the read that scheduled it.
-  void MaybePrefetchWholeObject(const std::string& key, size_t object_size);
+  void WaitForPrefetch(const std::vector<std::string>& keys);
+  void MaybePrefetchWholeObjects(const std::vector<std::string>& keys);
   // The other half of the same decision: the arena slice already holds the
   // whole object (the caller's ranges tiled it in order), so locality costs one
   // local copy instead of a second trip to the peer.  Synchronous because the
   // slice is live only until the next sub-batch reuses it.  Mutually exclusive
-  // with MaybePrefetchWholeObject — exactly one runs per fetched key.
+  // with MaybePrefetchWholeObjects — exactly one runs per fetched key.
   void MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
                                        size_t object_size);
   // The two locality paths are gated separately, because they do not cost the

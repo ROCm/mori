@@ -49,6 +49,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/common/prefetch_service.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
@@ -1123,9 +1124,24 @@ bool PoolClient::Init() {
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
 
+  if (config_.prefetch_budget_bytes > 0 || config_.ranged_locality_prefetch) {
+    prefetch_queue_ =
+        std::make_unique<PrefetchQueue>([this](const auto& keys, auto options, auto deadline) {
+          return ExecutePrefetch(keys, options, deadline);
+        });
+  }
+
   if (config_.peer_service_port > 0 || config_.auto_peer_service_port) {
     peer_service_ =
         std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes, metric_sink_);
+    if (config_.prefetch_budget_bytes > 0) {
+      prefetch_service_ = std::make_unique<PrefetchService>(
+          [this](const auto& keys, auto options, auto id) {
+            return SubmitPrefetch(keys, options, std::move(id));
+          },
+          [this](const auto& id) { return GetPrefetchStatus(id); });
+      peer_service_->SetPrefetchService(*prefetch_service_);
+    }
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -1191,12 +1207,6 @@ bool PoolClient::Init() {
     }
   }
 
-  if (config_.prefetch_budget_bytes > 0 || config_.ranged_locality_prefetch) {
-    prefetch_queue_ =
-        std::make_unique<PrefetchQueue>([this](const auto& keys, auto options, auto deadline) {
-          return ExecutePrefetch(keys, options, deadline);
-        });
-  }
   // Whole-object reads that already own the bytes only need a local install.
   if (config_.cache_remote_fetches && registry_.Get(medium_) != nullptr) {
     {
@@ -1231,6 +1241,9 @@ bool PoolClient::Init() {
 void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
+  // Drain control RPCs before stopping their shared task queue.
+  peer_service_.reset();
+  prefetch_service_.reset();
   if (prefetch_queue_) prefetch_queue_->Stop();
 
   if (kv_indexer_) {
@@ -1280,8 +1293,6 @@ void PoolClient::Shutdown() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peers_.clear();
   }
-
-  peer_service_.reset();
 
   // hipHostUnregister the gather regions before their backing memory goes
   // away: the medium's buffers die with the registry below, and the scratch
@@ -2228,14 +2239,20 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
   }
 }
 
-void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size) {
-  if (!prefetch_queue_ || !config_.ranged_locality_prefetch || !CanInstallLocally() ||
-      !ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
-                          config_.admission_max_block_bytes, object_size))
-    return;
-  // Resolve the route when execution starts; the foreground read's route may be stale.
-  if (prefetch_queue_->Submit({key}, {}, {}, /*retain=*/false).accepted)
-    recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
+void PoolClient::WaitForPrefetch(const std::vector<std::string>& keys) {
+  const auto timeout = ExplicitPrefetchWaitTimeout();
+  if (!prefetch_queue_ || timeout.count() == 0 || !prefetch_queue_->HasRunningKeys(keys)) return;
+  const auto local = default_pool_->BatchContains(keys);
+  std::vector<std::string> missing;
+  for (size_t i = 0; i < keys.size(); ++i)
+    if (i >= local.size() || !local[i]) missing.push_back(keys[i]);
+  if (!missing.empty()) prefetch_queue_->WaitForKeys(missing, timeout);
+}
+
+void PoolClient::MaybePrefetchWholeObjects(const std::vector<std::string>& keys) {
+  if (!prefetch_queue_ || !config_.ranged_locality_prefetch || !CanInstallLocally()) return;
+  // Routes are resolved at execution; repeated cold reads share pending hints.
+  recache_stats_.admitted.fetch_add(prefetch_queue_->SubmitHint(keys), std::memory_order_relaxed);
 }
 
 void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
@@ -3243,7 +3260,7 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
     return results;
   }
-  if (prefetch_queue_) prefetch_queue_->WaitForKeys(keys, ExplicitPrefetchWaitTimeout());
+  WaitForPrefetch(keys);
 
   // Both arms are route-then-partition; they differ only in WHICH keys reach
   // the master and whether an unroutable key may still fall back to a local
@@ -3521,7 +3538,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     return results;
   }
 
-  if (prefetch_queue_) prefetch_queue_->WaitForKeys(keys, ExplicitPrefetchWaitTimeout());
+  WaitForPrefetch(keys);
 
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
   double local_bytes = 0.0;
@@ -3952,6 +3969,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
   size_t pos = 0;
+  std::vector<std::string> cold_keys;
   while (pos < units.size()) {
     std::vector<size_t> scratch_offsets;
     size_t cursor = 0;
@@ -3998,7 +4016,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     sub_timer.Stop();
     // recache_remote=false: a ranged entry never holds the whole object, so
     // there is nothing the generic re-cache could legally install.  Locality is
-    // restored by MaybePrefetchWholeObject below instead.
+    // restored by MaybePrefetchWholeObjects below instead.
     ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
 
     // Scatter EVERY fetched unit out of the arena with ONE transfer, for the
@@ -4066,12 +4084,15 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
       PhaseTimer install_timer(dbg ? &dbg->rmt_install : nullptr);
       if (unit.holds_whole_object) {
         MaybeInstallCompleteArenaObject(sub_keys[j], sub_dsts[j], unit.object_size);
-      } else {
-        MaybePrefetchWholeObject(sub_keys[j], unit.object_size);
+      } else if (config_.ranged_locality_prefetch &&
+                 ShouldAdmitReCache(true, config_.cache_remote_admission,
+                                    config_.admission_max_block_bytes, unit.object_size)) {
+        cold_keys.push_back(sub_keys[j]);
       }
     }
     pos = end;
   }
+  MaybePrefetchWholeObjects(cold_keys);
 
   for (const auto& [original, ok] : unit_ok) results[original] = ok;
   return results;
@@ -5152,7 +5173,7 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     // Never for a ranged entry: the destination holds only the requested spans,
     // and a medium slot is whole-object, so installing it would publish a key
     // whose remaining bytes are undefined.  The ranged path schedules its own
-    // whole-object prefetch instead (MaybePrefetchWholeObject).
+    // whole-object prefetch instead (MaybePrefetchWholeObjects).
     if (recache_remote && entry.item && !entry.item->Ranged()) {
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
@@ -5235,7 +5256,7 @@ bool PoolClient::Exists(const std::string& key) {
 
 size_t PoolClient::BatchPrefetch(const std::vector<std::string>& keys) {
   if (!initialized_ || !prefetch_queue_ || config_.prefetch_budget_bytes == 0) return 0;
-  return prefetch_queue_->Submit(keys, {}, {}, /*retain=*/false).accepted ? keys.size() : 0;
+  return prefetch_queue_->SubmitHint(keys);
 }
 
 PrefetchSubmitResult PoolClient::SubmitPrefetch(const std::vector<std::string>& keys,
@@ -5276,7 +5297,13 @@ std::vector<bool> PoolClient::ExecutePrefetch(const std::vector<std::string>& ke
       std::vector<ReCacheJob> jobs;
       uint64_t bytes = 0;
       auto flush = [&] {
-        if (!jobs.empty() && Clock::now() < deadline) FetchWholeObjectsIntoMedium(jobs);
+        if (!jobs.empty() && Clock::now() < deadline) {
+          std::vector<std::string> copying;
+          for (const auto& job : jobs) copying.push_back(job.key);
+          prefetch_queue_->BeginKeys(copying);
+          ScopeExit finish_batch{[this] { prefetch_queue_->EndKeys(); }};
+          FetchWholeObjectsIntoMedium(jobs);
+        }
         jobs.clear();
         bytes = 0;
       };

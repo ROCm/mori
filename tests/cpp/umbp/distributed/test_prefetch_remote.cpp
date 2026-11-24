@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <future>
 
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/pool_client.h"
@@ -42,6 +43,26 @@ class PrefetchRemoteTest : public ::testing::Test {
     auto client = std::make_unique<PoolClient>(config);
     EXPECT_TRUE(client->Init());
     return client;
+  }
+
+  struct Gate {
+    std::promise<void> started, release;
+    std::shared_future<void> resume = release.get_future().share();
+  };
+
+  auto BlockResidentPrefetch(PoolClient& client) {
+    auto gate = std::make_shared<Gate>();
+    client.prefetch_queue_ =
+        std::make_unique<PrefetchQueue>([&client, gate](const auto& keys, auto, auto) {
+          if (keys.front() == "resident") {
+            client.prefetch_queue_->BeginKeys(keys);
+            gate->started.set_value();
+            gate->resume.wait();
+            client.prefetch_queue_->EndKeys();
+          }
+          return std::vector<bool>(keys.size(), false);
+        });
+    return gate;
   }
 
   auto Pull(PoolClient& client, const std::vector<std::string>& keys, size_t size = 4096) {
@@ -95,6 +116,30 @@ TEST_F(PrefetchRemoteTest, OnlyCommittedTransfersAreReadyAndFailedSlotsAreReusab
   // Reuse every other page. A leaked failed allocation would prevent this.
   auto retry = Pull(*client, {"b", "c", "d"});
   for (const auto& result : retry) EXPECT_TRUE(result);
+}
+
+TEST_F(PrefetchRemoteTest, ForegroundReadsSkipResidentAndQueuedPrefetchKeys) {
+  auto client = MakeClient();
+  std::vector<char> expected(4096, 0x29);
+  ASSERT_TRUE(client->Put("resident", expected.data(), expected.size()));
+  auto gate = BlockResidentPrefetch(*client);
+  EXPECT_TRUE(client->SubmitPrefetch({"resident"}).accepted);
+  EXPECT_EQ(gate->started.get_future().wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  EXPECT_TRUE(client->SubmitPrefetch({"missing"}).accepted);
+  auto read = std::async(std::launch::async, [&] {
+    std::vector<char> local(4096), missing(4096);
+    const std::vector<std::string> keys{"resident", "missing"};
+    auto whole = client->BatchGet(keys, {local.data(), missing.data()}, {4096, 4096});
+    auto ranged = client->BatchGetRanges(keys, {{local.data()}, {missing.data()}}, {{4096}, {4096}},
+                                         {{0}, {0}});
+    return whole == std::vector<bool>({true, false}) &&
+           ranged == std::vector<bool>({true, false}) && local == expected;
+  });
+  const auto state = read.wait_for(std::chrono::seconds(1));
+  gate->release.set_value();  // Always unblock teardown, even if a regression waited.
+  EXPECT_EQ(state, std::future_status::ready);
+  EXPECT_TRUE(read.get());
 }
 
 TEST_F(PrefetchRemoteTest, CrossBufferSlotFailsBeforeTransportAndReleasesItsPages) {

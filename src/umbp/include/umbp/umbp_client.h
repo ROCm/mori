@@ -135,8 +135,8 @@ class IUMBPClient {
 
   /// Hint that these keys are about to be read: copy this node's SSD-resident
   /// ones into DRAM and pull other nodes' into this node's DRAM in the
-  /// background. Returns the number of input keys admitted, not completed;
-  /// 0 where unsupported or the bounded queue cannot accept this hint.
+  /// background. Skips invalid/duplicate/pending keys and splits large hints.
+  /// Returns unique keys admitted, not completed; 0 where unsupported or full.
   virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   /// Tracked prefetch to local DRAM. Submission only acknowledges admission;

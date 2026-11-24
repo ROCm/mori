@@ -44,7 +44,13 @@ class PrefetchQueue {
   ~PrefetchQueue();
   PrefetchSubmitResult Submit(const std::vector<std::string>& keys, PrefetchOptions options = {},
                               std::string request_id = {}, bool retain = true);
+  size_t SubmitHint(const std::vector<std::string>& keys);
   PrefetchStatus Status(const std::string& request_id);
+  // Called by the single executor around each batch, not around its whole task.
+  void BeginKeys(const std::vector<std::string>& keys);
+  void EndKeys();
+  bool HasRunningKeys(const std::vector<std::string>& keys);
+  // Wait for current batch tokens only; a timeout does not cancel their I/O.
   bool WaitForKeys(const std::vector<std::string>& keys, std::chrono::milliseconds timeout);
   void PauseAndDrain();
   void Resume();
@@ -52,6 +58,8 @@ class PrefetchQueue {
 
  private:
   struct Task;
+  PrefetchSubmitResult SubmitLocked(const std::vector<std::string>& keys, PrefetchOptions options,
+                                    std::string id, bool retain);
   void Run();
   void FinishLocked(Task& task, std::vector<bool> ok);
   void CancelLocked();
@@ -61,8 +69,10 @@ class PrefetchQueue {
   std::condition_variable cv_;
   std::unordered_map<std::string, std::shared_ptr<Task>> tasks_;
   std::unordered_map<std::string, size_t> pending_keys_;
+  std::unordered_map<std::string, uint64_t> running_keys_;
   std::deque<std::shared_ptr<Task>> queue_;
   uint64_t next_id_ = 1;
+  uint64_t execution_token_ = 0;
   bool active_ = false;
   bool paused_ = false;
   bool stopped_ = false;

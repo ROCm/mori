@@ -567,6 +567,7 @@ bool PeerServiceServer::Start(uint16_t port) {
   int selected_port = 0;
   builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &selected_port);
   builder.RegisterService(service_.get());
+  if (prefetch_service_ != nullptr) builder.RegisterService(prefetch_service_);
   server_ = builder.BuildAndStart();
 
   if (!server_) {
