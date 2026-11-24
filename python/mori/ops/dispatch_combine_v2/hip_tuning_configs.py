@@ -786,12 +786,57 @@ class KernelConfig(NamedTuple):
     # kernel sends on. A compile-time constant of each kernel, chosen per phase
     # and per bucket (the table's active_qps), so it is part of the key too.
     active_qps: int | None = None
+    # Intranode dispatch only: build this bucket's kernel as the block-per-token
+    # LL body. Part of the key like the two above -- EpEntryName gives it its own
+    # "_ll" name, so a schedule may hold both forms and pick by token count.
+    ll_dispatch: bool = False
 
 
 class ScheduleEntry(NamedTuple):
     max_tokens: int | None
     dispatch: KernelConfig
     combine: KernelConfig
+
+
+def _split_at_ll_cap(cfg, rows):
+    """Make ll_dispatch_max_tokens a bucket edge, as internode_schedule() does for
+    its own crossover.
+
+    Without this the cap could only ever turn LL off: most shapes are untuned and
+    resolve to a single open-ended bucket, and an open-ended bucket is never at or
+    below a finite cap. Splitting it keeps the geometry identical on both sides --
+    only the body differs -- so the pair costs one extra kernel, not a re-tune.
+    """
+    if not getattr(cfg, "ll_dispatch", False):
+        return rows
+    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
+    if cap is None:
+        return rows
+    out = []
+    for row in rows:
+        ceiling = row[0]
+        if (ceiling is None or ceiling > cap) and not any(r[0] == cap for r in out):
+            out.append((cap, *row[1:]))
+        out.append(row)
+    return tuple(out)
+
+
+def _ll_bucket(cfg, ceiling) -> bool:
+    """Whether this intranode dispatch bucket is built as the LL body.
+
+    ll_dispatch alone is the whole schedule, which is what an explicit opt-in has
+    always meant. With ll_dispatch_max_tokens set, only buckets whose ceiling is at
+    or below it are LL and the rest stay portable, so one op holds both forms and
+    kernel_config() picks by the call's token count -- the intranode counterpart of
+    internode_auto_ll_max_tokens.
+    """
+    if not getattr(cfg, "ll_dispatch", False):
+        return False
+    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
+    if cap is None:
+        return True
+    # An open-ended bucket reaches past any finite cap.
+    return ceiling is not None and ceiling <= cap
 
 
 def resolve_schedule(
@@ -823,9 +868,12 @@ def resolve_schedule(
                 cfg.combine_warp_num_per_block,
             ),
         )
+        rows = _split_at_ll_cap(cfg, rows)
         return tuple(
             ScheduleEntry(
-                ceiling, KernelConfig("intra", db, dw), KernelConfig("intra", cb, cw)
+                ceiling,
+                KernelConfig("intra", db, dw, ll_dispatch=_ll_bucket(cfg, ceiling)),
+                KernelConfig("intra", cb, cw),
             )
             for ceiling, db, dw, cb, cw in rows
         )
@@ -885,7 +933,8 @@ def describe_schedule(cfg, schedule) -> str:
 
     def fmt(spec):
         if spec.rdma_block_num is None:
-            return f"{spec.family} B/W={spec.block_num}/{spec.warp_per_block}"
+            ll = " LL" if spec.ll_dispatch else ""
+            return f"{spec.family}{ll} B/W={spec.block_num}/{spec.warp_per_block}"
         return (
             f"{spec.family} B/R/W="
             f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"

@@ -293,6 +293,13 @@ class EpDispatchCombineConfig:
     # combine is unchanged. The warp split is derived from hidden_dim at compile time,
     # so leave warp_num_per_block None unless you are sweeping it.
     ll_dispatch: bool = False
+    # Largest call, in tokens a rank, that the LL body serves. None (the default)
+    # means every bucket is LL, which is what ll_dispatch alone has always meant.
+    # A number makes the schedule hold both bodies and pick by the call's token
+    # count: the LL body wins on every shape measured up to 512 tokens a rank and
+    # regresses on a few above 2048, so 512 is the edge the data supports. The
+    # intranode counterpart of internode_auto_ll_max_tokens.
+    ll_dispatch_max_tokens: int | None = None
     # Receive layout of async_ll over "sdma" on one node: "compact" (default),
     # "segmented" or "auto".
     #

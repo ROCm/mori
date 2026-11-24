@@ -993,7 +993,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         Pinned means the CALLER set it: _resolve_geometry has already filled the field
         from the tuning table by the time a backend sees the config, so the field being
         non-None says nothing. _pinned_geometry is the record of what was passed in."""
-        if cfg.ll_dispatch and "warp_num_per_block" not in cfg._pinned_geometry:
+        if spec.ll_dispatch and "warp_num_per_block" not in cfg._pinned_geometry:
             return 0
         return spec.warp_per_block
 
@@ -1010,6 +1010,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
                     warp_per_block=self._dispatch_warps(cfg, spec),
+                    ll_dispatch=spec.ll_dispatch,
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
@@ -1190,8 +1191,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             disp["card_combine"] = True
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
-        if cfg.ll_dispatch:
-            disp["ll_dispatch"] = True
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
         if self._is1250:
             for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
@@ -2167,6 +2166,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **bound,
                     block_num=spec.block_num,
                     warp_per_block=self._dispatch_warps(cfg, spec),
+                    ll_dispatch=spec.ll_dispatch,
                     call_tok_max=cap,
                 )
                 plan.bind(rank=cfg.rank)
