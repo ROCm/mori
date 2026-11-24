@@ -58,9 +58,12 @@ using CombineInternalFp8 = uint8_t;
 // Use typedef here since otherwise alignment attribute is lost.
 typedef uint32_t VecU32x4 __attribute__((ext_vector_type(4), aligned(8)));
 
-// Explicit specializations to preserve alignment attribute on VecU32x4.
-// Otherwise, 16-byte load then becomes align 16, which is UB on
-// the 8-byte-aligned buffers callers actually pass).
+// VecU32x4 is declared aligned(8) on purpose. A 16-byte vector access lowers to 
+// a single global/flat *_dwordx4, which the hardware executes correctly at any 
+// byte alignment; the attribute only sets the alignment the compiler is allowed 
+// to assume. load<16>/store<16> must not assume 16: EP buffers are only 8-byte 
+// aligned, and the shmem put/get byte-offset paths pass pointers aligned to as 
+// little as 1 byte.
 namespace detail {
 template <int VecBytes>
 struct VecTypeS {

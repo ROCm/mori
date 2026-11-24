@@ -211,7 +211,7 @@ AREAS = [
         "shmem_tests",
         {"shmem"},
         r"^tests/python/shmem/|^examples/shmem/|^benchmark/shmem/"
-        r"|^tests/cpp/ops/test_block_copy\.cpp$",
+        r"|^tests/cpp/ops/test_block_copy_alignment\.cpp$",
     ),
     # The application layer includes it.
     ("core", ALL, r"^include/mori/shmem/internal\.hpp$"),

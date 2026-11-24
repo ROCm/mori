@@ -47,18 +47,18 @@ endif()
 # so it is not registered with ctest.
 if(BUILD_SHMEM AND WITH_MPI)
   find_package(MPI REQUIRED)
-  add_executable(test_block_copy ops/test_block_copy.cpp)
-  set_source_files_properties(ops/test_block_copy.cpp PROPERTIES LANGUAGE HIP)
+  add_executable(test_block_copy_alignment ops/test_block_copy_alignment.cpp)
+  set_source_files_properties(ops/test_block_copy_alignment.cpp PROPERTIES LANGUAGE HIP)
   target_include_directories(
-    test_block_copy PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
+    test_block_copy_alignment PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
                             ${MPI_CXX_INCLUDE_DIRS})
-  target_link_libraries(test_block_copy mori_shmem hip::host hip::device
+  target_link_libraries(test_block_copy_alignment mori_shmem hip::host hip::device
                         ${MPI_CXX_LIBRARIES})
   if(MORI_DEVICE_NIC_DEFINE)
-    target_compile_definitions(test_block_copy PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+    target_compile_definitions(test_block_copy_alignment PRIVATE ${MORI_DEVICE_NIC_DEFINE})
   endif()
   if(DEFINED GPU_TARGETS)
-    set_target_properties(test_block_copy PROPERTIES HIP_ARCHITECTURES
+    set_target_properties(test_block_copy_alignment PROPERTIES HIP_ARCHITECTURES
                                                      "${GPU_TARGETS}")
   endif()
 endif()

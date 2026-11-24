@@ -24,8 +24,8 @@
 // shmem, and exactly two PEs. Not registered with ctest (needs two GPUs).
 //
 //   cmake -B build -DBUILD_TESTS=ON -DWITH_MPI=ON
-//   cmake --build build --target test_block_copy
-//   MORI_SHMEM_HEAP_SIZE=6G mpirun -np 2 ./build/tests/cpp/test_block_copy
+//   cmake --build build --target test_block_copy_alignment
+//   MORI_SHMEM_HEAP_SIZE=6G mpirun -np 2 ./build/tests/cpp/test_block_copy_alignment
 
 #include <mpi.h>
 

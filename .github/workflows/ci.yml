@@ -444,8 +444,8 @@ jobs:
             set -e
             cd $GITHUB_WORKSPACE
             cmake -B build -DBUILD_TESTS=ON
-            cmake --build build --target test_block_copy -j
-            MORI_SHMEM_HEAP_SIZE=6G timeout 180 mpirun --allow-run-as-root -np 2 ./build/tests/cpp/test_block_copy
+            cmake --build build --target test_block_copy_alignment -j
+            MORI_SHMEM_HEAP_SIZE=6G timeout 180 mpirun --allow-run-as-root -np 2 ./build/tests/cpp/test_block_copy_alignment
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
