@@ -102,9 +102,11 @@ COMB_MODE = os.environ.get("COMB_MODE", "push")
 ASYNC_LL = int(os.environ.get("ASYNC_LL", 0)) == 1
 # "sdma" (copy engine, overlappable) or "lsa" (peer stores, faster on one node).
 ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
-if COMB_MODE not in ("pull", "push"):
-    raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
+if COMB_MODE not in ("pull", "push", "scatter"):
+    raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push|scatter")
 _PUSH = COMB_MODE == "push"
+# COMB_MODE=scatter is the unquantized scatter combine; test_op.py checks it.
+_SCATTER = COMB_MODE == "scatter"
 # COMB_MODE=push is the quantized combine: gfx125x's push, or the gfx942/gfx950
 # scatter. Only the push has a check here; test_op.py checks the scatter.
 _GFX125X = is_gfx125x()
@@ -130,7 +132,7 @@ _PUSH_WIRE = (
     * 128
 )
 CHECK = int(os.environ.get("CHECK", 1))
-if COMB_MODE == "push" and not _GFX125X:
+if (COMB_MODE == "push" and not _GFX125X) or _SCATTER:
     CHECK = 0
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
@@ -319,6 +321,7 @@ def main():
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
             quant_type=PUSH_QUANT if _PUSH else "none",
+            combine_mode="scatter" if _SCATTER else "gather",
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
         )

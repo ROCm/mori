@@ -260,7 +260,9 @@ struct EpCfg {
   // gfx942/gfx950 scatter combine with an fp8 wire: elements per scale, 32 (E8M0)
   // or 128 (f32); 0 = off. Each sender quantizes into the origin's landing row.
   int combineScatterQGroup = 0;
-  bool combineScatterFp4 = false;  // e2m1 instead of fp8 on that wire (gfx950)
+  bool combineScatterFp4 = false;    // e2m1 instead of fp8 on that wire (gfx950)
+  bool replay = false;               // dispatch sends to the slots a handle's dest map names
+  bool combineScatterPlain = false;  // the unquantized scatter combine (bf16/fp32 rows)
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -293,6 +295,8 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineBf16Push);
   MORI_FIELD(combineScatterQGroup);
   MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(replay);
+  MORI_FIELD(combineScatterPlain);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -305,7 +309,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 27, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 29, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -363,11 +367,14 @@ constexpr int EpBlockThreads(const EpCfg& c) { return c.warpPerBlock * c.waveSiz
 // and need the multi-iteration-safe code path. Compile-time via the Cfg NTTP.
 constexpr bool EpIsWideEp(const EpCfg& c) { return c.worldSize > c.waveSize; }
 
-// Recv-slot capacity. The flat token index encodes (pe, localTokId) with this
-// stride, so host and device must agree exactly.
+// Recv-slot capacity, and the bound on every published slot. The flat token
+// index encodes (pe, localTokId) with this stride, so host and device must agree.
 constexpr int EpMaxRecv(const EpCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
+
+// A capacity below the worst case: dispatch drops the slots past it.
+constexpr bool EpRecvCapped(const EpCfg& c) { return EpMaxRecv(c) < c.worldSize * c.maxTokPerRank; }
 
 constexpr int EpCallTok(const EpCfg& c) {
   return c.callTokMax > 0 && c.callTokMax < c.maxTokPerRank ? c.callTokMax : c.maxTokPerRank;
@@ -578,11 +585,15 @@ constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
 // rank, origin token) holding the fp8 / e2m1 payload, its scales (an E8M0 byte a
 // 32-element group, or an f32 a 128-element block) and the token's topk weights,
 // padded to 128 B.
-constexpr bool EpCombineScatter(const EpCfg& c) { return c.combineScatterQGroup != 0; }
+constexpr bool EpCombineScatter(const EpCfg& c) {
+  return c.combineScatterQGroup != 0 || c.combineScatterPlain;
+}
 constexpr int EpScatterScaleBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return 0;
   return c.combineScatterQGroup == 32 ? c.hiddenDim / 32 : c.hiddenDim / 128 * 4;
 }
 constexpr int EpScatterPayloadBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return EpTokenBytes(c);
   return c.combineScatterFp4 ? c.hiddenDim / 2 : c.hiddenDim;
 }
 constexpr int EpScatterRowBytes(const EpCfg& c) {
@@ -681,11 +692,6 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          c.numExpertPerToken > 0 && c.numExpertPerRank > 0 && c.blockNum > 0 &&
          (c.waveSize == 32 || c.waveSize == 64) && c.warpPerBlock > 0 &&
          EpBlockThreads(c) <= 1024 &&
-         // The recv capacity must cover the worst case: the device slot counter is
-         // unbounded, and since EpMaxRecv is also the flat-index stride an overflow
-         // re-encodes to the next peer and combine folds in a stranger's token.
-         // Token dropping is not implemented, so reject the cap at construction.
-         EpMaxRecv(c) >= c.worldSize * c.maxTokPerRank &&
          // The dedup ballot assumes one lane per top-k slot within a wavefront.
          // worldSize may exceed waveSize (wide EP) but must fit within one
          // block so the combine XDB barrier's thdId < npes poll covers all peers.
@@ -700,13 +706,16 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          (!c.cardDedup || EpCardDedupOk(c)) && (c.cardDedup || c.cardPullBlocks == 0) &&
          (!c.cardFwdMark || (c.cardDedup && c.cardPullBlocks == 0)) &&
          (!c.cardCombine || c.cardDedup || EpCardCombineOk(c)) &&
-         // The scatter combine quantizes whole 128-element blocks with 8 lanes a 64-wide
-         // wave, and is the portable body's: no push, ll128 or card mode beside it.
+         // The quantized scatter combine quantizes whole 128-element blocks with 8 lanes
+         // a 64-wide wave; either scatter is the portable body's: no push, ll128 or card
+         // mode beside it.
          (EpCombineScatter(c) || !c.combineScatterFp4) &&
-         (!EpCombineScatter(c) ||
-          ((c.combineScatterQGroup == 32 || c.combineScatterQGroup == 128) &&
-           c.hiddenDim % 128 == 0 && c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
-           !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
+         (!c.combineScatterPlain || (c.combineScatterQGroup == 0 && !c.combineScatterFp4)) &&
+         (!EpCombineScatter(c) || ((c.combineScatterPlain || ((c.combineScatterQGroup == 32 ||
+                                                               c.combineScatterQGroup == 128) &&
+                                                              c.hiddenDim % 128 == 0)) &&
+                                   c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
+                                   !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
 }
 
 }  // namespace v2

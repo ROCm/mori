@@ -94,6 +94,33 @@ def _assert_all_pass(rc, out):
 
 _skip_fp4 = pytest.mark.skipif(not _IS_GFX950, reason="fp4 is gfx950-only")
 
+
+def _required_tags(env):
+    """The OP lines a case must print, so a check its knobs turn on cannot drop out
+    silently (several are gated on the op's capabilities)."""
+    default = "hip" if _IS_GFX125X else "flydsl"
+    hip = env.get("MORI_V2_KERNEL_BACKEND", default) == "hip"
+    tags = set()
+    if not (hip and _IS_GFX125X):  # gfx125x HIP has no local_expert_count
+        tags.add("OP-LEC")
+    for knob, tag in (
+        ("REPLAY", "OP-REPLAY"),
+        ("REROUTE", "OP-REROUTE"),
+        ("STDMOE", "OP-STDMOE-PACK"),
+        ("MAXRECV", "OP-CAP"),
+        ("FRESH", "OP-FRESH"),
+        ("SCALE_DIM", "OP-SCALES"),
+    ):
+        if int(env.get(knob, 0) or 0):
+            tags.add(tag)
+    return tags
+
+
+def _assert_tags(env, text):
+    missing = sorted(t for t in _required_tags(env) if f"# {t} " not in text)
+    assert not missing, f"checks that never ran: {missing}; output:\n{text}"
+
+
 # This is a functional test, not a perf test: hidden_dim is fixed at 7168 and the
 # token-count "shape" is covered cheaply by SWEEP inside a single torchrun launch.
 # The parametrized matrix covers the functional axes (dtype, combine, quant, scale
@@ -141,6 +168,34 @@ def _cases():
         "QUANT": "fp8_blockwise_1x32",
         "SPREAD": 6,
     }
+    # the HIP backend's unquantized scatter combine
+    for dt in ("bf16", "f32"):
+        yield f"hip-{dt}-scatter", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": dt,
+            "COMBINE": "scatter",
+        }
+    # a partial last step (hidden 2304), and a recv cap
+    yield "hip-bf16-scatter-h2304", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "HIDDEN": 2304,
+    }
+    yield "hip-bf16-scatter-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "MAXRECV": 1024,
+    }
+    yield "hip-bf16-scatter-scales-ragged", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "SCALE_DIM": 32,
+        "RAGGED": 1,
+        "TOPK": 9,
+    }
     # the HIP backend's quantized scatter combine, every format at the three scales
     for elem in ("fp8", "fp4"):
         for group in (32, 128):
@@ -178,6 +233,34 @@ def _cases():
             "QUANT": f"{elem}_blockwise_1x128",
             "TINY": 1,
         }
+    # recv cap: drops at 512 tokens a rank (demand ~2700 > 1024), none at 128
+    for backend in ("", "hip"):
+        env = {"MORI_V2_KERNEL_BACKEND": backend} if backend else {}
+        pre = f"{backend}-" if backend else ""
+        yield f"{pre}bf16-gather-cap", {
+            **env,
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "MAXRECV": 1024,
+        }
+    yield "hip-bf16-scatter-fp8-1x128-cap", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "scatter",
+        "QUANT": "fp8_blockwise_1x128",
+        "MAXRECV": 1024,
+    }
+    # replay ahead of a scatter combine, which reads the reverse map and weights it rewrites
+    for quant in ("none", "fp8_blockwise_1x128"):
+        yield "hip-bf16-scatter-" + (
+            "" if quant == "none" else "fp8-1x128-"
+        ) + "replay", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": "bf16",
+            "COMBINE": "scatter",
+            "QUANT": quant,
+            "REPLAY": 1,
+        }
     # per-token scale forwarding (v1 uses scale_dim=32), on both combine modes
     yield "bf16-gather-scales", {"DTYPE": "bf16", "COMBINE": "gather", "SCALE_DIM": 32}
     yield "bf16-scatter-scales", {
@@ -190,8 +273,53 @@ def _cases():
         yield f"bf16-gather-topk{k}", {"DTYPE": "bf16", "COMBINE": "gather", "TOPK": k}
     # feature paths
     yield "bf16-gather-tuned", {"DTYPE": "bf16", "COMBINE": "gather", "TUNED": 1}
+    # rows and reverse map read in-stream right after dispatch, before any barrier
+    yield "bf16-gather-fresh", {"DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
+    yield "hip-bf16-gather-fresh", {
+        "MORI_V2_KERNEL_BACKEND": "hip",
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "FRESH": 1,
+    }
     yield "bf16-gather-replay", {"DTYPE": "bf16", "COMBINE": "gather", "REPLAY": 1}
+    for extra in (
+        {},
+        {"SCALE_DIM": 32},
+        {"TOPK": 9, "RAGGED": 1, "NOSELF": 1},
+        {"MAXRECV": 1024},
+    ):
+        tag = "".join(f"-{k.lower()}" for k in extra)
+        yield f"hip-bf16-gather-replay{tag}", {
+            "MORI_V2_KERNEL_BACKEND": "hip",
+            "DTYPE": "bf16",
+            "COMBINE": "gather",
+            "REPLAY": 1,
+            **extra,
+        }
     yield "bf16-stdmoe", {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}
+    # The hip backend's gather path; OP-LEC runs in every case. No TUNED here: it
+    # injects FlyDSL's table, and hip resolves its own.
+    hip = {"MORI_V2_KERNEL_BACKEND": "hip", "COMBINE": "gather"}
+    yield "hip-bf16-gather", dict(hip, DTYPE="bf16")
+    yield "hip-bf16-gather-scales-ragged", dict(
+        hip, DTYPE="bf16", SCALE_DIM=32, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-gather-topk9", dict(hip, DTYPE="bf16", TOPK=9)
+    yield "hip-bf16-gather-reroute", dict(hip, DTYPE="bf16", REROUTE=8)
+    yield "hip-bf16-stdmoe", dict(hip, DTYPE="bf16", STDMOE=1)
+    # Few experts a rank: one token often lands on several of them.
+    yield "hip-bf16-stdmoe-epr4-ragged", dict(
+        hip, DTYPE="bf16", STDMOE=1, EPR=4, RAGGED=1, NOSELF=1
+    )
+    yield "hip-bf16-stdmoe-reroute", dict(hip, DTYPE="bf16", STDMOE=1, REROUTE=8)
+    # StdMoE under a recv cap: packing and combine over the rows each PE kept
+    yield "bf16-stdmoe-cap", {
+        "DTYPE": "bf16",
+        "COMBINE": "gather",
+        "STDMOE": 1,
+        "MAXRECV": 1024,
+    }
+    yield "hip-bf16-stdmoe-cap", dict(hip, DTYPE="bf16", STDMOE=1, MAXRECV=1024)
 
 
 _CASES = dict(_cases())
@@ -243,7 +371,7 @@ def case_output():
         and c not in _GFX125X_UNSERVED
         and not _refused_quant(c)
     ]
-    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=1800)
+    rc, out = _run({"CASES": json.dumps([_CASES[c] for c in ids])}, timeout=3600)
     parts = {c: ([], False) for c in ids}
     current = None
     for ln in out.splitlines():
@@ -274,11 +402,32 @@ def test_dispatch_combine_v2_intranode(case, case_output):
     text, finished = parts[case]
     assert finished, f"{case} did not run: the launch failed in {crashed} first"
     _assert_all_pass(0, text)
+    _assert_tags(_CASES[case], text)
 
 
-def test_op_lifecycle():
+@pytest.mark.skipif(
+    _IS_GFX125X, reason="the dispatch drain is the gfx942/gfx950 body's"
+)
+@pytest.mark.parametrize("backend", ["default", "hip"])
+def test_dispatch_cached_window(backend):
+    """A cached cco window (CCO_UNCACHED_WINDOW=0): dispatch only drains each block's
+    peer stores before its counts, and rows read right behind it must still be complete.
+    """
+    env = {"CCO_UNCACHED_WINDOW": 0, "DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
+    if backend != "default":
+        env["MORI_V2_KERNEL_BACKEND"] = backend
+    rc, out = _run(env)
+    _assert_all_pass(rc, out)
+    _assert_tags(env, out)
+
+
+@pytest.mark.parametrize("backend", ["default", "hip"])
+def test_op_lifecycle(backend):
     """Repeated op build/close on one comm must not leak (see test_op_lifecycle.py)."""
     script = os.path.join(_HERE, "test_op_lifecycle.py")
+    env = os.environ.copy()
+    if backend != "default":
+        env["MORI_V2_KERNEL_BACKEND"] = backend
     cmd = [
         sys.executable,
         "-m",
@@ -290,10 +439,42 @@ def test_op_lifecycle():
     proc = subprocess.run(
         cmd,
         cwd=_HERE,
-        env=os.environ.copy(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=300,
+        timeout=600,
     )
     assert "# LIFECYCLE: PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout}"
+
+
+@pytest.mark.skipif(
+    _arch().startswith("gfx125"), reason="HIP local kernels are gfx942/gfx950"
+)
+@pytest.mark.parametrize("knobs", [{"LEC": 1}, {"LEC": 1, "STDMOE": 1}])
+def test_graph_capture_hip_local_kernels(knobs):
+    """local_expert_count and the StdMoE converts inside a captured, replayed step."""
+    script = os.path.join(_HERE, "test_graph_capture.py")
+    env = os.environ.copy()
+    env.update({k: str(v) for k, v in knobs.items()})
+    env["MORI_V2_KERNEL_BACKEND"] = "hip"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={_NPROC}",
+        script,
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=_HERE,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=900,
+    )
+    assert (
+        "# GRAPH-CAPTURE: PASS" in proc.stdout
+    ), f"rc={proc.returncode}\n{proc.stdout}"
