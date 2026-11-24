@@ -114,7 +114,8 @@ PF_MISC_W = 8
 @flyc.jit
 def _spin_ge_from(addr_i64, cur0, val):
     """Spin until the system-scope i32 at ``addr_i64`` reaches ``val``; ``cur0`` is a first
-    reading already loaded. Relaxed loads, no acquire (an acquire is a whole-L2 invalidate)."""
+    reading already loaded. Relaxed loads, no acquire (an acquire is a whole-L2 invalidate).
+    """
     cur = fx.Int32(cur0)
     while cur < fx.Int32(val):
         rocdl.s_sleep(1)
@@ -146,6 +147,7 @@ def opaque_i64(v):
             has_side_effects=True,
         )
     )
+
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -652,7 +654,9 @@ def compile_gemm2_8wave_sdma(
             cnt = fx.Int32(bc[pe * fx.Int32(TS) + fx.Int32(rank * experts) + j])
             gcol = fx.Int32(bc[pe * fx.Int32(TS) + fx.Int32(TE + rank)])
             par = fx.Int32(comm_ops.load_i32_system(cursor, fx.Int32(0)))  # parity
-            pc0 = fx.Int32(comm_ops.load_i32_system(tile_base, fx.Int32(rank)))  # pair_cfg
+            pc0 = fx.Int32(
+                comm_ops.load_i32_system(tile_base, fx.Int32(rank))
+            )  # pair_cfg
             pc1 = fx.Int32(comm_ops.load_i32_system(tile_base, fx.Int32(npes + rank)))
             return okp, okj, wave, lane, cnt, gcol, par, pc0, pc1
 
@@ -662,7 +666,9 @@ def compile_gemm2_8wave_sdma(
             enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
             a = packed & fx.Int32(0xFF)
             b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
-            nmem = enabled.select((a == b).select(fx.Int32(1), fx.Int32(2)), fx.Int32(0))
+            nmem = enabled.select(
+                (a == b).select(fx.Int32(1), fx.Int32(2)), fx.Int32(0)
+            )
             return enabled, a, b, nmem
 
         def pf_write(ld):
@@ -705,9 +711,9 @@ def compile_gemm2_8wave_sdma(
             if tid < fx.Int32(experts):
                 run = fx.Int32(0)
                 for q in range_constexpr(npes):
-                    i = fx.Int32(PF_REC) + (tid * fx.Int32(npes) + fx.Int32(q)) * fx.Int32(
-                        PF_REC_W
-                    )
+                    i = fx.Int32(PF_REC) + (
+                        tid * fx.Int32(npes) + fx.Int32(q)
+                    ) * fx.Int32(PF_REC_W)
                     c = pf_ld(i + fx.Int32(2))
                     pf_st(i + fx.Int32(1), run)
                     run = run + c
@@ -733,7 +739,12 @@ def compile_gemm2_8wave_sdma(
         def pf_misc():
             """(enabled, a, b, gpad), wave-uniform."""
             m = pf_vec4(fx.Int32(PF_MISC))
-            return fx.Int32(m[2]) != fx.Int32(0), fx.Int32(m[0]), fx.Int32(m[1]), fx.Int32(m[3])
+            return (
+                fx.Int32(m[2]) != fx.Int32(0),
+                fx.Int32(m[0]),
+                fx.Int32(m[1]),
+                fx.Int32(m[3]),
+            )
 
         def pf_out_row(packed, grow, in_tile, row_base, lane_id):
             """out_row of the row at sorted position ``grow`` with srcmap word ``packed``, in
@@ -768,7 +779,9 @@ def compile_gemm2_8wave_sdma(
                 & (pe < fx.Int32(npes))
             )
             pes = valid.select(pe, fx.Int32(0))
-            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + pes) * fx.Int32(PF_REC_W))
+            rec = pf_vec4(
+                fx.Int32(PF_REC) + (e * fx.Int32(npes) + pes) * fx.Int32(PF_REC_W)
+            )
             per = pf_vec4(fx.Int32(PF_PE) + pes * fx.Int32(PF_PE_W))
             cum_n, pfx_n, cnt_n = fx.Int32(rec[0]), fx.Int32(rec[1]), fx.Int32(rec[2])
             gcol, pfx_g = fx.Int32(per[0]), fx.Int32(per[1])
@@ -815,7 +828,9 @@ def compile_gemm2_8wave_sdma(
             rel = t * fx.Int32(SBM) - fx.Int32(tabp[e]) * fx.Int32(SBM)
             enabled, a, b, gpad = pf_misc()
             mem = enabled & ((e == a) | (e == b))
-            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W))
+            rec = pf_vec4(
+                fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W)
+            )
             cum_n, pfx_n, cnt_n = fx.Int32(rec[0]), fx.Int32(rec[1]), fx.Int32(rec[2])
 
             def clamp(x, hi):
@@ -831,7 +846,8 @@ def compile_gemm2_8wave_sdma(
 
         def pf_row_of_place(j, p, st_p, pv):
             """Sorted position of the row at place ``j`` of my run for ``p`` (per lane): the
-            inverse of the closed form. ``st_p``: LDS array of each expert's first place for p."""
+            inverse of the closed form. ``st_p``: LDS array of each expert's first place for p.
+            """
             gcol_p, pfx_g_p = pv[0], pv[1]
             stp = lds_typed_ptr(st_p, T.i32)
             lo = fx.Int32(0)
@@ -842,10 +858,14 @@ def compile_gemm2_8wave_sdma(
                     v = fx.Int32(stp[okc.select(cand, fx.Int32(0))])
                     lo = (okc & (v <= j)).select(cand, lo)
             e = lo
-            seg0 = fx.Int32(lds_typed_ptr(lds_addr(lds.E_tab), T.i32)[e]) * fx.Int32(SBM)
+            seg0 = fx.Int32(lds_typed_ptr(lds_addr(lds.E_tab), T.i32)[e]) * fx.Int32(
+                SBM
+            )
             enabled, a, b, gpad = pf_misc()
             mem = enabled & ((e == a) | (e == b))
-            rec = pf_vec4(fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W))
+            rec = pf_vec4(
+                fx.Int32(PF_REC) + (e * fx.Int32(npes) + p) * fx.Int32(PF_REC_W)
+            )
             cum_n, pfx_n = fx.Int32(rec[0]), fx.Int32(rec[1])
             g_grp = seg0 + pfx_g_p + j - (cum_n - gcol_p)
             g_nrm = seg0 + mem.select(gpad, fx.Int32(0)) + pfx_n + j - cum_n
@@ -1075,7 +1095,9 @@ def compile_gemm2_8wave_sdma(
                 orow, bad = pf_out_row(packed, grow, in_tile, row_base, lane_id)
                 # Impossible under aiter's compact layout; the host raises on the count.
                 if (bad != fx.Int32(0)) & (block_n == fx.Int32(0)):
-                    comm_ops.atomic_add_agent(fx.Int64(idx_send) + fx.Int64(4), fx.Int32(1))
+                    comm_ops.atomic_add_agent(
+                        fx.Int64(idx_send) + fx.Int64(4), fx.Int32(1)
+                    )
             else:
                 orow = in_tile.select(
                     fx.Int32(global_typed_ptr(out_row, T.i32)[grow]), fx.Int32(-1)
@@ -1389,7 +1411,8 @@ def compile_gemm2_8wave_sdma(
 
         def pf_push(p, lo, hi, pv, st_p, inv_base, value0, sbase_p):
             """inv[slot] = value0 + place for every place in [lo, hi) of my run for ``p``, the
-            slot read from the srcmap word of the row at that place (the inverse map)."""
+            slot read from the srcmap word of the row at that place (the inverse map).
+            """
             lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
             for base in range(lo, hi, fx.Int32(64 * PUSH_U)):
                 ok, js, gs = [], [], []
@@ -1419,7 +1442,8 @@ def compile_gemm2_8wave_sdma(
         def comm_role_pf():
             """Plan-free comm workgroup: the plan's offsets, chunk bounds and inverse map in
             closed form from the section table; wave p < npes serves peer p (wave ``rank``
-            fills this rank's own inv entries); then the overflow count and the cdone reset."""
+            fills this rank's own inv entries); then the overflow count and the cdone reset.
+            """
             tid = fx.Int32(fx.thread_idx.x)
             lane = tid % fx.Int32(64)
             wave = fx.Int32(rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
@@ -1438,7 +1462,9 @@ def compile_gemm2_8wave_sdma(
             total_tiles = (
                 global_typed_ptr(num_valid, T.i32)[0] + fx.Int32(SBM - 1)
             ) // fx.Int32(SBM)
-            n_chunks = (total_tiles + fx.Int32(chunk_tiles - 1)) // fx.Int32(chunk_tiles)
+            n_chunks = (total_tiles + fx.Int32(chunk_tiles - 1)) // fx.Int32(
+                chunk_tiles
+            )
             # Rows past the end of S go through the P2P fallback; count them as the plan did.
             if tid == fx.Int32(0):
                 over = fx.Int32(0)
@@ -1468,7 +1494,9 @@ def compile_gemm2_8wave_sdma(
                 _st_lds_i32(
                     st_p,
                     lane,
-                    okj.select(cum_l - mem_l.select(gcol_p, fx.Int32(0)), fx.Int32(0x7FFFFFFF)),
+                    okj.select(
+                        cum_l - mem_l.select(gcol_p, fx.Int32(0)), fx.Int32(0x7FFFFFFF)
+                    ),
                 )
                 if p != fx.Int32(rank):
                     w = cco.Window(win)
@@ -1530,7 +1558,8 @@ def compile_gemm2_8wave_sdma(
                         # Every (sort tile, N-block) of this chunk has stored.
                         if is_lane0:
                             comm_ops.spin_until_ge_i32_agent(
-                                fx.Int64(cdone) + fx.Int64(ci) * fx.Int64(CDONE_STRIDE * 4),
+                                fx.Int64(cdone)
+                                + fx.Int64(ci) * fx.Int64(CDONE_STRIDE * 4),
                                 (t1 - t0) * n_blocks,
                             )
                         comm_ops.fence_agent_acquire()
@@ -1615,7 +1644,9 @@ def compile_gemm2_8wave_sdma(
             # the start of each call; the kernel boundary orders these stores before them).
             fx.barrier()
             for c in range(tid, n_chunks, fx.Int32(512)):
-                _st_i32(fx.Int64(cdone), fx.Int32(c) * fx.Int32(CDONE_STRIDE), fx.Int32(0))
+                _st_i32(
+                    fx.Int64(cdone), fx.Int32(c) * fx.Int32(CDONE_STRIDE), fx.Int32(0)
+                )
 
         def gemm_role():
             tab_lds = lds_addr(lds.E_tab)
