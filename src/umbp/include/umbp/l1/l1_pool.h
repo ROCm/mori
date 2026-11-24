@@ -247,20 +247,78 @@ class PoolManager {
  private:
   enum class SlotState : uint8_t { kVacant, kCached, kHeld, kFilling };
 
+  struct Pool;
+
+  struct Holder {
+    Pool* pool = nullptr;
+    uint32_t slot = 0;
+  };
+
+  // The slots that hold one key, oldest first: nearly always one or two, so
+  // they sit in the index entry itself.
+  class Holders {
+   public:
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    Holder* begin() { return more_.empty() ? inline_ : more_.data(); }
+    Holder* end() { return begin() + size_; }
+    const Holder* begin() const { return more_.empty() ? inline_ : more_.data(); }
+    const Holder* end() const { return begin() + size_; }
+    Holder& operator[](size_t i) { return begin()[i]; }
+    const Holder& operator[](size_t i) const { return begin()[i]; }
+    void push_back(const Holder& holder);
+    // Drop element `i`, keeping the others' order.
+    void erase(size_t i);
+    // Make element `i` the newest.
+    void move_to_back(size_t i);
+    // The element for `pool`, or size().
+    size_t find(const Pool* pool) const;
+
+   private:
+    static constexpr size_t kInline = 3;
+    Holder inline_[kInline];
+    uint32_t size_ = 0;
+    std::vector<Holder> more_;  // every element, once there are more than kInline
+  };
+
+  // A group's content index: key -> who holds it. An entry never moves, so a
+  // slot points at the entry of the key it holds and reaches its holders
+  // without a lookup.
+  using Content = std::unordered_map<std::string, Holders>;
+  using ContentEntry = Content::value_type;
+
+  static constexpr uint32_t kNoSlot = UINT32_MAX;
+
   struct Slot {
     SlotState state = SlotState::kVacant;
+    // A cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
+    bool kept = false;
     uint32_t pins = 0;  // in-flight copies reading this slot
+    // Its neighbours in that list.
+    uint32_t prev = kNoSlot;
+    uint32_t next = kNoSlot;
     // Each settles once the pool's `committed` reaches it. A slot may be read
     // from outside when its content has landed, and filled from outside when
     // its owner has stopped using it; releasing a published slot does not
     // unsettle what it holds.
     uint64_t written = 0;
     uint64_t released = 0;
-    bool has_key = false;
-    std::string key;
-    // Where a cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
-    std::list<uint32_t>::iterator lru_it;
-    bool kept = false;
+    // The key this slot holds, as its entry in the group's index; null: none.
+    ContentEntry* content = nullptr;
+  };
+
+  // Slots linked through `Slot::prev` / `Slot::next`.
+  struct SlotList {
+    uint32_t head = kNoSlot;
+    uint32_t tail = kNoSlot;
+    uint32_t size = 0;
+  };
+
+  struct Group {
+    bool has_layout = false;
+    std::vector<uint64_t> unit_bytes;
+    Content content;
+    uint64_t slots = 0;  // of every pool bound so far: what `content` is sized for
   };
 
   struct Pool {
@@ -268,6 +326,7 @@ class PoolManager {
     // Tells this pool from a later one attached under the same id.
     uint64_t serial = 0;
     std::string group;
+    Group* content_group = nullptr;  // set once bound
     int device = -1;
     void* base = nullptr;
     uint64_t bytes = 0;
@@ -280,11 +339,10 @@ class PoolManager {
     bool bound = false;
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
-    std::list<uint32_t> lru;  // cached slots, coldest first
+    SlotList lru;  // cached slots, coldest first
     // Cached slots an eviction passed over as last copies (`keep_copies`),
     // oldest first. Evicted from only when `lru` has nothing to take.
-    std::list<uint32_t> kept;
-    std::unordered_map<std::string, uint32_t> index;
+    SlotList kept;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
     uint64_t committed = 0;  // how far the owner's device has got
@@ -296,17 +354,6 @@ class PoolManager {
     uint64_t copy_micros = 0;
   };
 
-  struct Holder {
-    Pool* pool = nullptr;
-    uint32_t slot = 0;
-  };
-
-  struct Group {
-    bool has_layout = false;
-    std::vector<uint64_t> unit_bytes;
-    std::unordered_map<std::string, std::vector<Holder>> holders;
-  };
-
   struct CopyStep {
     Pool* src = nullptr;
     uint32_t src_slot = 0;
@@ -315,6 +362,9 @@ class PoolManager {
   };
 
   Pool* FindLocked(const std::string& pool_id);
+  static void PushBack(Pool* pool, SlotList* list, uint32_t slot);
+  static void PushFront(Pool* pool, SlotList* list, uint32_t slot);
+  static void Unlink(Pool* pool, SlotList* list, uint32_t slot);
   // Stop advertising `slot`'s key. The slot keeps its state.
   void UnindexLocked(Pool* pool, uint32_t slot);
   // Take a cached slot off whichever list it stands in.
@@ -322,9 +372,9 @@ class PoolManager {
   // Whether evicting `slot` leaves `keep_copies_` newer copies of its key in
   // the group (or it has no key).
   bool IsSpareLocked(const Pool* pool, uint32_t slot) const;
-  // `key` gained a holder, its newest: the copy this pushes out of the newest
+  // A key gained a holder, its newest: the copy this pushes out of the newest
   // `keep_copies_` is spare, and the coldest spare copy of its pool.
-  void HolderAddedLocked(Group* group, const std::string& key);
+  void HolderAddedLocked(Holders* holders);
   // The owner took `slot` for a request: its copy is the newest of its key.
   void HolderUsedLocked(Pool* pool, uint32_t slot);
   void ResetSlotsLocked(Pool* pool);

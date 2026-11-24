@@ -749,6 +749,62 @@ TEST_F(L1PoolTest, TwoAttachesReplacingABusyPoolAllocateItOnce) {
   EXPECT_EQ(StatsOf("p1").bytes, 2 * kBytes);
 }
 
+TEST_F(L1PoolTest, AKeyHeldByManyPoolsIsTrackedThroughEveryHolderComingAndGoing) {
+  // Six pools: more holders of one key than an index entry keeps in place.
+  const int pools = 6;
+  for (int device = 2; device < pools; ++device) {
+    const std::string id = "p" + std::to_string(device);
+    ASSERT_TRUE(manager->Attach(id, "g", device, kBytes).status.ok);
+    ASSERT_TRUE(manager->BindLayout(id, TestLayout()).ok);
+    ASSERT_EQ(manager->Open(id).num_slots, kSlots);
+  }
+  auto pool = [](int device) { return "p" + std::to_string(device); };
+  FetchOptions probe;
+  probe.probe_only = true;
+  // p0 publishes; every other pool copies it in turn, each from the last.
+  Cache(0, {"shared", "tail"}, 10);
+  for (int device = 1; device < pools; ++device) {
+    FetchResult got = manager->Fetch(pool(device), {"shared", "tail"});
+    ASSERT_EQ(got.slots.size(), 2u) << device;
+    EXPECT_EQ(got.copied_slots, 2u);
+    EXPECT_TRUE(Holds(device, got.slots[0], 10));
+    EXPECT_TRUE(Holds(device, got.slots[1], 11));
+  }
+  // Holders leave one at a time, oldest first, then from the middle: whoever
+  // is left still serves the key, and a pool that dropped it sees it as
+  // another pool's again.
+  for (int device : {0, 1, 4, 2}) {
+    AllocateResult all = manager->Allocate(pool(device), kSlots);
+    ASSERT_EQ(all.slots.size(), kSlots);
+    EXPECT_EQ(all.evicted_keys.size(), 2u) << device;
+    std::vector<Op> back;
+    for (uint32_t slot : all.slots) back.push_back(Op{OpKind::kRelease, slot, ""});
+    ASSERT_TRUE(manager->Apply(pool(device), back).ok);
+    EXPECT_EQ(StatsOf(pool(device)).cached, 0u);
+    EXPECT_EQ(manager->Fetch(pool(device), {"shared", "tail"}, probe).available, 2u) << device;
+  }
+  // Two holders left (p3, p5). One of them republishes the key in another
+  // slot: the old slot is free again, and the key still has two holders.
+  AllocateResult extra = manager->Allocate("p3", 1);
+  ASSERT_EQ(extra.slots.size(), 1u);
+  ASSERT_TRUE(manager
+                  ->Apply("p3", {Op{OpKind::kPublish, extra.slots[0], "shared"},
+                                 Op{OpKind::kRelease, extra.slots[0], ""}})
+                  .ok);
+  EXPECT_EQ(StatsOf("p3").cached, 2u);
+  EXPECT_EQ(StatsOf("p3").vacant, kSlots - 2);
+  // The last holders go; then nobody has it.
+  for (int device : {3, 5}) {
+    ASSERT_TRUE(manager->Clear(pool(device)).ok);
+  }
+  EXPECT_EQ(manager->Fetch("p0", {"shared"}, probe).available, 0u);
+  // And it can come back.
+  Cache(1, {"shared"}, 40);
+  FetchResult again = manager->Fetch("p0", {"shared"});
+  ASSERT_EQ(again.slots.size(), 1u);
+  EXPECT_TRUE(Holds(0, again.slots[0], 40));
+}
+
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
   const std::string path = "/tmp/umbp_l1_test_" + std::to_string(getpid()) + ".sock";
   unlink(path.c_str());
