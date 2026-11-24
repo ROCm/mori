@@ -107,26 +107,7 @@ TEST(PrefetchQueue, ClearDrainsRealIoAndResumesAdmission) {
   EXPECT_FALSE(queue.Submit({"stopped"}).accepted);
 }
 
-TEST(PrefetchQueue, CompletedHistoryDoesNotBlockAdmission) {
-  PrefetchQueue queue(
-      [](const auto& keys, auto, auto) { return std::vector<bool>(keys.size(), true); });
-  for (int i = 0; i < 1024; ++i) {
-    const auto id = std::to_string(i);
-    ASSERT_TRUE(queue.Submit({"key"}, {}, id).accepted);
-    ASSERT_TRUE(WaitTask(queue, id));
-    ASSERT_EQ(queue.Status(id).state, PrefetchState::kReady);
-  }
-  EXPECT_TRUE(queue.Submit({"key"}, {}, "1023").accepted);  // Retained IDs remain idempotent.
-  ASSERT_TRUE(queue.Submit({"key"}, {}, "next").accepted);
-  EXPECT_EQ(queue.Status("0").state, PrefetchState::kUnknown);
-  ASSERT_TRUE(WaitTask(queue, "next"));
-  EXPECT_TRUE(queue.Submit({"key"}, {}, {}, false).accepted);  // Engine hint.
-  queue.PauseAndDrain();
-  queue.Resume();
-  EXPECT_TRUE(queue.Submit({"key"}).accepted);
-}
-
-TEST(PrefetchQueue, FullQueueKeepsUnfinishedRequests) {
+TEST(PrefetchQueue, CapacityRejectsUnfinishedWorkAndReclaimsCompletedHistory) {
   Gate io;
   PrefetchQueue queue([&](const auto& keys, auto, auto) {
     io.Block();
@@ -141,6 +122,11 @@ TEST(PrefetchQueue, FullQueueKeepsUnfinishedRequests) {
   EXPECT_TRUE(queue.Submit({"key"}, {}, "1023").accepted);
   io.Release();
   ASSERT_TRUE(WaitTask(queue, "1023"));
+  EXPECT_EQ(queue.Status("1023").state, PrefetchState::kReady);
+  EXPECT_TRUE(queue.Submit({"key"}, {}, "1023").accepted);  // Retained IDs remain idempotent.
+  ASSERT_TRUE(queue.Submit({"key"}, {}, "next").accepted);
+  EXPECT_EQ(queue.Status("0").state, PrefetchState::kUnknown);
+  ASSERT_TRUE(WaitTask(queue, "next"));
 }
 
 TEST(PrefetchQueue, ReadsWaitOnlyForTheCurrentlyExecutingBatch) {

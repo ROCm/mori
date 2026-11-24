@@ -44,24 +44,35 @@ class PrefetchService final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status SubmitPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
                               ::umbp::PrefetchSubmitResponse* response) override {
-    if (request->lease_ttl_ms() > 300000 || request->timeout_ms() > 300000) {
+    return SubmitRequest(*request, response, submit_);
+  }
+
+  grpc::Status GetPrefetchStatus(grpc::ServerContext*, const ::umbp::PrefetchStatusRequest* request,
+                                 ::umbp::PrefetchStatusResponse* response) override {
+    FillStatus(lookup_(request->request_id()), response);
+    return grpc::Status::OK;
+  }
+
+  template <class SubmitFn>
+  static grpc::Status SubmitRequest(const ::umbp::PrefetchRequest& request,
+                                    ::umbp::PrefetchSubmitResponse* response, SubmitFn&& submit) {
+    // Validate unsigned wire values before converting to signed chrono durations.
+    if (request.lease_ttl_ms() > 300000 || request.timeout_ms() > 300000) {
       response->set_error("prefetch timeout or lease exceeds the accepted bound");
       return grpc::Status::OK;
     }
     PrefetchOptions options;
-    options.lease_ttl = std::chrono::milliseconds(request->lease_ttl_ms());
-    options.timeout = std::chrono::milliseconds(request->timeout_ms());
-    const auto result =
-        submit_({request->keys().begin(), request->keys().end()}, options, request->request_id());
+    options.lease_ttl = std::chrono::milliseconds(request.lease_ttl_ms());
+    options.timeout = std::chrono::milliseconds(request.timeout_ms());
+    const std::vector<std::string> keys{request.keys().begin(), request.keys().end()};
+    const auto result = submit(keys, options, request.request_id());
     response->set_accepted(result.accepted);
     response->set_request_id(result.request_id);
     response->set_error(result.error);
     return grpc::Status::OK;
   }
 
-  grpc::Status GetPrefetchStatus(grpc::ServerContext*, const ::umbp::PrefetchStatusRequest* request,
-                                 ::umbp::PrefetchStatusResponse* response) override {
-    const auto status = lookup_(request->request_id());
+  static void FillStatus(const PrefetchStatus& status, ::umbp::PrefetchStatusResponse* response) {
     response->set_state(static_cast<::umbp::PrefetchState>(status.state));
     response->set_completed_keys(status.completed_keys);
     response->set_total_keys(status.ok.size());
@@ -70,7 +81,6 @@ class PrefetchService final : public ::umbp::UMBPStandalone::Service {
     response->set_execution_latency_us(status.execution_latency_us);
     response->set_total_latency_us(status.total_latency_us);
     for (bool ok : status.ok) response->add_ok(ok);
-    return grpc::Status::OK;
   }
 
  private:

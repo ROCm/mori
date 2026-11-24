@@ -28,6 +28,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "umbp/common/prefetch.h"
 
@@ -50,7 +51,7 @@ class PrefetchQueue {
   void BeginKeys(const std::vector<std::string>& keys);
   void EndKeys();
   bool HasRunningKeys(const std::vector<std::string>& keys);
-  // Wait for current batch tokens only; a timeout does not cancel their I/O.
+  // Wait for the current batch only; a timeout does not cancel its I/O.
   bool WaitForKeys(const std::vector<std::string>& keys, std::chrono::milliseconds timeout);
   void PauseAndDrain();
   void Resume();
@@ -69,7 +70,7 @@ class PrefetchQueue {
   std::condition_variable cv_;
   std::unordered_map<std::string, std::shared_ptr<Task>> tasks_;
   std::unordered_map<std::string, size_t> pending_keys_;
-  std::unordered_map<std::string, uint64_t> running_keys_;
+  std::unordered_set<std::string> running_keys_;
   std::deque<std::shared_ptr<Task>> queue_;
   uint64_t next_id_ = 1;
   uint64_t execution_token_ = 0;

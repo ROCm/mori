@@ -221,8 +221,7 @@ void PrefetchQueue::BeginKeys(const std::vector<std::string>& keys) {
   std::lock_guard<std::mutex> lock(mutex_);
   running_keys_.clear();
   ++execution_token_;
-  if (!paused_ && !stopped_)
-    for (const auto& key : keys) running_keys_[key] = execution_token_;
+  if (!paused_ && !stopped_) running_keys_.insert(keys.begin(), keys.end());
   cv_.notify_all();
 }
 
@@ -241,17 +240,12 @@ bool PrefetchQueue::HasRunningKeys(const std::vector<std::string>& keys) {
 bool PrefetchQueue::WaitForKeys(const std::vector<std::string>& keys,
                                 std::chrono::milliseconds timeout) {
   std::unique_lock<std::mutex> lock(mutex_);
-  std::vector<std::pair<std::string, uint64_t>> running;
-  for (const auto& key : keys) {
-    const auto it = running_keys_.find(key);
-    if (it != running_keys_.end()) running.push_back(*it);
-  }
+  if (std::none_of(keys.begin(), keys.end(),
+                   [&](const auto& key) { return running_keys_.count(key); }))
+    return true;
+  const auto token = execution_token_;
   return cv_.wait_for(lock, timeout, [&] {
-    return paused_ || stopped_ ||
-           std::none_of(running.begin(), running.end(), [&](const auto& key) {
-             const auto it = running_keys_.find(key.first);
-             return it != running_keys_.end() && it->second == key.second;
-           });
+    return paused_ || stopped_ || running_keys_.empty() || execution_token_ != token;
   });
 }
 

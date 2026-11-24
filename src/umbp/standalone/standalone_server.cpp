@@ -981,35 +981,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                               ::umbp::PrefetchSubmitResponse* response) override {
     std::shared_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
-    // Check unsigned wire values before converting to signed chrono durations.
-    if (request->lease_ttl_ms() > 300000 || request->timeout_ms() > 300000) {
-      response->set_error("prefetch timeout or lease exceeds the accepted bound");
-      return grpc::Status::OK;
-    }
-    PrefetchOptions options;
-    options.lease_ttl = std::chrono::milliseconds(request->lease_ttl_ms());
-    options.timeout = std::chrono::milliseconds(request->timeout_ms());
-    const auto result = client_->SubmitPrefetch({request->keys().begin(), request->keys().end()},
-                                                options, request->request_id());
-    response->set_accepted(result.accepted);
-    response->set_request_id(result.request_id);
-    response->set_error(result.error);
-    return grpc::Status::OK;
+    return PrefetchService::SubmitRequest(
+        *request, response, [this](const auto& keys, auto options, auto id) {
+          return client_->SubmitPrefetch(keys, options, std::move(id));
+        });
   }
 
   grpc::Status GetPrefetchStatus(grpc::ServerContext*, const ::umbp::PrefetchStatusRequest* request,
                                  ::umbp::PrefetchStatusResponse* response) override {
     std::shared_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
-    const auto status = client_->GetPrefetchStatus(request->request_id());
-    response->set_state(static_cast<::umbp::PrefetchState>(status.state));
-    response->set_completed_keys(status.completed_keys);
-    response->set_total_keys(status.ok.size());
-    response->set_error(status.error);
-    response->set_queue_latency_us(status.queue_latency_us);
-    response->set_execution_latency_us(status.execution_latency_us);
-    response->set_total_latency_us(status.total_latency_us);
-    for (bool ok : status.ok) response->add_ok(ok);
+    PrefetchService::FillStatus(client_->GetPrefetchStatus(request->request_id()), response);
     return grpc::Status::OK;
   }
 
