@@ -256,10 +256,11 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
 }
 
 /* ------------------------------------------------------------------------- */
-/*                         LL dispatch (Cfg.llDispatch)                       */
+/*                            Intranode dispatch                            */
 /* ------------------------------------------------------------------------- */
-// Ported from EP v1's EpDispatchIntraNodeLLKernel_body (intranode_ll.hpp). One block
-// owns one token at a time and its warps split by role:
+// Ported from EP v1's EpDispatchIntraNodeLLKernel_body (intranode_ll.hpp), and since
+// then the only intranode dispatch off gfx125x. One block owns one token at a time and its warps
+// split by role:
 //
 //   warp 0       control plane: route the NEXT token, then forward the current
 //                token's expert ids and weights to its destinations
@@ -270,11 +271,11 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
 // The route sits in LDS, double buffered, so the control warp's atomics for token
 // N+1 overlap the copy of token N; one block barrier a token. A copy warp's slice
 // is not a runtime division as in v1: warpPerBlock, hiddenDim and the dtype are Cfg
-// constants, so EpLl* fix how many rows each warp takes and the compiler unrolls the
+// constants, so EpRow* fix how many rows each warp takes and the compiler unrolls the
 // row loop to exactly that.
 
 template <int kMaxDests>
-struct EpLlRoute {
+struct EpRoute {
   int numDests;
   int srcTok;
   int destRank[kMaxDests];
@@ -297,9 +298,9 @@ __device__ __forceinline__ P* EpReadLanePtr(P* ptr, int srcLane) {
 // unrolled a fixed 8, which dropped the slots past it. The lowest slot that targets a
 // rank owns the copy, as in the portable body.
 template <EpCfg kCfg>
-__device__ __forceinline__ void EpLlComputeRoute(const EpArgs& args, int tokenId,
-                                                 EpLlRoute<EpLlMaxDests(kCfg)>& route,
-                                                 int& didAlloc, int& slotForMe, int& mySlot) {
+__device__ __forceinline__ void EpDispatchComputeRoute(const EpArgs& args, int tokenId,
+                                                       EpRoute<EpMaxDests(kCfg)>& route,
+                                                       int& didAlloc, int& slotForMe, int& mySlot) {
   constexpr int kTopk = kCfg.numExpertPerToken;
   constexpr int kNpes = kCfg.worldSize;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
@@ -330,7 +331,7 @@ __device__ __forceinline__ void EpLlComputeRoute(const EpArgs& args, int tokenId
     // as the portable body consumes it: the claim is what orders the ranks, and a
     // dropped claim must not renumber the ones that fit. Dropping before the ballot
     // keeps the destination out of the route, so no copy warp sends to it, and
-    // EpLlWriteMap leaves its map slot null.
+    // EpDispatchWriteMap leaves its map slot null.
     if constexpr (EpRecvCapped(kCfg)) {
       if (mySlot >= EpMaxRecv(kCfg)) didAlloc = 0;
     }
@@ -352,9 +353,9 @@ __device__ __forceinline__ void EpLlComputeRoute(const EpArgs& args, int tokenId
 // duplicate slot is already EpNullFlat, so the surviving slots are exactly the
 // distinct destinations the route wants.
 template <EpCfg kCfg>
-__device__ __forceinline__ void EpLlReplayRoute(const EpArgs& args, int tokenId,
-                                                EpLlRoute<EpLlMaxDests(kCfg)>& route, int& didAlloc,
-                                                int& destPe, int& mySlot) {
+__device__ __forceinline__ void EpDispatchReplayRoute(const EpArgs& args, int tokenId,
+                                                      EpRoute<EpMaxDests(kCfg)>& route,
+                                                      int& didAlloc, int& destPe, int& mySlot) {
   constexpr int kTopk = kCfg.numExpertPerToken;
   constexpr int kNpes = kCfg.worldSize;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
@@ -384,8 +385,8 @@ __device__ __forceinline__ void EpLlReplayRoute(const EpArgs& args, int tokenId,
 
 // Deferred past the block barrier so the copy warps are not held up by it.
 template <EpCfg kCfg>
-__device__ __forceinline__ void EpLlWriteMap(const EpArgs& args, int tokenId, int didAlloc,
-                                             int slotForMe, int mySlot) {
+__device__ __forceinline__ void EpDispatchWriteMap(const EpArgs& args, int tokenId, int didAlloc,
+                                                   int slotForMe, int mySlot) {
   constexpr int kTopk = kCfg.numExpertPerToken;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
 
@@ -406,29 +407,29 @@ __device__ __forceinline__ void EpLlWriteMap(const EpArgs& args, int tokenId, in
 }
 
 // The routing pass or the replay pass, whichever this Cfg renders. slotForMe carries
-// the map slot to write in the first and the decoded rank in the second; EpLlWriteMap
+// the map slot to write in the first and the decoded rank in the second; EpDispatchWriteMap
 // reads it the same way.
 template <EpCfg kCfg>
-__device__ __forceinline__ void EpLlRoute_(const EpArgs& args, int tokenId,
-                                           EpLlRoute<EpLlMaxDests(kCfg)>& route, int& didAlloc,
-                                           int& slotForMe, int& mySlot) {
+__device__ __forceinline__ void EpDispatchRoute(const EpArgs& args, int tokenId,
+                                                EpRoute<EpMaxDests(kCfg)>& route, int& didAlloc,
+                                                int& slotForMe, int& mySlot) {
   if constexpr (kCfg.replay) {
-    EpLlReplayRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
+    EpDispatchReplayRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
   } else {
-    EpLlComputeRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
+    EpDispatchComputeRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
   }
 }
 
 template <EpCfg kCfg, typename T>
-__device__ void EpDispatchLLBody(EpArgs args) {
+__device__ void EpDispatchBody(EpArgs args) {
   constexpr int kTopk = kCfg.numExpertPerToken;
-  constexpr int kCtrl = EpLlCtrlWarps(kCfg);
-  constexpr int kCopyWarps = EpLlCopyWarps(kCfg);
-  constexpr int kRows = EpLlRows(kCfg);
-  constexpr int kMaxRows = EpLlMaxRowCount(kCfg);
+  constexpr int kCtrl = EpCtrlWarps(kCfg);
+  constexpr int kCopyWarps = EpCopyWarps(kCfg);
+  constexpr int kRows = EpRowsPerToken(kCfg);
+  constexpr int kMaxRows = EpMaxRowCount(kCfg);
   constexpr bool kEvenRows = (kRows % kCopyWarps) == 0;
-  constexpr bool kPartialRow = EpLlLastRowVecs(kCfg) < kCfg.waveSize;
-  constexpr size_t kRowBytes = EpLlRowBytes(kCfg);
+  constexpr bool kPartialRow = EpLastRowVecs(kCfg) < kCfg.waveSize;
+  constexpr size_t kRowBytes = EpRowBytes(kCfg);
   constexpr size_t kTokBytes = EpTokenBytes(kCfg);
   constexpr int kChunk = kMaxRows < 4 ? kMaxRows : 4;
   // No warp has a short chunk: every row of every chunk exists.
@@ -442,11 +443,11 @@ __device__ void EpDispatchLLBody(EpArgs args) {
 
   using Vec = typename core::VecTypeSelector<16>::dataType;
 
-  __shared__ EpLlRoute<EpLlMaxDests(kCfg)> routeBuf[2];
+  __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2];
 
   const int copyWarp = warpId - kCtrl;
-  const int rowCount = kEvenRows ? kRows / kCopyWarps : EpLlRowCount(kCfg, copyWarp);
-  const int rowBegin = EpLlRowBegin(kCfg, copyWarp);
+  const int rowCount = kEvenRows ? kRows / kCopyWarps : EpRowCount(kCfg, copyWarp);
+  const int rowBegin = EpRowBegin(kCfg, copyWarp);
   const size_t laneOff = static_cast<size_t>(laneId) * 16;
   Vec pre[kChunk];
 
@@ -461,7 +462,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
     // with no more tokens than blocks -- this prologue IS the kernel.
     int nextDid = 0, nextSlotK = -1, nextSlot = 0;
     if (warpId == 0 && blockIdx.x < numTokens) {
-      EpLlRoute_<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
+      EpDispatchRoute<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
     } else if (warpId >= kCtrl && blockIdx.x < numTokens && rowCount > 0) {
       const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
                            static_cast<size_t>(blockIdx.x) * kTokBytes +
@@ -470,13 +471,13 @@ __device__ void EpDispatchLLBody(EpArgs args) {
       for (int u = 0; u < kChunk; ++u) {
         bool live = kRowsAlwaysLive || u < rowCount;
         if constexpr (kPartialRow)
-          live = live && !(rowBegin + u == kRows - 1 && laneId >= EpLlLastRowVecs(kCfg));
+          live = live && !(rowBegin + u == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
         if (live) pre[u] = core::load<16>(src + u * kRowBytes + laneOff);
       }
     }
     __syncthreads();
     if (warpId == 0 && blockIdx.x < numTokens) {
-      EpLlWriteMap<kCfg>(args, blockIdx.x, nextDid, nextSlotK, nextSlot);
+      EpDispatchWriteMap<kCfg>(args, blockIdx.x, nextDid, nextSlotK, nextSlot);
     }
 
     for (int tokenIdx = blockIdx.x; tokenIdx < numTokens; tokenIdx += gridDim.x) {
@@ -486,8 +487,9 @@ __device__ void EpDispatchLLBody(EpArgs args) {
       if (warpId == 0) {
         const int nextTok = tokenIdx + gridDim.x;
         if (nextTok < numTokens) {
-          EpLlRoute_<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK, nextSlot);
-          EpLlWriteMap<kCfg>(args, nextTok, nextDid, nextSlotK, nextSlot);
+          EpDispatchRoute<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK,
+                                nextSlot);
+          EpDispatchWriteMap<kCfg>(args, nextTok, nextDid, nextSlotK, nextSlot);
         }
       } else if (kCfg.scaleBytes > 0 && warpId == 1) {
         if constexpr (kCfg.scaleBytes > 0) {
@@ -572,7 +574,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
               const int row = c0 + u;
               bool live = kRowsAlwaysLive || row < rowCount;
               if constexpr (kPartialRow)
-                live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLlLastRowVecs(kCfg));
+                live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
               if (live)
                 v[u] =
                     (pre_ok && c0 == 0) ? pre[u] : core::load<16>(src + row * kRowBytes + laneOff);
@@ -584,7 +586,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
                 const int row = c0 + u;
                 bool live = kRowsAlwaysLive || row < rowCount;
                 if constexpr (kPartialRow)
-                  live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLlLastRowVecs(kCfg));
+                  live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
                 if (live) core::store<16>(dst + row * kRowBytes + laneOff, v[u]);
               }
             }

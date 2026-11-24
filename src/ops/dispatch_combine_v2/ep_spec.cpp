@@ -137,15 +137,22 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
-  // EpDispatchLLBody is the intranode dispatch on every arch but gfx125x, which has
-  // its own TDM body. There is no second body to choose, so this is not a request
-  // field any more: llDispatch marks the Cfg that renders it, which EpCfgValid reads
-  // to apply the role split's constraints to a dispatch and not to a combine.
+  // The intranode dispatch is a block-per-token pipeline on every arch but gfx125x,
+  // which has its own TDM body. Its warps are a role split rather than a geometry, so
+  // an unpinned count is derived from the payload instead of the generic default, and
+  // its constraints are checked here -- EpCfgIsValid cannot tell a dispatch from a
+  // combine, and worldSize <= waveSize is true of the first and not of the second.
   if (isDispatch && arch.rfind("gfx125", 0) != 0) {
-    c.llDispatch = true;
-    // The warp count is the role split, so an unpinned one is derived from the
-    // payload rather than taken from the generic dispatch default.
-    if (req.warpPerBlock <= 0) c.warpPerBlock = EpLlDefaultWarps(c);
+    if (req.warpPerBlock <= 0) c.warpPerBlock = EpDefaultDispatchWarps(c);
+    if (c.worldSize > c.waveSize || EpCopyWarps(c) < 1) {
+      throw std::runtime_error(
+          "mori v2 ep: the intranode dispatch routes with lane p owning destination p, so "
+          "worldSize (" +
+          std::to_string(c.worldSize) + ") must fit in a wavefront (" + std::to_string(c.waveSize) +
+          "), and the block needs a warp each for routing (and scales) and for copying "
+          "(warps=" +
+          std::to_string(c.warpPerBlock) + ")");
+    }
   }
 
   if (req.ll128) {
@@ -237,11 +244,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
         " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
-        " llDispatch=" + std::to_string(c.llDispatch) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
         "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), "
-        "aggReserve needs worldSize <= waveSize and blocks < 4096, and llDispatch needs "
-        "worldSize <= waveSize and a warp each for routing (and scales) and for copying");
+        "and aggReserve needs worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
@@ -385,7 +390,7 @@ std::string EpCombineSpec::EntryName(const Cfg& cfg) {
 }
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchLLBody", "EpDispatch1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {

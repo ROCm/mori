@@ -272,10 +272,6 @@ struct EpCfg {
   bool cardFwdMark = false;
   bool cardCombine = false;
   bool ll128Dedup = false;
-  // The portable dispatch as a block-per-token pipeline: one warp routes the next
-  // token while the others fan the current one out (EpDispatchLLBody). warpPerBlock
-  // then sets the role split, and EpLl* below turn it into exact per-warp row counts.
-  bool llDispatch = false;
 };
 
 template <typename Self, typename Visit>
@@ -310,11 +306,10 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(cardFwdMark);
   MORI_FIELD(cardCombine);
   MORI_FIELD(ll128Dedup);
-  MORI_FIELD(llDispatch);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 30, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 29, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -395,7 +390,7 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
 // ---------------------------------------------------------------------------
-// LL dispatch geometry (Cfg.llDispatch). A block owns one token at a time and its
+// Intranode dispatch geometry. A block owns one token at a time and its
 // warps take fixed roles: warp 0 routes, warp 1 forwards the scale row when there
 // is one, and every other warp copies a share of the payload. All of it is a
 // function of the Cfg, so the split is exact at compile time: the payload is a
@@ -403,28 +398,28 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // copy warps with the remainder spread one a warp, and no warp's trip count or
 // offset is computed on the device.
 // ---------------------------------------------------------------------------
-constexpr int EpLlCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
-constexpr int EpLlCopyWarps(const EpCfg& c) { return c.warpPerBlock - EpLlCtrlWarps(c); }
-constexpr int EpLlRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
-constexpr int EpLlRows(const EpCfg& c) {
-  return (EpTokenBytes(c) + EpLlRowBytes(c) - 1) / EpLlRowBytes(c);
+constexpr int EpCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
+constexpr int EpCopyWarps(const EpCfg& c) { return c.warpPerBlock - EpCtrlWarps(c); }
+constexpr int EpRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
+constexpr int EpRowsPerToken(const EpCfg& c) {
+  return (EpTokenBytes(c) + EpRowBytes(c) - 1) / EpRowBytes(c);
 }
 // 16 B vectors in the last row; the lanes past it sit that row out.
-constexpr int EpLlLastRowVecs(const EpCfg& c) {
-  return (EpTokenBytes(c) - (EpLlRows(c) - 1) * EpLlRowBytes(c)) / 16;
+constexpr int EpLastRowVecs(const EpCfg& c) {
+  return (EpTokenBytes(c) - (EpRowsPerToken(c) - 1) * EpRowBytes(c)) / 16;
 }
-// Copy warp w takes rows [EpLlRowBegin, EpLlRowBegin + EpLlRowCount): the first
+// Copy warp w takes rows [EpRowBegin, EpRowBegin + EpRowCount): the first
 // `rows % copyWarps` warps take one more than the rest.
-constexpr int EpLlRowCount(const EpCfg& c, int w) {
-  return EpLlRows(c) / EpLlCopyWarps(c) + (w < EpLlRows(c) % EpLlCopyWarps(c) ? 1 : 0);
+constexpr int EpRowCount(const EpCfg& c, int w) {
+  return EpRowsPerToken(c) / EpCopyWarps(c) + (w < EpRowsPerToken(c) % EpCopyWarps(c) ? 1 : 0);
 }
-constexpr int EpLlRowBegin(const EpCfg& c, int w) {
-  const int r = EpLlRows(c) % EpLlCopyWarps(c);
-  return w * (EpLlRows(c) / EpLlCopyWarps(c)) + (w < r ? w : r);
+constexpr int EpRowBegin(const EpCfg& c, int w) {
+  const int r = EpRowsPerToken(c) % EpCopyWarps(c);
+  return w * (EpRowsPerToken(c) / EpCopyWarps(c)) + (w < r ? w : r);
 }
-constexpr int EpLlMaxRowCount(const EpCfg& c) { return EpLlRowCount(c, 0); }
+constexpr int EpMaxRowCount(const EpCfg& c) { return EpRowCount(c, 0); }
 // Destinations a token can fan out to: one per distinct rank, so at most topk.
-constexpr int EpLlMaxDests(const EpCfg& c) {
+constexpr int EpMaxDests(const EpCfg& c) {
   return c.worldSize < c.numExpertPerToken ? c.worldSize : c.numExpertPerToken;
 }
 // The warp count a request without one gets: a row a copy warp wherever the block can
@@ -434,14 +429,14 @@ constexpr int EpLlMaxDests(const EpCfg& c) {
 // small count is where it matters -- there every block holds one token, so the row
 // count IS the block's parallelism.
 //
-// Past that many rows the split is the widest the block allows, and EpLlRowCount
+// Past that many rows the split is the widest the block allows, and EpRowCount
 // spreads the remainder; one row a warp is exactly even, so the common shapes also get
 // the single-constant row count.
-constexpr int EpLlDefaultWarps(const EpCfg& c) {
-  const int cap = 1024 / c.waveSize - EpLlCtrlWarps(c);  // EpBlockThreads(c) <= 1024
-  const int rows = EpLlRows(c);
+constexpr int EpDefaultDispatchWarps(const EpCfg& c) {
+  const int cap = 1024 / c.waveSize - EpCtrlWarps(c);  // EpBlockThreads(c) <= 1024
+  const int rows = EpRowsPerToken(c);
   const int copy = rows < cap ? rows : cap;
-  return EpLlCtrlWarps(c) + (copy > 0 ? copy : 1);
+  return EpCtrlWarps(c) + (copy > 0 ? copy : 1);
 }
 
 constexpr int EpCombinePushSlotAlign = 128;
@@ -770,11 +765,7 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
                                                                c.combineScatterQGroup == 128) &&
                                                               c.hiddenDim % 128 == 0)) &&
                                    c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
-                                   !c.ll128 && !c.ll128CombineOnly && !c.cardCombine)) &&
-         // llDispatch: lane p of the routing warp owns destination p, so the world
-         // fits in one wavefront, and a control warp plus a copy warp need a block of
-         // at least two (three with a scale row).
-         (!c.llDispatch || (c.worldSize <= c.waveSize && EpLlCopyWarps(c) >= 1));
+                                   !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
 }
 
 }  // namespace v2
