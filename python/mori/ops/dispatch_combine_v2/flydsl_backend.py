@@ -111,16 +111,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "'hip' backend implements; pass kernel_backend='hip' (or set "
                 "MORI_V2_KERNEL_BACKEND=hip)",
             )
-        # EpDispatchLLBody lives in the hip backend's kernel header; this backend has
-        # no counterpart. Without this the default backend ran its ordinary dispatch
-        # and reported "passed", so ll_dispatch=True meant nothing and a test of the
-        # LL body never touched it.
-        if cfg.ll_dispatch is True:
-            return (
-                "ll_dispatch=True selects the block-per-token LL dispatch, which only "
-                "the 'hip' backend implements; pass kernel_backend='hip' (or set "
-                "MORI_V2_KERNEL_BACKEND=hip)",
-            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):

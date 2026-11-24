@@ -70,7 +70,6 @@ struct EpRequest {
   bool cardFwdMark = false;
   bool cardCombine = false;
   bool ll128Dedup = false;
-  bool llDispatch = false;  // block-per-token LL dispatch; gfx942/gfx950 dispatch only
 };
 
 template <typename Self, typename Visit>
@@ -104,11 +103,10 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(cardFwdMark);
   MORI_FIELD(cardCombine);
   MORI_FIELD(ll128Dedup);
-  MORI_FIELD(llDispatch);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 29,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 28,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

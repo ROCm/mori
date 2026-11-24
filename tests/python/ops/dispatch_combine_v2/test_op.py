@@ -223,16 +223,6 @@ def _run(d, comm):
         combine_mode=COMBINE,
         quant_type=QUANT,
         max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
-        # Unset is the library default (None = automatic); 0 and 1 pin it off and on.
-        ll_dispatch=(
-            bool(int(os.environ["LL_DISPATCH"]))
-            if "LL_DISPATCH" in os.environ
-            else None
-        ),
-        # 0 (the default) leaves it None: every bucket is LL. A positive value
-        # splits the schedule, so a sweep that straddles it exercises both bodies
-        # and the bucket selection between them in one run.
-        ll_dispatch_max_tokens=int(os.environ.get("LL_MAX_TOK", 0)) or None,
     )
     if int(os.environ.get("TUNED", 0)):
         # Each backend tunes its own kernels, so take the table of the one that will

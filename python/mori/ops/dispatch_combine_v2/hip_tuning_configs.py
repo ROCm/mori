@@ -786,114 +786,12 @@ class KernelConfig(NamedTuple):
     # kernel sends on. A compile-time constant of each kernel, chosen per phase
     # and per bucket (the table's active_qps), so it is part of the key too.
     active_qps: int | None = None
-    # Intranode dispatch only: build this bucket's kernel as the block-per-token
-    # LL body. Part of the key like the two above -- EpEntryName gives it its own
-    # "_ll" name, so a schedule may hold both forms and pick by token count.
-    ll_dispatch: bool = False
 
 
 class ScheduleEntry(NamedTuple):
     max_tokens: int | None
     dispatch: KernelConfig
     combine: KernelConfig
-
-
-# Largest call, in tokens a rank, that the LL dispatch serves when nothing asks
-# for it explicitly. None = no ceiling: the LL body is the intranode hip dispatch,
-# and EpDispatchBody serves only what the LL body cannot (see _ll_auto_ok).
-#
-# What that accepts. Measured against the portable body on 8x MI300X and 8x MI355X
-# over 19 shape x dtype combinations (hidden 2048-7168, topk 4-9, bf16 / fp8 /
-# fp4): at 512 tokens a rank and below the LL body is faster on every one of them,
-# worst case +0.1%. Above 2048 three of them are slower -- hidden 2048 top-4 bf16
-# by 7-11%, fp4 at hidden 5120 by 5%, gpt-oss hidden 2880 by 1% -- and with no
-# ceiling those calls now take the LL body anyway. Setting this to 512 restores
-# the measured-best split; it is one value.
-#
-# Those numbers were also taken against a portable body that compiles to 5
-# waves/SIMD where the LL body gets 8, because its peer stores fall back to
-# flat_store_dwordx4 (EpPeer builds its pointer from an integer, so the compiler
-# cannot see address space 1). That is a property of the codegen, not of either
-# algorithm, and fixing it would move the comparison.
-_LL_AUTO_MAX_TOKENS = None
-
-
-def _ll_auto_ok(cfg) -> bool:
-    """Whether the automatic rule may put the LL body in a bucket.
-
-    Explicit ll_dispatch=True refuses a config it cannot run, which is right: the
-    caller asked for the body by name. Automatic selection must do the opposite and
-    fall back to the portable body without a word, since the caller asked for a
-    dispatch, not for this one. So every condition MakeEpCfg would throw on is
-    checked here first.
-    """
-    if getattr(cfg, "is_internode", False) or getattr(cfg, "async_ll", False):
-        return False
-    arch = _gpu.arch_name()
-    if not arch or is_gfx125x_arch(arch):
-        return False
-    # Lane p of the routing warp owns destination p, so the world fits in a wave.
-    # This is the last thing the LL body cannot do; routing replay and the receive
-    # cap it now implements itself.
-    if cfg.world_size > 64:
-        return False
-    return True
-
-
-def _ll_mode(cfg):
-    """(on, cap): whether any bucket is LL, and the largest that may be.
-
-    ll_dispatch is three-valued. True is the explicit opt-in and covers the whole
-    schedule unless ll_dispatch_max_tokens narrows it. False is never. None, the
-    default, is automatic: the small-token buckets only, and only where the body
-    can actually run.
-    """
-    flag = getattr(cfg, "ll_dispatch", None)
-    cap = getattr(cfg, "ll_dispatch_max_tokens", None)
-    if flag is False:
-        return False, None
-    if flag is True:
-        return True, cap
-    return _ll_auto_ok(cfg), cap if cap is not None else _LL_AUTO_MAX_TOKENS
-
-
-def _split_at_ll_cap(cfg, rows):
-    """Make ll_dispatch_max_tokens a bucket edge, as internode_schedule() does for
-    its own crossover.
-
-    Without this the cap could only ever turn LL off: most shapes are untuned and
-    resolve to a single open-ended bucket, and an open-ended bucket is never at or
-    below a finite cap. Splitting it keeps the geometry identical on both sides --
-    only the body differs -- so the pair costs one extra kernel, not a re-tune.
-    """
-    on, cap = _ll_mode(cfg)
-    if not on or cap is None:
-        return rows
-    out = []
-    for row in rows:
-        ceiling = row[0]
-        if (ceiling is None or ceiling > cap) and not any(r[0] == cap for r in out):
-            out.append((cap, *row[1:]))
-        out.append(row)
-    return tuple(out)
-
-
-def _ll_bucket(cfg, ceiling) -> bool:
-    """Whether this intranode dispatch bucket is built as the LL body.
-
-    ll_dispatch alone is the whole schedule, which is what an explicit opt-in has
-    always meant. With ll_dispatch_max_tokens set, only buckets whose ceiling is at
-    or below it are LL and the rest stay portable, so one op holds both forms and
-    kernel_config() picks by the call's token count -- the intranode counterpart of
-    internode_auto_ll_max_tokens.
-    """
-    on, cap = _ll_mode(cfg)
-    if not on:
-        return False
-    if cap is None:
-        return True
-    # An open-ended bucket reaches past any finite cap.
-    return ceiling is not None and ceiling <= cap
 
 
 def resolve_schedule(
@@ -925,12 +823,9 @@ def resolve_schedule(
                 cfg.combine_warp_num_per_block,
             ),
         )
-        rows = _split_at_ll_cap(cfg, rows)
         return tuple(
             ScheduleEntry(
-                ceiling,
-                KernelConfig("intra", db, dw, ll_dispatch=_ll_bucket(cfg, ceiling)),
-                KernelConfig("intra", cb, cw),
+                ceiling, KernelConfig("intra", db, dw), KernelConfig("intra", cb, cw)
             )
             for ceiling, db, dw, cb, cw in rows
         )
@@ -990,8 +885,7 @@ def describe_schedule(cfg, schedule) -> str:
 
     def fmt(spec):
         if spec.rdma_block_num is None:
-            ll = " LL" if spec.ll_dispatch else ""
-            return f"{spec.family}{ll} B/W={spec.block_num}/{spec.warp_per_block}"
+            return f"{spec.family} B/W={spec.block_num}/{spec.warp_per_block}"
         return (
             f"{spec.family} B/R/W="
             f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"

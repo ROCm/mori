@@ -286,25 +286,6 @@ class EpDispatchCombineConfig:
     # op's send. With the ops on separate streams, a two-op microbenchmark is
     # slower but DeepSeek-V4 prefill was still faster, so measure that case.
     async_ll_own_sdma_queue: bool = False
-    # Intranode dispatch as a block-per-token pipeline instead of one warp per
-    # (token, top-k slot): a control warp routes the next token while the others load
-    # a slice of the current one once and store it to every destination rank. Ported
-    # from the v1 IntraNodeLL dispatch. gfx942 / gfx950, one node, hip backend; the
-    # combine is unchanged. The warp split is derived from hidden_dim at compile time,
-    # so leave warp_num_per_block None unless you are sweeping it.
-    # None (the default) is automatic, and on the hip backend that now means the LL
-    # body is the intranode dispatch: every schedule bucket it can serve is built
-    # from it, and EpDispatchBody serves only what it cannot -- routing replay, a
-    # capped receive, a world past the wavefront, gfx125x. True asks for it by name
-    # and refuses such a config instead of falling back. False never builds it.
-    ll_dispatch: bool | None = None
-    # Largest call, in tokens a rank, that the LL body serves. None (the default)
-    # is no ceiling, under either ll_dispatch setting. A number makes the schedule
-    # hold both bodies and pick by the call's token count -- the intranode
-    # counterpart of internode_auto_ll_max_tokens. 512 is the measured split: see
-    # hip_tuning_configs._LL_AUTO_MAX_TOKENS for the shapes above it that the LL
-    # body is slower on.
-    ll_dispatch_max_tokens: int | None = None
     # Receive layout of async_ll over "sdma" on one node: "compact" (default),
     # "segmented" or "auto".
     #

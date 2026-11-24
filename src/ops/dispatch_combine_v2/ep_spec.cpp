@@ -137,15 +137,14 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
-  if (req.llDispatch) {
-    if (!isDispatch || arch.rfind("gfx125", 0) == 0 || c.waveSize != 64 || req.ll128) {
-      throw std::runtime_error(
-          "mori v2 ep: llDispatch is the portable wave64 dispatch (gfx942 / gfx950); it is not a "
-          "combine option and not available with ll128 or on gfx125x");
-    }
+  // EpDispatchLLBody is the intranode dispatch on every arch but gfx125x, which has
+  // its own TDM body. There is no second body to choose, so this is not a request
+  // field any more: llDispatch marks the Cfg that renders it, which EpCfgValid reads
+  // to apply the role split's constraints to a dispatch and not to a combine.
+  if (isDispatch && arch.rfind("gfx125", 0) != 0) {
     c.llDispatch = true;
-    // The warp count is the role split, so an unpinned one is derived from the payload
-    // rather than taken from the generic dispatch default.
+    // The warp count is the role split, so an unpinned one is derived from the
+    // payload rather than taken from the generic dispatch default.
     if (req.warpPerBlock <= 0) c.warpPerBlock = EpLlDefaultWarps(c);
   }
 
@@ -270,10 +269,7 @@ bool EpArchIs1250() { return mori::jit::v2::ActiveArch().rfind("gfx125", 0) == 0
 std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   std::string s = "mori_ep_";
   s += kind;
-  if (EpArchIs1250())
-    s += "_tdm";
-  else if (cfg.llDispatch)
-    s += "_ll";
+  if (EpArchIs1250()) s += "_tdm";
   s += '_';
   s += EpDTypeTag(cfg.dtype);
   s += "_ws" + std::to_string(cfg.worldSize);
@@ -389,8 +385,7 @@ std::string EpCombineSpec::EntryName(const Cfg& cfg) {
 }
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, EntryName(cfg), cfg.llDispatch ? "EpDispatchLLBody" : "EpDispatchBody",
-                        "EpDispatch1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), "EpDispatchLLBody", "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {

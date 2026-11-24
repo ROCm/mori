@@ -993,7 +993,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         Pinned means the CALLER set it: _resolve_geometry has already filled the field
         from the tuning table by the time a backend sees the config, so the field being
         non-None says nothing. _pinned_geometry is the record of what was passed in."""
-        if spec.ll_dispatch and "warp_num_per_block" not in cfg._pinned_geometry:
+        if not self._is1250 and "warp_num_per_block" not in cfg._pinned_geometry:
             return 0
         return spec.warp_per_block
 
@@ -1010,7 +1010,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
                     warp_per_block=self._dispatch_warps(cfg, spec),
-                    ll_dispatch=spec.ll_dispatch,
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
@@ -1289,13 +1288,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
-        if cfg.ll_dispatch is True and (
-            cfg.async_ll or cfg.is_internode or self._is1250
-        ):
-            return (
-                "ll_dispatch (the portable wave64 intranode dispatch: gfx942 / gfx950, "
-                "one node, not async_ll)",
-            )
         if cfg.async_ll:
             return self._asyncll_unsupported(cfg)
         if cfg.is_internode:
@@ -2168,7 +2160,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **bound,
                     block_num=spec.block_num,
                     warp_per_block=self._dispatch_warps(cfg, spec),
-                    ll_dispatch=spec.ll_dispatch,
                     call_tok_max=cap,
                 )
                 plan.bind(rank=cfg.rank)
@@ -2183,7 +2174,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         **bound,
                         block_num=spec.block_num,
                         warp_per_block=self._dispatch_warps(cfg, spec),
-                        ll_dispatch=spec.ll_dispatch,
                         call_tok_max=cap,
                         replay=True,
                     )
