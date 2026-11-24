@@ -628,15 +628,20 @@ gfx950 default), CUDA graph. Rank 0 rocprofv3 kernel trace, median round span
 
 | tok/rank | bf16 combine | `fp8_blockwise_1x128` | `fp8_blockwise_1x32` |
 |---:|---:|---:|---:|
-| 64   |  79.6 |  67.4 (-15.3%) |  68.8 (-13.6%) |
-| 2048 | 695.7 | 538.5 (-22.6%) | 543.8 (-21.8%) |
+| 64   |  79.6 |  66.3 (-16.7%) |  66.2 (-16.8%) |
+| 2048 | 695.7 | 517.0 (-25.7%) | 516.4 (-25.8%) |
 
-The gain is the wire: a 7168-element row goes from 14336 B to 7392 B, and the
-combine RecvTransfer at 2048 tokens from 337.6 to 178.2 us -- the SDMA link was
-already at its ceiling, so time tracks bytes. SendCopy gets cheaper too (58.6 to
-48.4 us), but RecvCopy gets slower (38.5 to 42.0 us at 1x128, 50.9 at 1x32): it
-reads eight bytes a lane, and 1x32 its scales a byte at a time. Round-trip error
-of an identity expert: worst row 2.7% (1x128) and 2.8% (1x32) relative L2.
+The gain is mostly the wire: a 7168-element row goes from 14336 B to 7392 B, and
+the combine RecvTransfer at 2048 tokens from 337.6 to 178.2 us -- the SDMA link
+was already at its ceiling, so time tracks bytes. The two copy passes get cheaper
+as well, 58.6 to 36.4 us (SendCopy) and 38.5 to 31.1 us (RecvCopy), because of
+how they are written: a lane takes 16 elements (one 16 B fp8 access), the arena
+pointers are rebuilt in address space 1 so the accesses are global rather than
+flat, and RecvCopy reads a token's top-k slots in one go and issues every row's
+load before summing. Loading slot and row one at a time first cost 42.0 us
+(1x128) and 50.9 us (1x32): top-k serial round trips, slower than the bf16
+gather despite half the bytes. Round-trip error of an identity expert: worst row
+2.7% (1x128) and 2.8% (1x32) relative L2.
 
 ### Tried and rejected
 

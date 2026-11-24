@@ -206,7 +206,8 @@ __device__ __forceinline__ void LaneCopyWords(uint8_t* dst, const uint8_t* src, 
 // group (an E8M0 byte per 32 elements, or an f32 per 128), padded to 16 B. Rows
 // sit at that stride in inter_combine_staging and inter_combine_inp, which are
 // sized for the bf16 row, so they fit. The codec is the scatter combine's
-// (ep_scatter_quant.hpp): eight elements a lane, a group's lanes share its amax.
+// (ep_scatter_quant.hpp); a lane takes 16 elements, one 16 B fp8 access, and a
+// group's lanes share its amax.
 template <EpInterNodeKernelCfg kConfig>
 inline constexpr bool CombineQuant = kConfig.combineQGroup != 0;
 
@@ -221,33 +222,56 @@ constexpr size_t CombineRowBytes() {
   }
 }
 
-// CombineSendCopy, quantizing: one warp per (recv row, 8 * warpSize elements).
+constexpr int kCombineQVec = 16;
+
+// Arena and input pointers are built from integers, so the compiler cannot see
+// that they are global: it emits flat accesses, which have no immediate offset
+// and keep a 64-bit address per access live. Rebuilding the pointer in address
+// space 1 gives global_load / global_store.
+template <typename V>
+__device__ __forceinline__ V LoadGlobal(const void* p) {
+  return *(const __attribute__((address_space(1))) V*)(reinterpret_cast<uintptr_t>(p));
+}
+template <typename V>
+__device__ __forceinline__ void StoreGlobal(void* p, V v) {
+  *(__attribute__((address_space(1))) V*)(reinterpret_cast<uintptr_t>(p)) = v;
+}
+
+// This warp's index in the grid, as a scalar: what a warp derives from it (its
+// token, the token's slots) then stays in SGPRs and loads as one.
+__device__ __forceinline__ int UniformWarpId() {
+  return __builtin_amdgcn_readfirstlane(blockIdx.x * (blockDim.x / warpSize) +
+                                        threadIdx.x / warpSize);
+}
+
+// CombineSendCopy, quantizing: one warp per (recv row, 16 * warpSize elements).
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ __forceinline__ void CombineQuantSendCopy(const EpDispatchCombineArgs& args,
                                                      uint8_t* staging, int rows) {
   static_assert(sizeof(T) == 2, "the quantized combine reads bf16 rows");
   constexpr int kGroup = kConfig.combineQGroup;
   constexpr int kHidden = kConfig.hiddenDim;
-  constexpr int kLanesPerGroup = kGroup / kEpScatterLaneElems;
+  constexpr int kLanesPerGroup = kGroup / kCombineQVec;
   constexpr size_t kRowB = CombineRowBytes<kConfig, T>();
   const int lane = threadIdx.x & (warpSize - 1);
-  const int warp = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   const int warps = gridDim.x * (blockDim.x / warpSize);
-  const int chunk = warpSize * kEpScatterLaneElems;
+  const int chunk = warpSize * kCombineQVec;
   const int steps = (kHidden + chunk - 1) / chunk;
   const T* inp = static_cast<const T*>(args.inpTokenBuf);
 
-  for (int u = warp; u < rows * steps; u += warps) {
+  for (int u = UniformWarpId(); u < rows * steps; u += warps) {
     const int tok = u / steps;
-    const int e = (u % steps) * chunk + lane * kEpScatterLaneElems;
+    const int e = (u % steps) * chunk + lane * kCombineQVec;
     const bool active = e < kHidden;
-    float f[8] = {};
-    if (active)
-      EpBf16x8ToF32(*reinterpret_cast<const uint4*>(inp + static_cast<size_t>(tok) * kHidden + e),
-                    f);
+    float f[2][8] = {};
+    if (active) {
+      const T* src = inp + static_cast<size_t>(tok) * kHidden + e;
+      EpBf16x8ToF32(LoadGlobal<uint4>(src), f[0]);
+      EpBf16x8ToF32(LoadGlobal<uint4>(src + 8), f[1]);
+    }
     float amax = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, fabsf(f[i]));
+    for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(f[i / 8][i % 8]));
 #pragma unroll
     for (int off = 1; off < kLanesPerGroup; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
     float scale, inv;
@@ -255,19 +279,24 @@ __device__ __forceinline__ void CombineQuantSendCopy(const EpDispatchCombineArgs
     EpScatterScale<kGroup, kEpScatterFp8Max>(amax, scale, inv, e8m0);
     if (!active) continue;
     uint8_t* row = staging + static_cast<size_t>(args.dispReceiverIdxMap[tok]) * kRowB;
-    EpScatterPack<false>(reinterpret_cast<char*>(row + e), f, inv);
+    uint2 q[2];
+    EpScatterPack<false>(reinterpret_cast<char*>(&q[0]), f[0], inv);
+    EpScatterPack<false>(reinterpret_cast<char*>(&q[1]), f[1], inv);
+    StoreGlobal(row + e, make_uint4(q[0].x, q[0].y, q[1].x, q[1].y));
     if (lane % kLanesPerGroup == 0) {
       if constexpr (kGroup == 32)
-        row[kHidden + e / kGroup] = static_cast<uint8_t>(e8m0);
+        StoreGlobal(row + kHidden + e / kGroup, static_cast<uint8_t>(e8m0));
       else
-        reinterpret_cast<float*>(row + kHidden)[e / kGroup] = scale;
+        StoreGlobal(row + kHidden + e / kGroup * 4, scale);
     }
   }
 }
 
-// CombineRecvCopy, dequantizing: one warp per (local token, 8 * warpSize
-// elements) sums the token's top-k rows in f32. Every row's loads go out before
-// the first is summed.
+// CombineRecvCopy, dequantizing: one warp per (local token, 16 * warpSize
+// elements) sums the token's top-k rows in f32. The slots are resolved first and
+// every row's load is issued before the first is summed: resolving and loading
+// one row at a time serialises top-k round trips. A dropped slot loads a harmless
+// row and is skipped at the sum, not scaled by 0, since its bytes may be NaN.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ __forceinline__ void CombineQuantRecvCopy(const EpDispatchCombineArgs& args,
                                                      const uint8_t* peerBase,
@@ -278,45 +307,61 @@ __device__ __forceinline__ void CombineQuantRecvCopy(const EpDispatchCombineArgs
   constexpr int kTopk = kConfig.numExpertPerToken;
   constexpr size_t kRowB = CombineRowBytes<kConfig, T>();
   const int lane = threadIdx.x & (warpSize - 1);
-  const int warp = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   const int warps = gridDim.x * (blockDim.x / warpSize);
-  const int chunk = warpSize * kEpScatterLaneElems;
+  const int chunk = warpSize * kCombineQVec;
   const int steps = (kHidden + chunk - 1) / chunk;
 
-  for (int u = warp; u < args.curRankNumToken * steps; u += warps) {
+  for (int u = UniformWarpId(); u < args.curRankNumToken * steps; u += warps) {
     const int tok = u / steps;
-    const int e = (u % steps) * chunk + lane * kEpScatterLaneElems;
+    const int e = (u % steps) * chunk + lane * kCombineQVec;
     if (e >= kHidden) continue;
-    EpScatterWire<false> q[kTopk];
+    // All of the token's slots in flight at once, then warp-uniform: the row
+    // addresses are scalar arithmetic and the choice between them a select.
+    index_t slots[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) slots[j] = args.dispDestTokIdMap[tok * kTopk + j];
+    const uint8_t* rows[kTopk];
+    bool live[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      const index_t destTokId = __builtin_amdgcn_readfirstlane(slots[j]);
+      const int pe = PeFromSendBufSlotOffset(config, destTokId);
+      live[j] = pe < kConfig.worldSize;
+      // Own rows were never transferred: they are still in combine's staging.
+      rows[j] =
+          live[j] ? (pe != args.rank ? peerBase : selfBase) + static_cast<size_t>(destTokId) * kRowB
+                  : selfBase;
+    }
+    uint4 q[kTopk];
     float scale[kTopk];
 #pragma unroll
     for (int j = 0; j < kTopk; ++j) {
-      const index_t destTokId = args.dispDestTokIdMap[tok * kTopk + j];
-      const int pe = PeFromSendBufSlotOffset(config, destTokId);
-      q[j] = {};
-      scale[j] = 0.0f;
-      if (pe >= kConfig.worldSize) continue;
-      // Own rows were never transferred: they are still in combine's staging.
-      const uint8_t* row =
-          (pe != args.rank ? peerBase : selfBase) + static_cast<size_t>(destTokId) * kRowB;
-      q[j] = *reinterpret_cast<const EpScatterWire<false>*>(row + e);
+      q[j] = LoadGlobal<uint4>(rows[j] + e);
       if constexpr (kGroup == 32)
-        scale[j] = __uint_as_float(static_cast<unsigned>(row[kHidden + e / kGroup]) << 23);
+        scale[j] = __uint_as_float(
+            static_cast<unsigned>(LoadGlobal<uint8_t>(rows[j] + kHidden + e / kGroup)) << 23);
       else
-        scale[j] = reinterpret_cast<const float*>(row + kHidden)[e / kGroup];
+        scale[j] = LoadGlobal<float>(rows[j] + kHidden + e / kGroup * 4);
     }
-    float acc[8] = {};
+    float acc[2][8] = {};
 #pragma unroll
-    for (int j = 0; j < kTopk; ++j) EpScatterAcc<false>(q[j], scale[j], acc);
-    unsigned pk[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const unsigned lo = __builtin_bit_cast(unsigned short, T(acc[2 * i]));
-      const unsigned hi = __builtin_bit_cast(unsigned short, T(acc[2 * i + 1]));
-      pk[i] = lo | (hi << 16);
+    for (int j = 0; j < kTopk; ++j) {
+      if (!live[j]) continue;
+      EpScatterAcc<false>(make_uint2(q[j].x, q[j].y), scale[j], acc[0]);
+      EpScatterAcc<false>(make_uint2(q[j].z, q[j].w), scale[j], acc[1]);
     }
-    *reinterpret_cast<uint4*>(out + static_cast<size_t>(tok) * kHidden + e) =
-        make_uint4(pk[0], pk[1], pk[2], pk[3]);
+    T* dst = out + static_cast<size_t>(tok) * kHidden + e;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      unsigned pk[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const unsigned lo = __builtin_bit_cast(unsigned short, T(acc[h][2 * i]));
+        const unsigned hi = __builtin_bit_cast(unsigned short, T(acc[h][2 * i + 1]));
+        pk[i] = lo | (hi << 16);
+      }
+      StoreGlobal(dst + 8 * h, make_uint4(pk[0], pk[1], pk[2], pk[3]));
+    }
   }
 }
 
