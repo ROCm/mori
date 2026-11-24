@@ -176,16 +176,18 @@ def make_dispatch(
                 vec_width=1,
                 dtype=T.i32(),
             )
-            # A negative expert id marks a slot not to send (e.g. padding rows): drop it
-            # like a duplicate, never dedup against it, and clamp its dest_pe to 0.
-            invalid = dest_expert < 0
+            # An id outside [0, npes * experts_per_rank) marks a slot not to send (-1
+            # on padding rows), as in the HIP kernel: drop it like a duplicate, never
+            # dedup against it, and clamp its dest_pe to 0. One unsigned compare.
+            n_exp = arith.constant(npes * experts_per_rank)
+            valid = arith.cmpi(arith.CmpIPredicate.ult, dest_expert, n_exp)
+            invalid = arith.cmpi(arith.CmpIPredicate.uge, dest_expert, n_exp)
             dest_pe = arith.select(
                 invalid, arith.constant(0), dest_expert // experts_per_rank
             )
             lane_dest_pe = lane_expert // experts_per_rank
-            lane_dups = arith.select(
-                lane_expert >= 0, lane_dest_pe == dest_pe, lane_expert >= 0
-            )
+            lane_ok = arith.cmpi(arith.CmpIPredicate.ult, lane_expert, n_exp)
+            lane_dups = arith.select(lane_ok, lane_dest_pe == dest_pe, lane_ok)
             dup_per_lane = arith.select(
                 lane_dups, arith.select(lane < k_slot, lane, WAVE), WAVE
             )
@@ -202,7 +204,7 @@ def make_dispatch(
                 dest_tok_lane0 = arith.constant(0)
                 if lane == 0:
                     if dup_ballot == 0:
-                        if dest_expert >= 0:
+                        if valid:
                             peer_tok_off = fx.Int64(
                                 window.lsa_ptr(dest_pe, off_tok_off)
                             )
