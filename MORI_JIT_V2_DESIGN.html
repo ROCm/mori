@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT v2 &mdash; MORI development (46510220) documentation</title>
+  <title>MORI JIT v2 &mdash; MORI development (e38a1e41) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=d310da26"></script>
+      <script src="_static/documentation_options.js?v=00e39987"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -399,8 +399,8 @@ DeepEP 的 <code class="docutils literal notranslate"><span class="pre">TokenLay
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">MakeEpCfg</span></code> 也是拒绝非法组合的地方：<code class="docutils literal notranslate"><span class="pre">EpCfgIsValid</span></code> 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
-单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。</p>
+topk 和 worldSize 必须装进一个 wavefront），低于最坏情况的 recv 容量只在 gfx125x 上拒绝（那里的 body
+不丢 token），combine 那条腿上的字节类型单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。</p>
 </section>
 <section id="id6">
 <h3>3.6 环境变量<a class="headerlink" href="#id6" title="Link to this heading"></a></h3>
@@ -486,9 +486,9 @@ kernel 内还是 host 侧）、<code class="docutils literal notranslate"><span 
 ctypes plan 的关键字参数各自在 <code class="docutils literal notranslate"><span class="pre">_wrap_*</span></code> 里适配。</p>
 <p><strong>特性面是真包含不是交集</strong>：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
 bf16/fp32（§3.7）；带 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
-本地反量化累加，gfx125x 是 push）。其余一概不接：非量化 scatter、StdMoE、routing replay、
-<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。能力门在<strong>构造期</strong>跑、且在分配 arena
-之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
+本地反量化累加，gfx125x 是 push）。gfx942/gfx950 上另有非量化 scatter、<code class="docutils literal notranslate"><span class="pre">max_total_recv_tokens</span></code> 截断、routing
+replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code> 和 bf16 StdMoE。能力门在<strong>构造期</strong>跑、且在分配 arena
+之前——问它要不支持的功能（如 gfx125x 上的非量化 scatter）会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。</p>
 <p><code class="docutils literal notranslate"><span class="pre">_regions</span></code> 归子类还消掉一个陷阱：FlyDSL 的 <code class="docutils literal notranslate"><span class="pre">off_out_tok</span></code> 对 dispatch 指 <code class="docutils literal notranslate"><span class="pre">disp_out</span></code>、对 combine 指
 <code class="docutils literal notranslate"><span class="pre">out_tok</span></code>，任何共享的 offset 传递路径都会静默接错 buffer。HIP 后端的 internode 布局又是另一张表，
@@ -712,8 +712,17 @@ dispatch 41→3、combine 57→10（<code class="docutils literal notranslate"><
 <code class="docutils literal notranslate"><span class="pre">shmem</span></code> 命名空间只是那层抽象加几个与后端无关的自旋。TDM 那套机器（<code class="docutils literal notranslate"><span class="pre">amd_gfx1250_TDM.h</span></code> builtin、
 <code class="docutils literal notranslate"><span class="pre">_cusplit_*</span></code> 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。</p>
-<p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：非量化 scatter combine、StdMoE、per-token
-scales 转发、routing replay、<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code>。这些在 FlyDSL 后端都有。注意 fp8/fp4 <strong>dispatch</strong>
+<p><strong>HIP 后端未实现</strong>（由能力门在构造期拒绝）：gfx125x 上的非量化 scatter combine、
+<code class="docutils literal notranslate"><span class="pre">max_total_recv_tokens</span></code> 截断和 StdMoE（gfx125x 上的 routing replay 与 <code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code> 不在门里拒绝，
+op 不声明这两个能力，调用时报 <code class="docutils literal notranslate"><span class="pre">NotImplementedError</span></code>）；这些在 FlyDSL 后端都有。</p>
+<p>gfx942/gfx950 的 dispatch 在 grid barrier 前让每个 block 用一次 <code class="docutils literal notranslate"><span class="pre">s_waitcnt</span></code> 排空自己的对端写（HIP 与
+FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（<code class="docutils literal notranslate"><span class="pre">CCO_UNCACHED_WINDOW=0</span></code>，或 ROCm 7.2.x 的 VMM
+路径忽略 uncached）按内存模型应改为每 block 一次 system release；但这些对端写不经 release 也已可见
+（<code class="docutils literal notranslate"><span class="pre">FRESH=1</span></code> 在 cached 窗口下同样通过），而 release 会让 dispatch 慢 6–40%，所以只做排空。
+<code class="docutils literal notranslate"><span class="pre">local_expert_count</span></code> 与 StdMoE 的两个 convert 是三个只读写本 rank 行的本地 kernel
+（<code class="docutils literal notranslate"><span class="pre">ep_local_kernels.hpp</span></code>，<code class="docutils literal notranslate"><span class="pre">ep_local_expert_count</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_convert_dispatch</span></code> / <code class="docutils literal notranslate"><span class="pre">ep_convert_combine</span></code>
+三个 plan，自有的 <code class="docutils literal notranslate"><span class="pre">EpLocalCfg</span></code> / <code class="docutils literal notranslate"><span class="pre">EpLocalArgs</span></code>）；方法和输出 buffer 归父类，后端只在 <code class="docutils literal notranslate"><span class="pre">KernelSet</span></code>
+里交回 callable，能力由 callable 是否存在决定。注意 fp8/fp4 <strong>dispatch</strong>
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> 是两回事。</p>
 <p><strong>cross-node 也有了</strong>：<code class="docutils literal notranslate"><span class="pre">src/ops/dispatch_combine_v2/</span></code> 现在是三个 body 头文件——两个 intranode
 （portable / gfx125x TDM）加一个 <code class="docutils literal notranslate"><span class="pre">ep_internode_kernel.hpp</span></code>，后者在一个头里放八个 pass 的 body，

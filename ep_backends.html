@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Choosing an EP API and backend &mdash; MORI development (46510220) documentation</title>
+  <title>Choosing an EP API and backend &mdash; MORI development (e38a1e41) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=d310da26"></script>
+      <script src="_static/documentation_options.js?v=00e39987"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -177,8 +177,11 @@ replay, subject to dtype and architecture restrictions below.</p></td>
 <tr class="row-even"><td><p>EPv2, HIP</p></td>
 <td><p>Same EPv2 import; <code class="docutils literal notranslate"><span class="pre">kernel_backend=&quot;hip&quot;</span></code></p></td>
 <td><p>Intra-node</p></td>
-<td><p>Gather combine in BF16/FP32. Dispatch can carry already-quantized FP8/FP4
-payloads. Does not require FlyDSL.</p></td>
+<td><p>Gather combine in BF16/FP32, and a quantized combine (see the EPv2 package
+README for the formats per arch). On gfx942/gfx950 also the unquantized
+scatter combine, the <code class="docutils literal notranslate"><span class="pre">max_total_recv_tokens</span></code> cap, routing replay,
+<code class="docutils literal notranslate"><span class="pre">local_expert_count()</span></code> and BF16 standard-MoE conversion. Dispatch can carry
+already-quantized FP8/FP4 payloads. Does not require FlyDSL.</p></td>
 </tr>
 <tr class="row-odd"><td><p>EPv2, HIP internode preview</p></td>
 <td><p>HIP backend with <code class="docutils literal notranslate"><span class="pre">gpu_per_node</span> <span class="pre">&lt;</span> <span class="pre">world_size</span></code></p></td>
