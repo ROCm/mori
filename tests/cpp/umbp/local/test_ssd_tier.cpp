@@ -22,8 +22,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -330,6 +332,51 @@ void test_io_uring_error_fails_only_its_call() {
   std::cout << "PASSED" << std::endl;
 }
 
+// A request the kernel answers with EAGAIN did not run, so the driver submits it
+// again and the call succeeds.  One that keeps answering EAGAIN past the retry
+// bound fails its call, and the next call on the driver still works.
+void test_io_uring_eagain_is_retried() {
+  std::cout << "test_io_uring_eagain_is_retried... ";
+  if (!CreateIoUringStorageIoDriverForTest(8, 0)->Capabilities().native_async) {
+    std::cout << "SKIPPED (io_uring unavailable)" << std::endl;
+    return;
+  }
+  const std::string path = "/tmp/umbp_test_io_uring_eagain";
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  assert(fd >= 0);
+  // Three 1 MiB requests per call; two of them answer EAGAIN once.
+  std::vector<char> data(3 << 20), out(3 << 20, 0);
+  for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<char>(i * 131 + 7);
+  const size_t mib = 1 << 20;
+
+  std::vector<IoWriteOp> writes = {{fd, data.data(), mib, 0},
+                                   {fd, data.data() + mib, mib, mib},
+                                   {fd, data.data() + 2 * mib, mib, 2 * mib}};
+  assert(CreateIoUringStorageIoDriverForTest(8, 2)->WriteBatch(writes).ok());
+
+  std::vector<IoReadOp> reads = {{fd, out.data(), mib, 0},
+                                 {fd, out.data() + mib, mib, mib},
+                                 {fd, out.data() + 2 * mib, mib, 2 * mib}};
+  assert(CreateIoUringStorageIoDriverForTest(8, 2)->ReadBatch(reads).ok());
+  assert(out == data);
+
+  out.assign(out.size(), 0);
+  assert(CreateIoUringStorageIoDriverForTest(8, 2)->ReadAt(fd, out.data(), out.size(), 0).ok());
+  assert(out == data);
+
+  // One EAGAIN more than the driver retries: the read fails with EAGAIN.
+  auto driver = CreateIoUringStorageIoDriverForTest(8, 4);
+  std::vector<char> small(4096, 0);
+  IoStatus failed = driver->ReadAt(fd, small.data(), small.size(), 0);
+  assert(!failed.ok() && failed.os_errno() == EAGAIN);
+  assert(driver->ReadAt(fd, small.data(), small.size(), 0).ok());
+  assert(std::equal(small.begin(), small.end(), data.begin()));
+
+  ::close(fd);
+  ::unlink(path.c_str());
+  std::cout << "PASSED" << std::endl;
+}
+
 // A reserved record is invisible until committed; an aborted one mid-log is
 // skipped on reopen without hiding the records after it.
 void test_reserved_records() {
@@ -376,6 +423,7 @@ int main() {
   test_ssd_batch_read_partial();
   test_ssd_batch_read_io_uring();
   test_io_uring_error_fails_only_its_call();
+  test_io_uring_eagain_is_retried();
   std::cout << "All Segmented SSD Tier tests passed!" << std::endl;
   return 0;
 }

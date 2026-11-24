@@ -41,9 +41,16 @@ namespace mori::umbp {
 
 namespace {
 
+// A read or write that completes with -EAGAIN did not run: the kernel could not
+// issue it without blocking and, completing it outside the submitting task, did
+// not reissue it itself.  It is submitted again this many times before the call
+// fails with it.
+constexpr uint8_t kMaxEagainRetries = 3;
+
 class IoUringStorageIoDriver final : public StorageIoDriver {
  public:
-  explicit IoUringStorageIoDriver(uint32_t queue_depth) {
+  explicit IoUringStorageIoDriver(uint32_t queue_depth, uint32_t eagain_completions = 0)
+      : eagain_completions_(eagain_completions) {
     if (queue_depth == 0) queue_depth = 128;
     struct io_uring_params p{};
     ring_fd_ = static_cast<int>(syscall(__NR_io_uring_setup, entriesOrDefault(queue_depth), &p));
@@ -176,6 +183,8 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
     size_t submit_idx = 0;
     size_t complete_cnt = 0;
     size_t inflight = 0;
+    std::vector<size_t> resubmit;
+    std::vector<uint8_t> eagain_retries(total_sqes, 0);
 
     while (complete_cnt < total_sqes) {
       uint32_t tail = *sq_tail_;
@@ -183,23 +192,23 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
       uint32_t avail = ring_cap - (tail - head);
       size_t remain_cap = static_cast<size_t>(avail);
       size_t inflight_cap = static_cast<size_t>(max_inflight) - inflight;
-      size_t remaining_ops = total_sqes - submit_idx;
+      size_t remaining_ops = total_sqes - submit_idx + resubmit.size();
       uint32_t can_submit =
           static_cast<uint32_t>(std::min(remain_cap, std::min(inflight_cap, remaining_ops)));
 
       for (uint32_t s = 0; s < can_submit; ++s) {
+        const size_t op_idx = NextRequest(&resubmit, &submit_idx);
         uint32_t idx = tail & *sq_ring_mask_;
         struct io_uring_sqe* sqe = &sqes_[idx];
         std::memset(sqe, 0, sizeof(*sqe));
         sqe->opcode = IORING_OP_WRITEV;
-        sqe->fd = descs[submit_idx].fd;
-        sqe->off = descs[submit_idx].file_offset;
-        sqe->addr = reinterpret_cast<uint64_t>(&descs[submit_idx].iov);
+        sqe->fd = descs[op_idx].fd;
+        sqe->off = descs[op_idx].file_offset;
+        sqe->addr = reinterpret_cast<uint64_t>(&descs[op_idx].iov);
         sqe->len = 1;
-        sqe->user_data = static_cast<uint64_t>(submit_idx + 1);
+        sqe->user_data = static_cast<uint64_t>(op_idx + 1);
         sq_array_[idx] = idx;
         ++tail;
-        ++submit_idx;
       }
 
       if (can_submit > 0) {
@@ -225,11 +234,18 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_sqes)
           return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) {
-          return FailBatch(IoStatus::IoError("io_uring batch write failed", -cqe->res), cq_h,
-                           inflight);
+        const int res = CompletionResult(cqe);
+        if (res == -EAGAIN && eagain_retries[op_idx] < kMaxEagainRetries) {
+          ++eagain_retries[op_idx];
+          resubmit.push_back(op_idx);
+          --inflight;
+          ++cq_h;
+          continue;
         }
-        if (static_cast<size_t>(cqe->res) != descs[op_idx].iov.iov_len) {
+        if (res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring batch write failed", -res), cq_h, inflight);
+        }
+        if (static_cast<size_t>(res) != descs[op_idx].iov.iov_len) {
           return FailBatch(IoStatus::ShortWrite("io_uring batch write completed partially"), cq_h,
                            inflight);
         }
@@ -279,6 +295,8 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
     size_t submit_idx = 0;
     size_t complete_cnt = 0;
     size_t inflight = 0;
+    std::vector<size_t> resubmit;
+    std::vector<uint8_t> eagain_retries(total_sqes, 0);
 
     while (complete_cnt < total_sqes) {
       uint32_t tail = *sq_tail_;
@@ -286,23 +304,23 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
       uint32_t avail = ring_cap - (tail - head);
       size_t remain_cap = static_cast<size_t>(avail);
       size_t inflight_cap = static_cast<size_t>(max_inflight) - inflight;
-      size_t remaining_ops = total_sqes - submit_idx;
+      size_t remaining_ops = total_sqes - submit_idx + resubmit.size();
       uint32_t can_submit =
           static_cast<uint32_t>(std::min(remain_cap, std::min(inflight_cap, remaining_ops)));
 
       for (uint32_t s = 0; s < can_submit; ++s) {
+        const size_t op_idx = NextRequest(&resubmit, &submit_idx);
         uint32_t idx = tail & *sq_ring_mask_;
         struct io_uring_sqe* sqe = &sqes_[idx];
         std::memset(sqe, 0, sizeof(*sqe));
         sqe->opcode = IORING_OP_READV;
-        sqe->fd = descs[submit_idx].fd;
-        sqe->off = descs[submit_idx].file_offset;
-        sqe->addr = reinterpret_cast<uint64_t>(&descs[submit_idx].iov);
+        sqe->fd = descs[op_idx].fd;
+        sqe->off = descs[op_idx].file_offset;
+        sqe->addr = reinterpret_cast<uint64_t>(&descs[op_idx].iov);
         sqe->len = 1;
-        sqe->user_data = static_cast<uint64_t>(submit_idx + 1);
+        sqe->user_data = static_cast<uint64_t>(op_idx + 1);
         sq_array_[idx] = idx;
         ++tail;
-        ++submit_idx;
       }
 
       if (can_submit > 0) {
@@ -328,11 +346,18 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_sqes)
           return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) {
-          return FailBatch(IoStatus::IoError("io_uring batch read failed", -cqe->res), cq_h,
-                           inflight);
+        const int res = CompletionResult(cqe);
+        if (res == -EAGAIN && eagain_retries[op_idx] < kMaxEagainRetries) {
+          ++eagain_retries[op_idx];
+          resubmit.push_back(op_idx);
+          --inflight;
+          ++cq_h;
+          continue;
         }
-        if (static_cast<size_t>(cqe->res) != descs[op_idx].iov.iov_len) {
+        if (res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring batch read failed", -res), cq_h, inflight);
+        }
+        if (static_cast<size_t>(res) != descs[op_idx].iov.iov_len) {
           return FailBatch(IoStatus::ShortRead("io_uring batch read completed partially"), cq_h,
                            inflight);
         }
@@ -355,6 +380,23 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
   }
 
  private:
+  // The request to submit next: one waiting to be submitted again, else the next new one.
+  static size_t NextRequest(std::vector<size_t>* resubmit, size_t* submit_idx) {
+    if (resubmit->empty()) return (*submit_idx)++;
+    const size_t op_idx = resubmit->back();
+    resubmit->pop_back();
+    return op_idx;
+  }
+
+  // The completion's result, or -EAGAIN while a test asks for EAGAIN completions.
+  int CompletionResult(const struct io_uring_cqe* cqe) {
+    if (eagain_completions_ > 0 && cqe->res >= 0) {
+      --eagain_completions_;
+      return -EAGAIN;
+    }
+    return cqe->res;
+  }
+
   static uint32_t entriesOrDefault(uint32_t queue_depth) {
     return queue_depth == 0 ? 128 : queue_depth;
   }
@@ -407,6 +449,8 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
     size_t submit_idx = 0;
     size_t complete_cnt = 0;
     size_t inflight = 0;
+    std::vector<size_t> resubmit;
+    std::vector<uint8_t> eagain_retries(total_ops, 0);
 
     while (complete_cnt < total_ops) {
       uint32_t tail = *sq_tail_;
@@ -414,23 +458,23 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
       uint32_t avail = ring_cap - (tail - head);
       size_t remain_cap = static_cast<size_t>(avail);
       size_t inflight_cap = static_cast<size_t>(max_inflight) - inflight;
-      size_t remaining_ops = total_ops - submit_idx;
+      size_t remaining_ops = total_ops - submit_idx + resubmit.size();
       uint32_t can_submit =
           static_cast<uint32_t>(std::min(remain_cap, std::min(inflight_cap, remaining_ops)));
 
       for (uint32_t s = 0; s < can_submit; ++s) {
+        const size_t op_idx = NextRequest(&resubmit, &submit_idx);
         uint32_t idx = tail & *sq_ring_mask_;
         struct io_uring_sqe* sqe = &sqes_[idx];
         std::memset(sqe, 0, sizeof(*sqe));
         sqe->opcode = opcode;
         sqe->fd = fd;
-        sqe->off = offset + (submit_idx * kChunkBytes);
-        sqe->addr = reinterpret_cast<uint64_t>(&iovs[submit_idx]);
+        sqe->off = offset + (op_idx * kChunkBytes);
+        sqe->addr = reinterpret_cast<uint64_t>(&iovs[op_idx]);
         sqe->len = 1;
-        sqe->user_data = static_cast<uint64_t>(submit_idx + 1);
+        sqe->user_data = static_cast<uint64_t>(op_idx + 1);
         sq_array_[idx] = idx;
         ++tail;
-        ++submit_idx;
       }
 
       if (can_submit > 0) {
@@ -455,11 +499,18 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
         if (cqe->user_data == 0) return IoStatus::Corruption("io_uring cqe user_data missing");
         size_t op_idx = static_cast<size_t>(cqe->user_data - 1);
         if (op_idx >= total_ops) return IoStatus::Corruption("io_uring cqe user_data out of range");
-        if (cqe->res < 0) {
-          return FailBatch(IoStatus::IoError("io_uring read/write failed", -cqe->res), cq_h,
-                           inflight);
+        const int res = CompletionResult(cqe);
+        if (res == -EAGAIN && eagain_retries[op_idx] < kMaxEagainRetries) {
+          ++eagain_retries[op_idx];
+          resubmit.push_back(op_idx);
+          --inflight;
+          ++cq_h;
+          continue;
         }
-        if (static_cast<size_t>(cqe->res) != expected[op_idx]) {
+        if (res < 0) {
+          return FailBatch(IoStatus::IoError("io_uring read/write failed", -res), cq_h, inflight);
+        }
+        if (static_cast<size_t>(res) != expected[op_idx]) {
           return FailBatch((opcode == IORING_OP_READV)
                                ? IoStatus::ShortRead("io_uring read completed partially")
                                : IoStatus::ShortWrite("io_uring write completed partially"),
@@ -508,6 +559,7 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
 
   int ring_fd_ = -1;
   bool ready_ = false;
+  uint32_t eagain_completions_;
   bool single_mmap_ = false;
 
   size_t sq_ring_sz_ = 0;
@@ -532,6 +584,11 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
 };
 
 }  // namespace
+
+std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriverForTest(uint32_t queue_depth,
+                                                                     uint32_t eagain_completions) {
+  return std::make_unique<IoUringStorageIoDriver>(queue_depth, eagain_completions);
+}
 
 std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriver(uint32_t queue_depth) {
   return std::make_unique<IoUringStorageIoDriver>(queue_depth);
