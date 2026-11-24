@@ -226,6 +226,7 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
 static constexpr size_t kLaneSlice = kChunk / 64;
 static constexpr int kThreadCapacity = 128;  // ring lines: 51 lanes' put + signal take 102
 static constexpr int kThreadRounds = 16;     // put rounds on kThreadCapacity-line rings
+static constexpr int kContendedRounds = 16;  // tm_branch_contended's rounds of the same puts
 
 __host__ __device__ inline bool ThreadActive(int lane) { return lane % 5 != 0; }  // 0, 5, .. idle
 
@@ -373,26 +374,29 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
 // but only the active lanes call, from divergent code. Lane L's k-th put goes
 // to ThreadPeer(me, n, k, L) unless noted.
 enum ThreadModeCase {
-  kTmBranch,       // odd / even active lanes put in the two arms of a branch;
-                   // the converged wavefront flushes, then sets Slot(me, u)
-  kTmSingle,       // one active lane at a time puts; then as kTmBranch
-  kTmGroupSignal,  // puts carry SignalInc{Slot(me, u)}: per call, one signal per
-                   // peer its lanes target (ccoGda's per-group signal)
-  kTmLaneSignal,   // puts, then signal(SignalInc{LaneSlot(me, u, L)}): per lane
-  kTmAggregate     // call k: every active lane puts to ThreadPeer(me, n, k, 0)
-                   // with ccoGdaThreadAggregate and SignalSet{Slot(me, u), 1}
+  kTmBranch,           // odd / even active lanes put in the two arms of a branch;
+                       // the converged wavefront flushes, then sets Slot(me, u)
+  kTmBranchContended,  // as kTmBranch, but the arms make the same call with other
+                       // arguments (the compiler may merge their tails), kContendedRounds
+                       // times, every unit on MPSC queue 0 of kThreadCapacity-line rings
+  kTmSingle,           // one active lane at a time puts; then as kTmBranch
+  kTmGroupSignal,      // puts carry SignalInc{Slot(me, u)}: per call, one signal per
+                       // peer its lanes target (ccoGda's per-group signal)
+  kTmLaneSignal,       // puts, then signal(SignalInc{LaneSlot(me, u, L)}): per lane
+  kTmAggregate         // call k: every active lane puts to ThreadPeer(me, n, k, 0)
+                       // with ccoGdaThreadAggregate and SignalSet{Slot(me, u), 1}
 };
 
 template <int Mode>
 __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                       const uint32_t* recvLocal, uint32_t salt, size_t chunk,
-                                      int nUnits, int* err) {
+                                      int nUnits, int zero, int* err) {
   const int u = blockIdx.x;
   const int lane = __lane_id();
   const int me = dc.rank;
   const int n = dc.worldSize;
   const bool active = ThreadActive(lane);
-  ccoProxy<MPSCD2HQueue> proxy{dc, u};
+  ccoProxy<MPSCD2HQueue> proxy{dc, Mode == kTmBranchContended ? 0 : u};
   auto off = [&](int p) {  // this lane's slice of chunk slot (p, u)
     return (static_cast<size_t>(p) * nUnits + u) * chunk + lane * kLaneSlice;
   };
@@ -412,6 +416,20 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
         for (int k = 0; k < n - 1; k++) putTo(k, ccoGda_NoSignal{});
       } else {
         for (int k = n - 2; k >= 0; k--) putTo(k, ccoGda_NoSignal{});  // differs: no arm merging
+      }
+    }
+  } else if constexpr (Mode == kTmBranchContended) {
+    // A push whose stores the compiler sinks past the join hangs: both arms
+    // claim and wait for credit before either writes its lines.
+    if (active) {
+      for (int r = 0; r < kContendedRounds; r++) {  // the same puts every round
+        for (int k = 0; k < n - 1; k++) {
+          if (lane & 1) {
+            putTo(k, ccoGda_NoSignal{});
+          } else {
+            putTo(k + zero, ccoGda_NoSignal{});  // zero is 0: only the arguments differ
+          }
+        }
       }
     }
   } else if constexpr (Mode == kTmSingle) {
@@ -436,7 +454,7 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
       for (int k = 0; k < n - 1; k++) putTo(k, ccoGda_SignalSet{Slot(me, u), 1});
     }
   }
-  if constexpr (Mode == kTmBranch || Mode == kTmSingle) {
+  if constexpr (Mode == kTmBranch || Mode == kTmBranchContended || Mode == kTmSingle) {
     proxy.flush(ccoCoopWarp{});  // covers the divergent puts
     for (int p = 0; p < n; p++) {
       if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, ccoCoopWarp{});
@@ -998,9 +1016,9 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 
 // Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
 static const char* const kAtomicFreeCases[] = {
-    "lane_value_set", "mpsc_lane_value_set", "set_put",      "set_signal",
-    "set_window",     "mpsc_set_put",        "conn_set_put", "tm_branch",
-    "tm_single",      "tm_agg_set",          "tm_value_set"};
+    "lane_value_set",      "mpsc_lane_value_set", "set_put",      "set_signal",
+    "set_window",          "mpsc_set_put",        "conn_set_put", "tm_branch",
+    "tm_branch_contended", "tm_single",           "tm_agg_set",   "tm_value_set"};
 
 // MORI_CCO_PROXY_TEST_CASES (same on every rank): unset or "all" runs every
 // positive case; else a comma-separated list of case names, where "atomic_free" stands
@@ -1142,12 +1160,12 @@ static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
 template <int Mode>
 static int RunThreadModeCase(Ctx& c, const char* name, uint32_t salt, uint32_t maxPutBytes = 0) {
   if (!CaseSelected(name)) return 0;
-  ccoDevComm d = c.dc;
+  ccoDevComm d = Mode == kTmBranchContended ? c.dcThread : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
   c.Fresh(d, salt, kChunk, kMaxUnits);
   ProxyThreadModeKernel<Mode><<<kMaxUnits, 64, 0, c.stream>>>(
       d, c.sendWin, c.recvWin, static_cast<const uint32_t*>(c.recvBuf), salt, kChunk, kMaxUnits,
-      c.dErr);
+      /*zero=*/0, c.dErr);
   c.Sync();  // every rank's kernel, and so its final flush, is done
   ProxyCheckSignalsKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots, c.dErr);  // exact counts
   HIP_CHECK(hipStreamSynchronize(c.stream));
@@ -1551,6 +1569,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
   // ccoCoopThread (MPSC): divergent and single-lane puts, Aggregate, putValue.
   fails += RunThreadModeCase<kTmBranch>(c, "tm_branch", 51);
+  fails += RunThreadModeCase<kTmBranchContended>(c, "tm_branch_contended", 59);
   fails += RunThreadModeCase<kTmSingle>(c, "tm_single", 52);
   fails += RunThreadModeCase<kTmAggregate>(c, "tm_agg_set", 56);
   fails += RunValueCase<MPSCD2HQueue, ccoCoopThread, true>(c, "tm_value_set", 58, kMaxUnits);
