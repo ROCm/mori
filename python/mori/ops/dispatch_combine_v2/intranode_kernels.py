@@ -176,13 +176,21 @@ def make_dispatch(
                 vec_width=1,
                 dtype=T.i32(),
             )
-            dest_pe = dest_expert // experts_per_rank
+            # A negative expert id marks a slot not to send (e.g. padding rows): drop it
+            # like a duplicate, never dedup against it, and clamp its dest_pe to 0.
+            invalid = dest_expert < 0
+            dest_pe = arith.select(
+                invalid, arith.constant(0), dest_expert // experts_per_rank
+            )
             lane_dest_pe = lane_expert // experts_per_rank
+            lane_dups = arith.select(
+                lane_expert >= 0, lane_dest_pe == dest_pe, lane_expert >= 0
+            )
             dup_per_lane = arith.select(
-                lane_dest_pe == dest_pe, arith.select(lane < k_slot, lane, WAVE), WAVE
+                lane_dups, arith.select(lane < k_slot, lane, WAVE), WAVE
             )
             dup_ballot = ballot(_BALLOT_INT(), dup_per_lane < WAVE)
-            is_dup = dup_ballot != 0
+            is_dup = arith.select(invalid, invalid, dup_ballot != 0)
 
             if const_expr(replay):
                 # decode dest_tok_id from cached tok_map (skip atomic alloc; same layout)
@@ -194,12 +202,17 @@ def make_dispatch(
                 dest_tok_lane0 = arith.constant(0)
                 if lane == 0:
                     if dup_ballot == 0:
-                        peer_tok_off = fx.Int64(window.lsa_ptr(dest_pe, off_tok_off))
-                        dest_tok_lane0 = P.atomic_add_global(peer_tok_off, fx.Int32(1))
+                        if dest_expert >= 0:
+                            peer_tok_off = fx.Int64(
+                                window.lsa_ptr(dest_pe, off_tok_off)
+                            )
+                            dest_tok_lane0 = P.atomic_add_global(
+                                peer_tok_off, fx.Int32(1)
+                            )
                 dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
                 overflow = dest_tok_id >= max_recv
                 is_dup_or_overflow = arith.select(is_dup, is_dup, overflow)
-                no_dup = dup_ballot == 0
+                no_dup = arith.select(is_dup, arith.constant(1), arith.constant(0)) == 0
                 in_cap = dest_tok_id < max_recv
                 do_publish = arith.select(no_dup, in_cap, no_dup)
                 tok_map_entry = arith.select(
