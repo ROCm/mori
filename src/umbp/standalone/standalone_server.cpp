@@ -692,6 +692,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // round numbers would otherwise take its last, most-settled window of
     // measurements with it.
     key_handle_stats_.Report();
+    // Its shared-memory sessions hold their RPCs open until told to stop.
+    if (l1_service_) l1::StopL1PoolService(l1_service_.get());
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }

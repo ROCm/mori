@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -37,6 +38,7 @@
 
 #include "umbp/l1/l1_pool.h"
 #include "umbp/l1/l1_service.h"
+#include "umbp/l1/shm_channel.h"
 
 namespace mori::umbp::l1 {
 namespace {
@@ -791,6 +793,478 @@ TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
     EXPECT_TRUE(client.Detach("p0").ok);
     EXPECT_FALSE(client.Open("p0").status.ok);
   }
+  unlink(path.c_str());
+}
+
+// ------------------------- shared-memory channel ---------------------------
+
+const std::chrono::milliseconds kNoWait{0};
+
+class ShmChannelTest : public ::testing::Test {
+ protected:
+  void Open(size_t request_bytes, size_t response_bytes) {
+    shm::Sizes sizes;
+    sizes.request_bytes = request_bytes;
+    sizes.response_bytes = response_bytes;
+    std::string error;
+    server = shm::ServerChannel::Create("/dev/shm", sizes, &error);
+    ASSERT_NE(server, nullptr) << error;
+    client = shm::ClientChannel::Open(server->path(), server->nonce(), &error);
+    ASSERT_NE(client, nullptr) << error;
+  }
+
+  // Record what arrives; answer a call with its payload reversed.
+  shm::Handler Echo() {
+    return [this](uint32_t method, const char* data, size_t size, std::string* reply) {
+      const std::string payload(data, size);
+      seen.emplace_back(method, payload);
+      if (reply != nullptr) reply->assign(payload.rbegin(), payload.rend());
+      return fail_method == method ? std::string("refused") : std::string();
+    };
+  }
+
+  std::unique_ptr<shm::ServerChannel> server;
+  std::unique_ptr<shm::ClientChannel> client;
+  std::vector<std::pair<uint32_t, std::string>> seen;
+  uint32_t fail_method = 0;
+};
+
+TEST_F(ShmChannelTest, DeliversRequestsInOrderAcrossManyWrapsOfTheRing) {
+  Open(4096, 4096);
+  size_t sent = 0;
+  for (int round = 0; round < 200; ++round) {
+    // Sizes that are not multiples of the record alignment, so records
+    // straddle the end of the ring at every offset.
+    for (int i = 0; i < 5; ++i) {
+      const std::string payload(static_cast<size_t>(1 + (round * 7 + i * 131) % 300),
+                                static_cast<char>('a' + sent % 26));
+      ASSERT_EQ(client->Send(3, payload.data(), payload.size(), kNoWait), shm::SendResult::kOk);
+      ++sent;
+    }
+    EXPECT_TRUE(server->Pending());
+    EXPECT_EQ(server->Drain(Echo()), 5u);
+    EXPECT_FALSE(server->Pending());
+  }
+  ASSERT_EQ(seen.size(), sent);
+  for (size_t i = 0; i < seen.size(); ++i) {
+    const int round = static_cast<int>(i / 5), k = static_cast<int>(i % 5);
+    EXPECT_EQ(seen[i].second, std::string(static_cast<size_t>(1 + (round * 7 + k * 131) % 300),
+                                          static_cast<char>('a' + i % 26)))
+        << i;
+  }
+}
+
+TEST_F(ShmChannelTest, AFullRingMakesASendWaitAndARequestTooLargeIsSaidSo) {
+  Open(4096, 4096);
+  const std::string big(client->max_request_bytes() + 1, 'x');
+  EXPECT_EQ(client->Send(1, big.data(), big.size(), kNoWait), shm::SendResult::kTooLarge);
+  const std::string fits(client->max_request_bytes(), 'y');
+  EXPECT_EQ(client->Send(1, fits.data(), fits.size(), kNoWait), shm::SendResult::kOk);
+  EXPECT_EQ(client->Send(1, fits.data(), fits.size(), kNoWait), shm::SendResult::kOk);
+  // No room, and no time allowed to wait for it.
+  EXPECT_EQ(client->Send(1, "z", 1, kNoWait), shm::SendResult::kTimeout);
+  // A waiting Send gets its room as soon as the server has drained.
+  std::thread drainer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    server->Drain(Echo());
+  });
+  EXPECT_EQ(client->Send(2, "z", 1, std::chrono::milliseconds(5000)), shm::SendResult::kOk);
+  drainer.join();
+  server->Drain(Echo());
+  ASSERT_EQ(seen.size(), 3u);
+  EXPECT_EQ(seen[2].first, 2u);
+}
+
+TEST_F(ShmChannelTest, ACallSleepsUntilItsReplyAndTheServerSleepsUntilARequest) {
+  Open(4096, 4096);
+  client->set_spin(std::chrono::microseconds(0));
+  std::atomic<bool> stop{false};
+  std::thread serving([&] {
+    while (!stop.load()) {
+      server->Drain(Echo());
+      server->Wait(std::chrono::microseconds(0), std::chrono::milliseconds(20));
+    }
+  });
+  for (int i = 0; i < 200; ++i) {
+    const std::string request = "call" + std::to_string(i);
+    std::string reply;
+    ASSERT_EQ(
+        client->Call(4, request.data(), request.size(), &reply, std::chrono::milliseconds(5000)),
+        shm::SendResult::kOk);
+    EXPECT_EQ(reply, std::string(request.rbegin(), request.rend()));
+    if (i % 50 == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));  // both sides asleep
+  }
+  stop = true;
+  serving.join();
+}
+
+TEST_F(ShmChannelTest, AReplyLargerThanItsBufferIsReportedNotTruncated) {
+  Open(1 << 16, 4096);
+  std::thread serving([&] {
+    while (!server->Wait(std::chrono::microseconds(0), std::chrono::milliseconds(20))) {
+    }
+    server->Drain(Echo());
+  });
+  const std::string request(5000, 'r');
+  std::string reply;
+  EXPECT_EQ(
+      client->Call(4, request.data(), request.size(), &reply, std::chrono::milliseconds(5000)),
+      shm::SendResult::kReplyTooLarge);
+  serving.join();
+}
+
+TEST_F(ShmChannelTest, AOneWayFailureIsParkedForItsMethodAndCollectedOnce) {
+  Open(4096, 4096);
+  fail_method = 1;
+  ASSERT_EQ(client->Send(1, "a", 1, kNoWait), shm::SendResult::kOk);
+  ASSERT_EQ(client->Send(2, "b", 1, kNoWait), shm::SendResult::kOk);
+  std::string text;
+  EXPECT_FALSE(client->TakeError(1, &text));  // not handled yet
+  server->Drain(Echo());
+  EXPECT_FALSE(client->TakeError(2, &text));
+  ASSERT_TRUE(client->TakeError(1, &text));
+  EXPECT_EQ(text, "refused");
+  EXPECT_FALSE(client->TakeError(1, &text));
+}
+
+TEST_F(ShmChannelTest, AWaitEndsWhenTheServerClosesOrIsFoundDead) {
+  Open(4096, 4096);
+  std::string reply;
+  std::thread closing([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    server->Close();
+  });
+  EXPECT_EQ(client->Call(4, "x", 1, &reply, std::chrono::milliseconds(5000)),
+            shm::SendResult::kClosed);
+  closing.join();
+  EXPECT_EQ(client->Send(1, "x", 1, kNoWait), shm::SendResult::kClosed);
+
+  Open(4096, 4096);
+  client->set_alive([] { return false; });
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_EQ(client->Call(4, "x", 1, &reply, std::chrono::milliseconds(60000)),
+            shm::SendResult::kClosed);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(5));
+  // Nobody answers and nothing says the server is gone: the deadline does.
+  Open(4096, 4096);
+  EXPECT_EQ(client->Call(4, "x", 1, &reply, std::chrono::milliseconds(150)),
+            shm::SendResult::kTimeout);
+}
+
+TEST_F(ShmChannelTest, TheBlockingHooksBracketSleepsAndNothingElse) {
+  Open(4096, 4096);
+  std::atomic<int> entered{0}, left{0};
+  client->set_blocking([&] { ++entered; }, [&] { ++left; });
+  // Queuing never sleeps.
+  for (int i = 0; i < 20; ++i) ASSERT_EQ(client->Send(1, "q", 1, kNoWait), shm::SendResult::kOk);
+  EXPECT_EQ(entered.load(), 0);
+  server->Drain(Echo());
+  // A reply that is there before the poll ends: no sleep either.
+  client->set_spin(std::chrono::seconds(5));
+  std::atomic<bool> stop{false};
+  std::thread serving([&] {
+    while (!stop.load()) {
+      server->Drain(Echo());
+      server->Wait(std::chrono::microseconds(0), std::chrono::milliseconds(5));
+    }
+  });
+  std::string reply;
+  ASSERT_EQ(client->Call(4, "ab", 2, &reply, std::chrono::milliseconds(5000)),
+            shm::SendResult::kOk);
+  EXPECT_EQ(reply, "ba");
+  EXPECT_EQ(entered.load(), 0);
+  stop = true;
+  serving.join();
+  // One that is not: the call sleeps, between the two hooks.
+  client->set_spin(std::chrono::microseconds(0));
+  std::thread late([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    server->Drain(Echo());
+  });
+  ASSERT_EQ(client->Call(4, "cd", 2, &reply, std::chrono::milliseconds(5000)),
+            shm::SendResult::kOk);
+  late.join();
+  EXPECT_EQ(entered.load(), 1);
+  EXPECT_EQ(left.load(), 1);
+  // A second thread's call waits for the first one's, also between hooks,
+  // and each is left exactly as often as entered.
+  std::thread answering([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int handled = 0; handled < 2;) {
+      handled += static_cast<int>(server->Drain(Echo()));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
+  std::string other;
+  std::thread second([&] {
+    EXPECT_EQ(client->Call(4, "ef", 2, &other, std::chrono::milliseconds(5000)),
+              shm::SendResult::kOk);
+  });
+  ASSERT_EQ(client->Call(4, "gh", 2, &reply, std::chrono::milliseconds(5000)),
+            shm::SendResult::kOk);
+  second.join();
+  answering.join();
+  EXPECT_EQ(reply, "hg");
+  EXPECT_EQ(other, "fe");
+  EXPECT_EQ(entered.load(), left.load());
+  EXPECT_GE(entered.load(), 3);
+}
+
+TEST_F(ShmChannelTest, AClientDoesNotOpenASegmentItWasNotGiven) {
+  Open(4096, 4096);
+  std::string error;
+  EXPECT_EQ(shm::ClientChannel::Open(server->path(), server->nonce() + 1, &error), nullptr);
+  EXPECT_FALSE(server->ClientAttached() && error.empty());
+  server->Unlink();
+  EXPECT_EQ(shm::ClientChannel::Open(server->path(), server->nonce(), &error), nullptr);
+  // The mapping outlives the name.
+  ASSERT_EQ(client->Send(1, "x", 1, kNoWait), shm::SendResult::kOk);
+  EXPECT_EQ(server->Drain(Echo()), 1u);
+}
+
+// --------------------- the service over shared memory ----------------------
+
+class L1ShmServiceTest : public ::testing::Test {
+ protected:
+  void Start(const char* request_bytes = nullptr) {
+    static std::atomic<int> counter{0};
+    path = "/tmp/umbp_l1_shm_test_" + std::to_string(getpid()) + "_" +
+           std::to_string(counter.fetch_add(1)) + ".sock";
+    unlink(path.c_str());
+    address = "unix://" + path;
+    if (request_bytes != nullptr) setenv("UMBP_L1_SHM_REQUEST_BYTES", request_bytes, 1);
+    server = std::make_unique<L1Server>(address, MakeHostMemoryApi());
+    unsetenv("UMBP_L1_SHM_REQUEST_BYTES");
+    ASSERT_TRUE(server->ok());
+    L1ClientOptions options;
+    options.shm = true;
+    client = std::make_unique<L1Client>(address, options);
+    ASSERT_TRUE(client->shm_active());
+    for (int device : {0, 1}) {
+      const std::string id = "p" + std::to_string(device);
+      ASSERT_TRUE(client->Attach(id, "g", device, kBytes).status.ok);
+      ASSERT_TRUE(client->BindLayout(id, TestLayout()).ok);
+      ASSERT_EQ(client->Open(id).num_slots, kSlots);
+    }
+  }
+  void TearDown() override {
+    client.reset();
+    server.reset();
+    unlink(path.c_str());
+  }
+  PoolStats StatsOf(const std::string& id) {
+    std::vector<PoolStats> all;
+    EXPECT_TRUE(client->Stats(&all).ok);
+    for (const PoolStats& stats : all) {
+      if (stats.pool_id == id) return stats;
+    }
+    return PoolStats{};
+  }
+
+  std::string path, address;
+  std::unique_ptr<L1Server> server;
+  std::unique_ptr<L1Client> client;
+};
+
+TEST_F(L1ShmServiceTest, EveryCallGivesWhatItGivesOverTheSocket) {
+  Start();
+  AllocateResult got = client->Allocate("p0", 2, 2);
+  ASSERT_TRUE(got.status.ok) << got.status.error;
+  ASSERT_EQ(got.slots, (std::vector<uint32_t>{0, 1}));
+  const std::string binary_key("\x00\xff\x01key", 6);
+  ASSERT_TRUE(client
+                  ->Apply("p0", {Op{OpKind::kPublish, 0, binary_key}, Op{OpKind::kPublish, 1, "k1"},
+                                 Op{OpKind::kRelease, 0, ""}})
+                  .ok);
+  // Stamped ops stay invisible to other pools until the commit arrives.
+  AllocateResult late = client->Allocate("p0", 1, 1);
+  ASSERT_TRUE(client->Apply("p0", {Op{OpKind::kPublish, late.slots[0], "late"}}, 500).ok);
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(client->Fetch("p1", {"late"}, probe).available, 0u);
+  EXPECT_TRUE(client->Fetch("p1", {"late"}).slots.empty());
+  ASSERT_TRUE(client->Commit("p0", 500).ok);
+  EXPECT_EQ(client->Fetch("p1", {"late"}, probe).available, 1u);
+  EXPECT_EQ(client->Fetch("p1", {"late"}).slots.size(), 1u);
+  // A copying fetch travels as an RPC and still sees the Apply before it.
+  FetchResult fetched = client->Fetch("p1", {binary_key, "k1", "missing"});
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  EXPECT_EQ(fetched.slots.size(), 2u);
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_EQ(StatsOf("p1").fetched_in_slots, 3u);
+  // Evicted keys come back in an Allocate's reply.
+  ASSERT_TRUE(
+      client->Apply("p0", {Op{OpKind::kRelease, 1, ""}, Op{OpKind::kRelease, late.slots[0], ""}})
+          .ok);
+  AllocateResult all = client->Allocate("p0", kSlots, kSlots);
+  ASSERT_TRUE(all.status.ok) << all.status.error;
+  EXPECT_EQ(all.slots.size(), kSlots);
+  EXPECT_EQ(all.evicted_keys.size(), 3u);
+}
+
+TEST_F(L1ShmServiceTest, AFailedApplyIsReportedByTheNextCallThatDependsOnIt) {
+  Start();
+  // Queued, not yet judged.
+  EXPECT_TRUE(client->Apply("p0", {Op{OpKind::kRelease, 5, ""}}).ok);
+  AllocateResult got = client->Allocate("p0", 1, 1);
+  EXPECT_FALSE(got.status.ok);
+  EXPECT_NE(got.status.error.find("earlier Apply failed"), std::string::npos) << got.status.error;
+  EXPECT_NE(got.status.error.find("release of a slot that is not held"), std::string::npos);
+  // Reported once; the channel goes on working.
+  EXPECT_TRUE(client->Allocate("p0", 1, 1).status.ok);
+
+  EXPECT_TRUE(client->Apply("p0", {Op{OpKind::kRelease, 7, ""}}).ok);
+  EXPECT_TRUE(StatsOf("p0").num_slots == kSlots);  // an RPC: the Apply has been applied by now
+  EXPECT_FALSE(client->Apply("p0", {}).ok);
+  EXPECT_TRUE(client->Apply("p0", {}).ok);
+
+  EXPECT_TRUE(client->Commit("nobody", 1).ok);
+  StatsOf("p0");
+  Status commit = client->Commit("p0", 2);
+  EXPECT_FALSE(commit.ok);
+  EXPECT_NE(commit.error.find("unknown pool nobody"), std::string::npos) << commit.error;
+}
+
+TEST_F(L1ShmServiceTest, ASmallRingKeepsOrderUnderBackpressureAndAnOversizeApplyTakesTheSocket) {
+  Start("4096");
+  // Thousands of small applies through a 4 KiB ring: hold and release every
+  // slot again and again. Any reordering or loss fails an op, which the
+  // final Allocate reports.
+  AllocateResult got = client->Allocate("p0", kSlots, kSlots);
+  ASSERT_EQ(got.slots.size(), kSlots);
+  for (int round = 0; round < 3000; ++round) {
+    std::vector<Op> ops;
+    for (uint32_t slot = 0; slot < kSlots; ++slot) ops.push_back(Op{OpKind::kRelease, slot, ""});
+    ASSERT_TRUE(client->Apply("p0", ops).ok);
+    ops.clear();
+    for (uint32_t slot = 0; slot < kSlots; ++slot) ops.push_back(Op{OpKind::kHold, slot, ""});
+    ASSERT_TRUE(client->Apply("p0", ops).ok);
+  }
+  // One batch too large for the ring, between two that fit: publish, then
+  // (oversize, by socket) republish under long keys, then release. In order,
+  // the pool ends with the long keys cached.
+  std::vector<Op> first, big, last;
+  for (uint32_t slot = 0; slot < kSlots; ++slot) {
+    first.push_back(Op{OpKind::kPublish, slot, "short" + std::to_string(slot)});
+    big.push_back(Op{OpKind::kPublish, slot, std::string(1024, static_cast<char>('A' + slot))});
+    last.push_back(Op{OpKind::kRelease, slot, ""});
+  }
+  ASSERT_TRUE(client->Apply("p0", first).ok);
+  ASSERT_TRUE(client->Apply("p0", big).ok);
+  ASSERT_TRUE(client->Apply("p0", last).ok);
+  FetchOptions probe;
+  probe.probe_only = true;
+  FetchResult found = client->Fetch("p1", {std::string(1024, 'A'), std::string(1024, 'B')}, probe);
+  ASSERT_TRUE(found.status.ok) << found.status.error;
+  EXPECT_EQ(found.available, 2u);
+  EXPECT_EQ(client->Fetch("p1", {"short0"}, probe).available, 0u);
+  EXPECT_EQ(StatsOf("p0").cached, kSlots);
+}
+
+TEST_F(L1ShmServiceTest, ClientsOnSeveralThreadsAndChannelsShareOneServer) {
+  Start();
+  L1ClientOptions options;
+  options.shm = true;
+  L1Client other(address, options);
+  ASSERT_TRUE(other.shm_active());
+  std::atomic<int> failures{0};
+  auto churn = [&](L1Client* c, const std::string& pool, const std::string& peer, int seed) {
+    for (int i = 0; i < 400; ++i) {
+      AllocateResult got = c->Allocate(pool, 2, 2);
+      if (!got.status.ok || got.slots.size() != 2) {
+        ++failures;
+        return;
+      }
+      const std::string key = pool + "-" + std::to_string(seed) + "-" + std::to_string(i);
+      if (!c->Apply(pool, {Op{OpKind::kPublish, got.slots[0], key}}, 0).ok) ++failures;
+      if (!c->Commit(pool, static_cast<uint64_t>(i)).ok) ++failures;
+      FetchOptions probe;
+      probe.probe_only = true;
+      // This thread's own publish precedes its probe, on the channel and in
+      // what the probe sees from the other pool's side.
+      if (c->Fetch(peer, {key}, probe).available != 1) ++failures;
+      if (!c->Apply(pool, {Op{OpKind::kRelease, got.slots[0], ""},
+                           Op{OpKind::kRelease, got.slots[1], ""}})
+               .ok) {
+        ++failures;
+      }
+    }
+  };
+  // Two threads on one client and pool, a second client on the other pool.
+  std::thread a(churn, client.get(), "p0", "p1", 1);
+  std::thread b(churn, client.get(), "p0", "p1", 2);
+  std::thread c(churn, &other, "p1", "p0", 3);
+  a.join();
+  b.join();
+  c.join();
+  EXPECT_EQ(failures.load(), 0);
+  EXPECT_EQ(StatsOf("p0").held, 0u);
+  EXPECT_EQ(StatsOf("p1").held, 0u);
+}
+
+TEST_F(L1ShmServiceTest, AClientThatLeavesFreesItsChannelAndOneWhoseServerDiedDoesNotHang) {
+  Start();
+  // What a client queued before it left is still applied.
+  AllocateResult got = client->Allocate("p0", 1, 1);
+  ASSERT_TRUE(client->Apply("p0", {Op{OpKind::kPublish, got.slots[0], "parting"}}).ok);
+  client.reset();
+  L1Client plain(address, L1ClientOptions{});
+  EXPECT_FALSE(plain.shm_active());
+  FetchOptions probe;
+  probe.probe_only = true;
+  for (int i = 0; i < 100 && plain.Fetch("p1", {"parting"}, probe).available == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_EQ(plain.Fetch("p1", {"parting"}, probe).available, 1u);
+
+  L1ClientOptions options;
+  options.shm = true;
+  L1Client orphan(address, options);
+  ASSERT_TRUE(orphan.shm_active());
+  server.reset();
+  const auto started = std::chrono::steady_clock::now();
+  EXPECT_FALSE(orphan.Allocate("p0", 1, 1).status.ok);
+  EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(10));
+}
+
+TEST_F(L1ShmServiceTest, QueuedCallsNeverEnterTheBlockingHooksAndRpcsAlwaysDo) {
+  Start();
+  std::atomic<int> entered{0}, left{0};
+  client->SetBlockingHooks([&] { ++entered; }, [&] { ++left; });
+  AllocateResult got = client->Allocate("p0", 4, 4);
+  ASSERT_EQ(got.slots.size(), 4u);
+  const int after_allocate = entered.load();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(
+        client->Apply("p0", {Op{OpKind::kPublish, got.slots[0], "k" + std::to_string(i)}}).ok);
+    ASSERT_TRUE(client->Commit("p0", static_cast<uint64_t>(i)).ok);
+  }
+  EXPECT_EQ(entered.load(), after_allocate);
+  // A copying fetch and Stats are RPCs.
+  EXPECT_TRUE(client->Fetch("p1", {"k99"}).status.ok);
+  StatsOf("p0");
+  EXPECT_EQ(entered.load(), after_allocate + 2);
+  EXPECT_EQ(entered.load(), left.load());
+}
+
+TEST(L1ShmFallbackTest, AClientAskedForSharedMemoryItCannotGetStaysOnTheSocket) {
+  const std::string path = "/tmp/umbp_l1_shm_fallback_" + std::to_string(getpid()) + ".sock";
+  unlink(path.c_str());
+  setenv("UMBP_L1_SHM_DIR", "/nonexistent/umbp", 1);
+  L1Server server("unix://" + path, MakeHostMemoryApi());
+  unsetenv("UMBP_L1_SHM_DIR");
+  ASSERT_TRUE(server.ok());
+  L1ClientOptions options;
+  options.shm = true;
+  L1Client client("unix://" + path, options);
+  EXPECT_FALSE(client.shm_active());
+  ASSERT_TRUE(client.Attach("p0", "g", 0, kBytes).status.ok);
+  ASSERT_TRUE(client.BindLayout("p0", TestLayout()).ok);
+  EXPECT_EQ(client.Open("p0").num_slots, kSlots);
+  EXPECT_EQ(client.Allocate("p0", 1, 1).slots.size(), 1u);
+  // Synchronous again: the failure comes back from the call itself.
+  EXPECT_FALSE(client.Apply("p0", {Op{OpKind::kRelease, 5, ""}}).ok);
   unlink(path.c_str());
 }
 

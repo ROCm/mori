@@ -483,7 +483,7 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 # of its own so an engine process can load the client without the rest of the
 # distributed stack (mori_io, the master/peer protos).
 add_library(umbp_l1 STATIC ${UMBP_L1_PROTO_SRCS} ${UMBP_L1_GRPC_SRCS} l1/l1_pool.cpp
-                           l1/l1_service.cpp)
+                           l1/l1_service.cpp l1/shm_channel.cpp)
 set_target_properties(umbp_l1 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   umbp_l1 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}

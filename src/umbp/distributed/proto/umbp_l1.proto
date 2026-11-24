@@ -37,6 +37,13 @@ service UMBPL1Pool {
   // Release the pool and its memory.
   rpc Detach(PoolRequest) returns (StatusResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
+  // Open a shared-memory channel for this client's small calls (Apply, Commit,
+  // Allocate, a probing Fetch). The server answers once with where the
+  // segment is, then keeps the stream open for as long as it serves the
+  // channel: the channel ends when the stream does, however the client left.
+  // What a client sends on the channel and what it sends as RPCs are applied
+  // in the order it issued them.
+  rpc ShmSession(ShmSessionRequest) returns (stream ShmSessionInfo);
 }
 
 message StatusResponse {
@@ -167,6 +174,18 @@ message FetchResponse {
 }
 
 message StatsRequest {}
+
+message ShmSessionRequest {}
+
+message ShmSessionInfo {
+  bool ok = 1;
+  string error = 2;
+  // The segment, a file the client maps. The two processes must share the
+  // directory it is in (UMBP_L1_SHM_DIR on the server, /dev/shm by default).
+  string path = 3;
+  // Written in the segment, so a client can tell it opened the right file.
+  uint64 nonce = 4;
+}
 
 message PoolStats {
   string pool_id = 1;
