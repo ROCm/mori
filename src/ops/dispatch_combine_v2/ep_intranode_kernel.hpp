@@ -523,12 +523,57 @@ __device__ __forceinline__ void EpLlComputeRoute(const EpArgs& args, int tokenId
     didAlloc = 1;
     mySlot = __hip_atomic_fetch_add(EpPeer<int>(args.window, laneId, args.offTokOff), 1,
                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    // Under a receive cap a slot past it is dropped. The offset is still consumed,
+    // as the portable body consumes it: the claim is what orders the ranks, and a
+    // dropped claim must not renumber the ones that fit. Dropping before the ballot
+    // keeps the destination out of the route, so no copy warp sends to it, and
+    // EpLlWriteMap leaves its map slot null.
+    if constexpr (EpRecvCapped(kCfg)) {
+      if (mySlot >= EpMaxRecv(kCfg)) didAlloc = 0;
+    }
   }
 
   const unsigned long long active = __ballot(didAlloc);
   if (didAlloc) {
     const int pos = __popcll(active & ((1ull << laneId) - 1));
     route.destRank[pos] = laneId;
+    route.recvSlot[pos] = mySlot;
+  }
+  if (laneId == 0) route.numDests = __popcll(active);
+}
+
+// Replay: the handle's dest map already names every slot, so nothing is claimed and
+// nothing is written back. Lane k reads top-k slot k rather than owning destination
+// k, so the rank is decoded instead of being the lane -- which is why destPe is an
+// output here and not simply laneId. Dedup happened when the map was written: a
+// duplicate slot is already EpNullFlat, so the surviving slots are exactly the
+// distinct destinations the route wants.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpLlReplayRoute(const EpArgs& args, int tokenId,
+                                                EpLlRoute<EpLlMaxDests(kCfg)>& route, int& didAlloc,
+                                                int& destPe, int& mySlot) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kNpes = kCfg.worldSize;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+
+  route.srcTok = tokenId;
+  didAlloc = 0;
+  destPe = -1;
+  mySlot = 0;
+  if (laneId < kTopk) {
+    const int flat = args.dispDestTokIdMap[tokenId * kTopk + laneId];
+    const int pe = EpPeFromFlat<kCfg>(flat);
+    if (flat >= 0 && pe < kNpes) {
+      didAlloc = 1;
+      destPe = pe;
+      mySlot = EpLocalTokFromFlat<kCfg>(flat);
+    }
+  }
+
+  const unsigned long long active = __ballot(didAlloc);
+  if (didAlloc) {
+    const int pos = __popcll(active & ((1ull << laneId) - 1));
+    route.destRank[pos] = destPe;
     route.recvSlot[pos] = mySlot;
   }
   if (laneId == 0) route.numDests = __popcll(active);
@@ -541,12 +586,33 @@ __device__ __forceinline__ void EpLlWriteMap(const EpArgs& args, int tokenId, in
   constexpr int kTopk = kCfg.numExpertPerToken;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
 
-  if (laneId < kTopk) args.dispDestTokIdMap[tokenId * kTopk + laneId] = EpNullFlat<kCfg>();
+  // Which rank this lane speaks for: its own in the routing pass, the one it
+  // decoded in replay.
+  const int destPe = kCfg.replay ? slotForMe : laneId;
+  if constexpr (!kCfg.replay) {
+    if (laneId < kTopk) args.dispDestTokIdMap[tokenId * kTopk + laneId] = EpNullFlat<kCfg>();
+  }
   if (didAlloc) {
-    atomicAdd(args.destPeTokenCounter + laneId, 1);
-    EpPeer<int>(args.window, laneId, args.offRecvToSrc)[mySlot] =
+    atomicAdd(args.destPeTokenCounter + destPe, 1);
+    EpPeer<int>(args.window, destPe, args.offRecvToSrc)[mySlot] =
         EpSrcTokIndex<kCfg>(args.rank, tokenId);
-    args.dispDestTokIdMap[tokenId * kTopk + slotForMe] = EpFlatIndex<kCfg>(laneId, mySlot);
+    if constexpr (!kCfg.replay) {
+      args.dispDestTokIdMap[tokenId * kTopk + slotForMe] = EpFlatIndex<kCfg>(laneId, mySlot);
+    }
+  }
+}
+
+// The routing pass or the replay pass, whichever this Cfg renders. slotForMe carries
+// the map slot to write in the first and the decoded rank in the second; EpLlWriteMap
+// reads it the same way.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpLlRoute_(const EpArgs& args, int tokenId,
+                                           EpLlRoute<EpLlMaxDests(kCfg)>& route, int& didAlloc,
+                                           int& slotForMe, int& mySlot) {
+  if constexpr (kCfg.replay) {
+    EpLlReplayRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
+  } else {
+    EpLlComputeRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
   }
 }
 
@@ -592,7 +658,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
     // with no more tokens than blocks -- this prologue IS the kernel.
     int nextDid = 0, nextSlotK = -1, nextSlot = 0;
     if (warpId == 0 && blockIdx.x < numTokens) {
-      EpLlComputeRoute<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
+      EpLlRoute_<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
     } else if (warpId >= kCtrl && blockIdx.x < numTokens && rowCount > 0) {
       const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
                            static_cast<size_t>(blockIdx.x) * kTokBytes +
@@ -617,8 +683,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
       if (warpId == 0) {
         const int nextTok = tokenIdx + gridDim.x;
         if (nextTok < numTokens) {
-          EpLlComputeRoute<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK,
-                                 nextSlot);
+          EpLlRoute_<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK, nextSlot);
           EpLlWriteMap<kCfg>(args, nextTok, nextDid, nextSlotK, nextSlot);
         }
       } else if (kCfg.scaleBytes > 0 && warpId == 1) {

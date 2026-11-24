@@ -320,14 +320,19 @@ def test_ll_dispatch_is_a_different_cfg_from_the_portable_dispatch():
         # A control warp and a copy warp do not fit in two warps once a scale row
         # takes the second control warp.
         (dict(arch="gfx950", warp_per_block=2, scale_bytes=32), "inconsistent config"),
-        # Neither feature of the portable body is implemented in the LL one.
-        (dict(arch="gfx950", replay=True), "replay"),
-        (dict(arch="gfx950", max_recv=32), "receive cap"),
     ],
 )
 def test_ll_dispatch_refuses_what_it_cannot_run(extra, match):
     with pytest.raises(RuntimeError, match=match):
         cb.EpDispatchPlan.describe(**{**_LL, **extra})
+
+
+@pytest.mark.parametrize("extra", [dict(replay=True), dict(max_recv=32)])
+def test_ll_dispatch_serves_replay_and_the_receive_cap(extra):
+    # Both were the portable body's alone until EpDispatchLLBody grew them: replay
+    # reads the handle's dest map instead of claiming, and a claim past max_recv is
+    # dropped before the ballot so no copy warp sends to it.
+    assert cb.EpDispatchPlan.describe(arch="gfx950", **{**_LL, **extra})
 
 
 def test_ll_dispatch_is_not_a_combine_option():

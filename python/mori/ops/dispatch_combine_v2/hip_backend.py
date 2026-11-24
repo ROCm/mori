@@ -2182,7 +2182,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         **disp_req,
                         **bound,
                         block_num=spec.block_num,
-                        warp_per_block=spec.warp_per_block,
+                        warp_per_block=self._dispatch_warps(cfg, spec),
+                        ll_dispatch=spec.ll_dispatch,
                         call_tok_max=cap,
                         replay=True,
                     )

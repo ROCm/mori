@@ -350,6 +350,10 @@ def _cases():
     # Both bodies in one op: SWEEP straddles the cap, so a call at or below 128
     # runs the LL bucket and the larger ones the portable bucket.
     yield "ll-bf16-bucket-split", dict(ll, LL_MAX_TOK=128)
+    # The two the LL body took over from the portable one.
+    yield "ll-bf16-replay", dict(ll, REPLAY=1)
+    yield "ll-bf16-cap", dict(ll, MAXRECV=1024)
+    yield "ll-bf16-cap-ragged", dict(ll, MAXRECV=1024, RAGGED=1, NOSELF=1)
 
 
 _CASES = dict(_cases())

@@ -833,10 +833,9 @@ def _ll_auto_ok(cfg) -> bool:
     if not arch or is_gfx125x_arch(arch):
         return False
     # Lane p of the routing warp owns destination p, so the world fits in a wave.
+    # This is the last thing the LL body cannot do; routing replay and the receive
+    # cap it now implements itself.
     if cfg.world_size > 64:
-        return False
-    # EpDispatchLLBody drops no slot, so a capped receive would write past maxRecv.
-    if cfg.effective_max_recv < cfg.world_size * cfg.max_num_inp_token_per_rank:
         return False
     return True
 

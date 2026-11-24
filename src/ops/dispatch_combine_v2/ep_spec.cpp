@@ -143,17 +143,6 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
           "mori v2 ep: llDispatch is the portable wave64 dispatch (gfx942 / gfx950); it is not a "
           "combine option and not available with ll128 or on gfx125x");
     }
-    // Two features of the portable body that EpDispatchLLBody does not implement.
-    // Refused rather than ignored: replay would silently route by this call's own
-    // atomics instead of the handle's dest map, and a capped receive would let the
-    // LL body write past maxRecv, since nothing in it drops a slot.
-    if (req.replay || EpRecvCapped(c)) {
-      throw std::runtime_error(
-          "mori v2 ep: llDispatch has neither routing replay nor the receive cap "
-          "(maxRecv=" +
-          std::to_string(EpMaxRecv(c)) + " below worldSize * maxTokPerRank=" +
-          std::to_string(c.worldSize * c.maxTokPerRank) + "); use the portable dispatch for those");
-    }
     c.llDispatch = true;
     // The warp count is the role split, so an unpinned one is derived from the payload
     // rather than taken from the generic dispatch default.
