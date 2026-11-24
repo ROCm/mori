@@ -46,7 +46,8 @@
  * (MORI_CCO_PROXY_PUSH_UNSUPPORTED), where upstream accepts any GFX9 target
  * and fails the build on the rest. Added: the MPSC push_active_lanes(), where
  * any subset of a wavefront, in divergent code too, pushes one message per
- * lane through one claim; a compiler fence keeps its stores inside the call.
+ * lane through one claim; a compiler fence keeps its stores inside the call,
+ * and its own credit cache keeps the full-wavefront pushes' cache uniform.
  *
  * Quick Start:
  * @code

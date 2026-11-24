@@ -95,13 +95,16 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
    * credit cache; any earlier published value is a safe lower bound.
    * Device operations are wavefront-collective: all 64 lanes call them,
    * with identical arguments except push_lane_masked()'s per-lane
-   * arguments.
+   * arguments. push_active_lanes(), the exception, keeps its own cache,
+   * `divergent_consumer_index_cached`: written from divergent code, it may
+   * differ across lanes, while `consumer_index_cached` stays wave-uniform.
    */
   struct DeviceHandle : detail::PushApi<DeviceHandle> {
     detail::global_ptr<detail::Chunk> chunks;           ///< ring, extended-scope host memory
     detail::global_ptr<const uint64_t> consumer_index;  ///< published consumer line, host memory
     detail::global_ptr<uint64_t> producer_index;        ///< device memory, fetch-add target (lines)
     uint64_t consumer_index_cached;                     ///< credit cache (register)
+    uint64_t divergent_consumer_index_cached;           ///< push_active_lanes()' credit cache
     uint32_t log2_capacity;                             ///< log2(capacity in lines)
 
     /**
@@ -212,9 +215,12 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
                                       __HIP_MEMORY_SCOPE_AGENT);
       }
       base = detail::broadcast_lane0(base);
-      // The credit wait of push_lanes(), for the whole claim.
+      // The credit wait of push_lanes(), for the whole claim. Divergent calls
+      // use their own cache, and the leader's copy decides for every lane.
+      uint64_t& cached = kFullWave ? consumer_index_cached : divergent_consumer_index_cached;
+      const uint64_t known = kFullWave ? cached : detail::broadcast_lane0(cached);
       const uint64_t cap = uint64_t{1} << log2_capacity;
-      if (base + c.total - consumer_index_cached > cap) {
+      if (base + c.total - known > cap) {
         uint64_t fresh = 0;
         if (__lane_id() == leader) {
           // The chunk stores below depend on this loop's exit.
@@ -222,7 +228,7 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
             __builtin_amdgcn_s_sleep(1);
           }
         }
-        consumer_index_cached = detail::broadcast_lane0(fresh);
+        cached = detail::broadcast_lane0(fresh);
       }
       detail::write_lane_message(chunks, log2_capacity, base + c.prefix, message, bytes, metadata,
                                  c.lines);

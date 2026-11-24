@@ -75,6 +75,7 @@ Queue<Direction::DeviceToHost, Concurrency::MPSC>::device_handle() const {
   h.consumer_index = detail::to_global<const uint64_t>(consumer_index_);
   h.producer_index = detail::to_global(producer_index_);
   h.consumer_index_cached = __atomic_load_n(consumer_index_, __ATOMIC_ACQUIRE);
+  h.divergent_consumer_index_cached = h.consumer_index_cached;
   h.log2_capacity = log2_capacity_;
   return h;
 }
