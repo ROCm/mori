@@ -143,7 +143,6 @@ class PeerPool {
   std::vector<bool> LeasePrefetched(const std::vector<std::string>& keys,
                                     std::chrono::milliseconds ttl);
 
-
   // A caller's recency hint (IUMBPClient::BatchTouch), passed to every medium
   // that holds the keys: their eviction order is the only thing that changes.
   // Returns the number of (medium, key) copies touched.
