@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "mori/jit/v2/compiler.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace jit {
@@ -48,6 +49,17 @@ struct LaunchGeometry {
   unsigned blockX = 1;
   unsigned sharedBytes = 0;
 };
+
+// The launch accepts a workgroup whose static plus dynamic LDS is over the limit, and the
+// kernel then never gets scheduled, so the plan is refused instead.
+inline void CheckWorkgroupLds(const std::string& entry, int staticBytes, unsigned dynamicBytes,
+                              int limit) {
+  if (limit <= 0 || (long long)staticBytes + dynamicBytes <= limit) return;
+  throw std::runtime_error("mori jit: '" + entry + "' needs " + std::to_string(staticBytes) +
+                           " B static + " + std::to_string(dynamicBytes) +
+                           " B dynamic LDS, over the " + std::to_string(limit) +
+                           " B workgroup limit");
+}
 
 // CfgT is an explicit parameter rather than `typename Derived::Cfg`: the derived
 // class is still incomplete while its own base is being instantiated.
@@ -81,6 +93,21 @@ class KernelSpec {
     p.geom = Derived::Geometry(cfg);
     p.module = Compiler::Instance().Build(Derived::kName, Derived::RenderSource(cfg),
                                           Derived::SourceDeps(), Derived::EntryName(cfg));
+    int staticLds = 0, dev = 0, limit = 0;
+    if (hipFuncGetAttribute(&staticLds, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, p.module->Entry()) ==
+            hipSuccess &&
+        hipGetDevice(&dev) == hipSuccess &&
+        hipDeviceGetAttribute(&limit, hipDeviceAttributeMaxSharedMemoryPerBlock, dev) ==
+            hipSuccess) {
+      CheckWorkgroupLds(Derived::EntryName(cfg), staticLds, p.geom.sharedBytes, limit);
+    } else {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        MORI_WARN(mori::modules::OPS, "[jit] LDS query failed for {}; workgroup LDS check skipped",
+                  Derived::EntryName(cfg));
+      }
+    }
     return p;
   }
 

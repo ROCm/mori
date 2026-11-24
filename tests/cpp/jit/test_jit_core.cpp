@@ -186,6 +186,64 @@ TEST(Geometry, CombineSharedMemCoversOnePointerArrayPerWarp) {
   EXPECT_EQ(EpCombineSharedBytes(c), int(sizeof(void*)) * 8 * 8);
 }
 
+TEST(Geometry, WorkgroupLdsOverTheLimitIsRefused) {
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 0, 327680, 327680));
+  EXPECT_NO_THROW(CheckWorkgroupLds("k", 48, 327680, 0));  // limit unknown
+  try {
+    CheckWorkgroupLds("k", 48, 327680, 327680);
+    FAIL() << "48 B over the limit was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("48 B static + 327680 B dynamic"), std::string::npos)
+        << e.what();
+  }
+}
+
+TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
+  EpCfg c;
+  c.worldSize = 4;
+  c.numExpertPerToken = 6;
+  c.waveSize = 32;
+  c.warpPerBlock = 16;
+  // 5120 used to take the metadata slab too: 16 x 2 x 10240 B, all of the LDS.
+  const std::pair<int, int> want[] = {
+      {4096, 262144}, {5120, 163840}, {6144, 196608}, {7168, 229376}};
+  for (const auto& [hidden, bytes] : want) {
+    c.hiddenDim = hidden;
+    EXPECT_EQ(EpDispatch1250xLdsBytes(c), bytes) << hidden;
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+}
+
+// ROCm/mori#951: a fixed 16-warp dispatch default asks 458752 B of a 327680 B
+// workgroup at fp32 7168, which the launch accepts and then never schedules. The
+// bound is the slab a row takes, not the dtype: bf16 at 10240 hits it too.
+TEST(Geometry, Dispatch1250xDefaultWarpsFitTheSlabs) {
+  EpRequest req;
+  const struct {
+    int hidden;
+    EpDType dtype;
+    int warps;
+  } want[] = {
+      {7168, EpDType::Bf16, 16}, {7168, EpDType::Fp32, 8},  {10240, EpDType::Bf16, 8},
+      {10240, EpDType::Fp32, 4}, {4096, EpDType::Fp32, 16}, {7168, EpDType::Fp8, 16},
+  };
+  for (const auto& w : want) {
+    req.hiddenDim = w.hidden;
+    req.dtype = w.dtype;
+    const EpCfg c = MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch);
+    EXPECT_EQ(c.warpPerBlock, w.warps) << w.hidden << " dtype " << static_cast<int>(w.dtype);
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+  // Only the arch with the LDS slabs, and only dispatch.
+  req.hiddenDim = 7168;
+  req.dtype = EpDType::Fp32;
+  EXPECT_EQ(MakeEpCfg("gfx950", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Combine).warpPerBlock, 8);
+  // A geometry the caller pinned is its own.
+  req.warpPerBlock = 16;
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+}
+
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EpCfg ok;
   EXPECT_TRUE(EpCfgIsValid(ok));
@@ -628,6 +686,49 @@ TEST(AsyncLLMode, FactoryRejectsInvalidAndIncompatibleModes) {
                                      EpInterNodeFamily::AsyncLL));
 }
 
+TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
+  const auto kinds = {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy};
+  // Only the fused mode resolves a ceiling, and only its receive copies use it.
+  for (int mode : {0, 1}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, 0);
+    for (const auto kind : kinds) {
+      EXPECT_EQ(EpAsyncLLGeometry(cfg, kind).gridX, static_cast<unsigned>(cfg.mpCount));
+    }
+  }
+  const auto fused = AsyncLLCfgForMode(2);
+  EXPECT_EQ(fused.asyncLlFusedRecvCtas, fused.mpCount / 2);
+  for (const auto kind : kinds) {
+    EXPECT_EQ(EpAsyncLLGeometry(fused, kind).gridX, static_cast<unsigned>(fused.mpCount / 2));
+  }
+  EXPECT_EQ(EpAsyncLLGeometry(fused, EpAsyncLLKernel::CombineSendCopy).gridX,
+            static_cast<unsigned>(fused.mpCount));
+
+  // An explicit ceiling is aligned down to worldSize and never widens the grid.
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = 2;
+  for (const auto& [ctas, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
+    request.asyncLlFusedRecvCtas = ctas;
+    const auto cfg = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, ctas);
+    EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvCopy).gridX,
+              static_cast<unsigned>(grid));
+  }
+
+  request.asyncLlFusedRecvCtas = -1;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlMode = 1;
+  request.asyncLlFusedRecvCtas = 16;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+}
+
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
   for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
     const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"
@@ -772,4 +873,88 @@ TEST(Describe, FailsWhereCreateWould) {
   // The push combine is gfx125x only; RenderSource rejects it, compiled or not.
   ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
   EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
+}
+
+// --------------------------------------------------------------------------
+// arch= retargets one plan call and is gone when it returns.
+// --------------------------------------------------------------------------
+
+extern "C" const char* mori_jit_plan_describe(const char*, const char*, const char* const*,
+                                              const long long*, int);
+
+namespace {
+std::string CacheDirNow() {
+  return Compiler::Instance().CacheDirFor("combine_reduce", "constexpr int x = 1;", {});
+}
+}  // namespace
+
+TEST(Arch, ScopedArchRetargetsOnlyItsScope) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  const std::string base = CacheDirNow();
+  {
+    ScopedArch scope("gfx1250");
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+    EXPECT_EQ(ActiveArchSource(), "arch=");
+    EXPECT_NE(CacheDirNow().find("/gfx1250_mlx5/"), std::string::npos);
+    {
+      ScopedArch keep(nullptr);
+      EXPECT_EQ(ActiveArch(), "gfx1250");
+    }
+    {
+      ScopedArch inner("gfx942");
+      EXPECT_EQ(ActiveArch(), "gfx942");
+    }
+    EXPECT_EQ(ActiveArch(), "gfx1250");
+  }
+  EXPECT_EQ(ActiveArch(), "gfx950");
+  EXPECT_EQ(CacheDirNow(), base);
+}
+
+TEST(Arch, ScopedArchIsThreadLocal) {
+  ToolchainOverride guard(FakeToolchain("gfx950", "mlx5"));
+  ScopedArch scope("gfx1250");
+  std::string seen;
+  std::thread([&seen] { seen = ActiveArch(); }).join();
+  EXPECT_EQ(seen, "gfx950");
+}
+
+TEST(Arch, DescribeArchDoesNotOutliveTheCall) {
+  // Two arch= in a row used to throw "toolchain already resolved", and the first
+  // one stuck: every later plan in the process compiled for it.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  const char* text = mori_jit_plan_describe("ep_dispatch", "gfx942", nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_EQ(ParseInfo(text)["stagingBytes"], "0");
+  ASSERT_NE(mori_jit_plan_describe("ep_dispatch", "gfx950", nullptr, nullptr, 0), nullptr)
+      << PlanError();
+  EXPECT_EQ(ActiveArch(), "gfx1250");
+  text = mori_jit_plan_describe("ep_dispatch", nullptr, nullptr, nullptr, 0);
+  ASSERT_NE(text, nullptr) << PlanError();
+  EXPECT_NE(ParseInfo(text)["stagingBytes"], "0");
+}
+
+// --------------------------------------------------------------------------
+// gfx1250-strict is a gfx125x target of its own.
+// --------------------------------------------------------------------------
+
+TEST(Gfx1250Strict, RoutesLikeGfx1250) {
+  EXPECT_EQ(mori::jit::v2::WaveSizeForArch("gfx1250-strict"), 32);
+  ToolchainOverride guard(FakeToolchain("gfx1250-strict", "ionic"));
+  const EpCfg cfg;
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::RenderSource(cfg).find("ep_intranode_1250x.hpp"),
+            std::string::npos);
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(cfg).find("_tdm"), std::string::npos);
+  EpCfg c;
+  c.scaleBytes = 224;
+  c.aggReserve = true;
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}))["stagingBytes"],
+            std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_NO_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+}
+
+TEST(Gfx1250Strict, HasItsOwnCacheEntries) {
+  EXPECT_EQ(fs::path(CacheDirWith("gfx1250-strict", "ionic")).parent_path().filename(),
+            "gfx1250-strict_ionic");
+  EXPECT_NE(fs::path(CacheDirWith("gfx1250-strict", "ionic")).filename(),
+            fs::path(CacheDirWith("gfx1250", "ionic")).filename());
 }

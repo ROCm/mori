@@ -56,9 +56,17 @@ struct EpRequest {
   bool combineFp4F32Scale = false;
   bool combineFp8 = false;
   bool tokOffExt = false;
+  bool combineBf16Push = false;
+  int combineScatterQGroup = 0;    // gfx942/gfx950 fp8 scatter combine: 32 or 128; 0 = off
+  bool combineScatterFp4 = false;  // e2m1 on that wire instead (gfx950)
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
+  bool cardDedup = false;
+  int cardPullBlocks = 0;
+  bool cardFwdMark = false;
+  bool cardCombine = false;
+  bool ll128Dedup = false;
 };
 
 template <typename Self, typename Visit>
@@ -79,13 +87,21 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(tokOffExt);
+  MORI_FIELD(combineBf16Push);
+  MORI_FIELD(combineScatterQGroup);
+  MORI_FIELD(combineScatterFp4);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
+  MORI_FIELD(cardDedup);
+  MORI_FIELD(cardPullBlocks);
+  MORI_FIELD(cardFwdMark);
+  MORI_FIELD(cardCombine);
+  MORI_FIELD(ll128Dedup);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 18,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 26,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

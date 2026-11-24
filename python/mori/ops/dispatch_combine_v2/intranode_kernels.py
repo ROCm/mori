@@ -73,6 +73,9 @@ import mori.cco.device.flydsl as cco
 from . import flydsl_prims as P
 
 from mori.jit.config import detect_wave_size
+from mori.jit.core import _target_arch
+
+from .quant_types import fp8_max
 
 WAVE = detect_wave_size()
 LANE_MASK = WAVE - 1
@@ -83,7 +86,6 @@ _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
 # for memory-level parallelism; gfx9 (WAVE=64) stays at 2.
 _DISP_NSTREAMS = 4 if WAVE == 32 else 2
 _MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
-_BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
 # ── dispatch ──────────────────────────────────────────────────────────────
 
@@ -426,7 +428,7 @@ def _V1I32():
     return T.VectorType.get([1], T.i32())
 
 
-def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
+def _accum_funcs(hidden_elem_size, fp8_to_bf16=False, fp4=False):
     if fp4:  # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
         if WAVE == 32:
             # gfx1250: one pack-8 instr converts all 8 fp4/i32 at once. The
@@ -488,10 +490,10 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
             return arith.constant_vector(0.0, _V8F32())
 
         return to_accum, from_accum, zero_accum
-    return _accum_funcs_int(hidden_elem_size, fp8_direct_cast)
+    return _accum_funcs_int(hidden_elem_size, fp8_to_bf16)
 
 
-def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
+def _accum_funcs_int(hidden_elem_size, fp8_to_bf16=False):
     """Return (to_accum, from_accum, zero_accum) for one i32 'unit' of the
     transport dtype, mirroring the FlyDSL reference's per-dtype branches.
 
@@ -535,7 +537,7 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
             f1 = vector.extract(acc, static_position=[1])
             f2 = vector.extract(acc, static_position=[2])
             f3 = vector.extract(acc, static_position=[3])
-            if fp8_direct_cast:  # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
+            if fp8_to_bf16:  # wire fp8 -> external bf16: v4f32 -> v4bf16 -> 2 i32
                 v4bf16 = acc.truncf(T.VectorType.get([4], T.bf16()))
                 return vector.bitcast(T.VectorType.get([2], T.i32()), v4bf16)
             zero = arith.constant(0, type=T.i32())
@@ -576,7 +578,6 @@ def make_combine(
     off_xdb_mem,
     off_out_wts=0,
     enable_weights=True,
-    fp8_direct_cast=False,
     fp4=False,
     _s3_cache=2,
     _unroll=4,
@@ -585,18 +586,12 @@ def make_combine(
         f"combine block_num {block_num} exceeds xdb_flag_slots {xdb_flag_slots}: "
         f"the per-block xdb flag array would overflow"
     )
-    # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
-    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
-    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
-        hidden_elem_size, fp8_direct_cast, fp4
-    )
+    # Transport dtype = external dtype. fp4: i32 = 8 fp4.
+    _to_accum2, _from_accum2, _zero_accum = _accum_funcs(hidden_elem_size, fp4=fp4)
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
-    # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
-    out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
-    # vec4 gather: 4 i32 per load (global_load_dwordx4) when output is 1:1.
-    _use_vec4 = (n_i32 % 4 == 0) and not fp8_direct_cast
-    out_step_mult = 2 if fp8_direct_cast else 1
+    # vec4 gather: 4 i32 per load (global_load_dwordx4).
+    _use_vec4 = n_i32 % 4 == 0
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_combine(
@@ -768,7 +763,7 @@ def make_combine(
             eff = arith.select(
                 rem < units_per_warp, rem, units_per_warp
             )  # i32 units this warp
-            out_base = tok_id * out_n_i32
+            out_base = tok_id * n_i32
 
             # Nested fn: closure over expert_bases/valids (lists can't be loop-carried).
             def _one(off):  # reduce k contributions for one i32 unit
@@ -781,9 +776,7 @@ def make_combine(
                 acc = _zero_accum()
                 for k_slot in range_constexpr(experts_per_token):
                     acc = acc + _to_accum2(vals[k_slot])
-                buffer_store(
-                    _from_accum2(acc), rsrc_out, out_base + off * out_step_mult
-                )
+                buffer_store(_from_accum2(acc), rsrc_out, out_base + off)
 
             if const_expr(_use_vec4):
                 # Vec4 path: load 4 i32 (16B, global_load_dwordx4) per expert
@@ -855,11 +848,7 @@ def make_combine(
                             acc = _zero_accum()
                             for k_slot in range_constexpr(experts_per_token):
                                 acc = acc + _to_accum2(pre_vals[r][k_slot])
-                            buffer_store(
-                                _from_accum2(acc),
-                                rsrc_out,
-                                out_base + off * out_step_mult,
-                            )
+                            buffer_store(_from_accum2(acc), rsrc_out, out_base + off)
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
 
@@ -902,8 +891,10 @@ def make_combine(
     return run
 
 
-_FP8_MAX = 240.0  # gfx942 native fp8 is e4m3fnuz: max finite 240 (NOT OCP 448);
-# clamping above 240 yields NaN from cvt_pk_fp8_f32 on this arch
+# cvt_pk_fp8_f32 is e4m3fnuz on gfx942 (max 240; above it yields NaN), OCP on gfx950.
+_FP8_MAX = fp8_max(_target_arch())
+# Smallest amax whose 1x128 scale amax/_FP8_MAX is a normal f32 (so 1/scale is finite).
+_FP8_MIN_AMAX = _FP8_MAX * 2.0**-126
 
 
 def _fabs(f):
@@ -916,14 +907,39 @@ def _bf16x2(i32_scalar):  # i32 (2 bf16) -> v2f32
     )
 
 
-def _warp_amax(lane, v):
-    """Max-reduce an f32 across the wavefront (butterfly via ds_bpermute, per-lane
-    gather index). Every lane returns the wavefront max; raw values in/out."""
-    for off in _BUTTERFLY_OFFSETS:
+def _warp_amax(lane, v, lanes=WAVE):
+    """Max-reduce an f32 across each aligned run of `lanes` lanes (butterfly via
+    ds_bpermute, per-lane gather index). Every lane returns its run's max; raw
+    values in/out."""
+    for off in tuple(lanes >> i for i in range(1, lanes.bit_length())):
         idx = arith.unwrap((lane ^ off) * 4)  # byte addr = lane*4
         o = ds_bpermute(T.i32(), idx, arith.bitcast(T.i32(), arith.unwrap(v)))
         v = arith.maximumf(v, arith.bitcast(T.f32(), o))
     return v
+
+
+def _block_scale(amax):
+    """1x128 f32 scale and its inverse: amax / _FP8_MAX, so the block spans the
+    whole fp8 range; 1 when that scale would be subnormal (e.g. an all-zero block)."""
+    fp8max = arith.constant(_FP8_MAX, type=T.f32())
+    one = arith.constant(1.0, type=T.f32())
+    scaled = amax >= arith.constant(_FP8_MIN_AMAX, type=T.f32())
+    scale = arith.select(scaled, arith.divf(amax, fp8max), one)
+    inv = arith.select(scaled, arith.divf(fp8max, amax), one)
+    return scale, inv
+
+
+def _e8m0_scale(amax):
+    """1x32 E8M0 scale (biased exponent e, i32) and its inverse 2^(127-e) (f32):
+    quant_types.e8m0_round_up, the smallest 2^k with amax / 2^k <= _FP8_MAX."""
+    t = arith.mulf(amax, arith.constant(1.0 / _FP8_MAX, type=T.f32()))
+    bits = arith.bitcast(T.i32(), arith.unwrap(t))
+    e = (arith.constant(0x7FFFFFFF) & bits) + arith.constant(0x7FFFFF)
+    e = e >> arith.constant(23)
+    e = arith.select(e < arith.constant(1), arith.constant(1), e)
+    e = arith.select(e > arith.constant(254), arith.constant(254), e)
+    inv_bits = (arith.constant(254) - e) << arith.constant(23)
+    return e, arith.bitcast(T.f32(), arith.unwrap(inv_bits))
 
 
 def make_combine_scatter(
@@ -945,43 +961,53 @@ def make_combine_scatter(
     off_comb_wts=0,
     off_comb_scales=0,
     enable_weights=True,
-    fp8_direct_cast=False,
     fp8_blockwise=False,
-    scale_dim=0,
+    quant_group=128,
     _s3_cache=2,
 ):
     """Scatter combine (mori useExternalInpBuffer / _nop2p path).
 
     Stage 1  each computing rank P2P-WRITES its post-expert tokens back to the
              ORIGIN rank's comb_inp[computing_rank*M + origin_lid] (origin from
-             tis); under fp8_direct_cast the bf16 token is cast to fp8 on write.
+             tis); under fp8_blockwise the bf16 token is quantized to fp8 on write.
     Stage 2  cross-device barrier.
     Stage 3  origin rank LOCAL-reads comb_inp[dest_pe*M + tok] for its token's k
-             expert PEs (from tok_map) and reduces (fp8->bf16 dequant if cast).
+             expert PEs (from tok_map) and reduces (fp8->bf16 dequant if quantized).
+
+    fp8_blockwise scales each quant_group elements: 128 with an f32 amax/fp8_max
+    scale (fp8_blockwise_1x128), 32 with an E8M0 one (fp8_blockwise_1x32).
 
     vs the gather path: 2 passes (remote write + local read) but compresses the
-    transport to fp8; the natural home for fp8_direct_cast (gather has no
+    transport to fp8; the natural home for fp8_blockwise (gather has no
     Stage-1 writer to compress at)."""
     if fp8_blockwise and WAVE != 64:
         raise NotImplementedError(
             "fp8_blockwise combine's coalesced path assumes wave64 (one wave == one "
-            "128-elem block); wave32 (gfx12) port is TODO"
+            "128-element chunk); wave32 (gfx12) port is TODO"
         )
-    # blockwise reuses the fp8->bf16 accum (output bf16, wire fp8) + per-block scale.
-    _fp8_out = fp8_direct_cast or fp8_blockwise
-    wire_elem_size = 1 if _fp8_out else hidden_elem_size
-    to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, _fp8_out)
+    # blockwise uses the fp8->bf16 accum (output bf16, wire fp8) + per-block scale.
+    wire_elem_size = 1 if fp8_blockwise else hidden_elem_size
+    to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, fp8_blockwise)
     inp_nbytes = hidden_dim * hidden_elem_size  # source out_tok (bf16/f32)
     wire_nbytes = hidden_dim * wire_elem_size  # comb_inp transport
     wire_n_i32 = wire_nbytes // 4
-    out_n_i32 = (hidden_dim * 2) // 4 if _fp8_out else wire_n_i32
-    out_step_mult = 2 if _fp8_out else 1
+    out_n_i32 = (hidden_dim * 2) // 4 if fp8_blockwise else wire_n_i32
+    out_step_mult = 2 if fp8_blockwise else 1
     if fp8_blockwise:
-        block_elems = hidden_dim // scale_dim
+        if quant_group not in (32, 128):
+            raise ValueError(f"quant_group must be 32 or 128, got {quant_group}")
+        # one wave-wide i32 load (2 bf16 a lane) covers a 128-element chunk
+        chunk_elems = 2 * WAVE
         assert (
-            hidden_dim % scale_dim == 0 and block_elems == 128
-        ), "blockwise (coalesced path): block_elems must be 128 (scale_dim = hidden/128)"
-        block_i32_fp8 = block_elems // 4  # fp8 i32 units per block (=32)
+            hidden_dim % chunk_elems == 0
+        ), f"fp8_blockwise combine needs hidden_dim % {chunk_elems} == 0"
+        n_chunks = hidden_dim // chunk_elems
+        chunk_i32_fp8 = chunk_elems // 4  # fp8 i32 units per chunk (=32)
+        group_lanes = quant_group // 2
+        e8m0 = quant_group == 32
+        # Per-token scale row: an f32 per 1x128 block or an E8M0 byte per 1x32
+        # group, so a chunk's scales are one dword either way.
+        scale_row_bytes = n_chunks * 4
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_combine_s(
@@ -1031,51 +1057,46 @@ def make_combine_scatter(
             rsrc_src = create_buffer_resource_from_addr(src)
             rsrc_dst = create_buffer_resource_from_addr(dst)
             if const_expr(fp8_blockwise):
-                # Blockwise fp8 quant, COALESCED + warp-reduce (block_elems==128
-                # so one i32/lane spans a full block). Per block scale_block:
-                # lanes load the block coalesced (lane l -> elems 2l,2l+1),
-                # ds_bpermute butterfly gives every lane the block amax, then
-                # lane-pairs combine their 2 fp8 each into one i32 (even lane
-                # writes, coalesced). scale = (amax>MAX)? amax/MAX : 1;
-                # quant = clamp(v*MAX/amax). Token sign sentinel: if ANY block
-                # scaled, negate block-0 scale.
+                # Blockwise fp8 quant, COALESCED + sub-wave reduce. Per 128-element
+                # chunk: lanes load it coalesced (lane l -> elems 2l,2l+1), a
+                # ds_bpermute butterfly over each group's lanes gives them the
+                # group amax, then lane pairs combine their 2 fp8 each into one
+                # i32 (even lane writes, coalesced). quant = clamp(v / scale).
                 scale_dst = fx.Int64(
                     window.lsa_ptr(origin_pe, off_comb_scales)
                 ) + fx.Int64(rank * max_tok_per_rank + origin_lid) * fx.Int64(
-                    scale_dim
-                ) * fx.Int64(
-                    4
+                    scale_row_bytes
                 )
                 rsrc_scales = create_buffer_resource_from_addr(scale_dst)
                 fp8max = arith.constant(_FP8_MAX, type=T.f32())
                 nlim = arith.constant(-_FP8_MAX, type=T.f32())
-                any_scaled = arith.constant(0) != arith.constant(0)  # False (uniform)
-                for scale_block in range_constexpr(scale_dim):
+                for chunk in range_constexpr(n_chunks):
                     v2 = _bf16x2(
                         buffer_load(
                             rsrc_src,
-                            scale_block * 64 + lane,
+                            chunk * WAVE + lane,
                             vec_width=1,
                             dtype=T.i32(),
                         )
                     )
                     e0 = vector.extract(v2, static_position=[0])
                     e1 = vector.extract(v2, static_position=[1])
-                    amax = _warp_amax(lane, arith.maximumf(_fabs(e0), _fabs(e1)))
-                    scaled = amax > fp8max
-                    any_scaled = arith.select(scaled, scaled, any_scaled)
-                    scale = arith.select(
-                        scaled,
-                        arith.divf(amax, fp8max),
-                        arith.constant(1.0, type=T.f32()),
+                    amax = _warp_amax(
+                        lane, arith.maximumf(_fabs(e0), _fabs(e1)), group_lanes
                     )
-                    inv = arith.select(
-                        scaled,
-                        arith.divf(fp8max, amax),
-                        arith.constant(1.0, type=T.f32()),
-                    )
-                    if lane == 0:
-                        buffer_store(scale, rsrc_scales, scale_block)
+                    if const_expr(e8m0):
+                        e, inv = _e8m0_scale(amax)
+                        # the chunk's 4 group exponents, byte g = group g
+                        packed_e = readlane(T.i32(), e, 0)
+                        for g in range_constexpr(1, 4):
+                            e_g = readlane(T.i32(), e, g * group_lanes)
+                            packed_e = packed_e | (e_g << arith.constant(8 * g))
+                        if lane == 0:
+                            buffer_store(packed_e, rsrc_scales, chunk)
+                    else:
+                        scale, inv = _block_scale(amax)
+                        if lane == 0:
+                            buffer_store(scale, rsrc_scales, chunk)
                     f0 = fmed3(T.f32(), arith.mulf(e0, inv), fp8max, nlim)
                     f1 = fmed3(T.f32(), arith.mulf(e1, inv), fp8max, nlim)
                     my_packed = cvt_pk_fp8_f32(
@@ -1099,31 +1120,8 @@ def make_combine_scatter(
                         buffer_store(
                             packed_pair,
                             rsrc_dst,
-                            scale_block * block_i32_fp8 + (lane >> arith.constant(1)),
+                            chunk * chunk_i32_fp8 + (lane >> arith.constant(1)),
                         )
-                if any_scaled:
-                    if lane == 0:
-                        s0 = buffer_load(rsrc_scales, 0, vec_width=1, dtype=T.f32())
-                        buffer_store(arith.negf(s0), rsrc_scales, 0)
-            elif const_expr(fp8_direct_cast):
-                # 2 bf16 i32 -> v4f32 -> cvt_pk_fp8 x2 -> 1 fp8 i32
-                for elem in range(lane, wire_n_i32, WAVE):
-                    bf = buffer_load(rsrc_src, elem * 2, vec_width=2, dtype=T.i32())
-                    v4 = vector.bitcast(T.VectorType.get([4], T.bf16()), bf).extf(
-                        _V4F32()
-                    )
-                    f0 = vector.extract(v4, static_position=[0])
-                    f1 = vector.extract(v4, static_position=[1])
-                    f2 = vector.extract(v4, static_position=[2])
-                    f3 = vector.extract(v4, static_position=[3])
-                    z = arith.constant(0, type=T.i32())
-                    lo = cvt_pk_fp8_f32(
-                        res=T.i32(), src_a=f0, src_b=f1, old=z, word_sel=False
-                    )
-                    fp8 = cvt_pk_fp8_f32(
-                        res=T.i32(), src_a=f2, src_b=f3, old=lo, word_sel=True
-                    )
-                    buffer_store(fp8, rsrc_dst, elem)
             else:
                 for elem in range(lane, wire_n_i32, WAVE):
                     v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())
@@ -1235,9 +1233,7 @@ def make_combine_scatter(
                         fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank)
                         + fx.Int64(tok_id)
                     ) * fx.Int64(
-                        scale_dim
-                    ) * fx.Int64(
-                        4
+                        scale_row_bytes
                     )
                     expert_scales.append(create_buffer_resource_from_addr(scale_addr))
             if const_expr(enable_weights):
@@ -1275,13 +1271,14 @@ def make_combine_scatter(
 
             def _one(off):
                 acc = zero_acc()
-                # blockwise: 4 fp8 per i32 unit are 4 consecutive elements in the
-                # same block -> one scale per unit. scale_block = (off*4)//block_elems.
+                # blockwise: the 4 fp8 of an i32 unit sit in one group -> one scale
+                # per unit, in the scale dword of the unit's 128-element chunk.
                 if const_expr(fp8_blockwise):
-                    scale_block = (off * arith.constant(4)) // arith.constant(
-                        block_elems
-                    )
-                    is_b0 = scale_block == arith.constant(0)
+                    scale_dword = off // arith.constant(chunk_i32_fp8)
+                    if const_expr(e8m0):
+                        # byte (off/8)%4 of the dword: the unit's 32-element group
+                        group_in_chunk = (off >> arith.constant(3)) & arith.constant(3)
+                        e_shift = group_in_chunk << arith.constant(3)
                 for k_slot in range_constexpr(experts_per_token):
                     v = buffer_load(
                         expert_rsrcs[k_slot],
@@ -1292,15 +1289,24 @@ def make_combine_scatter(
                     )
                     v = arith.select(expert_valids[k_slot], v, arith.constant(0))
                     if const_expr(fp8_blockwise):
-                        scale = buffer_load(
-                            expert_scales[k_slot],
-                            scale_block,
-                            vec_width=1,
-                            dtype=T.f32(),
-                        )
-                        scale = arith.select(
-                            is_b0, _fabs(scale), scale
-                        )  # undo block-0 sign sentinel
+                        if const_expr(e8m0):
+                            scale_e = buffer_load(
+                                expert_scales[k_slot],
+                                scale_dword,
+                                vec_width=1,
+                                dtype=T.i32(),
+                            )
+                            scale_e = (scale_e >> e_shift) & arith.constant(0xFF)
+                            scale = arith.bitcast(
+                                T.f32(), arith.unwrap(scale_e << arith.constant(23))
+                            )
+                        else:
+                            scale = buffer_load(
+                                expert_scales[k_slot],
+                                scale_dword,
+                                vec_width=1,
+                                dtype=T.f32(),
+                            )
                         # invalid expert -> v already 0; force finite scale so a
                         # stale/garbage comb_scales slot can't make 0*NaN = NaN.
                         scale = arith.select(

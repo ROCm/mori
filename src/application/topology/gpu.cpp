@@ -22,10 +22,13 @@
 #include "mori/application/topology/gpu.hpp"
 
 #include <dlfcn.h>
+#include <link.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
@@ -42,7 +45,49 @@ namespace {
 #if MORI_USE_AMDSMI
 // ---- amd_smi path (ROCm 10.1+) ----
 
+// The libamd_smi already mapped into the process, if any: torch brings its own
+// from the rocm_sdk wheels, and a second copy loaded beside it binds part of its
+// state to the first one's symbols and then reports 0 sockets. amd_smi counts
+// init/shut_down references, so sharing the instance leaves the other user's
+// session alone. A copy of another major version than the header mori was built
+// against may lay out its structs differently, so it is not reused. And a later
+// amdsmi_init only takes a reference and ignores its flags: the shared instance
+// sees GPUs only if its first user initialized it with AMDSMI_INIT_AMD_GPUS, as
+// torch does.
+void* LoadedAmdSmi() {
+  std::string path;
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void* data) {
+        const char* slash = info->dlpi_name ? strrchr(info->dlpi_name, '/') : nullptr;
+        if (slash && strncmp(slash + 1, "libamd_smi.so", strlen("libamd_smi.so")) == 0) {
+          *static_cast<std::string*>(data) = info->dlpi_name;
+          return 1;
+        }
+        return 0;
+      },
+      &path);
+  if (path.empty()) return nullptr;
+  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+  if (!handle) return nullptr;
+
+  auto getLibVersion = reinterpret_cast<decltype(&::amdsmi_get_lib_version)>(
+      dlsym(handle, "amdsmi_get_lib_version"));
+  amdsmi_version_t version = {};
+  if (getLibVersion && getLibVersion(&version) == AMDSMI_STATUS_SUCCESS &&
+      version.major == AMDSMI_LIB_VERSION_MAJOR) {
+    return handle;
+  }
+  fprintf(stderr, "[AMD-SMI] not reusing %s: its major version is %u, mori was built against %d\n",
+          path.c_str(), version.major, AMDSMI_LIB_VERSION_MAJOR);
+  dlclose(handle);
+  return nullptr;
+}
+
 void* OpenAmdSmi() {
+  const char* explicitPath = std::getenv("MORI_AMD_SMI_PATH");
+  if (!(explicitPath && explicitPath[0])) {
+    if (void* h = LoadedAmdSmi()) return h;
+  }
   const char* candidates[] = {
       std::getenv("MORI_AMD_SMI_PATH"),  "libamd_smi.so",      "/opt/rocm/lib/libamd_smi.so",
       std::getenv("MORI_ROCM_SMI_PATH"), "librocm_smi64.so.1", "librocm_smi64.so",

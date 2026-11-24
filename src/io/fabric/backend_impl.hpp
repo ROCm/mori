@@ -23,12 +23,14 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/io/backend.hpp"
@@ -78,10 +80,6 @@ class FabricBackendSession : public BackendSession {
   bool Alive() const override;
 
  private:
-  // Launch the copy kernel over [srcBase+srcOff, dstBase+dstOff) for `size`
-  // bytes on `stream`. Returns hipSuccess or the launch error.
-  hipError_t LaunchCopy(void* dst, const void* src, size_t size, hipStream_t stream);
-
   FabricBackendConfig config{};
   void* localAddr{nullptr};   // local registered pointer
   void* remoteAddr{nullptr};  // imported peer VA (aliases remote HBM over fabric)
@@ -113,21 +111,34 @@ class FabricBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  // Cannot fence: a peer writes through its import of our fabric handle, which cannot be
+  // revoked. Once a handle was exported, reports any peer but this engine as not cut off.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
+  std::string RejectReason(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
-  // JIT-loaded contiguous copy kernel (fabric_copy.hip), one module per device.
+  // JIT-loaded batched copy kernels (fabric_copy.hip), loaded lazily per device.
+  // Reloading retains prior modules until backend destruction.
   void LoadFabricCopyModule(const std::string& hsacoPath);
-  hipFunction_t GetFabricCopyFunc(int deviceId);
+  struct CopyFunctions {
+    hipFunction_t single{nullptr};
+    hipFunction_t small{nullptr};
+    hipFunction_t large{nullptr};
+    explicit operator bool() const {
+      return single != nullptr && small != nullptr && large != nullptr;
+    }
+  };
+  CopyFunctions GetFabricCopyFunctions(int deviceId);
+  uint32_t FabricCopyMaxBlocks() const { return fabricCopyMaxBlocks_; }
 
  private:
   void Initialize();
   std::optional<int> LookupVisibleDevice(const std::string& busId) const;
-  fabric::VpodKey LocalVpodKey(int deviceId) const;
 
   // Import a peer's fabric handle and map it into a fresh local VA; cached per
   // (remote engine, remote mem id, local device). Returns the mapped pointer, or
   // the local pointer directly when the memory is owned by this engine.
-  void* GetImportedAddress(const MemoryDesc& desc, int localDeviceId);
+  void* GetImportedAddress(const MemoryDesc& desc, int localDeviceId, std::string* error);
 
   struct SessionCacheKey {
     EngineKey remoteEngineKey;
@@ -150,7 +161,8 @@ class FabricBackend : public Backend {
       return seed;
     }
   };
-  FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  FabricBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote,
+                                                 std::string* error);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
   struct ImportedRegion {
@@ -194,6 +206,9 @@ class FabricBackend : public Backend {
   std::vector<fabric::VpodKey> deviceVpodKeys;  // indexed by device id
   std::unordered_map<std::string, int> localDeviceByBusId;
 
+  std::mutex registrationReasonsMu;
+  std::unordered_set<std::string> registrationReasons;
+
   mutable std::shared_mutex importMutex;
   std::unordered_map<ImportCacheKey, ImportedRegion, ImportCacheKeyHash> importedRegions;
 
@@ -203,10 +218,18 @@ class FabricBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+  // Whether a fabric handle of our memory was ever exported, for FenceRemoteEngine: a peer's
+  // import outlives the deregistration of the memory or of the peer.
+  std::atomic<bool> exportedMemory_{false};
 
   std::string fabricCopyHsacoPath_;
-  std::vector<hipModule_t> fabricCopyModules_;
-  std::vector<hipFunction_t> fabricCopyFuncs_;
+  struct CopyModule {
+    int device;
+    hipModule_t module;
+  };
+  std::vector<CopyModule> fabricCopyModules_;  // all generations, with their owning device
+  std::vector<CopyFunctions> fabricCopyFuncs_;
+  uint32_t fabricCopyMaxBlocks_;
   std::mutex moduleMu_;
 };
 

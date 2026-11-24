@@ -306,8 +306,8 @@ int GetCurDeviceWallClockFreqMhz() { return mori::GetCurDeviceWallClockFreqMhz()
 
 void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   pybind11::class_<mori::moe::EpDispatchCombineHandle>(m, "EpDispatchCombineHandle")
-      .def(pybind11::init<mori::moe::EpDispatchCombineConfig, uintptr_t>(),
-           py::arg("config") = mori::moe::EpDispatchCombineConfig{}, py::arg("cco_comm_ptr") = 0);
+      .def(pybind11::init<mori::moe::EpDispatchCombineConfig>(),
+           py::arg("config") = mori::moe::EpDispatchCombineConfig{});
 
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);
@@ -368,7 +368,6 @@ void RegisterMoriOps(py::module_& m) {
       .export_values();
   pybind11::enum_<mori::moe::QuantType>(m, "EpDispatchCombineQuantType")
       .value("None_", mori::moe::QuantType::None)
-      .value("Fp8DirectCast", mori::moe::QuantType::Fp8DirectCast)
       .value("Fp8BlockwiseQuant", mori::moe::QuantType::Fp8BlockwiseQuant)
       .value("Fp4BlockwiseQuant", mori::moe::QuantType::Fp4BlockwiseQuant)
       .export_values();

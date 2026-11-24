@@ -39,6 +39,7 @@
 #endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/nic_limits.h"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -178,6 +179,7 @@ void PageBackend::InstallTierConfig(TierConfig cfg) {
     throw std::invalid_argument("PageBackend: buffer_bases / buffer_sizes length mismatch");
   }
   allocator_ = std::make_unique<PageBitmapAllocator>(page_size_, cfg.buffer_sizes);
+  owned_.reserve(KeyIndexReserve(allocator_->TotalBytes(), page_size_));
   buffer_descs_ = std::move(cfg.buffer_descs);
   buffer_bases_ = std::move(cfg.buffer_bases);
   BuildBufferRefs();
@@ -282,6 +284,12 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
+          WarnIfNicRegionExceedsAinicLimit(
+              "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
+                  " MiB",
+              size, buffer.backing_page_size,
+              "Use UMBP_DRAM_USE_HUGEPAGES, or a UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages "
+              "(1 GiB of 4 KiB ones).");
           msgpack::sbuffer sbuf;
           msgpack::pack(sbuf, ref.mem);
           desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
@@ -547,6 +555,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
   owned.hold = std::make_shared<char>();
+  owned.generation = NextCopyGeneration();
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -602,6 +611,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   r.pages = it->second.pages;
   r.size = it->second.size;
   r.page_size = page_size_;
+  r.generation = it->second.generation;
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  CAS-max rather than a plain store: with a shared lock two
   // readers can renew the same key at once, and neither may shorten it.
@@ -639,6 +649,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.pages = it->second.pages;
     entry.size = it->second.size;
     entry.page_size = page_size_;
+    entry.generation = it->second.generation;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     if (reader == ResolveReader::kLocal) {
       entry.hold = it->second.hold;
@@ -701,6 +712,21 @@ std::vector<bool> PageBackend::BatchContains(const std::vector<std::string>& key
   // existence answer needs no page vector, no lease renewal and no LRU touch.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < keys.size(); ++i) out[i] = owned_.find(keys[i]) != owned_.end();
+  return out;
+}
+
+std::vector<bool> PageBackend::BatchStillHolds(const std::vector<std::string>& keys,
+                                               const std::vector<uint64_t>& generations) const {
+  std::vector<bool> out(keys.size(), false);
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size() && i < generations.size(); ++i) {
+    if (generations[i] == 0) {
+      out[i] = true;
+      continue;
+    }
+    const auto it = owned_.find(keys[i]);
+    out[i] = it != owned_.end() && it->second.generation == generations[i];
+  }
   return out;
 }
 
@@ -881,6 +907,24 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
         EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
   }
   return out;
+}
+
+size_t PageBackend::Touch(const std::vector<std::string>& keys) {
+  if (keys.empty()) return 0;
+  // Shared, like the resolve paths: only the LRU position changes, and the LRU
+  // has its own lock.  Collect first so lru_mutex_ is taken once.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return 0;
+  std::vector<std::pair<const std::string*, OwnedSlot*>> held;
+  held.reserve(keys.size());
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) held.emplace_back(&key, &it->second);
+  }
+  if (held.empty()) return 0;
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto& [key, slot] : held) TouchLruLocked(*key, *slot);
+  return held.size();
 }
 
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {

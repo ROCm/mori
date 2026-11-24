@@ -277,6 +277,8 @@ class PageBackend : public MediumBackend {
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   uint64_t PageSize() const override { return page_size_; }
@@ -318,10 +320,14 @@ class PageBackend : public MediumBackend {
   void SetEventPublishing(bool enabled) override;
 
   // ==================== Eviction ordering ====================
-  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // An LRU of owned keys (Commit inserts, Resolve and Touch renew), kept only after
   // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+
+  // Moves held keys to the recent end of the order, as a read would, without
+  // the read's lease.  0 until TrackEvictionOrder().
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   // ==================== Reaper ====================
 
@@ -360,6 +366,10 @@ class PageBackend : public MediumBackend {
     // Copied into every kLocal hit; a reader still has it while use_count() > 1.
     // Made at commit, so the shared-lock resolve path only copies it.
     std::shared_ptr<const void> hold;
+    // ResolvedEntry::generation for these pages.  Stamped at commit; the pages
+    // are freed only with the slot (Evict, ClearLocal), so a slot that still
+    // carries it still holds the bytes a remote reader was told about.
+    uint64_t generation = 0;
     // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
@@ -378,6 +388,7 @@ class PageBackend : public MediumBackend {
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
           hold(std::move(other.hold)),
+          generation(other.generation),
           lru_it(other.lru_it),
           in_lru(other.in_lru) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
@@ -387,6 +398,7 @@ class PageBackend : public MediumBackend {
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
       hold = std::move(other.hold);
+      generation = other.generation;
       lru_it = other.lru_it;
       in_lru = other.in_lru;
       return *this;
@@ -521,7 +533,7 @@ class PageBackend : public MediumBackend {
   std::vector<DeferredFree> deferred_frees_;
 
   // ---- eviction order (see TrackEvictionOrder) ----
-  // Front = most recently committed/resolved, back = eviction candidate.
+  // Front = most recently committed, resolved or touched; back = eviction candidate.
   // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_

@@ -83,6 +83,10 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
   }
 }
 
+// The NUMA node of each GPU this process sees, by device ordinal; a GPU with no
+// node is left out.
+std::unordered_map<int, int> GpuNumaNodes();
+
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
 // directly to the peer (AllocateSlot → RDMA → CommitSlot or
@@ -215,6 +219,11 @@ class PoolClient {
   PrefetchStatus GetPrefetchStatus(const std::string& request_id);
   bool SupportsAsyncPrefetch() const { return config_.prefetch_budget_bytes > 0; }
 
+  // Recency hint (IUMBPClient::BatchTouch); returns the copies touched on this
+  // node's media.  In the master eviction modes the keys also join the local
+  // reads reported to the master.  Never contacts another peer.
+  size_t BatchTouch(const std::vector<std::string>& keys);
+
   MasterClient& Master();
 
   // Every named storage backend live on this node.  Callers use them through
@@ -222,6 +231,8 @@ class PoolClient {
   BackendRegistry& Backends();
   TierTransitionMetrics TransitionMetrics() const;
   LocalEvictionMetrics LocalEvictionStats() const;
+  // Cumulative remote single-flight outcomes (config remote_single_flight).
+  SingleFlightActivity RemoteSingleFlightStats() const;
   std::map<std::string, uint64_t> TierReadHits() const;
   std::string LogicalTierForBackend(uint32_t backend_id) const;
 
@@ -414,6 +425,7 @@ class PoolClient {
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
   TransferRef LocalUserBytes(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
+  int SourceDeviceFor(const void* ptr, size_t size) const;
   // The NUMA node a write's source lives on: its GPU's, or the node its registered
   // host region was placed on; -1 when unknown.
   int SourceNumaHint(const void* src, size_t size) const;
@@ -721,8 +733,12 @@ class PoolClient {
    public:
     // Non-owning: the buffer belongs to the caller (DistributedClient).  A shard
     // count of 0 or 1 keeps the original single-arena behaviour.
-    void Reset(void* base, size_t bytes, size_t shards);
+    void Reset(void* base, size_t bytes, size_t shards, int numa_node = -1);
     size_t ShardBytes() const { return shard_bytes_; }
+    char* Base() const { return base_; }
+    size_t Bytes() const { return bytes_; }
+    // The node the buffer was placed on; -1 when it was not placed by node.
+    int NumaNode() const { return numa_node_; }
 
     // Holds a shard for its lifetime and gives it back on destruction, so every
     // early exit out of an arena loop releases it.
@@ -792,10 +808,20 @@ class PoolClient {
     // the proxy-reference specialisation buys nothing at these sizes.
     std::vector<uint8_t> busy_;
     size_t shard_bytes_ = 0;
+    char* base_ = nullptr;
+    size_t bytes_ = 0;
+    int numa_node_ = -1;
   };
 
-  ScratchArena ranged_get_scratch_;
-  ScratchArena ranged_put_scratch_;
+  // PoolClientConfig::ranged_{get,put}_scratch, held by pointer because an
+  // arena owns a mutex.
+  std::vector<std::unique_ptr<ScratchArena>> ranged_get_scratch_;
+  std::vector<std::unique_ptr<ScratchArena>> ranged_put_scratch_;
+  // The arena a remote ranged call stages through, given its first caller
+  // buffer: the one on that buffer's NUMA node, else the first; null when the
+  // direction has none.  Its RDMA leg then uses that node's NICs, and the copy
+  // between the arena and a GPU stays on the GPU's socket.
+  ScratchArena* RangedArenaFor(bool get, const void* caller_buffer);
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;
@@ -820,6 +846,39 @@ class PoolClient {
     std::atomic<uint64_t> fragmented{0};
   };
   ReCacheCounters recache_stats_;
+
+  // ---- Remote single-flight (config_.remote_single_flight) ----
+  // One whole-object pull per key per node.  The first BatchGetRanges that would
+  // pull a remote key into a local slot leads: it registers an episode, pulls,
+  // commits and then finishes the episode.  A concurrent call that wants the
+  // same key joins instead, waits for the episode AFTER its own work is done
+  // (so it never holds an arena lease or an unfinished episode of its own while
+  // waiting), and then reads the key again, locally if the leader's commit
+  // landed.
+  struct RemoteFetchEpisode {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+  };
+  using LedEpisodes = std::vector<std::pair<std::string, std::shared_ptr<RemoteFetchEpisode>>>;
+  // Caller key indices a BatchGetRanges call left for ServeRangedFollowers,
+  // with the episode each waits on (null: already local, nothing to wait for).
+  struct RangedFollowers {
+    std::vector<size_t> indices;
+    std::vector<std::shared_ptr<RemoteFetchEpisode>> episodes;
+  };
+  struct SingleFlightCounters {
+    std::atomic<uint64_t> lead{0};
+    std::atomic<uint64_t> joined{0};
+    std::atomic<uint64_t> already_local{0};
+    std::atomic<uint64_t> served_local{0};
+    std::atomic<uint64_t> refetched{0};
+    std::atomic<uint64_t> timed_out{0};
+  };
+  std::mutex remote_inflight_mutex_;
+  std::unordered_map<std::string, std::shared_ptr<RemoteFetchEpisode>> remote_inflight_;
+  SingleFlightCounters single_flight_stats_;
+
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -1022,6 +1081,25 @@ class PoolClient {
       const std::vector<std::string>& keys, std::vector<RangeFetchUnit> units,
       std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes);
 
+  // `followers` null disables single-flight for the call (the follower re-read).
+  std::vector<bool> BatchGetRangesImpl(const std::vector<std::string>& keys,
+                                       const std::vector<std::vector<void*>>& dsts,
+                                       const std::vector<std::vector<size_t>>& sizes,
+                                       const std::vector<std::vector<size_t>>& src_offsets,
+                                       RangedFollowers* followers);
+  // Splits whole-object units into leaders (kept, episode registered in `led`)
+  // and keys another call is pulling or that are already local (moved to
+  // `followers` and out of `units` / `unit_ok`).
+  void ClaimRemoteFetches(const std::vector<std::string>& keys, std::vector<RangeFetchUnit>* units,
+                          std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
+                          RangedFollowers* followers);
+  void FinishRemoteEpisodes(LedEpisodes* led);
+  void ServeRangedFollowers(const std::vector<std::string>& keys,
+                            const std::vector<std::vector<void*>>& dsts,
+                            const std::vector<std::vector<size_t>>& sizes,
+                            const std::vector<std::vector<size_t>>& src_offsets,
+                            const RangedFollowers& followers, std::vector<bool>* results);
+
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key
   // contributes one item carrying its arena slice, its span list, and the span
   // total.  Spans are passed by pointer rather than by value: the caller
@@ -1046,6 +1124,8 @@ class PoolClient {
     size_t result_index;
     const BatchGetItem* item;
     SlotPlan plan;
+    // Which copy the peer resolved (0 = unstamped, nothing to check).
+    uint64_t generation = 0;
     bool failed = false;
   };
 
@@ -1070,6 +1150,11 @@ class PoolClient {
                                std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
                                 bool recache_remote);
+  // Check-after-read: the peer's read lease is only a timer and may lapse
+  // while the RDMA read runs, so ask it whether each copy read is still the one
+  // it resolved.  Marks entries whose copy changed (or that cannot be
+  // confirmed) failed, so they become misses instead of another key's bytes.
+  void ValidateRemoteGetEntries(PeerConnection& peer, std::vector<RemoteGetEntry>& entries);
 
   // One posted-but-not-yet-waited remote read for a single peer; the scheduler
   // waits it later.  The lifetime contract that used to live here — statuses

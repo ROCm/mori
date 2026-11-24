@@ -103,6 +103,15 @@ typedef enum {
   AMO_OP_SENTINEL = INT_MAX,
 } atomicType;
 
+// Published by a cco GDA post that does not ring for itself, at the slot of its
+// first WQE once all of its WQEs are written: tag = (first WQE index << 32) | WQE
+// count, dbrVal = the doorbell value for its last WQE. Other posts write count 0.
+// See "Doorbell coalescing" in cco_scale_out.hpp.
+struct WqeReadyMark {
+  uint64_t tag;
+  uint64_t dbrVal;
+};
+
 struct WorkQueueHandle {
   uint32_t postIdx{0};     // numbers of wqe that post to work queue
   uint32_t dbTouchIdx{0};  // numbers of wqe that touched doorbell
@@ -125,10 +134,11 @@ struct WorkQueueHandle {
   uint32_t sqWqeNum{0};
   uint32_t msntblNum{0};
   uint32_t rqWqeNum{0};
-  uint32_t postSendLock{0};
+  uint32_t postSendLock{0};  // cco GDA: held by mark sweeps and CallerOrdered flushes
   bool color;
   uint64_t sq_dbval{0};
   uint64_t rq_dbval{0};
+  WqeReadyMark* readyMarks{nullptr};  // cco GDA: sqWqeNum entries, zeroed
 };
 
 struct CompletionQueueHandle {

@@ -52,6 +52,15 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// One tier over one backend that never offloads or promotes (pure SSD): no
+// transition to plan, so a resolve can take the policy-free direct path.
+bool TrivialTierGraph(const LogicalTierGraph& graph) {
+  if (graph.TierCount() != 1) return false;
+  const auto& node = graph.NodeAt(0);
+  return node.members.size() == 1 && node.offload_to.empty() &&
+         node.promote_trigger == PoolPromoteTrigger::kNever;
+}
+
 // One watermark scan queues at most this many keys; the worker tops the queue
 // up after each completed offload, so a tier still drains all the way down to
 // its low watermark without ever queueing its whole key set at once.
@@ -87,6 +96,15 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
       transfer_engine_(transfer_engine),
       tier_graph_(policy_ == nullptr ? nullptr : policy_->TierGraph()),
       transition_executor_(backends, transfer_engine) {
+  if (backends_ != nullptr) {
+    uint64_t keys = 0;
+    for (uint32_t id = 0; id < BackendRegistry::kMaxBackends; ++id) {
+      auto* backend = backends_->Get(id);
+      if (backend == nullptr || backend->Tier() == TierType::SSD) continue;
+      keys += KeyIndexReserve(backend->Capacity().total_bytes, backend->PageSize());
+    }
+    placements_.reserve(keys);
+  }
   if (tier_graph_ != nullptr) {
     // A tier graph without an engine would accept offload and promotion rules
     // and then silently fail every one of them, leaving the topology looking
@@ -561,6 +579,23 @@ void PeerPool::TransitionWorkerLoop() {
   }
 }
 
+// Moves the HBM backend on the writer's GPU to the front of `order`, when the
+// policy's choices up to it are HBM too: it only reorders equals, never lifts a
+// lower tier over a higher one. The rest keep their order as the fallbacks.
+void PeerPool::PreferSourceDevice(int device, std::vector<uint32_t>* order) const {
+  if (device < 0 || order->size() < 2) return;
+  for (size_t i = 0; i < order->size(); ++i) {
+    auto* backend = backends_->Get((*order)[i]);
+    if (backend == nullptr || backend->Tier() != TierType::HBM || backend->BufferCount() == 0)
+      return;
+    const TransferRef buffer = backend->BufferRef(0);
+    if (buffer.loc != mori::io::MemoryLocationType::GPU || buffer.device != device) continue;
+    std::rotate(order->begin(), order->begin() + static_cast<std::ptrdiff_t>(i),
+                order->begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    return;
+  }
+}
+
 std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     const std::vector<PoolPlacementRequest>& requests) {
   std::lock_guard<std::mutex> operation_lock(operation_mutex_);
@@ -612,6 +647,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     }
 
     put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
+    PreferSourceDevice(requests[i].preferred_device, &put_orders[i]);
     if (!put_orders[i].empty()) {
       const uint32_t selected = put_orders[i].front();
       pending_keys_[requests[i].key] =
@@ -844,8 +880,9 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   MediumBackend* direct_backend = nullptr;
   {
     std::lock_guard<std::mutex> operation_lock(operation_mutex_);
-    if (backends_ != nullptr && policy_ != nullptr && tier_graph_ == nullptr &&
-        !track_access_order_ && backends_->Size() == 1) {
+    if (backends_ != nullptr && policy_ != nullptr &&
+        (tier_graph_ == nullptr || TrivialTierGraph(*tier_graph_)) && !track_access_order_ &&
+        backends_->Size() == 1) {
       const std::vector<uint32_t> order = policy_->ReadOrder(*backends_);
       if (order.size() == 1 && order.front() < BackendRegistry::kMaxBackends) {
         const uint32_t backend_id = order.front();
@@ -1074,6 +1111,7 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   std::vector<size_t> pending(keys.size());
   std::iota(pending.begin(), pending.end(), 0);
   std::vector<std::string> batch;
+  std::vector<std::string> found;
   std::vector<size_t> still_missing;
   for (uint32_t backend_id : read_order) {
     if (pending.empty()) break;
@@ -1085,14 +1123,56 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
 
     const auto hits = backend->BatchContains(batch);
     still_missing.clear();
+    found.clear();
     for (size_t j = 0; j < pending.size(); ++j) {
       if (j < hits.size() && hits[j]) {
         out[pending[j]] = true;
+        found.push_back(std::move(batch[j]));
       } else {
         still_missing.push_back(pending[j]);
       }
     }
+    if (!found.empty()) backend->Touch(found);
     pending.swap(still_missing);
+  }
+  if (track_access_order_) {
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (out[i]) TouchLocked(keys[i]);
+    }
+  }
+  return out;
+}
+
+std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                             const std::vector<std::string>& keys,
+                                             const std::vector<uint64_t>& generations,
+                                             bool release) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::vector<bool> out(keys.size(), false);
+  if (keys.empty() || backends_ == nullptr) return out;
+  if (backend_ids.size() != keys.size() || generations.size() != keys.size()) return out;
+
+  // One call per backend named, not one per key.
+  std::unordered_map<uint32_t, std::vector<size_t>> by_backend;
+  for (size_t i = 0; i < keys.size(); ++i) by_backend[backend_ids[i]].push_back(i);
+
+  std::vector<std::string> batch_keys;
+  std::vector<uint64_t> batch_generations;
+  for (const auto& [backend_id, indices] : by_backend) {
+    auto* backend = backends_->Get(backend_id);
+    if (backend == nullptr) continue;  // nothing to have read from: stays false
+    batch_keys.clear();
+    batch_generations.clear();
+    for (size_t i : indices) {
+      batch_keys.push_back(keys[i]);
+      batch_generations.push_back(generations[i]);
+    }
+    const auto holds = release ? backend->BatchFinishReads(batch_keys, batch_generations)
+                               : backend->BatchStillHolds(batch_keys, batch_generations);
+    for (size_t j = 0; j < indices.size(); ++j) {
+      out[indices[j]] = j < holds.size() && holds[j];
+    }
   }
   return out;
 }
@@ -1116,6 +1196,25 @@ uint32_t PeerPool::EvictSourceLocked(const PoolEvictRequest& request) const {
     if (holds(backend_id)) return backend_id;
   }
   return kNone;
+}
+
+size_t PeerPool::BatchTouch(const std::vector<std::string>& keys) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (keys.empty() || backends_ == nullptr) return 0;
+  // Every copy, not just the first in read order: a key held by two media is
+  // just as recently used in both.  The backend calls stay outside
+  // operation_mutex_, as in BatchContains.
+  size_t touched = 0;
+  for (auto* backend : backends_->All()) touched += backend->Touch(keys);
+  if (track_access_order_) {
+    // Watermark offload picks from this order, which a read moves too.  Only
+    // placed keys: the access index must not keep ones that are not stored.
+    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    for (const auto& key : keys) {
+      if (placements_.count(key) != 0) TouchLocked(key);
+    }
+  }
+  return touched;
 }
 
 void PeerPool::RepairAfterDropLocked(const std::string& key) {

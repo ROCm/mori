@@ -48,6 +48,10 @@ struct PoolPlacementRequest {
   std::string backend_name;
   std::string logical_tier;
   int preferred_numa_node = -1;
+  // The GPU the writer's source lives on. Among HBM backends that are equal
+  // choices otherwise, the one on this GPU is tried first: the write is then a
+  // copy inside one GPU. Absent: no preference.
+  int preferred_device = -1;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot
@@ -168,8 +172,8 @@ class TieredPlacementPolicy final : public PoolPolicy {
     }
     if (graph_ == nullptr) return {};
     return request.logical_tier.empty()
-               ? graph_->PutOrder(request.key)
-               : graph_->PutOrderFromTier(request.logical_tier, request.key);
+               ? graph_->PutOrder(request.key, request.size)
+               : graph_->PutOrderFromTier(request.logical_tier, request.key, request.size);
   }
 
   std::vector<uint32_t> ReadOrder(const BackendRegistry&) const override {

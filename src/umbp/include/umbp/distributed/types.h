@@ -72,6 +72,17 @@ struct TierCapacity {
   uint64_t max_allocatable_bytes = 0;
 };
 
+// Slots to reserve in a per-key index over a paged tier.  A key takes at least a
+// page, so this bounds the index and a rehash of millions of keys never runs
+// under the index's lock.  The cap spares a fine-grained pool from paying for
+// keys it will not hold.
+inline uint64_t KeyIndexReserve(uint64_t total_bytes, uint64_t page_size) {
+  constexpr uint64_t kMaxReservedKeys = 64ULL << 20;
+  if (page_size == 0) return 0;
+  const uint64_t pages = total_bytes / page_size;
+  return pages < kMaxReservedKeys ? pages : kMaxReservedKeys;
+}
+
 struct LogicalTierCapacity {
   TierType representative_tier = TierType::UNKNOWN;
   TierCapacity capacity;
@@ -81,6 +92,8 @@ struct LogicalTierCapacity {
   // tier it aggregates every tier reachable by offload, so neither of its
   // ratios can be checked against this tier's watermarks.
   double peak_member_utilization = 0.0;
+  // Smaller objects would land only on members whose min_object_size they are under.
+  uint64_t min_object_bytes = 0;
 };
 
 struct TierTransitionMetrics {

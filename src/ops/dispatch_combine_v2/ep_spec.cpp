@@ -60,8 +60,33 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "one of them");
   }
   c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
+  if (req.combineBf16Push && (req.combineFp4 || req.combineFp8)) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push is the push combine without quantization, and combineFp4 / "
+        "combineFp8 pick a quantized wire; set one of them");
+  }
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
+
+  if (kind == EpKernelKind::Combine && req.combineScatterQGroup != 0) {
+    if (arch.rfind("gfx125", 0) == 0 || req.dtype != EpDType::Bf16 ||
+        (req.combineScatterQGroup != 32 && req.combineScatterQGroup != 128) || req.combineFp4 ||
+        req.combineFp8 || req.combineBf16Push || req.ll128 || req.ll128CombineOnly ||
+        req.cardCombine) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterQGroup is the gfx942/gfx950 quantized scatter combine: 32 or "
+          "128, "
+          "a bf16 combine, and no push, ll128 or card combine beside it");
+    }
+    c.combineScatterQGroup = req.combineScatterQGroup;
+    if (req.combineScatterFp4 && arch.rfind("gfx950", 0) != 0) {
+      throw std::runtime_error(
+          "mori v2 ep: combineScatterFp4 needs gfx950, the arch with the e2m1 conversions");
+    }
+    c.combineScatterFp4 = req.combineScatterFp4;
+  } else if (kind == EpKernelKind::Combine && req.combineScatterFp4) {
+    throw std::runtime_error("mori v2 ep: combineScatterFp4 needs combineScatterQGroup");
+  }
 
   // Defaults for the bare C++ caller only -- the Python path uses the tuning
   // table (hip_tuning_configs) and never sees these. Split by kernel because
@@ -78,6 +103,17 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
                      : 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
+  // The gfx125x dispatch stages a token row a warp in LDS, so how many warps fit
+  // depends on the row: 16 warps of a 7168 fp32 row ask 448 KiB of a 320 KiB
+  // workgroup, and bf16 does the same at hidden 10240. Halve the default until the
+  // slabs fit. This is the default, not a cap: a geometry the caller pinned is its
+  // own, and the plan refuses one that cannot be scheduled (CheckWorkgroupLds, which
+  // has the compiled kernel's own static LDS).
+  if (isDispatch && arch.rfind("gfx125", 0) == 0) {
+    while (c.warpPerBlock > 1 && EpDispatch1250xLdsBytes(c) > EpDispatch1250xSlabLdsBytes) {
+      c.warpPerBlock /= 2;
+    }
+  }
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
@@ -104,6 +140,48 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
           "scales, wave32, at most 256 combine blocks, and no ll128");
     }
     c.ll128CombineOnly = true;
+  }
+  if (req.ll128Dedup && isDispatch) {
+    if (!c.ll128 || c.worldSize % 2 != 0) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128Dedup is the ll128 dispatch's cardDedup, so it needs ll128 and an even "
+          "worldSize (ranks 2c and 2c + 1 being card c's partitions)");
+    }
+    c.ll128Dedup = true;
+  }
+  c.combineBf16Push = !isDispatch && req.combineBf16Push && !c.ll128 && !c.ll128CombineOnly;
+  if (c.combineBf16Push && c.dtype != EpDType::Bf16) {
+    throw std::runtime_error(
+        "mori v2 ep: combineBf16Push sums bf16 rows, so it needs a bf16 combine");
+  }
+  if (req.cardDedup && isDispatch) {
+    c.cardDedup = true;
+    c.cardPullBlocks = req.cardPullBlocks;
+    c.cardFwdMark = req.cardFwdMark && req.cardPullBlocks == 0;
+    c.cardCombine = req.cardCombine;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardDedupOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardDedup needs gfx125x, a bf16 / fp8 / fp32 dispatch, or an fp4 one past "
+          "four ranks with more warps a block than ranks, without ll128, an even worldSize below "
+          "32, more than 8 warps a block and at least one a rank, and 0 to 64 pull blocks (world=" +
+          std::to_string(c.worldSize) + " warps=" + std::to_string(c.warpPerBlock) +
+          " pullBlocks=" + std::to_string(c.cardPullBlocks) + ")");
+    }
+  } else if (isDispatch && (req.cardPullBlocks != 0 || req.cardFwdMark || req.cardCombine)) {
+    throw std::runtime_error(
+        "mori v2 ep: cardPullBlocks, cardFwdMark and cardCombine need cardDedup");
+  } else if (!isDispatch && req.cardCombine) {
+    c.cardCombine = true;
+    if (arch.rfind("gfx125", 0) != 0 || !EpCardCombineOk(c)) {
+      throw std::runtime_error(
+          "mori v2 ep: cardCombine needs gfx125x, the bf16 / fp8 / fp4 push combine with e8m0 "
+          "scales, without ll128, on 16 warps a block, an even worldSize from 8 to 30, and at "
+          "most " +
+          std::to_string(EpCardCombineRowsMax) +
+          " rows a block (world=" + std::to_string(c.worldSize) +
+          " warps=" + std::to_string(c.warpPerBlock) + " blocks=" + std::to_string(c.blockNum) +
+          " maxRecv=" + std::to_string(EpMaxRecv(c)) + ")");
+    }
   }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
@@ -144,7 +222,7 @@ std::string EpRequestSchema() {
 namespace {
 
 // gfx125x -> the TDM body + its LDS geometry.
-bool EpArchIs1250() { return mori::jit::v2::GetToolchain().arch.rfind("gfx125", 0) == 0; }
+bool EpArchIs1250() { return mori::jit::v2::ActiveArch().rfind("gfx125", 0) == 0; }
 
 // The exported symbol, and the name a profile shows: which kernel, which body,
 // the transported dtype, the shape, the launch geometry. The tuning schedule
@@ -163,7 +241,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
 }
 
 // Arch routing: gfx125x renders the TDM body, every other arch the portable one.
-// The render-time arch is the same GetToolchain().arch the compile uses
+// The render-time arch is the same ActiveArch() the compile uses
 // (--offload-arch), so host and device cannot disagree, and the choice is in the
 // rendered text and therefore in the cache key.
 std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
@@ -224,7 +302,8 @@ std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
          EpKv("region.dispOut", disp ? EpRegionDispOutBytes(c) : 0) +
          EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
          EpKv("region.xdb", EpRegionXdbBytes(c)) +
-         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0);
+         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0) +
+         EpKv("region.fwdMap", disp || c.cardCombine ? EpRegionFwdMapBytes(c) : 0);
 }
 
 }  // namespace
@@ -238,17 +317,27 @@ std::string EpDispatchInfo(const EpCfg& c) {
 
 std::string EpCombineInfo(const EpCfg& c) {
   std::string s = Describe(c);
-  if (EpCombinePush(c)) {
+  if (EpCombinePush(c) || c.combineBf16Push) {
     s += EpKv("pushWireBytes", EpCombinePushWireBytes(c)) +
          EpKv("pushLandRows", EpCombinePushLandRows(c)) +
          EpKv("pushLandOff", EpCombinePushLandOff(c));
+  }
+  if (EpCombineScatter(c)) {
+    s +=
+        EpKv("scatterRowBytes", EpScatterRowBytes(c)) + EpKv("scatterLandOff", EpScatterLandOff(c));
   }
   return s + EpRegionInfo(c, EpKernelKind::Combine);
 }
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineScatterQGroup) {
+    const bool g32 = cfg.combineScatterQGroup == 32;
+    if (cfg.combineScatterFp4) return EpEntryName(cfg, g32 ? "combine_fp4x32" : "combine_fp4x128");
+    return EpEntryName(cfg, g32 ? "combine_fp8x32" : "combine_fp8x128");
+  }
   if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
+  if (cfg.combineBf16Push) return EpEntryName(cfg, "combine_bf16p");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -258,12 +347,13 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (EpCombinePush(cfg) && !EpArchIs1250()) {
+  if ((EpCombinePush(cfg) || cfg.combineBf16Push) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
-        "TDM)");
+        "mori v2 ep: the push combine is gfx125x only (it moves every token through TDM)");
   }
-  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg),
+                        EpCombineScatter(cfg) ? "EpCombineScatterBody" : "EpCombineBody",
+                        "EpCombine1250xBody");
 }
 
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }
@@ -271,7 +361,7 @@ const std::vector<std::string>& EpCombineSpec::SourceDeps() { return EpSourceDep
 
 mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
-  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.gridX = static_cast<unsigned>(cfg.blockNum + cfg.cardPullBlocks);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
   // Portable dispatch keeps everything in registers; the gfx1250 TDM dispatch
   // stages one hidden-dim token tile per warp in dynamic LDS.
@@ -310,7 +400,7 @@ mori::ops::v2::EpCfg EpCfgFromFields(const mori::jit::v2::FieldBag& f,
   EpApplyFields(
       req, /*prefix=*/"", [&](const std::string& n) { return f.Has(n.c_str()); },
       [&](const std::string& n) { return f.Get(n.c_str(), 0); });
-  return MakeEpCfg(mori::jit::v2::GetToolchain().arch, req, kind);
+  return MakeEpCfg(mori::jit::v2::ActiveArch(), req, kind);
 }
 
 mori::ops::v2::EpCfg EpDispatchFromFields(const mori::jit::v2::FieldBag& f) {

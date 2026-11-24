@@ -21,6 +21,9 @@ service UMBPStandalone {
   rpc SubmitPrefetch(PrefetchRequest) returns (PrefetchSubmitResponse);
   rpc GetPrefetchStatus(PrefetchStatusRequest) returns (PrefetchStatusResponse);
 
+  // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
+  rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
   rpc ConfigureKvIndexer(StandaloneKvIndexerConfig) returns (BoolResponse);

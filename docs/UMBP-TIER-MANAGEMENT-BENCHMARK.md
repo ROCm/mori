@@ -90,7 +90,7 @@ exactly one logical tier. Offload targets may name a backend or logical tier
 and must resolve to a later tier, which makes the
 topology acyclic. A multi-device HBM definition expands to one backend per
 device while preserving the logical backend's aggregate weight and capacity.
-The current per-peer limit is eight concrete backends.
+The current per-peer limit is 16 concrete backends.
 
 Production distributed clients may set
 `UMBPDistributedConfig::backend_policy_path`; Python exposes the same

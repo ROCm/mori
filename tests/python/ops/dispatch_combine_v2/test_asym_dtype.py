@@ -37,6 +37,10 @@ converts dtype: dispatch moves fp8 tokens, the (mock) expert dequants fp8->bf16
 
     torchrun --nnodes=1 --nproc_per_node=4 --tee 3 ... test_asym_dtype.py
     SCALE_DIM=16 DISP=fp4 torchrun ... test_asym_dtype.py
+    COMBINE=scatter QUANT=fp8_blockwise_1x128 MORI_V2_KERNEL_BACKEND=hip torchrun ...
+
+COMBINE / QUANT pick the combine leg (default gather, unquantized). A quantized
+combine is also held to the L2 bound test_op.py uses.
 """
 import os
 import sys
@@ -69,6 +73,11 @@ SWEEP = [int(x) for x in os.environ.get("SWEEP", "8,64,512").split(",")]
 # Bytes per scale row, 0 = off. A real MX wire sends HIDDEN//32; mori pads that
 # to its own stride, so a value that is not 128 B-aligned is the one worth passing.
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
+COMBINE = os.environ.get("COMBINE", "gather")
+QUANT = os.environ.get("QUANT", "none")
+# Relative L2 bound of a quantized combine (test_op.py's): rounding is ~2.6% for an
+# fp8 wire and ~11% for e2m1.
+_QUANT_REL_L2 = {"fp8": 0.05, "fp4": 0.15}
 
 
 class Dist:
@@ -122,6 +131,57 @@ def as_bytes(t):
     return t.view(torch.uint8)
 
 
+def small_grid_scales(d, comm, dev):
+    ct, k = 128, 8
+    num_experts = d.world * EPR
+    g = torch.Generator(device="cpu").manual_seed(4321 + d.rank)
+    idx = torch.randint(0, num_experts, (ct, k), generator=g, dtype=torch.int32).to(dev)
+    wts = torch.rand(ct, k, generator=g, dtype=torch.float32).to(dev)
+    sc_n_i32 = (SCALE_DIM + 3) // 4
+    scales = (
+        (torch.arange(ct, device=dev) + d.rank * 100003)
+        .view(ct, 1)
+        .expand(ct, sc_n_i32)
+        .contiguous()
+        .to(torch.int32)
+        .view(torch.uint8)
+    )
+    cfg = EpDispatchCombineConfig(
+        rank=d.rank,
+        world_size=d.world,
+        hidden_dim=HIDDEN,
+        max_num_inp_token_per_rank=ct,
+        num_experts_per_rank=EPR,
+        num_experts_per_token=k,
+        dispatch_data_type=DISP,
+        combine_data_type=torch.bfloat16,
+        combine_mode="gather",
+        scale_dim=SCALE_DIM,
+        scale_type_size=1,
+        dispatch_block_num=8,
+        warp_num_per_block=4,
+    )
+    with EpDispatchCombineOp(cfg, comm) as op:
+        comm.barrier()
+        _x, _w, out_s, _i, total_recv_t, routing = op.dispatch(
+            gen_inp(d.rank, ct).to(dev), wts, scales, idx, return_routing=True
+        )
+        total_recv = int(total_recv_t.cpu().item())
+        sync()
+        comm.barrier()
+        tis = routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu().long()
+        exp_sc = ((tis // ct) * 100003 + (tis % ct)).view(total_recv, 1)
+        got_sc = out_s[:total_recv].cpu()
+        ok_sc = bool(torch.equal(got_sc, exp_sc.expand(total_recv, sc_n_i32)))
+        errs_sc = d.allreduce_sum(0 if ok_sc else 1)
+    if d.rank == 0:
+        print(
+            f"# ASYM-SCALES({_TAG}) grid=8x4 topk={k} ct={ct}: "
+            f"{'PASS' if errs_sc == 0 else 'FAIL'} (recv={total_recv})",
+            flush=True,
+        )
+
+
 def main():
     d = Dist()
     rank, npes = d.rank, d.world
@@ -158,6 +218,8 @@ def main():
     with Communicator.init(
         npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
     ) as comm:
+        if SCALE_DIM:
+            small_grid_scales(d, comm, dev)
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=npes,
@@ -167,7 +229,8 @@ def main():
             num_experts_per_token=K,
             dispatch_data_type=DISP,  # fp8 or fp4 dispatch
             combine_data_type=torch.bfloat16,  # bf16 combine
-            combine_mode="gather",
+            combine_mode=COMBINE,
+            quant_type=QUANT,
             scale_dim=SCALE_DIM,
             scale_type_size=1 if SCALE_DIM else 0,
         )
@@ -234,9 +297,19 @@ def main():
                 torch.bfloat16
             )
             exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
-            ok_comb = torch.allclose(
+            # e2m1 is too coarse for an elementwise bound; its L2 bound stands
+            ok_comb = QUANT.startswith("fp4") or torch.allclose(
                 out.float().cpu(), exp.float(), atol=3e-1, rtol=1e-1
             )
+            rel = 0.0
+            if QUANT != "none":
+                ref_n = exp.float().norm()
+                rel = (
+                    float((out.float().cpu() - exp.float()).norm() / ref_n)
+                    if ref_n > 0
+                    else 0.0
+                )
+                ok_comb = ok_comb and rel < _QUANT_REL_L2[QUANT[:3]]
             ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
             # dtype sanity: dispatch recv is fp8, combine out is bf16
             ok_dt = recv_x.dtype == DISP and out.dtype == torch.bfloat16
@@ -250,9 +323,12 @@ def main():
                     flush=True,
                 )
                 print(
-                    f"# ASYM-COMBINE(bf16) ct={ct}: {'PASS' if errs_comb == 0 else 'FAIL'} "
+                    f"# ASYM-COMBINE(bf16 {COMBINE}"
+                    f"{'' if QUANT == 'none' else ' ' + QUANT}) ct={ct}: "
+                    f"{'PASS' if errs_comb == 0 else 'FAIL'} "
                     f"(hidden={'ok' if ok_comb else 'BAD'} wts={'ok' if ok_w else 'BAD'} "
-                    f"dtype={'ok' if ok_dt else 'BAD'})",
+                    f"dtype={'ok' if ok_dt else 'BAD'}"
+                    f"{'' if QUANT == 'none' else f' rel_l2={rel:.4f}'})",
                     flush=True,
                 )
                 if SCALE_DIM:

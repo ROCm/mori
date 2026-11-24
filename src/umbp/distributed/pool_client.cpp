@@ -63,6 +63,31 @@
 
 namespace mori::umbp {
 
+std::unordered_map<int, int> GpuNumaNodes() {
+  std::unordered_map<int, int> nodes;
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) return nodes;
+  for (int device = 0; device < count; ++device) {
+    int node = -1;
+    mori::application::detail::GpuLocalCpuList(device, node);
+    if (node >= 0) nodes.emplace(device, node);
+  }
+  return nodes;
+}
+
+size_t RangedScratchShardsFromEnv() {
+  static const size_t n = [] {
+    size_t shards = 0;
+    if (const char* value = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS")) {
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0' && parsed > 0) shards = static_cast<size_t>(parsed);
+    }
+    return std::min<size_t>(shards, 64);
+  }();
+  return n;
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -227,6 +252,7 @@ struct RangedPhases {
   double rmt_sub = 0.0;          // per-group sub_* vectors + PartitionBatchGetRangeTargets
   double rmt_items_build = 0.0;  // BuildContiguousToRangesItems for the scatter
   double rmt_final = 0.0;        // ApplyTransferFailures + FinalizeRemoteGetEntries
+  double rmt_check = 0.0;        // ValidateReads round trip after the RDMA read
   double rmt_medium = 0.0;       // ServeWholeObjectUnitsFromMedium
   double rmt_install = 0.0;      // install-from-arena / background prefetch
   double rmt_scatter = 0.0;      // arena -> caller buffers
@@ -302,6 +328,7 @@ struct RemoteLegSinks {
   double* peer = nullptr;
   double* decode = nullptr;
   double* final_ = nullptr;
+  double* check = nullptr;
   double* wait = nullptr;
 };
 thread_local RemoteLegSinks* t_remote_leg = nullptr;
@@ -348,6 +375,7 @@ class RangedStats {
     t.rmt_sub += p.rmt_sub;
     t.rmt_items_build += p.rmt_items_build;
     t.rmt_final += p.rmt_final;
+    t.rmt_check += p.rmt_check;
     t.rmt_medium += p.rmt_medium;
     t.rmt_install += p.rmt_install;
     t.rmt_scatter += p.rmt_scatter;
@@ -405,8 +433,8 @@ class RangedStats {
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
            rmt_peer = 0, rmt_decode = 0, rmt_sub = 0, rmt_items_build = 0, rmt_final = 0,
-           rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0, scat_plan = 0,
-           scat_submit = 0, scat_wait = 0, bytes = 0;
+           rmt_check = 0, rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0,
+           scat_plan = 0, scat_submit = 0, scat_wait = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -425,8 +453,8 @@ class RangedStats {
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
-        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% med={:.1f}% "
-        "inst={:.1f}% rdma={:.1f}% "
+        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% chk={:.1f}% "
+        "med={:.1f}% inst={:.1f}% rdma={:.1f}% "
         "scat={:.1f}%[pl={:.1f}% sub={:.1f}% wt={:.1f}%]) "
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
@@ -437,9 +465,9 @@ class RangedStats {
         share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
         share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
         share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
-        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
-        share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter), share(t.scat_plan),
-        share(t.scat_submit), share(t.scat_wait), share(other),
+        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_check),
+        share(t.rmt_medium), share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter),
+        share(t.scat_plan), share(t.scat_submit), share(t.scat_wait), share(other),
         t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
@@ -593,6 +621,17 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
 }
 
+// Check-after-read for remote readers (#749).  On by default;
+// UMBP_REMOTE_READ_VALIDATE=0 turns it off for an A/B of its cost, which also
+// reopens the window where a read returns another key's bytes as a hit.
+inline bool RemoteReadValidateEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("UMBP_REMOTE_READ_VALIDATE");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
 std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
     PeerPool* pool, const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs,
     const std::vector<ObjectExtent>* extents = nullptr) {
@@ -671,18 +710,7 @@ constexpr size_t kRangedScratchAlignment = 64;
 // How many shards each ranged scratch arena is cut into.  1 is the historical
 // single-arena behaviour; 8 is one shard per rank of a TP8 node, which is what
 // the single arena mutex was serializing.
-size_t RangedScratchShards() {
-  static const size_t n = [] {
-    size_t shards = 1;
-    if (const char* value = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS")) {
-      char* end = nullptr;
-      const unsigned long long parsed = std::strtoull(value, &end, 10);
-      if (end != value && *end == '\0' && parsed > 0) shards = static_cast<size_t>(parsed);
-    }
-    return std::min<size_t>(shards, 64);
-  }();
-  return n;
-}
+size_t RangedScratchShards() { return std::max<size_t>(RangedScratchShardsFromEnv(), 1); }
 
 bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
   if (!out || alignment == 0) return false;
@@ -896,18 +924,18 @@ bool PoolClient::Init() {
       std::any_of(backend_configs.begin(), backend_configs.end(), [](const auto& backend) {
         return backend.tier == TierType::DRAM && backend.dram.numa_nodes.size() > 1;
       });
-  if (numa_placement) {
-    int count = 0;
-    if (hipGetDeviceCount(&count) == hipSuccess) {
-      for (int device = 0; device < count; ++device) {
-        int node = -1;
-        mori::application::detail::GpuLocalCpuList(device, node);
-        if (node >= 0) gpu_to_numa_.emplace(device, node);
-      }
-    }
+  // Arenas laid out by NUMA node are picked by the caller's GPU's node too.
+  const auto placed = [](const auto& arenas) {
+    return std::any_of(arenas.begin(), arenas.end(),
+                       [](const auto& arena) { return arena.numa_node >= 0; });
+  };
+  const bool numa_scratch =
+      placed(config_.ranged_get_scratch) || placed(config_.ranged_put_scratch);
+  if (numa_placement || numa_scratch) {
+    gpu_to_numa_ = GpuNumaNodes();
     if (gpu_to_numa_.empty()) {
       MORI_UMBP_WARN(
-          "[PoolClient] NUMA tier configured but GPU affinity is unavailable; no steering");
+          "[PoolClient] NUMA placement configured but GPU affinity is unavailable; no steering");
     }
   }
   for (const auto& backend_config : backend_configs) {
@@ -1019,35 +1047,42 @@ bool PoolClient::Init() {
       }
     }
   }
-  if (config_.ranged_get_scratch_buffer != nullptr && config_.ranged_get_scratch_size > 0) {
-    platform_->AddHostGatherRegion(config_.ranged_get_scratch_buffer,
-                                   config_.ranged_get_scratch_size);
-  }
-  if (config_.ranged_put_scratch_buffer != nullptr && config_.ranged_put_scratch_size > 0) {
-    platform_->AddHostGatherRegion(config_.ranged_put_scratch_buffer,
-                                   config_.ranged_put_scratch_size);
+  for (const auto* arenas : {&config_.ranged_get_scratch, &config_.ranged_put_scratch}) {
+    for (const auto& arena : *arenas) {
+      if (arena.buffer != nullptr && arena.size > 0) {
+        platform_->AddHostGatherRegion(arena.buffer, arena.size);
+      }
+    }
   }
 
   // Registration above covers the whole buffer; the shards below are slices of
   // it, so cutting them needs no further registration.
-  const size_t scratch_shards = RangedScratchShards();
-  ranged_get_scratch_.Reset(config_.ranged_get_scratch_buffer, config_.ranged_get_scratch_size,
-                            scratch_shards);
-  ranged_put_scratch_.Reset(config_.ranged_put_scratch_buffer, config_.ranged_put_scratch_size,
-                            scratch_shards);
-  if (config_.ranged_get_scratch_size > 0) {
-    MORI_UMBP_INFO("[PoolClient] ranged scratch: shards={} get_shard={}B put_shard={}B",
-                   scratch_shards, ranged_get_scratch_.ShardBytes(),
-                   ranged_put_scratch_.ShardBytes());
-  }
+  const auto make_arenas = [](const std::vector<PoolClientConfig::RangedScratchArena>& configured,
+                              const char* direction,
+                              std::vector<std::unique_ptr<ScratchArena>>* out) {
+    out->clear();
+    for (const auto& c : configured) {
+      if (c.buffer == nullptr || c.size == 0) continue;
+      auto arena = std::make_unique<ScratchArena>();
+      arena->Reset(c.buffer, c.size, c.shards > 0 ? c.shards : RangedScratchShards(), c.numa_node);
+      MORI_UMBP_INFO("[PoolClient] ranged {} scratch{}: {}B in {}B shards", direction,
+                     c.numa_node >= 0 ? " on NUMA node " + std::to_string(c.numa_node) : "", c.size,
+                     arena->ShardBytes());
+      out->push_back(std::move(arena));
+    }
+  };
+  make_arenas(config_.ranged_get_scratch, "get", &ranged_get_scratch_);
+  make_arenas(config_.ranged_put_scratch, "put", &ranged_put_scratch_);
   // The switches that decide how much of a ranged call is even reachable, said
   // once at startup so a run can assert which configuration it got.  An arm
   // that silently ran a different one is the failure mode that still produces
   // plausible numbers, and local_first in particular changes whether the master
   // is consulted at all -- it is worth 30% of a fully-local call.
   MORI_UMBP_INFO(
-      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={}",
-      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch);
+      "[PoolClient] routing: local_first={} cache_remote_fetches={} ranged_locality_prefetch={} "
+      "remote_single_flight={} (wait {} ms)",
+      config_.local_first, config_.cache_remote_fetches, config_.ranged_locality_prefetch,
+      config_.remote_single_flight, config_.remote_single_flight_wait_ms);
 
   if (master_client_) master_client_->SetBackendRegistry(&registry_);
 
@@ -1509,6 +1544,28 @@ int PoolClient::SourceNumaHint(const void* src, size_t size) const {
   return -1;
 }
 
+PoolClient::ScratchArena* PoolClient::RangedArenaFor(bool get, const void* caller_buffer) {
+  const auto& arenas = get ? ranged_get_scratch_ : ranged_put_scratch_;
+  if (arenas.empty()) return nullptr;
+  if (arenas.size() > 1 && caller_buffer != nullptr) {
+    const int node = SourceNumaHint(caller_buffer, 1);
+    for (const auto& arena : arenas) {
+      if (arena->NumaNode() == node) return arena.get();
+    }
+  }
+  return arenas.front().get();
+}
+
+// The GPU a registered device buffer lives on, or -1.
+int PoolClient::SourceDeviceFor(const void* ptr, size_t size) const {
+  if (ptr == nullptr || size == 0) return -1;
+  std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+  const RegisteredRegion* region = FindRegisteredRegionLocked(ptr, size);
+  return region != nullptr && region->ref.loc == mori::io::MemoryLocationType::GPU
+             ? region->ref.device
+             : -1;
+}
+
 int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
   if (gpu_to_numa_.empty()) return -1;
   const auto ref = UserBufferRef(ptr, size).first;
@@ -1582,6 +1639,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.tier = tier;
   request.logical_tier = logical_tier;
   request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
+  request.preferred_device = SourceDeviceFor(src, size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
   if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
   auto* backend = registry_.Get(pool_alloc.backend_id);
@@ -1961,9 +2019,14 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     const auto& first_range = requests.front().ranges.front();
     const int preferred_node = PreferredNumaNodeFor(first_range.user, first_range.size);
     for (const auto& request : requests) {
+      // Each key goes to the HBM pool on the GPU its own data is on.
+      const int source_device =
+          request.ranges.empty()
+              ? -1
+              : SourceDeviceFor(request.ranges.front().user, request.ranges.front().size);
       asks.push_back(PoolPlacementRequest{*request.key, request.object_size, request.tier,
-                                          /*backend_name=*/{}, request.logical_tier,
-                                          preferred_node});
+                                          /*backend_name=*/{}, request.logical_tier, preferred_node,
+                                          source_device});
     }
     allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(requests.size());
@@ -3270,12 +3333,17 @@ std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const voi
 
 }  // namespace
 
-void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards) {
+void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards, int numa_node) {
   std::lock_guard<std::mutex> lock(mutex_);
   bases_.clear();
   busy_.clear();
   shard_bytes_ = 0;
+  base_ = nullptr;
+  bytes_ = 0;
+  numa_node_ = numa_node;
   if (base == nullptr || bytes == 0 || shards == 0) return;
+  base_ = static_cast<char*>(base);
+  bytes_ = bytes;
 
   // Shards are cut on kRangedScratchAlignment so a slice never starts mid-cache
   // line, and a count that would leave a shard smaller than one alignment unit
@@ -3432,6 +3500,21 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
                                              const std::vector<std::vector<size_t>>& src_offsets) {
+  RangedFollowers followers;
+  std::vector<bool> results = BatchGetRangesImpl(
+      keys, dsts, sizes, src_offsets, config_.remote_single_flight ? &followers : nullptr);
+  // After the call above has returned: its arena lease is released and its own
+  // episodes are finished, so waiting here cannot hold up the call we wait on.
+  if (!followers.indices.empty()) {
+    ServeRangedFollowers(keys, dsts, sizes, src_offsets, followers, &results);
+  }
+  return results;
+}
+
+std::vector<bool> PoolClient::BatchGetRangesImpl(
+    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets, RangedFollowers* followers) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
@@ -3656,9 +3739,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // GET has its own arena, so it overlaps a concurrent remote PUT (which uses
   // the separate PUT arena).  Sizing below is against ONE SHARD, not the whole
   // buffer: a unit that fits the buffer but not a shard would never get a slice.
-  char* const scratch_all = static_cast<char*>(config_.ranged_get_scratch_buffer);
-  if (scratch_all == nullptr || ranged_get_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_get_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t index : missed) {
+    if (!dsts[index].empty()) {
+      caller_buffer = dsts[index].front();
+      break;
+    }
+  }
+  ScratchArena* const arena = RangedArenaFor(/*get=*/true, caller_buffer);
+  char* const scratch_all = arena != nullptr ? arena->Base() : nullptr;
+  if (scratch_all == nullptr || arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena->Bytes()).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -3674,8 +3765,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // even the full arena is no better off exclusive, so it must not answer for
   // the others: taking the max let one such key veto exclusivity for a
   // batch-mate that needed it and would have fitted.
-  const size_t shard_bytes = ranged_get_scratch_.ShardBytes();
-  const size_t full_bytes = config_.ranged_get_scratch_size;
+  const size_t shard_bytes = arena->ShardBytes();
+  const size_t full_bytes = arena->Bytes();
   bool exclusive_arena = false;
   for (size_t index : missed) {
     size_t key_total = 0;
@@ -3799,12 +3890,25 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::unordered_map<size_t, bool> unit_ok;
   for (const auto& unit : units) unit_ok.emplace(unit.original, true);
 
+  // Single-flight: a whole-object unit another call is already pulling (or that
+  // has landed locally since phase 1) is left to ServeRangedFollowers instead
+  // of being pulled a second time.  Whatever this call leads is finished once
+  // its slots are committed, and on every exit after this point.
+  LedEpisodes led;
+  ScopeExit finish_led{[this, &led] { FinishRemoteEpisodes(&led); }};
+  if (followers != nullptr && CanInstallLocally()) {
+    ClaimRemoteFetches(keys, &units, &unit_ok, &led, followers);
+  }
+
   // Whole-object units skip the arena entirely when a slot can be had; what
   // comes back is everything that still needs one.
   {
     PhaseTimer medium_timer(dbg ? &dbg->rmt_medium : nullptr);
     units = ServeWholeObjectUnitsFromMedium(keys, std::move(units), &unit_ok, &remote_bytes);
   }
+  // Committed or given up: either way the joiners can stop waiting now, before
+  // this call spends time on its arena units.
+  FinishRemoteEpisodes(&led);
   if (units.empty()) {
     for (const auto& [original, ok] : unit_ok) results[original] = ok;
     return results;
@@ -3815,8 +3919,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_get_scratch_.AcquireAll() : ranged_get_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena->AcquireAll() : arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena described ONCE, by its registered base.  Plans key on (src base,
@@ -3844,6 +3947,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
            .peer = &dbg->rmt_peer,
            .decode = &dbg->rmt_decode,
            .final_ = &dbg->rmt_final,
+           .check = &dbg->rmt_check,
            .wait = &dbg->rmt_wait};
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
@@ -4098,9 +4202,17 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // so this is the one direction that needs the arena.  PUT has its own arena,
   // so it overlaps a concurrent remote GET (which uses the separate GET arena).
   // Sizing is against ONE SHARD; see the GET path for why.
-  char* const scratch_all = static_cast<char*>(config_.ranged_put_scratch_buffer);
-  if (scratch_all == nullptr || ranged_put_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_put_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t r : remote) {
+    if (!srcs[valid[r]].empty()) {
+      caller_buffer = srcs[valid[r]].front();
+      break;
+    }
+  }
+  ScratchArena* const arena = RangedArenaFor(/*get=*/false, caller_buffer);
+  char* const scratch_all = arena != nullptr ? arena->Base() : nullptr;
+  if (scratch_all == nullptr || arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena->Bytes()).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -4109,8 +4221,8 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // the get path spells out: a batch-wide max lets an object too big for the
   // whole arena veto exclusivity for one that needed it, and that one then gets
   // rejected at shard size though it was servable before sharding existed.
-  const size_t put_shard_bytes = ranged_put_scratch_.ShardBytes();
-  const size_t put_full_bytes = config_.ranged_put_scratch_size;
+  const size_t put_shard_bytes = arena->ShardBytes();
+  const size_t put_full_bytes = arena->Bytes();
   bool exclusive_arena = false;
   for (size_t r : remote) {
     const size_t object_size = object_sizes[valid[r]];
@@ -4123,8 +4235,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_put_scratch_.AcquireAll() : ranged_put_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena->AcquireAll() : arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena named once, by its registered base -- the read side's reason
@@ -4284,6 +4395,147 @@ PoolClient::BatchGetPlan PoolClient::PartitionBatchGetTargets(
         .index = i, .key = &keys[i], .dst = dsts[i], .size = sizes[i], .route = route});
   }
   return plan;
+}
+
+void PoolClient::ClaimRemoteFetches(const std::vector<std::string>& keys,
+                                    std::vector<RangeFetchUnit>* units,
+                                    std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
+                                    RangedFollowers* followers) {
+  // Only whole-object units: they are the ones the slot path pulls AND commits,
+  // so they are the ones a second reader can be served from afterwards.
+  std::vector<size_t> candidates;
+  for (size_t u = 0; u < units->size(); ++u) {
+    if ((*units)[u].holds_whole_object) candidates.push_back(u);
+  }
+  if (candidates.empty()) return;
+  auto* backend = registry_.Get(medium_);
+  if (backend == nullptr) return;
+  std::vector<std::string> candidate_keys;
+  candidate_keys.reserve(candidates.size());
+  for (size_t u : candidates) candidate_keys.push_back(keys[(*units)[u].original]);
+
+  std::vector<char> follows(units->size(), 0);
+  {
+    // Under this lock a key being pulled always has its episode registered: the
+    // leader commits before FinishRemoteEpisodes, which takes this lock to
+    // retire the episode.  So "no episode and not committed" means nobody is
+    // pulling it, and this call takes it.
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    const std::vector<bool> present = backend->BatchContains(candidate_keys);
+    for (size_t c = 0; c < candidates.size(); ++c) {
+      const size_t u = candidates[c];
+      const std::string& key = candidate_keys[c];
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end()) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(it->second);
+        follows[u] = 1;
+        single_flight_stats_.joined.fetch_add(1, std::memory_order_relaxed);
+      } else if (c < present.size() && present[c]) {
+        followers->indices.push_back((*units)[u].original);
+        followers->episodes.push_back(nullptr);
+        follows[u] = 1;
+        single_flight_stats_.already_local.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        auto episode = std::make_shared<RemoteFetchEpisode>();
+        remote_inflight_.emplace(key, episode);
+        led->emplace_back(key, std::move(episode));
+        single_flight_stats_.lead.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  // A whole-object unit is its key's only unit, so its key leaves unit_ok too.
+  std::vector<RangeFetchUnit> kept;
+  kept.reserve(units->size());
+  for (size_t u = 0; u < units->size(); ++u) {
+    if (follows[u]) {
+      unit_ok->erase((*units)[u].original);
+    } else {
+      kept.push_back(std::move((*units)[u]));
+    }
+  }
+  *units = std::move(kept);
+}
+
+SingleFlightActivity PoolClient::RemoteSingleFlightStats() const {
+  SingleFlightActivity out;
+  out.lead = single_flight_stats_.lead.load(std::memory_order_relaxed);
+  out.joined = single_flight_stats_.joined.load(std::memory_order_relaxed);
+  out.already_local = single_flight_stats_.already_local.load(std::memory_order_relaxed);
+  out.served_local = single_flight_stats_.served_local.load(std::memory_order_relaxed);
+  out.refetched = single_flight_stats_.refetched.load(std::memory_order_relaxed);
+  out.timed_out = single_flight_stats_.timed_out.load(std::memory_order_relaxed);
+  return out;
+}
+
+void PoolClient::FinishRemoteEpisodes(LedEpisodes* led) {
+  if (led->empty()) return;
+  {
+    std::lock_guard<std::mutex> lock(remote_inflight_mutex_);
+    for (const auto& [key, episode] : *led) {
+      const auto it = remote_inflight_.find(key);
+      if (it != remote_inflight_.end() && it->second == episode) remote_inflight_.erase(it);
+    }
+  }
+  for (const auto& [key, episode] : *led) {
+    {
+      std::lock_guard<std::mutex> lock(episode->mutex);
+      episode->done = true;
+    }
+    episode->cv.notify_all();
+  }
+  led->clear();
+}
+
+void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<void*>>& dsts,
+                                      const std::vector<std::vector<size_t>>& sizes,
+                                      const std::vector<std::vector<size_t>>& src_offsets,
+                                      const RangedFollowers& followers,
+                                      std::vector<bool>* results) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config_.remote_single_flight_wait_ms);
+  uint64_t timed_out = 0;
+  for (const auto& episode : followers.episodes) {
+    if (episode == nullptr) continue;
+    std::unique_lock<std::mutex> lock(episode->mutex);
+    if (!episode->cv.wait_until(lock, deadline, [&episode] { return episode->done; })) {
+      ++timed_out;
+    }
+  }
+
+  const size_t m = followers.indices.size();
+  std::vector<std::string> sub_keys;
+  std::vector<std::vector<void*>> sub_dsts;
+  std::vector<std::vector<size_t>> sub_sizes;
+  std::vector<std::vector<size_t>> sub_offsets;
+  sub_keys.reserve(m);
+  sub_dsts.reserve(m);
+  sub_sizes.reserve(m);
+  sub_offsets.reserve(m);
+  for (size_t index : followers.indices) {
+    sub_keys.push_back(keys[index]);
+    sub_dsts.push_back(dsts[index]);
+    sub_sizes.push_back(sizes[index]);
+    sub_offsets.push_back(src_offsets[index]);
+  }
+  // Counted before the re-read, so a key evicted in between counts as local
+  // here and is still read correctly (remotely) below.
+  if (auto* backend = registry_.Get(medium_); backend != nullptr) {
+    const std::vector<bool> present = backend->BatchContains(sub_keys);
+    uint64_t local = 0;
+    for (bool hit : present) local += hit ? 1 : 0;
+    single_flight_stats_.served_local.fetch_add(local, std::memory_order_relaxed);
+    single_flight_stats_.refetched.fetch_add(m - local, std::memory_order_relaxed);
+  }
+  single_flight_stats_.timed_out.fetch_add(timed_out, std::memory_order_relaxed);
+
+  // Single-flight off for the re-read: a key the leader did not leave local is
+  // pulled by this call itself, exactly as it would have been without the wait.
+  const std::vector<bool> again =
+      BatchGetRangesImpl(sub_keys, sub_dsts, sub_sizes, sub_offsets, /*followers=*/nullptr);
+  for (size_t j = 0; j < m; ++j) (*results)[followers.indices[j]] = again[j];
 }
 
 std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMedium(
@@ -4531,6 +4783,13 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   if (!PrepareRemoteGetEntries(items, peer, stub, &inflight->entries, results)) {
     return nullptr;
   }
+  // A batch given up between here and the post never reaches
+  // WaitRemoteBatchGet, where the peer is told its copies are no longer needed.
+  // Tell it on the way out, so they do not wait for their read leases.
+  auto abandon = [&] {
+    for (auto& entry : inflight->entries) entry.failed = true;
+    ValidateRemoteGetEntries(peer, inflight->entries);
+  };
 
   // Everything between the resolve reply and the RDMA being in flight.
   PhaseTimer build_timer(t_remote_leg ? t_remote_leg->build : nullptr);
@@ -4541,6 +4800,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
         "[PoolClient] SubmitRemoteBatchGet: BuildRemoteGetTransfers failed, node='{}' entries={}",
         first.route.node_id, inflight->entries.size());
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+    abandon();
     return nullptr;
   }
 
@@ -4554,6 +4814,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     for (auto& entry : inflight->entries) {
       if (entry.failed) (*results)[entry.result_index] = false;
     }
+    abandon();
     return nullptr;
   }
 
@@ -4574,6 +4835,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
     for (auto& entry : inflight->entries) {
       if (entry.failed) (*results)[entry.result_index] = false;
     }
+    abandon();
     return nullptr;
   }
   // POST; do NOT wait.  Everything the post references is owned by the returned
@@ -4583,6 +4845,7 @@ std::unique_ptr<PoolClient::RemoteGetInFlight> PoolClient::SubmitRemoteBatchGet(
   inflight->handle = transfer_engine_->Submit(std::move(planned.plans));
   if (inflight->handle == nullptr) {
     for (auto& entry : inflight->entries) (*results)[entry.result_index] = false;
+    abandon();
     return nullptr;
   }
   return inflight;
@@ -4597,10 +4860,20 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
     PhaseTimer wait_timer(t_remote_leg ? t_remote_leg->wait : nullptr);
     if (f.handle != nullptr) f.handle->Wait(&failures);
   }
-  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
-  ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  {
+    PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
+    ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  }
+  // Before anything is reported or re-cached: a read the peer cannot vouch for
+  // must not become a hit, nor be installed locally under the key.  Timed on
+  // its own, outside `final_`, because it is a network round trip.
+  if (f.peer != nullptr) {
+    PhaseTimer check_timer(t_remote_leg ? t_remote_leg->check : nullptr);
+    ValidateRemoteGetEntries(*f.peer, f.entries);
+  }
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
+  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
 }
 
@@ -4715,6 +4988,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // once; the pages below are indices into THIS backend's buffers.
     entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    entry.generation = key.generation;
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -4885,6 +5159,71 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
   }
 }
 
+void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
+                                          std::vector<RemoteGetEntry>& entries) {
+  if (!RemoteReadValidateEnabled()) return;
+
+  // Name every entry that carries a generation.  0 means the medium does not
+  // stamp copies, or the peer predates the field and so has no ValidateReads to
+  // call either.  The answer matters only for reads that landed (`asked`); a
+  // read that already failed is listed so the peer can stop holding its copy
+  // for us, which is what `release` asks for the whole list.
+  ::umbp::ValidateReadsRequest req;
+  req.set_release(true);
+  std::vector<size_t> asked;    // entries whose answer is used
+  std::vector<int> asked_slot;  // their position in the request
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    if (entry.generation == 0) continue;
+    if (!entry.failed) {
+      asked.push_back(i);
+      asked_slot.push_back(req.keys_size());
+    }
+    req.add_keys(*entry.item->key);
+    req.add_backend_id(entry.plan.backend_id);
+    req.add_generation(entry.generation);
+  }
+  if (req.keys_size() == 0) return;
+
+  auto drop = [&](const std::vector<size_t>& which, const char* reason) {
+    for (size_t i : which) entries[i].failed = true;
+    CountMetric(MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL_HELP, {{"reason", reason}},
+                static_cast<double>(which.size()));
+  };
+
+  // Fail closed.  A peer that stamped a generation is new enough to answer, so
+  // any error here (UNIMPLEMENTED included) means the bytes are unconfirmed,
+  // and an unconfirmed read is exactly what this check exists to refuse.
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+  ::umbp::ValidateReadsResponse resp;
+  grpc::Status status(grpc::StatusCode::UNAVAILABLE, "no peer stub");
+  if (stub != nullptr) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + ResolveBusyRetryTimeout());
+    status = stub->ValidateReads(&ctx, req, &resp);
+  }
+  if (!status.ok() || resp.still_valid_size() != req.keys_size()) {
+    // Nothing landed: the call was only a release, and the leases time out.
+    if (asked.empty()) return;
+    MORI_UMBP_WARN("[PoolClient] ValidateReads failed on {} ({} keys): {}", peer.node_id,
+                   asked.size(), status.ok() ? "answer count mismatch" : status.error_message());
+    drop(asked, "unverified");
+    return;
+  }
+
+  std::vector<size_t> stale;
+  for (size_t j = 0; j < asked.size(); ++j) {
+    if (!resp.still_valid(asked_slot[j])) stale.push_back(asked[j]);
+  }
+  if (stale.empty()) return;
+  MORI_UMBP_WARN(
+      "[PoolClient] BatchGet: {} of {} remote reads from {} changed under the read, returned "
+      "as misses (first key='{}')",
+      stale.size(), asked.size(), peer.node_id, *entries[stale.front()].item->key);
+  drop(stale, "stale");
+}
+
 // ---------------------------------------------------------------------------
 //  Cluster-wide existence check
 // ---------------------------------------------------------------------------
@@ -5007,6 +5346,14 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
     if (remote[j]) out[unknown_indices[j]] = true;
   }
   return out;
+}
+
+size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
+  if (!initialized_ || keys.empty() || default_pool_ == nullptr) return 0;
+  // In the master eviction modes victims follow the master's recency, which
+  // hears of uses only through these reports.
+  if (master_client_ != nullptr) master_client_->NoteLocalReads(keys);
+  return default_pool_->BatchTouch(keys);
 }
 
 // ---------------------------------------------------------------------------
@@ -5455,6 +5802,7 @@ ActivitySnapshot PoolClient::CollectActivitySnapshot() const {
   snap.recache.install_failed = recache_stats_.install_failed.load(std::memory_order_relaxed);
   snap.recache.prefetched = recache_stats_.prefetched.load(std::memory_order_relaxed);
   snap.recache.fragmented = recache_stats_.fragmented.load(std::memory_order_relaxed);
+  snap.single_flight = RemoteSingleFlightStats();
   return snap;
 }
 

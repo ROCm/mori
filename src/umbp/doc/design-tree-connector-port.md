@@ -254,7 +254,7 @@ splitting them would have produced a commit that does not compile.
 
 ## 7. Verification — what was actually run
 
-Built and run in `rocm/mori-dev:…-rdmapush` with `/apps/ditian12` bind-mounted at
+Built and run in `rocm/mori-dev:…-rdmapush` with the work tree bind-mounted at
 the same path, so the existing `build_check/` cache stays valid. The image has
 `ENTRYPOINT ["bash"]`, so `--entrypoint bash` is required or the command is
 passed to bash as a filename.
@@ -568,7 +568,7 @@ assume it took effect.
 ## 13. Verification — round three
 
 Same container as §7 (`rocm/mori-dev:…-rdmapush`, `--entrypoint bash`,
-`/apps/ditian12` bind-mounted at the same path), on a host with `/dev/kfd`,
+the work tree bind-mounted at the same path), on a host with `/dev/kfd`,
 `/dev/dri` and `/dev/infiniband`.
 
 - **Build:** whole tree clean, incremental over the existing `build_check/`.

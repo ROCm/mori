@@ -80,9 +80,136 @@ _MI325X_TABLE = {
     (8, 2048, 8): {"fp8": _MI325X_SCHEDULE},
 }
 
-# ── MI300X (gfx942, 304 CU) — TODO: re-tune. Falls back to CU-scaled default. ──
-_MI300X_DEFAULT = None  # None => derive from CU count (see _cu_scaled_default)
-_MI300X_TABLE = {}
+# ── MI300X (gfx942, 304 CU) — EP8. 384/6 and 256/6 share the topk-6 hidden-7168
+# key (tuned on 384/6).
+_MI300X_SCHED_H7168_T8_BF16 = (
+    (16, 32, 4, 128, 2),
+    (32, 32, 8, 128, 2),
+    (64, 304, 4, 128, 2),
+    (128, 304, 4, 64, 8),
+    (256, 304, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H7168_T8_FP8 = (
+    (32, 48, 8, 128, 2),
+    (64, 128, 4, 128, 2),
+    (128, 256, 4, 64, 8),
+    (256, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H7168_T9_BF16 = (
+    (32, 96, 4, 128, 2),
+    (64, 228, 8, 128, 2),
+    (128, 228, 8, 64, 8),
+    (None, 152, 8, 32, 8),
+)
+_MI300X_SCHED_H7168_T9_FP8 = (
+    (32, 96, 4, 128, 2),
+    (64, 192, 4, 128, 2),
+    (128, 304, 8, 64, 8),
+    (None, 152, 8, 32, 8),
+)
+_MI300X_SCHED_H6144_T8_BF16 = (
+    (16, 32, 4, 32, 8),
+    (32, 32, 8, 32, 8),
+    (64, 128, 4, 32, 8),
+    (128, 128, 4, 64, 8),
+    (512, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H6144_T8_FP8 = (
+    (32, 64, 4, 32, 8),
+    (64, 256, 4, 32, 8),
+    (128, 256, 4, 64, 8),
+    (512, 256, 4, 32, 8),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H7168_T6_BF16 = (
+    (32, 48, 4, 32, 8),
+    (64, 192, 4, 32, 8),
+    (128, 192, 4, 64, 8),
+    (1024, 192, 4, 32, 16),
+    (None, 192, 4, 32, 8),
+)
+_MI300X_SCHED_H7168_T6_FP8 = (
+    (32, 48, 4, 128, 2),
+    (64, 304, 4, 128, 2),
+    (128, 256, 4, 64, 8),
+    (256, 96, 8, 32, 16),
+    (1024, 64, 16, 32, 16),
+    (None, 64, 16, 32, 8),
+)
+_MI300X_SCHED_H5120_T6_BF16 = (
+    (16, 96, 4, 32, 8),
+    (32, 96, 4, 32, 16),
+    (128, 96, 4, 64, 8),
+    (4096, 192, 4, 32, 16),
+    (None, 128, 4, 32, 8),
+)
+_MI300X_SCHED_H5120_T6_FP8 = (
+    (16, 32, 4, 128, 2),
+    (32, 48, 4, 32, 16),
+    (128, 256, 4, 64, 8),
+    (256, 96, 8, 32, 16),
+    (2048, 192, 4, 32, 16),
+    (4096, 64, 16, 32, 16),
+    (8192, 64, 16, 32, 8),
+    (None, 192, 8, 32, 8),
+)
+_MI300X_SCHED_H3584_T16_BF16 = (
+    (16, 96, 4, 228, 4),
+    (32, 228, 4, 128, 2),
+    (128, 256, 4, 128, 2),
+    (256, 256, 4, 128, 4),
+    (512, 128, 16, 64, 16),
+    (1024, 96, 16, 152, 8),
+    (2048, 96, 16, 152, 16),
+    (4096, 96, 16, 64, 8),
+    (None, 152, 16, 64, 8),
+)
+_MI300X_SCHED_H3584_T16_FP8 = (
+    (32, 128, 4, 128, 2),
+    (128, 256, 4, 128, 2),
+    (256, 64, 16, 128, 4),
+    (512, 128, 16, 64, 16),
+    (1024, 128, 16, 152, 8),
+    (2048, 128, 16, 152, 16),
+    (None, 128, 16, 64, 8),
+)
+# Single-shot fields (scatter combine, StdMoE) keep the untuned CU-scaled values.
+_MI300X_DEFAULT = dict(
+    dispatch_block_num=304,
+    combine_block_num=256,
+    warp_num_per_block=16,
+    combine_warp_num_per_block=4,
+    schedule=_MI300X_SCHED_H7168_T8_BF16,
+)
+_MI300X_TABLE = {
+    (8, 7168, 8): {
+        "bf16": _MI300X_SCHED_H7168_T8_BF16,
+        "fp8": _MI300X_SCHED_H7168_T8_FP8,
+    },
+    (8, 7168, 9): {
+        "bf16": _MI300X_SCHED_H7168_T9_BF16,
+        "fp8": _MI300X_SCHED_H7168_T9_FP8,
+    },
+    (8, 6144, 8): {
+        "bf16": _MI300X_SCHED_H6144_T8_BF16,
+        "fp8": _MI300X_SCHED_H6144_T8_FP8,
+    },
+    (8, 7168, 6): {
+        "bf16": _MI300X_SCHED_H7168_T6_BF16,
+        "fp8": _MI300X_SCHED_H7168_T6_FP8,
+    },
+    (8, 5120, 6): {
+        "bf16": _MI300X_SCHED_H5120_T6_BF16,
+        "fp8": _MI300X_SCHED_H5120_T6_FP8,
+    },
+    (8, 3584, 16): {
+        "bf16": _MI300X_SCHED_H3584_T16_BF16,
+        "fp8": _MI300X_SCHED_H3584_T16_FP8,
+    },
+}
 
 # ── MI355X (gfx950, wave64) — EP8, vec4 combine gather. combine wants a small
 # block (32-48) + warp up to 16; dispatch grows block 96->160. wave64 => warp <= 16
@@ -270,7 +397,46 @@ def _cu_scaled_default():
     )
 
 
-def lookup(world_size, hidden_dim, topk, dtype="fp8"):
+# The quantized combine (FlyDSL runs it as a scatter): its own (max_tok_inclusive |
+# None, comb_block, comb_warp) buckets per device and shape, in place of the
+# schedule's combine half. EP8, fp8 1x128, 2026-11-16, dispatch 64x16, min of 2
+# rounds, combine us at 32 / 128 / 512 / 4096 tokens a rank:
+#   MI300X  256x4 (the old single geometry) 92.2 / 112.0 / 259.6 / 1770.9
+#           128x4                           90.1 / 169.9 / 467.3 / 3395.0
+#           128x8                           92.5 / 108.2 / 266.5 / 1907.0
+#           256x8                          100.7 / 111.8 / 202.9 / 1122.7
+#   MI355X  48x16 (the old single geometry) 92.8 / 111.2 / 404.8 / 2845.1 (op bench)
+#           128x8                           89.6 / 105.5 / 260.6 / 1913.0
+#           128x16                          93.5 / 100.6 / 184.2 / 1069.3
+#           256x16                         107.3 / 109.8 / 144.1 /  825.7
+# fp8 1x32 is within 7% of 1x128 at every point.
+_QUANT_COMBINE = {
+    "mi300x": {(8, 7168, 8): ((32, 128, 4), (128, 128, 8), (None, 256, 8))},
+    "mi355x": {(8, 7168, 8): ((32, 128, 8), (128, 128, 16), (None, 256, 16))},
+}
+
+
+def _with_combine(schedule, base, comb):
+    """`schedule` with its combine half replaced by the `comb` buckets."""
+    disp = (
+        [row[:3] for row in schedule]
+        if schedule
+        else [(None, base["dispatch_block_num"], base["warp_num_per_block"])]
+    )
+    edges = sorted({r[0] for r in (*disp, *comb) if r[0] is not None})
+
+    def pick(rows, tok):
+        for row in rows:
+            if row[0] is None or (tok is not None and tok <= row[0]):
+                return row
+        return rows[-1]
+
+    return tuple(
+        (edge,) + pick(disp, edge)[1:] + pick(comb, edge)[1:] for edge in (*edges, None)
+    )
+
+
+def lookup(world_size, hidden_dim, topk, dtype="fp8", quant=False):
     """Return {dispatch_block_num, combine_block_num, warp_num_per_block,
     combine_warp_num_per_block, schedule} for the current GPU, shape, and dtype.
 
@@ -284,7 +450,10 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     buckets, ascending; the op precompiles the distinct (block, warp) variants
     and picks a bucket at runtime from cur_rank_num_token. dispatch_block_num /
     warp_num_per_block / combine_block_num / combine_warp_num_per_block are the
-    single-shot fallback used when schedule is None."""
+    single-shot fallback used when schedule is None.
+
+    `quant` (a quantized combine) takes its combine buckets from _QUANT_COMBINE
+    where it has them; the single-shot combine fallback becomes the last bucket."""
     key = _device_key()
     if key is None or key not in _DEVICES:
         return _cu_scaled_default()
@@ -294,4 +463,8 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     entry = dev_table.get((world_size, hidden_dim, topk))
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
-    return base
+    comb = _QUANT_COMBINE.get(key, {}).get((world_size, hidden_dim, topk))
+    if quant and comb:
+        base["schedule"] = _with_combine(base["schedule"], base, comb)
+        base["combine_block_num"], base["combine_warp_num_per_block"] = comb[-1][1:]
+    return gpu_utils.fit_blocks_to_cus(base)

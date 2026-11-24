@@ -24,11 +24,26 @@
 """Runtime build configuration: GPU arch detection and compiler tool paths."""
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-_SUPPORTED_ARCHS = ["gfx942", "gfx950", "gfx1250"]
+_SUPPORTED_ARCHS = ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"]
+
+# Whole target names only: "gfx1250" is a substring of "gfx1250-strict".
+_ARCH_TOKEN = re.compile(r"gfx[0-9a-f]+(?:-strict)?")
+
+
+def _match_archs(text: str) -> list[str]:
+    """The supported archs named in `text`, in _SUPPORTED_ARCHS order."""
+    tokens = set(_ARCH_TOKEN.findall(text))
+    return [arch for arch in _SUPPORTED_ARCHS if arch in tokens]
+
+
+def _match_arch(text: str) -> str | None:
+    """The first supported arch named in `text`, in _SUPPORTED_ARCHS order."""
+    return next(iter(_match_archs(text)), None)
 
 
 @dataclass(frozen=True)
@@ -43,46 +58,60 @@ class BuildConfig:
 _cached_config: BuildConfig | None = None
 
 
-def detect_gpu_arch(rocm_path: str = "/opt/rocm") -> str:
-    """Detect the GPU architecture on the current machine.
-
-    Raises RuntimeError if detection fails and no env override is set.
-    """
-    env_arch = os.environ.get("MORI_GPU_ARCHS")
-    if env_arch:
-        for arch in _SUPPORTED_ARCHS:
-            if arch in env_arch:
-                return arch
-
+def enumerated_gpu_arch(rocm_path: str = "/opt/rocm") -> str | None:
+    """The first supported arch rocm_agent_enumerator reports, ignoring env overrides."""
     enumerator = os.path.join(rocm_path, "bin", "rocm_agent_enumerator")
-    if os.path.isfile(enumerator):
-        try:
-            out = subprocess.check_output(
-                [enumerator], text=True, stderr=subprocess.DEVNULL
-            )
-            for line in out.strip().split("\n"):
-                line = line.strip()
-                if line in _SUPPORTED_ARCHS:
-                    return line
-        except subprocess.CalledProcessError:
-            pass
+    if not os.path.isfile(enumerator):
+        return None
+    try:
+        out = subprocess.check_output(
+            [enumerator], text=True, stderr=subprocess.DEVNULL
+        )
+    except subprocess.CalledProcessError:
+        return None
+    for line in out.strip().split("\n"):
+        line = line.strip()
+        if line in _SUPPORTED_ARCHS:
+            return line
+    return None
 
+
+def _rocminfo_gpu_arch() -> str | None:
+    """The first supported arch rocminfo reports."""
     try:
         out = subprocess.check_output(
             ["rocminfo"], text=True, stderr=subprocess.DEVNULL
         )
-        for line in out.split("\n"):
-            for arch in _SUPPORTED_ARCHS:
-                if arch in line:
-                    return arch
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+        return None
+    for line in out.split("\n"):
+        arch = _match_arch(line)
+        if arch:
+            return arch
+    return None
 
-    env_amdgpu = os.environ.get("AMDGPU_TARGETS")
+
+def detect_gpu_arch(rocm_path: str = "/opt/rocm") -> str:
+    """Detect the GPU architecture on the current machine.
+
+    MORI_GPU_ARCHS naming one arch overrides detection. Naming several (a build's
+    target list) only stands in when no GPU answers: the arch the GPU reports wins,
+    so a gfx1250 device gets gfx1250 or gfx1250-strict code as the runtime reports
+    it. Raises RuntimeError if detection fails and nothing names an arch.
+    """
+    listed = _match_archs(os.environ.get("MORI_GPU_ARCHS", ""))
+    if len(listed) == 1:
+        return listed[0]
+
+    detected = enumerated_gpu_arch(rocm_path) or _rocminfo_gpu_arch()
+    if detected:
+        return detected
+    if listed:
+        return listed[0]
+
+    env_amdgpu = _match_arch(os.environ.get("AMDGPU_TARGETS", ""))
     if env_amdgpu:
-        for arch in _SUPPORTED_ARCHS:
-            if arch in env_amdgpu:
-                return arch
+        return env_amdgpu
 
     raise RuntimeError(
         f"Cannot detect GPU architecture. "

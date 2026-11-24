@@ -168,6 +168,31 @@ inline void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item,
   }
 }
 
+// One past the last segment of the run starting at `first` that a single memcpy
+// may cover: every later segment adjacent on both sides, and none starting on a
+// host registration piece boundary.  The builder cut the item there on purpose
+// (AppendWithinHostPieces): hipMemcpy rejects a host range spanning two
+// registrations, so a run must not put the two halves back together.  `bytes`
+// receives the run's length.
+inline size_t CoalescedRunEnd(const TransferPlan& plan, size_t first, size_t piece, size_t* bytes) {
+  const bool host_is_src = plan.src.loc != mori::io::MemoryLocationType::GPU;
+  const bool host_is_dst = !host_is_src && plan.dst.loc != mori::io::MemoryLocationType::GPU;
+  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(plan.src.host_ptr)
+                              : host_is_dst ? reinterpret_cast<uintptr_t>(plan.dst.host_ptr)
+                                            : 0;
+  const std::vector<size_t>& host_offsets = host_is_src ? plan.src_offsets : plan.dst_offsets;
+  size_t run = plan.sizes[first];
+  size_t next = first + 1;
+  while (next < plan.sizes.size() && plan.src_offsets[next] == plan.src_offsets[first] + run &&
+         plan.dst_offsets[next] == plan.dst_offsets[first] + run &&
+         (host_base == 0 || piece == 0 || (host_base + host_offsets[next]) % piece != 0)) {
+    run += plan.sizes[next];
+    ++next;
+  }
+  *bytes = run;
+  return next;
+}
+
 // Builder for engines with one plan per (src, dst) buffer pair.  Admits what
 // CanHandle() and ItemInBounds() accept; `append(plan, item)` adds segments.
 // `Engine` is the final class, so CanHandle() is not a virtual call.

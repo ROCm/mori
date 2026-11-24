@@ -1,0 +1,57 @@
+name: CI badge
+
+# Called by ci.yml on a scheduled run: once its lanes start, and again after the
+# CI gate. Writes the commit the run tests, its MoRI CI (main) status and how many
+# of the jobs the gate listed on it passed as main-ci.json, the only file on the
+# badges branch, which the main CI badge in README.md renders through
+# img.shields.io/endpoint.
+on:
+  workflow_call:
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish main-ci.json
+        # A failed push leaves the badge a run behind. It must not fail the run:
+        # ci_scope.py reads the run's conclusion to find main's last green run.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COUNTS=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/status?per_page=100" --jq '
+            [.statuses[] | select(.context | startswith("MoRI CI (main) / ")) | .state] as $jobs
+            | [(.statuses[] | select(.context == "MoRI CI (main)") | .state) // "none",
+               ($jobs | map(select(. == "success")) | length), ($jobs | length)]
+            | @tsv')
+          read -r STATE PASSED TOTAL <<< "$COUNTS"
+          case "$STATE" in
+            success) WORD=passing COLOR=brightgreen ;;
+            failure) WORD=failing COLOR=red ;;
+            # The CI gate reports a run with a cancelled lane as error.
+            error) WORD=cancelled COLOR=lightgrey ;;
+            pending) WORD="in progress" COLOR=yellow ;;
+            *)
+              echo "No scheduled run reported on $GITHUB_SHA; the badge stays as it is"
+              exit 0
+              ;;
+          esac
+          MESSAGE="${GITHUB_SHA::8} · $WORD"
+          # Passed / listed, as the commit shows them; while pending, any listed
+          # jobs are an earlier run's.
+          if [ "$STATE" != pending ] && [ "$TOTAL" -gt 0 ]; then
+            MESSAGE="$MESSAGE · $PASSED/$TOTAL"
+          fi
+          DIR="$RUNNER_TEMP/badges"
+          git init -q -b badges "$DIR"
+          jq -n --arg message "$MESSAGE" --arg color "$COLOR" \
+            '{schemaVersion: 1, label: "main CI", message: $message, color: $color}' > "$DIR/main-ci.json"
+          cat "$DIR/main-ci.json"
+          git -C "$DIR" add main-ci.json
+          git -C "$DIR" -c user.name="github-actions[bot]" \
+            -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "main CI: $MESSAGE"
+          # A new orphan commit each time, so the branch never grows a history.
+          git -C "$DIR" push -q -f "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:refs/heads/badges

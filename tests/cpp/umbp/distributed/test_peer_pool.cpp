@@ -177,6 +177,56 @@ class NoSpaceBackend final : public MockBackend {
   }
 };
 
+// An HBM backend on one GPU. Its buffer is never dereferenced: placement reads
+// only where it lives.
+class GpuBackend : public MockBackend {
+ public:
+  GpuBackend(int device, bool full = false)
+      : MockBackend(TierType::HBM), device_(device), full_(full) {}
+
+  size_t BufferCount() const override { return 1; }
+  TransferRef BufferRef(uint32_t /*buffer_index*/) const override {
+    return TransferRef::HostBytes(const_cast<char*>(&anchor_), 1, mori::io::MemoryLocationType::GPU,
+                                  device_);
+  }
+  std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
+    if (!full_) return MockBackend::BatchAllocate(entries);
+    std::vector<AllocateResult> results(entries.size());
+    for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
+    return results;
+  }
+
+ private:
+  int device_;
+  bool full_;
+  char anchor_ = 0;
+};
+
+// A policy that returns the same backends, in the order given, for every key.
+class FixedOrderPolicy final : public PoolPolicy {
+ public:
+  explicit FixedOrderPolicy(std::vector<std::string> names) : names_(std::move(names)) {}
+  std::vector<uint32_t> PutOrder(const BackendRegistry& backends,
+                                 const PoolPlacementRequest&) const override {
+    std::vector<uint32_t> order;
+    for (const auto& name : names_) order.push_back(backends.BackendId(backends.Get(name)));
+    return order;
+  }
+  std::vector<uint32_t> ReadOrder(const BackendRegistry& backends) const override {
+    return AllBackendIds(backends);
+  }
+
+ private:
+  std::vector<std::string> names_;
+};
+
+PoolPlacementRequest HbmPutFromGpu(std::string key, int device) {
+  PoolPlacementRequest request = PutRequest(std::move(key));
+  request.tier = TierType::HBM;
+  request.preferred_device = device;
+  return request;
+}
+
 // LocalCopyEngine whose next `failures` copies fail.
 class FailingEngine final : public TransferEngine {
  public:
@@ -465,6 +515,81 @@ TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
   EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
 }
 
+// Answers BatchStillHolds by generation parity and records what it was asked.
+class ParityStillHoldsBackend final : public MockBackend {
+ public:
+  explicit ParityStillHoldsBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    ++calls;
+    asked.insert(asked.end(), keys.begin(), keys.end());
+    std::vector<bool> out(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = generations[i] % 2 == 0;
+    return out;
+  }
+
+  // Same answers, and a record that the readers said they were done.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override {
+    finished.insert(finished.end(), keys.begin(), keys.end());
+    return BatchStillHolds(keys, generations);
+  }
+
+  mutable int calls = 0;
+  mutable std::vector<std::string> asked;
+  std::vector<std::string> finished;
+};
+
+TEST(PeerPool, ValidateResolvedAsksEachNamedBackendOnce) {
+  BackendRegistry registry;
+  auto a = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto b = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto* pa = a.get();
+  auto* pb = b.get();
+  ASSERT_TRUE(registry.Register("dram_a", std::move(a)));
+  ASSERT_TRUE(registry.Register("dram_b", std::move(b)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t ida = registry.BackendId(pa);
+  const uint32_t idb = registry.BackendId(pb);
+
+  // Answered by the backend the reader read from, not by whichever holds the
+  // key now; a backend this peer does not have cannot vouch for anything.
+  const auto valid = pool.ValidateResolved({ida, idb, ida, BackendRegistry::kMaxBackends, idb},
+                                           {"a1", "b1", "a2", "x", "b2"}, {2, 2, 3, 2, 5});
+  EXPECT_EQ(valid, (std::vector<bool>{true, true, false, false, false}));
+  EXPECT_EQ(pa->calls, 1);
+  EXPECT_EQ(pb->calls, 1);
+  EXPECT_EQ(pa->asked, (std::vector<std::string>{"a1", "a2"}));
+  EXPECT_EQ(pb->asked, (std::vector<std::string>{"b1", "b2"}));
+
+  // Parallel vectors that disagree are a malformed request: nothing is vouched for.
+  EXPECT_EQ(pool.ValidateResolved({ida}, {"a1", "a2"}, {2, 2}), (std::vector<bool>{false, false}));
+  EXPECT_TRUE(pa->finished.empty()) << "a plain check must not end anyone's lease";
+  EXPECT_TRUE(pb->finished.empty());
+}
+
+// With `release` the same call also tells each backend its reader is done,
+// stale answers included: a reader is finished with a copy it has to drop too.
+TEST(PeerPool, ValidateResolvedWithReleaseFinishesTheReadsOnEachBackend) {
+  BackendRegistry registry;
+  auto a = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto b = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto* pa = a.get();
+  auto* pb = b.get();
+  ASSERT_TRUE(registry.Register("dram_a", std::move(a)));
+  ASSERT_TRUE(registry.Register("dram_b", std::move(b)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t ida = registry.BackendId(pa);
+  const uint32_t idb = registry.BackendId(pb);
+
+  const auto valid = pool.ValidateResolved({ida, idb, ida}, {"a1", "b1", "a2"}, {2, 2, 3},
+                                           /*release=*/true);
+  EXPECT_EQ(valid, (std::vector<bool>{true, true, false}));
+  EXPECT_EQ(pa->finished, (std::vector<std::string>{"a1", "a2"}));
+  EXPECT_EQ(pb->finished, (std::vector<std::string>{"b1"}));
+}
+
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
@@ -607,6 +732,62 @@ TEST(PeerPool, WeightedPolicyPlacesNewKeysOnMultipleBackends) {
   pool.BatchAbort(slots);
 }
 
+// One node with an HBM pool on each GPU: a key whose data is on GPU 2 goes to
+// the pool on GPU 2, whatever its hash would have picked.
+TEST(PeerPool, HbmPutGoesToThePoolOnTheSourceGpu) {
+  BackendRegistry registry;
+  for (int device = 0; device < 4; ++device) {
+    ASSERT_TRUE(
+        registry.Register("hbm@" + std::to_string(device), std::make_unique<GpuBackend>(device)));
+  }
+  PeerPool pool(&registry, MakeWeightedPlacementPolicy(
+                               {{"hbm@0", 1}, {"hbm@1", 1}, {"hbm@2", 1}, {"hbm@3", 1}}));
+
+  std::vector<PoolPlacementRequest> from_gpu2, no_preference;
+  for (size_t i = 0; i < 64; ++i) {
+    from_gpu2.push_back(HbmPutFromGpu("on-source-" + std::to_string(i), 2));
+    no_preference.push_back(HbmPutFromGpu("by-hash-" + std::to_string(i), -1));
+  }
+  const uint32_t on_gpu2 = registry.BackendId(registry.Get("hbm@2"));
+  for (const auto& result : pool.BatchAllocate(from_gpu2)) {
+    ASSERT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    EXPECT_EQ(result.backend_id, on_gpu2);
+  }
+  // Without a source GPU the keys still spread by hash.
+  size_t elsewhere = 0;
+  for (const auto& result : pool.BatchAllocate(no_preference)) {
+    ASSERT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+    if (result.backend_id != on_gpu2) ++elsewhere;
+  }
+  EXPECT_GT(elsewhere, 0u);
+}
+
+// The pool on the source GPU is a preference, not a requirement.
+TEST(PeerPool, HbmPutFallsBackWhenThePoolOnTheSourceGpuIsFull) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("hbm@0", std::make_unique<GpuBackend>(0)));
+  ASSERT_TRUE(registry.Register("hbm@1", std::make_unique<GpuBackend>(1, /*full=*/true)));
+  PeerPool pool(&registry, MakeWeightedPlacementPolicy({{"hbm@0", 1}, {"hbm@1", 1}}));
+
+  auto result = pool.BatchAllocate({HbmPutFromGpu("spills", 1)}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("hbm@0")));
+}
+
+// It reorders equals only: a pool the policy put behind another medium stays
+// behind it.
+TEST(PeerPool, SourceGpuDoesNotLiftAPoolOverAnEarlierMedium) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("hbm@1", std::make_unique<GpuBackend>(1)));
+  PeerPool pool(&registry,
+                std::make_unique<FixedOrderPolicy>(std::vector<std::string>{"dram", "hbm@1"}));
+
+  auto result = pool.BatchAllocate({HbmPutFromGpu("stays", 1)}).front();
+  EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram")));
+}
+
 TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("dram_a", std::make_unique<NoSpaceBackend>(TierType::DRAM)));
@@ -631,6 +812,35 @@ TEST(PeerPool, WeightedPolicyFallsBackWhenPrimaryHasNoSpace) {
   auto result = pool.BatchAllocate({request}).front();
   EXPECT_EQ(result.allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(result.backend_id, registry.BackendId(registry.Get("dram_b")));
+}
+
+TEST(TieredPlacementPolicy, SmallObjectsSkipMembersWithMinObjectSize) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto compiled = LogicalTierGraph::Compile(
+      {LogicalTierConfig{{{"dram", 1}, {"ssd", 1000, 64 << 10}}}}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  const uint32_t dram = registry.BackendId(registry.Get("dram"));
+  const uint32_t ssd = registry.BackendId(registry.Get("ssd"));
+  for (int i = 0; i < 32; ++i) {
+    const std::string key = "small-" + std::to_string(i);
+    EXPECT_EQ(compiled.graph->PutOrder(key, 4096), (std::vector<uint32_t>{dram, ssd}));
+    // Large and unknown sizes keep the plain weighted order.
+    EXPECT_EQ(compiled.graph->PutOrder(key, 1 << 20), compiled.graph->PutOrder(key));
+  }
+}
+
+TEST(TieredPlacementPolicy, AdvertisesLowestMinObjectSizePerTier) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto mixed =
+      LogicalTierGraph::Compile({LogicalTierConfig{{{"dram", 1}, {"ssd", 1, 64 << 10}}}}, registry);
+  auto ssd_only = LogicalTierGraph::Compile({LogicalTierConfig{{{"ssd", 1, 64 << 10}}}}, registry);
+  ASSERT_TRUE(mixed.ok() && ssd_only.ok());
+  EXPECT_EQ(mixed.graph->CapacitySnapshot().begin()->second.min_object_bytes, 0u);
+  EXPECT_EQ(ssd_only.graph->CapacitySnapshot().begin()->second.min_object_bytes, 64u << 10);
 }
 
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
@@ -1443,6 +1653,73 @@ TEST(PeerPoolLocalEviction, DrainsAFullBackendColdestFirstToItsLowWatermark) {
   EXPECT_EQ(pool.PlacementCount(), 5u);
   EXPECT_GE(pool.LocalEvictionStats().rounds, 1u);
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // Served from the caller's own cache, so never read here.  A prefix comes
+  // tail first, so that its head is the last of it to go.
+  EXPECT_EQ(pool.BatchTouch({"k5", "k4", "k3", "k2", "k1", "k0", "missing"}), 6u);
+  CommitKey(&pool, "k8");
+
+  // The untouched k6 and k7 go first, then the prefix's tail.
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(dram->OwnedKeyCount(), 5u);
+  for (int i = 4; i <= 7; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i : {0, 1, 2, 3, 8}) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPool, ATouchReachesEveryCopyInAMediumThatKeepsAnOrder) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    RegisterPageBackend(&registry, &engine, name, TierType::DRAM, kHostPage, 4);
+  }
+  registry.Get("ordered_a")->TrackEvictionOrder();
+  registry.Get("ordered_b")->TrackEvictionOrder();
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  // A copy in each medium, put there directly rather than through placement.
+  for (const char* name : {"ordered_a", "ordered_b", "unordered"}) {
+    auto* backend = registry.Get(name);
+    auto slot = backend->BatchAllocate({AllocateRequest{"k", 64}}).front();
+    ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}}).front().success) << name;
+  }
+  EXPECT_EQ(pool.BatchTouch({"k", "missing"}), 2u);
+}
+
+TEST(PeerPool, WatermarkOffloadMovesATouchedKeyLast) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 40);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kWatermark);
+  tiers.front().high_watermark = 0.9;
+  tiers.front().low_watermark = 0.5;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // The oldest key, used from the caller's own cache.  The offload picks from
+  // the pool's own order, not from a medium's.
+  pool.BatchTouch({"k0"});
+  CommitKey(&pool, "k8");  // 9 of 10 pages
+
+  auto* hot = registry.Get("hot");
+  ASSERT_TRUE(WaitUntil([&] { return hot->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_TRUE(registry.Get("cold")->Contains("k1")) << "the coldest key stayed";
+  EXPECT_TRUE(hot->Contains("k0")) << "the touched key was offloaded";
+  EXPECT_FALSE(registry.Get("cold")->Contains("k0"));
 }
 
 TEST(PeerPoolLocalEviction, RankedCandidatesGoFirstAndTheMediumCoversTheRest) {

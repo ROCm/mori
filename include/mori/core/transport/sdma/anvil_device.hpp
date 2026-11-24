@@ -32,6 +32,8 @@
 
 #include <cassert>
 
+#include "mori/core/arch.hpp"
+
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include <hip/hip_runtime.h>
 #else
@@ -56,7 +58,7 @@ constexpr long long MAX_RETRIES = 1LL << 34;
 // for gfx1250 -- the packets below are still the gfx9 layout, with no npd/scope
 // fields, so this path is not ported to gfx12.5 (see cco.hpp for one that is).
 __device__ __forceinline__ void PublishStores() {
-#if defined(__gfx1250__)
+#if defined(MORI_GFX125X)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 #else
   __builtin_amdgcn_s_waitcnt(0);
@@ -85,7 +87,7 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
 // so the 2D path is left undefined on gfx1250: a caller fails to compile
 // rather than posting a packet that engine does not decode. (cco's put2d posts
 // the gfx12 rect packet there.)
-#if !defined(__gfx1250__)
+#if !defined(MORI_GFX125X)
 __device__ __forceinline__ SDMA_PKT_COPY_LARGE_SUB_WINDOW
 CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
                    uint32_t widthBytes, uint32_t height) {
@@ -105,7 +107,7 @@ CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPi
 
   return packet;
 }
-#endif  // !__gfx1250__
+#endif  // !MORI_GFX125X
 
 __device__ __forceinline__ SDMA_PKT_COPY_BROADCAST
 CreateCopyBroadcastPacket(void* srcBuf, void* dstBuf1, void* dstBuf2, long long int packetSize) {
@@ -342,7 +344,7 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   handle.submitPacket(base, pendingWptr);
 }
 
-#if !defined(__gfx1250__)  // see CreateCopy2DPacket
+#if !defined(MORI_GFX125X)  // see CreateCopy2DPacket
 __device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, uint32_t dstPitch,
                                       void* src, uint32_t srcPitch, uint32_t widthBytes,
                                       uint32_t height) {
@@ -353,7 +355,7 @@ __device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, 
   handle.placePacket(packet, pendingWptr, offset);
   handle.submitPacket(base, pendingWptr);
 }
-#endif  // !__gfx1250__
+#endif  // !MORI_GFX125X
 
 __device__ __forceinline__ void putBroadcast(SdmaQueueDeviceHandle& handle, void* dst1, void* dst2,
                                              void* src, size_t size) {

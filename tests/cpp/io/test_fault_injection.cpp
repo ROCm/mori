@@ -23,8 +23,8 @@
 // Runs a fault catalog: by default tests/cpp/io/fault_catalog/ibverbs.yaml, one
 // entry per real-world fault on the ibverbs data path (MORI-IO fault simulation,
 // part 1/N). The YAML file explains each field and the checks every entry is held
-// to (ends, honest, recovers, alive, and waits where the entry asks for it); this
-// file only runs them.
+// to (ends, honest, recovers, alive, stopped, and waits where the entry asks for it);
+// this file only runs them.
 //
 // Processes, all on one node:
 //   runner     runs each entry in its own initiator process, so a crash or a
@@ -89,6 +89,13 @@ enum class Op {
   Write,  // one 1 MiB RDMA write
   Read,   // one 1 MiB RDMA read
   Batch,  // BatchWrite of 2 non-adjacent segments, one per QP (qpPerTransfer=2)
+  // BatchWrite of a 256 MiB and a 4 KiB segment, one per QP, so a fault on the small one
+  // lands while the large one is still on the wire. Segments go out in remote-offset order.
+  LargeThenSmall,  // the large one is posted first: for faults on the second post
+  SmallThenLarge,  // the small one is posted, and completes, first
+  // BatchWrite of 4 non-adjacent 60 MiB segments over 4 QPs. With worker threads each
+  // segment is posted by its own worker on its own QP, so the workers' posts interleave.
+  Spread,
 };
 
 enum class Side { Initiator, Target };  // which process the fault is armed in
@@ -111,7 +118,7 @@ struct Entry {
 };
 
 const std::set<std::string> kChecks = {"ends",     "honest", "recovers", "alive",
-                                       "reported", "during", "waits"};
+                                       "reported", "during", "waits",    "stopped"};
 
 std::string CatalogPath() {
   const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
@@ -145,9 +152,17 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       e.op = Op::Read;
     } else if (transfer == "batch") {
       e.op = Op::Batch;
+    } else if (transfer == "large_then_small") {
+      e.op = Op::LargeThenSmall;
+    } else if (transfer == "small_then_large") {
+      e.op = Op::SmallThenLarge;
+    } else if (transfer == "spread") {
+      e.op = Op::Spread;
     } else {
-      throw std::runtime_error(where + ": transfer must be write, read or batch, got '" + transfer +
-                               "'");
+      throw std::runtime_error(where +
+                               ": transfer must be write, read, batch, large_then_small, "
+                               "small_then_large or spread, got '" +
+                               transfer + "'");
     }
     e.notify = mori::yaml::GetBool(raw, "notify", false, where);
     long warmup = mori::yaml::GetInt(raw, "warmup", 0, where);
@@ -194,7 +209,7 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       if (kChecks.count(check) == 0) {
         throw std::runtime_error(where + ": fails lists '" + check +
                                  "'; checks are ends, honest, recovers, alive, reported, during, "
-                                 "waits");
+                                 "waits, stopped");
       }
       e.fails.insert(check);
     }
@@ -221,9 +236,41 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
 /*                                     Shared by both processes                                   */
 /* ---------------------------------------------------------------------------------------------- */
 
-constexpr size_t kBufBytes = 1 << 20;
+constexpr size_t kXferBytes = 1 << 20;   // Write, Read: [0, 1M)
 constexpr size_t kSegBytes = 256 << 10;  // Batch: [0, 256K) and [512K, 768K)
 constexpr size_t kSeg2Offset = 512 << 10;
+// LargeThenSmall: [0, 256M) then [257M, 257M + 4K); SmallThenLarge: [0, 4K) then [1M, 257M).
+constexpr size_t kSkewLargeBytes = size_t{256} << 20;
+constexpr size_t kSkewSmallBytes = 4 << 10;
+constexpr size_t kSkewFarOffset = kSkewLargeBytes + (1 << 20);
+constexpr size_t kBufBytes = kSkewFarOffset + kSkewSmallBytes;
+// Spread: [k * 64M, k * 64M + 60M) for k = 0..3, one per QP.
+constexpr int kSpreadSegments = 4;
+constexpr size_t kSpreadStride = size_t{64} << 20;
+constexpr size_t kSpreadBytes = size_t{60} << 20;
+static_assert((kSpreadSegments - 1) * kSpreadStride + kSpreadBytes <= kBufBytes);
+
+// The segments of a batch op: {offsets, sizes}, the same in the source and the destination.
+std::pair<SizeVec, SizeVec> Segments(Op op) {
+  switch (op) {
+    case Op::Batch:
+      return {{0, kSeg2Offset}, {kSegBytes, kSegBytes}};
+    case Op::LargeThenSmall:
+      return {{0, kSkewFarOffset}, {kSkewLargeBytes, kSkewSmallBytes}};
+    case Op::SmallThenLarge:
+      return {{0, 1 << 20}, {kSkewSmallBytes, kSkewLargeBytes}};
+    case Op::Spread: {
+      SizeVec offsets, sizes;
+      for (int k = 0; k < kSpreadSegments; ++k) {
+        offsets.push_back(k * kSpreadStride);
+        sizes.push_back(kSpreadBytes);
+      }
+      return {offsets, sizes};
+    }
+    default:
+      return {{0}, {kXferBytes}};
+  }
+}
 constexpr int kDeadlineMs = 5000;
 constexpr int kSetupMs = 30000;  // target start-up: HIP init, engine, buffer
 constexpr int kRpcMs = 10000;
@@ -300,7 +347,9 @@ std::unique_ptr<IOEngine> MakeEngine(const std::string& key, const Entry& e) {
   RdmaBackendConfig rdmaCfg{};
   rdmaCfg.enableNotification = e.notify;
   rdmaCfg.notifPerQp = 64;
-  rdmaCfg.qpPerTransfer = e.op == Op::Batch ? 2 : 1;
+  rdmaCfg.qpPerTransfer = e.op == Op::Write || e.op == Op::Read ? 1
+                          : e.op == Op::Spread                  ? kSpreadSegments
+                                                                : 2;
   engine->CreateBackend(BackendType::RDMA, rdmaCfg);
   return engine;
 }
@@ -330,8 +379,11 @@ struct GpuBuffer {
       }
       return true;
     };
-    if (op == Op::Batch) return filled(0, kSegBytes) && filled(kSeg2Offset, kSegBytes);
-    return filled(0, kBufBytes);
+    auto [offsets, sizes] = Segments(op);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      if (!filled(offsets[i], sizes[i])) return false;
+    }
+    return true;
   }
 };
 
@@ -562,16 +614,20 @@ class PeerRig {
 
     switch (op) {
       case Op::Write:
-        engine_->Write(local_->desc, 0, remote_, 0, kBufBytes, &t->status, t->id);
+        engine_->Write(local_->desc, 0, remote_, 0, kXferBytes, &t->status, t->id);
         break;
       case Op::Read:
-        engine_->Read(local_->desc, 0, remote_, 0, kBufBytes, &t->status, t->id);
+        engine_->Read(local_->desc, 0, remote_, 0, kXferBytes, &t->status, t->id);
         break;
-      case Op::Batch: {
+      case Op::Batch:
+      case Op::LargeThenSmall:
+      case Op::SmallThenLarge:
+      case Op::Spread: {
         MemDescVec local{local_->desc};
         MemDescVec remote{remote_};
-        BatchSizeVec offsets{{0, kSeg2Offset}};
-        BatchSizeVec sizes{{kSegBytes, kSegBytes}};
+        auto [segOffsets, segSizes] = Segments(op);
+        BatchSizeVec offsets{segOffsets};
+        BatchSizeVec sizes{segSizes};
         TransferStatusPtrVec statuses{&t->status};
         TransferUniqueIdVec ids{t->id};
         engine_->BatchWrite(local, offsets, remote, offsets, sizes, statuses, ids);
@@ -730,7 +786,7 @@ class PeerRig {
   std::vector<std::unique_ptr<Transfer>> transfers_;  // MORI keeps pointers to their statuses
 };
 
-// Prints "RESULT ends= honest= recovers= target= reported= during= waits=" for the runner,
+// Prints "RESULT ends= honest= recovers= target= reported= during= waits= stopped=" for the runner,
 // each 1 (passed), 0 (failed) or -1 (the entry does not ask for the check).
 int RunEntry(const Entry& e) {
   ApplyEnv(e);
@@ -755,6 +811,17 @@ int RunEntry(const Entry& e) {
                 CodeName(atReturn));
   }
   StatusCode code = t->status.WaitFor(kDeadlineMs);
+  // A caller frees its buffers once the transfer reports an error, so by then none of its
+  // WRs may still be able to move data. Only the injector in this process sees its WRs.
+  int stopped = -1;
+  if (faulted && e.side == Side::Initiator && code > StatusCode::ERR_BEGIN) {
+    std::string inFlight = FaultInjector::Instance().DataWrInFlight();
+    stopped = inFlight.empty();
+    if (!stopped) {
+      std::printf("    reported %s while a data WR could still run: %s\n", CodeName(code),
+                  inFlight.c_str());
+    }
+  }
   bool ends = code != StatusCode::IN_PROGRESS;
   bool honest = true;
   if (code == StatusCode::SUCCESS) {
@@ -800,9 +867,12 @@ int RunEntry(const Entry& e) {
     std::printf("    the injection failed; this is a harness error, not a known bug\n");
     return kExitFail;
   }
-  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d waits=%d\n",
-              ends, honest, recovers, targetAlive, reported, during, waits);
-  return ends && honest && recovers && targetAlive && reported != 0 && during != 0 && waits != 0
+  std::printf(
+      "RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d waits=%d "
+      "stopped=%d\n",
+      ends, honest, recovers, targetAlive, reported, during, waits, stopped);
+  return ends && honest && recovers && targetAlive && reported != 0 && during != 0 && waits != 0 &&
+                 stopped != 0
              ? kExitPass
              : kExitFail;
 }
@@ -816,7 +886,8 @@ struct Outcome {
   bool skipped{false};
   bool hasResult{false};  // the initiator printed its RESULT line
   // 1 = passed, 0 = failed, -1 = not reached (a process died before reporting)
-  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, reported{-1}, during{-1}, waits{-1};
+  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, reported{-1}, during{-1}, waits{-1},
+      stopped{-1};
   bool alive{true};
   std::string note;      // how a process died, if one did
   std::string topology;  // "initiator GPU 0 ionic_0 -> target ... (cross-NIC)"
@@ -868,9 +939,9 @@ Outcome RunChild(const char* self, const Entry& e) {
       out.hasResult =
           std::sscanf(line.c_str(),
                       "RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d "
-                      "waits=%d",
+                      "waits=%d stopped=%d",
                       &out.ends, &out.honest, &out.recovers, &out.target, &out.reported,
-                      &out.during, &out.waits) == 7;
+                      &out.during, &out.waits, &out.stopped) == 8;
     } else if (!line.empty()) {
       size_t topo = line.find("topology: ");
       if (topo != std::string::npos) out.topology = line.substr(topo + 10);
@@ -921,9 +992,10 @@ const char* const kVerdictNames[] = {"PASS", "XFAIL", "FAIL", "XPASS", "SKIP"};
 Verdict Judge(const Entry& e, const Outcome& o) {
   if (o.skipped) return {Verdict::Skip, ""};
   if (!o.hasResult && o.alive) return {Verdict::Fail, "no result; see the output above"};
-  const std::pair<const char*, int> checks[] = {
-      {"ends", o.ends},         {"honest", o.honest}, {"recovers", o.recovers}, {"alive", o.alive},
-      {"reported", o.reported}, {"during", o.during}, {"waits", o.waits}};
+  const std::pair<const char*, int> checks[] = {{"ends", o.ends},         {"honest", o.honest},
+                                                {"recovers", o.recovers}, {"alive", o.alive},
+                                                {"reported", o.reported}, {"during", o.during},
+                                                {"waits", o.waits},       {"stopped", o.stopped}};
   std::set<std::string> unexpected, fixed;
   for (const auto& [name, result] : checks) {
     bool expectedToFail = e.fails.count(name) > 0;
@@ -1073,11 +1145,12 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
     const char* alive = o.skipped ? "-" : o.alive ? "ok" : "FAIL";
     std::printf("%-36s %-6s %-6s %-8s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
                 Mark(o.recovers), alive, kVerdictNames[v.kind], v.why.c_str());
-    std::printf("    reported=%s during=%s waits=%s\n", Mark(o.reported), Mark(o.during),
-                Mark(o.waits));
+    std::printf("    reported=%s during=%s waits=%s stopped=%s\n", Mark(o.reported), Mark(o.during),
+                Mark(o.waits), Mark(o.stopped));
     rows += "| " + e->id + " | " + Mark(o.ends) + " | " + Mark(o.honest) + " | " +
             Mark(o.recovers) + " | " + alive + " | " + Mark(o.reported) + " | " + Mark(o.during) +
-            " | " + Mark(o.waits) + " | " + kVerdictNames[v.kind] + " | " + v.why + " |\n";
+            " | " + Mark(o.waits) + " | " + Mark(o.stopped) + " | " + kVerdictNames[v.kind] +
+            " | " + v.why + " |\n";
     if (github && (v.kind == Verdict::Fail || v.kind == Verdict::XPass)) {
       std::printf("::error title=Fault catalog %s::%s %s\n", kVerdictNames[v.kind], e->id.c_str(),
                   v.why.c_str());
@@ -1108,9 +1181,9 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
        << "\n\n**" << summary << "**";
     if (!topology.empty()) md << "  \nTopology: " << topology;
     if (!bugs.empty()) md << "  \nKnown bugs: " << bugs;
-    md << "\n\n| entry | ends | honest | recovers | alive | reported | during | waits | verdict | "
-          "note |\n"
-       << "|---|---|---|---|---|---|---|---|---|---|\n"
+    md << "\n\n| entry | ends | honest | recovers | alive | reported | during | waits | stopped | "
+          "verdict | note |\n"
+       << "|---|---|---|---|---|---|---|---|---|---|---|\n"
        << rows << "\n";
   }
   return counts[Verdict::Fail] + counts[Verdict::XPass] == 0 ? 0 : 1;

@@ -77,6 +77,8 @@ class StandaloneProcessClient : public IUMBPClient {
   PrefetchStatus GetPrefetchStatus(const std::string& request_id) override;
   bool SupportsAsyncPrefetch() const override;
 
+  size_t BatchTouch(const std::vector<std::string>& keys) override;
+
   void ConfigureKvIndexer(const KvIndexerConfig& config) override;
 
   bool Clear() override;

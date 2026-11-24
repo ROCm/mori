@@ -149,6 +149,18 @@ class IUMBPClient {
   virtual PrefetchStatus GetPrefetchStatus(const std::string& request_id) { return {}; }
   virtual bool SupportsAsyncPrefetch() const { return false; }
 
+  /// Recency hint for objects the caller served from a faster cache of its
+  /// own, so never read here: counted as just used, as a read would be, but
+  /// nothing is read or leased, and keys not stored are skipped.  This node's
+  /// paged media move them in the order given, the last ending up the most
+  /// recent, and its SSD tier counts them as just accessed.  In the master
+  /// eviction modes the master also hears of them, wherever they are placed,
+  /// on the next heartbeat, unordered; otherwise copies on other nodes are
+  /// unaffected.  Returns the copies moved on this node, a duplicate key
+  /// counted each time: 0 where no medium here moves them (DRAM in the
+  /// `master` mode), or from an older server.
+  virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

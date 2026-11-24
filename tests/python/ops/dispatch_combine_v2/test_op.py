@@ -27,6 +27,8 @@ input[t] (U = #unique dest PEs) and out_weights[t] == U[t] * wts[t].
 
     torchrun --standalone --nproc_per_node=8 test_op.py
 """
+import contextlib
+import json
 import os
 import sys
 
@@ -46,6 +48,7 @@ from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x  # noqa: E402
 
 
 class Dist:
@@ -71,14 +74,16 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
 
+    def allreduce_max(self, value):
+        t = torch.tensor([value], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
-HIDDEN = int(os.environ.get("HIDDEN", 7168))
-K = int(os.environ.get("TOPK", 8))
-EPR = int(os.environ.get("EPR", 32))
 # fp8 flavor is arch-specific: OCP e4m3 on gfx950/gfx1250, fnuz on gfx942.
 from mori.ops.dispatch_combine_v2 import tuning_configs as _tc  # noqa: E402
 
@@ -87,36 +92,67 @@ _FP8_DT = (
     if _tc._topology()[1] in (90500, 120500)
     else torch.float8_e4m3fnuz
 )
-DTYPE = {
-    "bf16": torch.bfloat16,
-    "f32": torch.float32,
-    "fp8": _FP8_DT,
-    "fp4": torch.float4_e2m1fn_x2,
-}[os.environ.get("DTYPE", "bf16")]
-_IS_FP4 = DTYPE == torch.float4_e2m1fn_x2
-_IS_FP8 = DTYPE == _FP8_DT
-STDMOE = int(os.environ.get("STDMOE", 0))
-SCALE_DIM = int(
-    os.environ.get("SCALE_DIM", 0)
-)  # >0 = also verify per-token scales forwarding
-COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
-QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
-# Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
-# fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
-INSCALE = float(os.environ.get("INSCALE", 1))
-SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
-# RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on ranks
-# 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing with
-# ranks the tuned schedule puts on different geometries.
-RAGGED = int(os.environ.get("RAGGED", 0))
-# NOSELF=1: no token picks an expert on its own rank, so no rank receives from itself.
-NOSELF = int(os.environ.get("NOSELF", 0))
 
 
-def main():
-    d = Dist()
+def _configure():
+    """Read the knobs below from the environment (again for every CASES entry)."""
+    global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF, NOWTS
+    HIDDEN = int(os.environ.get("HIDDEN", 7168))
+    K = int(os.environ.get("TOPK", 8))
+    EPR = int(os.environ.get("EPR", 32))
+    DTYPE = {
+        "bf16": torch.bfloat16,
+        "f32": torch.float32,
+        "fp8": _FP8_DT,
+        "fp4": torch.float4_e2m1fn_x2,
+    }[os.environ.get("DTYPE", "bf16")]
+    _IS_FP4 = DTYPE == torch.float4_e2m1fn_x2
+    _IS_FP8 = DTYPE == _FP8_DT
+    STDMOE = int(os.environ.get("STDMOE", 0))
+    SCALE_DIM = int(
+        os.environ.get("SCALE_DIM", 0)
+    )  # >0 = also verify per-token scales forwarding
+    COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
+    QUANT = os.environ.get("QUANT", "none")  # none | fp{8,4}_blockwise[_1x32|_1x128]
+    # The gfx125x push combine folds no weights and refuses them (it says "call
+    # combine with weights=None"), so those runs pass none and skip the weight check.
+    NOWTS = QUANT != "none" and is_gfx125x()
+    # Input magnitude: 200 puts a block's amax past the fp8 max, 0.001 below its
+    # normal range; a quantized wire must keep both within _QUANT_REL_L2.
+    INSCALE = float(os.environ.get("INSCALE", 1))
+    # SPREAD=n: each 32-element group times 2^u, u uniform in [-n, n], so a scale
+    # applied to the wrong group shows up as a gross error.
+    SPREAD = int(os.environ.get("SPREAD", 0))
+    # TINY=1: every row's first 128 elements are ~1e-37 with a zero among them, under
+    # a 1x128 scale's normal range, where the scale must be 1. Without that rule
+    # max / amax overflows and the zero becomes 0 * inf; the hardware clamp happens
+    # to turn that NaN into a finite value, so this guards the rule, not a crash.
+    TINY = int(os.environ.get("TINY", 0))
+    SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
+    # RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on
+    # ranks 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing
+    # with ranks the tuned schedule puts on different geometries.
+    RAGGED = int(os.environ.get("RAGGED", 0))
+    # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
+    # itself.
+    NOSELF = int(os.environ.get("NOSELF", 0))
+
+
+_configure()
+
+# Relative L2 error bound of a quantized combine, by element; rounding alone is
+# ~2.6% for fp8 e4m3 and ~11% for e2m1.
+_QUANT_REL_L2 = {"fp8": 0.05, "fp4": 0.15}
+
+
+def _window_bytes(npes):
+    return npes * max(SWEEP) * HIDDEN * _DT() * 2 + (1 << 24)
+
+
+def _run(d, comm):
+    """One configuration (the knobs as _configure last read them), on comm."""
     rank, npes = d.rank, d.world
-    set_device(d.local_rank)
     dev = torch.device("cuda", d.local_rank)
     M = max(SWEEP)
     num_experts = npes * EPR
@@ -132,9 +168,18 @@ def main():
         inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
         if INSCALE != 1.0:
             inp = inp * INSCALE
+        if SPREAD:
+            groups = inp.view(M, HIDDEN // 32, 32)
+            u = torch.randint(-SPREAD, SPREAD + 1, (M, HIDDEN // 32, 1), generator=g)
+            inp = (groups * torch.exp2(u.float())).view(M, HIDDEN)
+        if TINY:
+            inp[:, :128] *= 1e-37
+            inp[:, 0] = 0.0
         inp = inp.to(DTYPE).to(dev)
     if NOSELF:
-        idx = torch.randint(0, num_experts - EPR, (M, K), generator=g, dtype=torch.int32)
+        idx = torch.randint(
+            0, num_experts - EPR, (M, K), generator=g, dtype=torch.int32
+        )
         idx += (idx >= rank * EPR).to(torch.int32) * EPR
     else:
         idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32)
@@ -152,33 +197,40 @@ def main():
             + rank * 100003
         ).to(torch.int32)
 
-    uid = Communicator.get_unique_id() if rank == 0 else None
-    uid = d.bcast_uid(uid)
-    win_bytes = npes * M * HIDDEN * _DT() * 2 + (1 << 24)
-    with Communicator.init(
-        npes, rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
-    ) as comm:
-        cfg = EpDispatchCombineConfig(
-            rank=rank,
-            world_size=npes,
-            hidden_dim=HIDDEN,
-            max_num_inp_token_per_rank=M,
-            num_experts_per_rank=EPR,
-            num_experts_per_token=K,
-            data_type=DTYPE,
-            enable_std_moe=bool(STDMOE),
-            scale_dim=SCALE_DIM,
-            scale_type_size=1 if SCALE_DIM else 0,
-            combine_mode=COMBINE,
-            quant_type=QUANT,
-            max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
-        )
-        if int(os.environ.get("TUNED", 0)):
+    cfg = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=npes,
+        hidden_dim=HIDDEN,
+        max_num_inp_token_per_rank=M,
+        num_experts_per_rank=EPR,
+        num_experts_per_token=K,
+        data_type=DTYPE,
+        enable_std_moe=bool(STDMOE),
+        scale_dim=SCALE_DIM,
+        scale_type_size=1 if SCALE_DIM else 0,
+        combine_mode=COMBINE,
+        quant_type=QUANT,
+        max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
+    )
+    if int(os.environ.get("TUNED", 0)):
+        # Each backend tunes its own kernels, so take the table of the one that will
+        # run: a cco row carries no promise about the hip dispatch's geometry, and on
+        # gfx1250 it is not even launchable there (its 32-warp rows predate the hip
+        # dispatch's per-warp LDS slabs -- ROCm/mori#951).
+        from mori.ops.dispatch_combine_v2.dispatch_combine_op import _default_backend
+
+        _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
+        if (os.environ.get("MORI_V2_KERNEL_BACKEND") or _default_backend()) == "hip":
+            from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
+
+            cfg.schedule = lookup(
+                npes, HIDDEN, K, dtype=_dt, experts_per_rank=EPR, quant_type=QUANT
+            )["schedule"]
+        else:
             from mori.ops.dispatch_combine_v2.tuning_configs import lookup
 
-            _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
             cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
-        op = EpDispatchCombineOp(cfg, comm)
+    with EpDispatchCombineOp(cfg, comm) as op:
         comm.barrier()
 
         cap = cfg.effective_max_recv if cfg.max_total_recv_tokens > 0 else None
@@ -304,6 +356,7 @@ def main():
                         flush=True,
                     )
                 continue
+            rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
                 op.convert_dispatch_output()  # identity GEMM: packed_x = token
                 sync()
@@ -326,7 +379,9 @@ def main():
                 # identity expert: recv_x already holds the dispatched tokens.
                 # Weights passed because this test checks the weight fold; an
                 # inference caller passes None and the kernel skips it.
-                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
+                out, out_w = op.combine(
+                    recv_x, None if NOWTS else wts[:ct], routing=routing
+                )
                 sync()
                 comm.barrier()
                 U = np.array(
@@ -348,19 +403,74 @@ def main():
                     lossy = QUANT != "none" or _IS_FP8
                     atol = 3e-1 if lossy else 2e-2
                     rtol = 1e-1 if lossy else 2e-2
-                    ok = torch.allclose(
+                    # e2m1 is too coarse for an elementwise bound; its L2 bound stands
+                    ok = QUANT.startswith("fp4") or torch.allclose(
                         out.float().cpu(), exp.float(), atol=atol, rtol=rtol
                     )
-                ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
+                    if QUANT != "none":
+                        # atol=0.3 passes any small-input loss; the L2 error does not
+                        ref = exp.float()
+                        err = (out.float().cpu() - ref).norm()
+                        rel = float(err / ref.norm()) if ref.norm() > 0 else 0.0
+                        ok = ok and rel < _QUANT_REL_L2[QUANT[:3]]
+                ok_w = NOWTS or torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
+            quant_err = ""
+            if QUANT != "none":
+                quant_err = f" rel_l2={d.allreduce_max(rel):.4f}"
             if rank == 0:
                 print(
                     f"# {tag} ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
-                    f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
-                    f"recv={total_recv})",
+                    f"(hidden={'ok' if ok else 'BAD'} "
+                    f"wts={'n/a' if NOWTS else ('ok' if ok_w else 'BAD')}; "
+                    f"recv={total_recv}{quant_err})",
                     flush=True,
                 )
+
+
+@contextlib.contextmanager
+def _case_env(case):
+    """os.environ with one CASES entry applied, the knobs re-read from it."""
+    saved = {k: os.environ.get(k) for k in case}
+    os.environ.update({k: str(v) for k, v in case.items()})
+    _configure()
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _configure()
+
+
+def main():
+    d = Dist()
+    set_device(d.local_rank)
+    # CASES='[{"DTYPE": "f32"}, ...]': env overrides run one after another in this
+    # launch, on one communicator. Each case closes its op before the next builds
+    # one, so the arena only has to fit the largest.
+    cases = json.loads(os.environ.get("CASES") or "null")
+    uid = Communicator.get_unique_id() if d.rank == 0 else None
+    uid = d.bcast_uid(uid)
+    win_bytes = 0
+    for case in cases or [{}]:
+        with _case_env(case):
+            win_bytes = max(win_bytes, _window_bytes(d.world))
+    with Communicator.init(
+        d.world, d.rank, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
+    ) as comm:
+        if cases is None:
+            _run(d, comm)
+        for i, case in enumerate(cases or ()):
+            with _case_env(case):
+                if d.rank == 0:
+                    print(f"# CASE {i} {json.dumps(case, sort_keys=True)}", flush=True)
+                _run(d, comm)
+                if d.rank == 0:
+                    print(f"# CASE {i} DONE", flush=True)
     d.shutdown()
 
 

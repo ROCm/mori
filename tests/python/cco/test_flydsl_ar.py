@@ -230,6 +230,7 @@ def _run_bench(world_size, backend, m, n, extra_env=None, extra=()):
     return records[0]
 
 
+@pytest.mark.gpu_group
 @pytest.mark.parametrize("backend", ["lsa", "sdma"])
 @pytest.mark.parametrize("world_size,m,n", [(2, 256, 1024), (4, 256, 1024)])
 def test_flydsl_ar_gpu_smoke(backend, world_size, m, n):
@@ -271,6 +272,7 @@ def test_fp8_gather_is_correct_and_stays_at_the_e4m3_floor(world_size, m, n):
     )
 
 
+@pytest.mark.gpu_group
 def test_flydsl_ar_matches_aiter_bitwise():
     """Every element is reduced once on its owner rank, so the two agree exactly."""
     world_size = 2

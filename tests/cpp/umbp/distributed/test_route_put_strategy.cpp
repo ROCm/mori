@@ -434,6 +434,31 @@ TEST(ConfigurableRoutePut, RandomWeightedDistributionSmoke) {
   EXPECT_LT(frac_a, 0.92);
 }
 
+// A small object skips a tier it is under the floor of, unless nothing else can take it.
+TEST(ConfigurableRoutePut, SmallObjectsSkipTiersAboveTheirFloor) {
+  ConfigurableRoutePutStrategy strat(Algo::kRandom, Affinity::kNone, /*rng_seed=*/3);
+  auto node = [](const std::string& id, uint64_t floor) {
+    auto client = MakeClient(id, id + "-addr", {});
+    client.logical_tier_capacities["kv"] =
+        LogicalTierCapacity{TierType::SSD, TierCapacity{1000 * GB, 1000 * GB}, true, 0.0, floor};
+    return client;
+  };
+  const std::vector<ClientRecord> both{node("prefill", 0), node("decode", 256 << 10)};
+  std::vector<uint64_t> small(64, 4096), large(64, 1 << 20);
+  for (const auto& r : strat.SelectBatch("req", small, NoDedup(small.size()), both, {})) {
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->node_id, "prefill");
+  }
+  size_t on_decode = 0;
+  for (const auto& r : strat.SelectBatch("req", large, NoDedup(large.size()), both, {})) {
+    on_decode += r.has_value() && r->node_id == "decode";
+  }
+  EXPECT_GT(on_decode, 0u);
+  auto only = SelectOne(strat, both, 4096, {"prefill"});
+  ASSERT_TRUE(only.has_value());
+  EXPECT_EQ(only->node_id, "decode");
+}
+
 // NODE_AFFINITY = same: a node fits the whole non-dedup total -> all keys land
 // on it.
 TEST(ConfigurableRoutePut, SameWholeBatchOnOneNode) {
