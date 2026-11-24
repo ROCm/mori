@@ -1499,8 +1499,8 @@ ccoCreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t ds
 #endif
 
 struct ccoSdmaQueueDeviceHandle {
-  // Reserve slotBytes with one atomic_fetch_add. Returns the monotonic base;
-  // keeping packets off the ring end is the caller's job.
+  // Reserve slotBytes with one atomic_fetch_add. Returns the monotonic base. A
+  // run may cross the ring end; the writers wrap per dword.
   //
   // cachedHwReadIndex is by-value, so a refreshed read index must be published
   // back to `shared` (the handle this was copied from) or every caller re-reads
@@ -1509,8 +1509,8 @@ struct ccoSdmaQueueDeviceHandle {
   // set it back to an older rptr; an older value only costs another rptr load.
   //
   // The ring is never filled completely: the engine reads wptr == rptr (mod the
-  // ring) as empty, so a full ring would look idle and stall every waiter. So at
-  // most CCO_SDMA_QUEUE_SIZE - CCO_SDMA_UNIT bytes are outstanding, an Aggregate
+  // ring) as empty, so a full ring would look idle and stall every waiter. So
+  // less than CCO_SDMA_QUEUE_SIZE bytes are ever outstanding, an Aggregate
   // batch included: the put that would fill the ring waits for rptr, which an
   // uncommitted batch never moves. Same rule as anvil_device.hpp's CanWriteUpto.
   __device__ __forceinline__ static bool CanWriteUpto(uint64_t end, uint64_t readIndex) {
@@ -1624,92 +1624,90 @@ enum ccoSdmaOptFlags : uint32_t {
   ccoSdmaOptFlagsSignalPerCopy = (1u << 1),
 };
 
-// The queue is written in 32B units, one packet each: COPY (28B, padded with a
-// NOP dword) or ATOMIC (32B exactly). The ring is a whole number of units and
-// every reservation is too, so a unit is always 32B-aligned in it and a packet
-// is never split — which is what the engine requires.
+// Packets sit back to back in the ring at their natural sizes, with no NOP
+// padding: COPY 28B, ATOMIC 32B, POLL_REGMEM 24B, broadcast COPY 36B, 2D COPY
+// 80B (gfx12.5: 52B). Every NOP dword is a packet the engine has to retire, and
+// it costs about as much as a small COPY: padding each COPY to 32B with one NOP
+// cut 7KB-row throughput from ~54 to ~3.2 GB/s per link on MI355X.
+//
+// Offsets are monotonic byte counts and always dword aligned. A packet may
+// straddle the ring end: each dword goes to its own masked ring index, and the
+// engine reads the ring as a circle. test_sdma_edge (wrap, mixwrap),
+// test_sdma_put2d (ring_wrap) and test_sdma_wait_broadcast (D) cross the end
+// with COPY, ATOMIC, 2D and broadcast packets.
 //
 // A group of `n` lanes posting together reserves one run. Default layout keeps
 // the copies together and signals the group once at the end:
 //     [COPY]xn [ATOMIC local] [ATOMIC remote]
 // With ccoSdmaOptFlagsSignalPerCopy every copy carries its own:
 //     ([COPY] [ATOMIC local] [ATOMIC remote]) xn
-constexpr uint64_t CCO_SDMA_UNIT = 32;
+constexpr uint64_t CCO_SDMA_COPY_BYTES = sizeof(CCO_SDMA_PKT_COPY_LINEAR);
+constexpr uint64_t CCO_SDMA_ATOMIC_BYTES = sizeof(CCO_SDMA_PKT_ATOMIC);
+constexpr uint64_t CCO_SDMA_POLL_BYTES = sizeof(CCO_SDMA_PKT_POLL_REGMEM);
+constexpr uint64_t CCO_SDMA_BCAST_BYTES = sizeof(CCO_SDMA_PKT_COPY_BROADCAST);
+constexpr uint64_t CCO_SDMA_2D_BYTES = sizeof(ccoSdmaCopy2DPacket);
+static_assert(CCO_SDMA_COPY_BYTES % sizeof(uint32_t) == 0 &&
+                  CCO_SDMA_ATOMIC_BYTES % sizeof(uint32_t) == 0 &&
+                  CCO_SDMA_POLL_BYTES % sizeof(uint32_t) == 0 &&
+                  CCO_SDMA_BCAST_BYTES % sizeof(uint32_t) == 0 &&
+                  CCO_SDMA_2D_BYTES % sizeof(uint32_t) == 0,
+              "SDMA packets are whole dwords");
+
+constexpr uint64_t CCO_SDMA_RING_DWORDS = CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
+static_assert((CCO_SDMA_RING_DWORDS & (CCO_SDMA_RING_DWORDS - 1)) == 0,
+              "ring must be a power of two to mask");
 
 template <bool localSignal, bool remoteSignal>
 inline constexpr uint64_t ccoSdmaSignalUnits() {
   return (localSignal ? 1 : 0) + (remoteSignal ? 1 : 0);
 }
 
+// Bytes the trailing signal ATOMICs of a run occupy.
+template <bool localSignal, bool remoteSignal>
+inline constexpr uint64_t ccoSdmaSignalBytes() {
+  return CCO_SDMA_ATOMIC_BYTES * ccoSdmaSignalUnits<localSignal, remoteSignal>();
+}
+
 // Bytes one lane's slot occupies, and how far apart consecutive lanes sit.
 template <bool localSignal, bool remoteSignal, bool signalPerCopy>
 inline constexpr uint64_t ccoSdmaStrideBytes() {
-  return CCO_SDMA_UNIT *
-         (1 + (signalPerCopy ? ccoSdmaSignalUnits<localSignal, remoteSignal>() : 0));
+  return CCO_SDMA_COPY_BYTES + (signalPerCopy ? ccoSdmaSignalBytes<localSignal, remoteSignal>() : 0);
 }
 
 // Bytes a group of `n` lanes must reserve.
 template <bool localSignal, bool remoteSignal, bool signalPerCopy>
 inline __device__ uint64_t ccoSdmaGroupBytes(unsigned n) {
-  constexpr uint64_t sig = ccoSdmaSignalUnits<localSignal, remoteSignal>();
   return signalPerCopy ? ccoSdmaStrideBytes<localSignal, remoteSignal, true>() * n
-                       : CCO_SDMA_UNIT * (n + sig);
+                       : CCO_SDMA_COPY_BYTES * n + ccoSdmaSignalBytes<localSignal, remoteSignal>();
 }
 
-using ccoUint4 = uint32_t __attribute__((ext_vector_type(4)));
-struct alignas(16) ccoSdmaUnit {
-  constexpr static size_t kVecSize = CCO_SDMA_UNIT / sizeof(ccoUint4);
-  ccoUint4 vec[kVecSize];
-};
-static_assert(CCO_SDMA_UNIT % sizeof(ccoUint4) == 0,
-              "CCO_SDMA_UNIT must be divisible by sizeof(ccoUint4)");
-static_assert(sizeof(ccoSdmaUnit) == CCO_SDMA_UNIT);
-static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_UNIT == 0, "ring must be whole units");
-static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR) <= CCO_SDMA_UNIT, "COPY must fit one unit");
-static_assert(sizeof(CCO_SDMA_PKT_ATOMIC) == CCO_SDMA_UNIT, "ATOMIC must be exactly one unit");
-
-// Where a unit at monotonic byte offset `at` lands. Units are 32B-aligned in a
-// 32B-multiple ring, so this never needs to split a packet.
-inline __device__ ccoSdmaUnit* ccoSdmaUnitAt(uint32_t* queueBuf, uint64_t at) {
+// Write `n` packet dwords starting at monotonic byte offset `at`, wrapping at
+// the ring end.
+inline __device__ void ccoSdmaWriteDwords(uint32_t* queueBuf, uint64_t at, const uint32_t* p,
+                                          uint32_t n) {
   if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-    if ((at % CCO_SDMA_UNIT) != 0) __builtin_trap();  // caller must pass a unit-aligned offset
+    if ((at % sizeof(uint32_t)) != 0) __builtin_trap();  // caller must pass a dword offset
   }
-  constexpr uint64_t kRingDwords = CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
-  static_assert((kRingDwords & (kRingDwords - 1)) == 0, "ring must be a power of two to mask");
-  return reinterpret_cast<ccoSdmaUnit*>(queueBuf + ((at / sizeof(uint32_t)) & (kRingDwords - 1)));
+  auto ring = impl::global(queueBuf);
+  const uint64_t d0 = at / sizeof(uint32_t);
+#pragma unroll
+  for (uint32_t i = 0; i < n; i++) ring[(d0 + i) & (CCO_SDMA_RING_DWORDS - 1)] = p[i];
+}
+
+template <typename Packet>
+inline __device__ void ccoSdmaWritePacket(uint32_t* queueBuf, uint64_t at, const Packet& pkt) {
+  ccoSdmaWriteDwords(queueBuf, at, reinterpret_cast<const uint32_t*>(&pkt),
+                     sizeof(Packet) / sizeof(uint32_t));
 }
 
 inline __device__ void ccoSdmaWriteCopy(uint32_t* queueBuf, uint64_t at, void* srcPtr, void* dstPtr,
                                         size_t size) {
-  auto pkt = ccoCreateCopyPacket(srcPtr, dstPtr, size);
-  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
-  auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
-  // Last dword is NOP (op=0), pads COPY out to the unit; engine skips it
-  dst->vec[1] = ccoUint4{p[4], p[5], p[6], 0};
+  ccoSdmaWritePacket(queueBuf, at, ccoCreateCopyPacket(srcPtr, dstPtr, size));
 }
 
 inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAuint64* target) {
-  auto pkt = ccoCreateAtomicIncPacket(target);
-  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
-  auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
-  dst->vec[1] = ccoUint4{p[4], p[5], p[6], p[7]};
+  ccoSdmaWritePacket(queueBuf, at, ccoCreateAtomicIncPacket(target));
 }
-
-// A 2D copy is 80B (gfx12.5: 52B), so it takes a 128B (64B) slot, NOP-padded,
-// and the slot starts slot-aligned. The ring is a whole number of slots, so a
-// packet can never straddle the ring end, which a multi-unit packet at an
-// arbitrary unit could. A run reserves one slot less a unit of slack for that
-// alignment; whatever the alignment leaves over is NOP-filled after the run.
-#if defined(CCO_GFX125X)
-constexpr uint64_t CCO_SDMA_2D_SLOT = 2 * CCO_SDMA_UNIT;
-#else
-constexpr uint64_t CCO_SDMA_2D_SLOT = 4 * CCO_SDMA_UNIT;
-#endif
-constexpr uint64_t CCO_SDMA_2D_SLACK = CCO_SDMA_2D_SLOT - CCO_SDMA_UNIT;
-static_assert(sizeof(ccoSdmaCopy2DPacket) <= CCO_SDMA_2D_SLOT, "2D COPY must fit one slot");
-static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_2D_SLOT == 0, "ring must be whole 2D slots");
 
 // One rectangle: `height` rows of `widthBytes`, rows `srcPitch` / `dstPitch`
 // bytes apart. src and dst point at the rectangle's first byte.
@@ -1722,28 +1720,10 @@ struct ccoSdmaRect {
   uint32_t height;
 };
 
-// Zero dwords are 1-dword NOPs; `bytes` is a whole number of units.
-inline __device__ void ccoSdmaWriteNops(uint32_t* queueBuf, uint64_t at, uint64_t bytes) {
-  for (uint64_t off = 0; off < bytes; off += CCO_SDMA_UNIT) {
-    auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at + off));
-    dst->vec[0] = ccoUint4{0, 0, 0, 0};
-    dst->vec[1] = ccoUint4{0, 0, 0, 0};
-  }
-}
-
-// `at` is slot-aligned, so the slot's units are contiguous in the ring. The
-// zeros after the packet are 1-dword NOPs.
 inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const ccoSdmaRect& r) {
-  uint32_t p[CCO_SDMA_2D_SLOT / sizeof(uint32_t)] = {};
-  const auto pkt =
-      ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes, r.height);
-  __builtin_memcpy(p, &pkt, sizeof(pkt));
-  auto u = impl::global(ccoSdmaUnitAt(queueBuf, at));
-#pragma unroll
-  for (uint32_t i = 0; i < CCO_SDMA_2D_SLOT / CCO_SDMA_UNIT; i++) {
-    u[i].vec[0] = ccoUint4{p[8 * i], p[8 * i + 1], p[8 * i + 2], p[8 * i + 3]};
-    u[i].vec[1] = ccoUint4{p[8 * i + 4], p[8 * i + 5], p[8 * i + 6], p[8 * i + 7]};
-  }
+  ccoSdmaWritePacket(queueBuf, at,
+                     ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes,
+                                           r.height));
 }
 
 #if defined(CCO_GFX125X)
@@ -1771,12 +1751,6 @@ __device__ __forceinline__ ccoSdmaRect ccoSdma2DPiece(const ccoSdmaRect& r, uint
 }
 #endif
 
-inline __device__ void ccoSdmaWriteNop(uint32_t* queueBuf, uint64_t at) {
-  auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = ccoUint4{0, 0, 0, 0};
-  dst->vec[1] = ccoUint4{0, 0, 0, 0};
-}
-
 // Interval and retry_count of the poll: retry 0xFFF is "forever".
 constexpr uint32_t CCO_SDMA_POLL_INTERVAL = 10;
 constexpr uint32_t CCO_SDMA_POLL_RETRY_FOREVER = 0xFFF;
@@ -1796,14 +1770,9 @@ inline __device__ void ccoSdmaWritePoll(uint32_t* queueBuf, uint64_t at, const v
 #ifdef CCO_SDMA_SCOPE_FIELDS
   pkt.DW5_UNION.scope = CCO_SDMA_MEMORY_SCOPE_SYS;
 #endif
-  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
-  auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
-  dst->vec[1] = ccoUint4{p[4], p[5], 0, 0};  // trailing NOP dwords pad to the unit
+  ccoSdmaWritePacket(queueBuf, at, pkt);
 }
 
-// 36B, so two units. The caller keeps both on the same side of the ring end:
-// the second unit is not guaranteed to follow the first once the ring wraps.
 inline __device__ void ccoSdmaWriteBroadcast(uint32_t* queueBuf, uint64_t at, void* srcPtr,
                                              void* dstPtr1, void* dstPtr2, size_t size) {
   CCO_SDMA_PKT_COPY_BROADCAST pkt = {};
@@ -1817,13 +1786,7 @@ inline __device__ void ccoSdmaWriteBroadcast(uint32_t* queueBuf, uint64_t at, vo
   pkt.DST1_ADDR_HI = (uint32_t)((uintptr_t)dstPtr1 >> 32);
   pkt.DST2_ADDR_LO = (uint32_t)(uintptr_t)dstPtr2;
   pkt.DST2_ADDR_HI = (uint32_t)((uintptr_t)dstPtr2 >> 32);
-  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
-  auto lo = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  lo->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
-  lo->vec[1] = ccoUint4{p[4], p[5], p[6], p[7]};
-  auto hi = impl::global(ccoSdmaUnitAt(queueBuf, at + CCO_SDMA_UNIT));
-  hi->vec[0] = ccoUint4{p[8], 0, 0, 0};
-  hi->vec[1] = ccoUint4{0, 0, 0, 0};
+  ccoSdmaWritePacket(queueBuf, at, pkt);
 }
 
 template <bool localSignal, bool remoteSignal>
@@ -1831,21 +1794,21 @@ inline __device__ void ccoSdmaWriteSignals(uint32_t* queueBuf, uint64_t at, HSAu
                                            HSAuint64* remoteTarget) {
   if constexpr (localSignal) {
     ccoSdmaWriteAtomic(queueBuf, at, localTarget);
-    at += CCO_SDMA_UNIT;
+    at += CCO_SDMA_ATOMIC_BYTES;
   }
   if constexpr (remoteSignal) ccoSdmaWriteAtomic(queueBuf, at, remoteTarget);
 }
 
 // One lane's contribution to a group run: its COPY, plus its signals when they
-// are per-copy. `slot` is the lane's stride-aligned start.
+// are per-copy. `slot` is the lane's start (base + lane index * stride).
 template <bool localSignal, bool remoteSignal, bool signalPerCopy>
 inline __device__ void ccoSdmaFillLane(uint32_t* queueBuf, uint64_t slot, HSAuint64* localTarget,
                                        HSAuint64* remoteTarget, void* srcPtr, void* dstPtr,
                                        size_t size) {
   ccoSdmaWriteCopy(queueBuf, slot, srcPtr, dstPtr, size);
   if constexpr (signalPerCopy) {
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(queueBuf, slot + CCO_SDMA_UNIT, localTarget,
-                                                   remoteTarget);
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(queueBuf, slot + CCO_SDMA_COPY_BYTES,
+                                                   localTarget, remoteTarget);
   }
 }
 
@@ -1939,7 +1902,7 @@ inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void*
       if constexpr (!signalPerCopy) {
         if (myIdx == cnt - 1)
           ccoSdmaWriteSignals<localSignal, remoteSignal>(
-              handle.queueBuf, base + cnt * CCO_SDMA_UNIT, localTarget, remoteTarget);
+              handle.queueBuf, base + cnt * CCO_SDMA_COPY_BYTES, localTarget, remoteTarget);
       }
       // s_waitcnt is per-lane, so the leader's cannot publish anyone else's slot.
       ccoSdmaPublishStores();
@@ -2041,7 +2004,7 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     const uint64_t bytes = ccoSdmaGroupBytes<localSignal, remoteSignal, kPerCopy>(1);
     const uint64_t base = handle.ReserveSlot(bytes, shared);
     ccoSdmaWriteCopy(handle.queueBuf, base, srcBuf, dstBuf, copy_size);
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_UNIT,
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_COPY_BYTES,
                                                    localTarget, remoteTarget);
     if constexpr (kRing) {
       handle.submitPacket(base, base + bytes);
@@ -2081,7 +2044,7 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     if constexpr (!kPerCopy) {
       if (myIdx == nActive - 1)
         ccoSdmaWriteSignals<localSignal, remoteSignal>(
-            handle.queueBuf, base + nActive * CCO_SDMA_UNIT, localTarget, remoteTarget);
+            handle.queueBuf, base + nActive * CCO_SDMA_COPY_BYTES, localTarget, remoteTarget);
     }
     ccoSdmaPublishStores();  // per-lane: the leader cannot publish for us
     __builtin_amdgcn_wave_barrier();
@@ -2099,7 +2062,7 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     const uint64_t bytes = ccoSdmaGroupBytes<localSignal, remoteSignal, kPerCopy>(1);
     const uint64_t base = handle.ReserveSlot(bytes, shared);
     ccoSdmaWriteCopy(handle.queueBuf, base, srcBuf, dstBuf, copy_size);
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_UNIT,
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_COPY_BYTES,
                                                    localTarget, remoteTarget);
     if constexpr (!kRing) {
       // Aggregate: nobody rings here, so publish the packet dwords now (same
@@ -2149,7 +2112,7 @@ inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_s
 // lowest lane reserves one run, each lane fills its slot, and one doorbell
 // covers the group. Lanes on one queue -- the batching case -- are one pass; a
 // full wave is a 64-rectangle batch for the price of one submission.
-//     [NOP]xlead ([2D COPY][NOP...])xn [ATOMIC local] [ATOMIC remote] [NOP]x(slack-lead)
+//     [2D COPY]xn [ATOMIC local] [ATOMIC remote]
 // Signals ride the end of each group's run, so `expected` advances by one per
 // call on every queue the call touched, as with put().
 template <bool localSignal = false, bool remoteSignal = false,
@@ -2164,7 +2127,7 @@ inline __device__ void ccoSdmaPut2DThread(const ccoSdmaRect& rect,
   if (rect.widthBytes == 0 || rect.height == 0) return;
 
   constexpr bool kRing = !(optFlags & ccoSdmaOptFlagsAggregate);
-  constexpr uint64_t kSigBytes = CCO_SDMA_UNIT * ccoSdmaSignalUnits<localSignal, remoteSignal>();
+  constexpr uint64_t kSigBytes = ccoSdmaSignalBytes<localSignal, remoteSignal>();
   ccoSdmaQueueDeviceHandle* shared = *impl::global(deviceHandles + qId);
 
   // Uniform loop: `rem` and `group` are ballot results, identical in every lane.
@@ -2180,21 +2143,14 @@ inline __device__ void ccoSdmaPut2DThread(const ccoSdmaRect& rect,
       const unsigned myIdx = impl::waveLanesBelow(group);
 
       ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-      const uint64_t runBytes = CCO_SDMA_2D_SLACK + cnt * CCO_SDMA_2D_SLOT + kSigBytes;
+      const uint64_t runBytes = cnt * CCO_SDMA_2D_BYTES + kSigBytes;
       uint64_t base = (myIdx == 0) ? handle.ReserveSlot(runBytes, shared) : 0;
       base = impl::waveBcastLane(base, probe);  // the leader is the probe lane
-      const uint64_t first = (base + CCO_SDMA_2D_SLOT - 1) & ~(CCO_SDMA_2D_SLOT - 1);
-      const uint64_t lead = first - base;
 
-      if (myIdx == 0) {
-        ccoSdmaWriteNops(handle.queueBuf, base, lead);
-        ccoSdmaWriteNops(handle.queueBuf, first + cnt * CCO_SDMA_2D_SLOT + kSigBytes,
-                         CCO_SDMA_2D_SLACK - lead);
-      }
-      ccoSdmaWriteCopy2D(handle.queueBuf, first + myIdx * CCO_SDMA_2D_SLOT, rect);
+      ccoSdmaWriteCopy2D(handle.queueBuf, base + myIdx * CCO_SDMA_2D_BYTES, rect);
       if (myIdx == cnt - 1)
         ccoSdmaWriteSignals<localSignal, remoteSignal>(
-            handle.queueBuf, first + cnt * CCO_SDMA_2D_SLOT, localTarget, remoteTarget);
+            handle.queueBuf, base + cnt * CCO_SDMA_2D_BYTES, localTarget, remoteTarget);
       ccoSdmaPublishStores();  // per-lane: the leader cannot publish for us
       __builtin_amdgcn_wave_barrier();
       // Ring before the next group reserves, so the wave never holds two
@@ -2378,19 +2334,17 @@ __device__ inline void ccoSdmaDispatchWait(const ccoSdmaContext& s, int peer, in
     ccoSdmaQueueDeviceHandle* shared =
         *impl::global(s.deviceHandles + peer * s.sdmaNumQueue + queueId);
     ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-    const uint64_t base = handle.ReserveSlot(CCO_SDMA_UNIT, shared);
+    const uint64_t base = handle.ReserveSlot(CCO_SDMA_POLL_BYTES, shared);
     ccoSdmaWritePoll(handle.queueBuf, base, addr, value, mask, func);
     if constexpr (kRing) {
-      handle.submitPacket(base, base + CCO_SDMA_UNIT);
+      handle.submitPacket(base, base + CCO_SDMA_POLL_BYTES);
     } else {
       ccoSdmaPublishStores();
     }
   });
 }
 
-// One broadcast packet plus its signals. Layout: [BCAST x2][signals][NOP], or
-// [NOP][BCAST x2][signals] when the packet would straddle the ring end. The
-// unit of slack is always reserved because `base` is only known after the fact.
+// One broadcast packet plus its signals: [BCAST][signals].
 template <bool kRing>
 __device__ inline void ccoSdmaPostBroadcast(ccoSdmaQueueDeviceHandle* shared, void* src, void* dst1,
                                             void* dst2, size_t bytes,
@@ -2398,24 +2352,17 @@ __device__ inline void ccoSdmaPostBroadcast(ccoSdmaQueueDeviceHandle* shared, vo
   uint32_t nSignals = 0;
   for (int i = 0; i < 3; i++) nSignals += signals[i] != nullptr;
   ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-  const uint64_t runBytes = CCO_SDMA_UNIT * (3 + nSignals);
+  const uint64_t runBytes = CCO_SDMA_BCAST_BYTES + CCO_SDMA_ATOMIC_BYTES * nSignals;
   const uint64_t base = handle.ReserveSlot(runBytes, shared);
 
-  constexpr uint64_t kRingUnits = CCO_SDMA_QUEUE_SIZE / CCO_SDMA_UNIT;
-  const bool straddles = (base / CCO_SDMA_UNIT) % kRingUnits == kRingUnits - 1;
   uint64_t at = base;
-  if (straddles) {
-    ccoSdmaWriteNop(handle.queueBuf, at);
-    at += CCO_SDMA_UNIT;
-  }
   ccoSdmaWriteBroadcast(handle.queueBuf, at, src, dst1, dst2, bytes);
-  at += 2 * CCO_SDMA_UNIT;
+  at += CCO_SDMA_BCAST_BYTES;
   for (int i = 0; i < 3; i++) {
     if (signals[i] == nullptr) continue;
     ccoSdmaWriteAtomic(handle.queueBuf, at, signals[i]);
-    at += CCO_SDMA_UNIT;
+    at += CCO_SDMA_ATOMIC_BYTES;
   }
-  if (!straddles) ccoSdmaWriteNop(handle.queueBuf, at);
 
   if constexpr (kRing) {
     handle.submitPacket(base, base + runBytes);
@@ -2461,9 +2408,8 @@ __device__ inline void ccoSdmaDispatchBroadcast(const ccoSdmaContext& s, int pee
   });
 }
 
-// postWaitMemPutPtr's run: [POLL_REGMEM][COPY, or NOP if bytes == 0][local
-// signal]?[remote signal]?, 2-4 ring units per lane. Every packet is one unit,
-// so none straddles the ring end and no slack unit is needed. Each lane
+// postWaitMemPutPtr's run: [POLL_REGMEM][COPY, absent if bytes == 0][local
+// signal]?[remote signal]?. Each lane
 // reserves its whole run with one ReserveSlot and rings it with one doorbell.
 // Lanes on distinct queues post in parallel (publishing in chain order, as
 // ccoSdmaPutThread); lanes on a shared queue post in turn. A copy over
@@ -2480,7 +2426,9 @@ __device__ inline void ccoSdmaWaitPutThread(const ccoSdmaContext& s, int peer, i
     if (bytes == 0) return;  // nothing to gate: do not park the queue for nothing
   }
   constexpr bool kRing = !(optFlags & ccoSdmaOptFlagsAggregate);
-  constexpr uint64_t kBytes = CCO_SDMA_UNIT * (2 + ccoSdmaSignalUnits<localSignal, remoteSignal>());
+  const uint64_t copyBytes = bytes != 0 ? CCO_SDMA_COPY_BYTES : 0;
+  const uint64_t runBytes =
+      CCO_SDMA_POLL_BYTES + copyBytes + ccoSdmaSignalBytes<localSignal, remoteSignal>();
   if (__builtin_expect(bytes > CCO_SDMA_MAX_COPY_BYTES, 0)) {
     // One lane at a time, its wait and all its chunks together: posting every
     // lane's wait first would hold lane A's copy behind lane B's flag on a
@@ -2504,19 +2452,17 @@ __device__ inline void ccoSdmaWaitPutThread(const ccoSdmaContext& s, int peer, i
   auto fill = [&](ccoSdmaQueueDeviceHandle& handle, uint64_t base) {
     ccoSdmaWritePoll(handle.queueBuf, base, flag, value, mask, func);
     if (bytes != 0) {
-      ccoSdmaWriteCopy(handle.queueBuf, base + CCO_SDMA_UNIT, src, dst, bytes);
-    } else {
-      ccoSdmaWriteNop(handle.queueBuf, base + CCO_SDMA_UNIT);
+      ccoSdmaWriteCopy(handle.queueBuf, base + CCO_SDMA_POLL_BYTES, src, dst, bytes);
     }
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + 2 * CCO_SDMA_UNIT,
-                                                   localTarget, remoteTarget);
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(
+        handle.queueBuf, base + CCO_SDMA_POLL_BYTES + copyBytes, localTarget, remoteTarget);
   };
   auto postAlone = [&]() {
     ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-    const uint64_t base = handle.ReserveSlot(kBytes, shared);
+    const uint64_t base = handle.ReserveSlot(runBytes, shared);
     fill(handle, base);
     if constexpr (kRing) {
-      handle.submitPacket(base, base + kBytes);
+      handle.submitPacket(base, base + runBytes);
     } else {
       ccoSdmaPublishStores();
     }
@@ -2535,13 +2481,13 @@ __device__ inline void ccoSdmaWaitPutThread(const ccoSdmaContext& s, int peer, i
     return;
   }
   ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-  const uint64_t base = handle.ReserveSlot(kBytes, shared);
+  const uint64_t base = handle.ReserveSlot(runBytes, shared);
   fill(handle, base);
   if constexpr (!kRing) {
     ccoSdmaPublishStores();
     return;
   }
-  ccoSdmaPublishInChainOrder(handle, base, base + kBytes);
+  ccoSdmaPublishInChainOrder(handle, base, base + runBytes);
 }
 
 struct ccoSdma {

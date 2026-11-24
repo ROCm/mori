@@ -161,8 +161,8 @@ A bitmask, and a template argument. Two bits:
 
 `ccoSdmaOptFlagsAggregate` posts without ringing the doorbell — issue N puts,
 then one `commit(peer, queueId)` rings the batch. Amortises the doorbell; sweet
-spot around N = 8–16. A batch must fit in the ring with one unit to spare: at
-most 256 KB − 32 B on a queue before `commit` (8191 single-copy puts without
+spot around N = 8–16. A batch must stay below the 256 KB ring: at most
+256 KB − 4 B on a queue before `commit` (9362 single-copy puts of 28 B, without
 signals). The put that would fill the ring waits for the engine, which an
 uncommitted batch never starts, so it hangs.
 
@@ -170,8 +170,8 @@ uncommitted batch never starts, so it hangs.
 rarely want this.** By default a group of lanes signals once, after all of its
 copies, so `expected` advances by one per `put()` call whatever the scope and
 however many lanes joined. Per-copy signals make it advance by the lane count
-instead, and cost a packet each — an ATOMIC costs the engine about what a COPY
-does, so 64 signalled copies take 248 µs instead of 132 µs. Set it only if a
+instead, and cost a 32 B ATOMIC packet each, which the engine retires like any
+other packet. Set it only if a
 receiver has to observe copies landing one at a time. No effect at warp or block
 scope, which post a single copy either way.
 
@@ -269,50 +269,41 @@ issuers proceed in parallel.
 
 ## Transfer size
 
-Bandwidth is a function of **bytes per op** and nothing else. Scope, direction
-and queue count do not enter into it:
+Back-to-back puts, `cco_p2p_put_bw -t sdma -s thread`, 2 ranks, one link:
 
 | bytes per op | GB/s |
 |---|---|
-| 64 KB | 17 |
-| 128 KB | 26 |
-| 256 KB | 36 |
-| 512 KB | 46 |
-| 1 MB | 52 |
-| 2 MB | 56 |
+| 32 KB | 35 |
+| 64 KB | 50 |
+| 128 KB | 53 |
+| 256 KB | 54 |
+| 512 KB | 55 |
+| 1 MB | 56 |
+| 2 MB | 57 |
 | 4 MB | 59 |
-| 8 MB | 60 |
 
-`put` and `get` land within 1% of each other, and `thread`/`warp`/`block` are
-indistinguishable at equal bytes per op. Half of the achievable bandwidth is
-already gone at 512 KB, and below ~256 KB the fixed ~6 µs dispatch cost
-dominates whatever the copy itself does.
-
-So the only lever for bandwidth is **not splitting the transfer**. Two ops of
-4 MB reach 57 GB/s where one op of 8 MB reaches 60, even on separate queues —
-splitting always costs, in proportion to how small the pieces get. Issue the
-largest contiguous copy you have and let one engine drain it.
-
-Below ~256 KB you are latency-bound, not bandwidth-bound; that is the regime
-where warp aggregation and `SameQueue` matter and transfer size does not.
+The link is close to saturated from about 64 KB per op. `put` and `get` land
+within 1% of each other, and `thread`/`warp`/`block` are indistinguishable at
+equal bytes per op. A single put, launch to drain, takes about 5.1–5.4 µs up to
+16 KB (quiet) and 5.7–6.1 µs with a signal; that latency is what small
+standalone transfers pay.
 
 ### Many small copies
 
-The engine costs about **2 µs per packet**, near enough the same for 64 B as for
-4 KB. Two consequences.
+The engine retires a packet in about **0.1 µs** plus its data time: on MI355X,
+one queue runs about 10.6M 64 B packets/s, and 7 KB packets reach 54–58 GB/s per
+link, the same as large copies. With 7 peers each on its own queue, 7 KB packets
+moved about 370–380 GB/s per rank.
 
-Issuing is not the bottleneck: 64 packets take 1.3 µs to issue and 128 µs for the
-engine to run, so `SameQueue` aggregation buys latency and CU time, not
-throughput.
+So scattering is cheap: one packet per row is fine even for rows of a few KB,
+and there is no need to pack non-contiguous data first for bandwidth. Issuing
+is cheap too: a wave posts a 64-packet `SameQueue` group at about 30 ns per
+packet.
 
-Scattering is expensive: 64 x 4 KB costs 138 µs, where the same 256 KB in one
-copy costs about 11 µs.
-
-So if the data is non-contiguous, packing it first is usually faster: a local
-gather runs at ~7 TB/s, adding only a couple of percent to the transfer. Scatter
-directly when the chunks are large (≳1 MB, where the 2 µs is noise), when the CU
-must stay free for compute, or when you want the data to land in place with no
-unpack on the receiver.
+Earlier versions of this file quoted ~2 µs per packet. That was not the
+engine: cco used to pad every COPY to 32 B with a NOP dword, and each NOP costs
+the engine about as much as a small COPY. Since 2026-11 the ring holds packets
+back to back with no padding.
 
 ## Engine-side wait and broadcast
 
@@ -414,8 +405,8 @@ queue (122 GB/s for two `put`s on two queues), and local + remote was the same 4
 61. It was faster only when both destinations are local (68 vs 61 GB/s). For
 fan-out to peers, issue puts on separate queues.
 
-The packet is 36 B, so it takes two ring units plus one of slack that is padded with
-a NOP, so the packet is never split across the ring end.
+The packet is 36 B and sits back to back with the packets around it, like every
+other packet; it may straddle the ring end.
 
 ## Failure modes
 
@@ -425,7 +416,7 @@ a NOP, so the packet is never split across the ring end.
 | `ccoSdma` undeclared | kernel TU missing `-DBUILD_CCO_SDMA=1` |
 | `waitSignal` never returns | `expected` shared across queues, `comm.rank` passed where `comm.lsaRank` was meant, or `expected` counted per lane when the sender signals once per group |
 | `quiet` returns but data is stale | aggregate puts never `commit`ed — `quiet` drains to the last *rung* packet. Traps under `MORI_CCO_SDMA_DEBUG` |
-| a `put` inside an `Aggregate` batch never returns | over 256 KB − 32 B posted on one queue without `commit` — commit sooner. Traps under `MORI_CCO_SDMA_DEBUG` |
+| a `put` inside an `Aggregate` batch never returns | 256 KB or more posted on one queue without `commit` — commit sooner. Traps under `MORI_CCO_SDMA_DEBUG` |
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
 | a queue stops moving after `postWaitMem` | the flag never reached the value, or it points at another GPU's memory — `win`/`offset` must be local |

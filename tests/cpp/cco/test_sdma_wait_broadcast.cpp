@@ -35,8 +35,8 @@
 //      not deadlock (the lanes are serialized).
 //   F  same, with putBroadcast: every lane broadcasts its own slice to {next, self}
 //      on one queue; both destinations must hold every slice.
-//   D  broadcast ring wrap: enough 3-unit broadcasts that one is placed on the
-//      last unit of the ring, which must be padded rather than split.
+//   D  broadcast ring wrap: enough 36B broadcasts that at least one straddles
+//      the ring end, and both destinations still get the data.
 //   G  postWaitMemPutPtr: a wait, a copy and a signal in one run, held behind a flag
 //      like B (thread scope, Default and Aggregate).
 
@@ -147,7 +147,9 @@ __global__ void RelayKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 
 /* ---------------------------------- part D ---------------------------------- */
 
-constexpr int WRAP_ITERS = 9000;  // 3 units each: more than 3 laps of the 8192-unit ring
+// 36B each, about 2.2 laps of the 256KB ring. The ring is not a multiple of 36B,
+// so of the two ring ends crossed at most one can fall between two packets.
+constexpr int WRAP_ITERS = 16000;
 
 __global__ void BroadcastWrapKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
                                     ccoWindowDevice* recv2Win, int qid, uint32_t* straddles,
@@ -160,10 +162,11 @@ __global__ void BroadcastWrapKernel(ccoWindowDevice* sendWin, ccoWindowDevice* r
   ccoSdmaQueueDeviceHandle h =
       ccoSdmaLoadQueueHandle(devComm.sdma.deviceHandles + next * devComm.sdma.sdmaNumQueue + qid);
   uint64_t pos = __hip_atomic_load(h.cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  constexpr uint64_t kRingUnits = CCO_SDMA_QUEUE_SIZE / CCO_SDMA_UNIT;
+  static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_BCAST_BYTES != 0,
+                "part D relies on broadcasts not tiling the ring");
   uint32_t count = 0;
-  for (int i = 0; i < WRAP_ITERS; i++, pos += 3 * CCO_SDMA_UNIT)
-    count += (pos / CCO_SDMA_UNIT) % kRingUnits == kRingUnits - 1;
+  for (int i = 0; i < WRAP_ITERS; i++, pos += CCO_SDMA_BCAST_BYTES)
+    count += pos % CCO_SDMA_QUEUE_SIZE + CCO_SDMA_BCAST_BYTES > CCO_SDMA_QUEUE_SIZE;
   *straddles = count;
 
   for (int i = 0; i < WRAP_ITERS; i++) {
