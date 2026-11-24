@@ -30,6 +30,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace mori::umbp::l1 {
@@ -206,7 +207,10 @@ class PoolManager {
   OpenResult Open(const std::string& pool_id);
   // Up to `count` slots: vacant ones first (lowest id), then — only until
   // `min_count` slots are produced — the least recently released cached slot.
-  // Returned slots are held by the owner and carry no key.
+  // A vacant slot the owner's device may still be writing (released since its
+  // last Commit) comes last of all, and never beyond `min_count`: a fetch
+  // into it would wait for that device. Returned slots are held by the owner
+  // and carry no key.
   AllocateResult Allocate(const std::string& pool_id, uint32_t count,
                           uint32_t min_count = kAllRequired);
   static constexpr uint32_t kAllRequired = UINT32_MAX;
@@ -243,6 +247,11 @@ class PoolManager {
   // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 1;
   // 0 is plain least-recently-released).
   void SetEvictionPolicy(uint32_t keep_copies);
+  // Whether a grant passes over vacant slots their owner's device may still
+  // be writing, evicting cold content instead, until nothing else is free.
+  // Read from UMBP_L1_GRANT_SETTLED_FIRST at construction (default 1). Set
+  // before any pool is in use.
+  void SetGrantSettledFirst(bool on);
 
  private:
   enum class SlotState : uint8_t { kVacant, kCached, kHeld, kFilling };
@@ -339,6 +348,10 @@ class PoolManager {
     bool bound = false;
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
+    // Vacant slots their owner's device may still be writing, by the stamp
+    // that settles each: handed out only when nothing else can be
+    // (`settled_first_`), and moved to `vacant` once `committed` passes them.
+    std::set<std::pair<uint64_t, uint32_t>> unsettled;
     SlotList lru;  // cached slots, coldest first
     // Cached slots an eviction passed over as last copies (`keep_copies`),
     // oldest first. Evicted from only when `lru` has nothing to take.
@@ -378,6 +391,9 @@ class PoolManager {
   // The owner took `slot` for a request: its copy is the newest of its key.
   void HolderUsedLocked(Pool* pool, uint32_t slot);
   void ResetSlotsLocked(Pool* pool);
+  // `slot` becomes vacant / a vacant slot is taken by its owner.
+  void VacateLocked(Pool* pool, uint32_t slot);
+  void UnvacateLocked(Pool* pool, uint32_t slot);
   // A free slot for new content, or false. Appends the key it destroyed; with
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
   // other than the owner, which must not write where the owner still may.
@@ -398,6 +414,9 @@ class PoolManager {
 
   std::shared_ptr<MemoryApi> api_;
   uint32_t keep_copies_ = 0;
+  // A grant prefers evicting cold content to handing out a slot whose owner's
+  // writes have not landed (UMBP_L1_GRANT_SETTLED_FIRST, default on).
+  bool settled_first_ = true;
   mutable std::mutex mutex_;
   std::condition_variable idle_;
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;

@@ -325,6 +325,8 @@ PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api)) 
   // On by default: with ranks copying each other's prefixes, plain LRU evicts
   // a conversation's only up-to-date copy while older duplicates of it stay.
   SetEvictionPolicy(EnvCount("UMBP_L1_KEEP_COPIES", 1));
+  settled_first_ = EnvCount("UMBP_L1_GRANT_SETTLED_FIRST", 1) != 0;
+  MORI_UMBP_INFO("[L1Pool] grants take settled slots first: {}", settled_first_ ? "on" : "off");
 }
 
 void PoolManager::SetEvictionPolicy(uint32_t keep_copies) {
@@ -400,6 +402,11 @@ void PoolManager::Unlink(Pool* pool, SlotList* list, uint32_t slot) {
   }
   s.prev = s.next = kNoSlot;
   --list->size;
+}
+
+void PoolManager::SetGrantSettledFirst(bool on) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  settled_first_ = on;
 }
 
 void PoolManager::UncacheLocked(Pool* pool, uint32_t slot) {
@@ -491,6 +498,7 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
   pool->lru = SlotList{};
   pool->kept = SlotList{};
   pool->vacant.clear();
+  pool->unsettled.clear();
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) {
     pool->slots[slot] = Slot{};
     pool->vacant.insert(slot);
@@ -499,8 +507,31 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
   pool->committed = 0;
 }
 
+void PoolManager::VacateLocked(Pool* pool, uint32_t slot) {
+  Slot& s = pool->slots[slot];
+  s.state = SlotState::kVacant;
+  // A pool whose owner has never reported progress has no settled slots at
+  // all: nothing in it can be filled from outside, so nothing is held back.
+  if (settled_first_ && pool->committed != 0 && !Fillable(*pool, s)) {
+    pool->unsettled.emplace(std::max(s.released, s.written), slot);
+  } else {
+    pool->vacant.insert(slot);
+  }
+}
+
+void PoolManager::UnvacateLocked(Pool* pool, uint32_t slot) {
+  if (pool->vacant.erase(slot) != 0) return;
+  const Slot& s = pool->slots[slot];
+  pool->unsettled.erase({std::max(s.released, s.written), slot});
+}
+
 bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
                                  bool settled_only) {
+  // Vacant slots whose owner's writes have landed since they were released.
+  while (!pool->unsettled.empty() && pool->unsettled.begin()->first <= pool->committed) {
+    pool->vacant.insert(pool->unsettled.begin()->second);
+    pool->unsettled.erase(pool->unsettled.begin());
+  }
   for (auto it = pool->vacant.begin(); it != pool->vacant.end(); ++it) {
     if (pool->slots[*it].pins != 0) continue;
     if (settled_only && !Fillable(*pool, pool->slots[*it])) continue;
@@ -508,6 +539,21 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
     pool->vacant.erase(it);
     return true;
   }
+  // A slot its owner released a moment ago is the last one to hand out: what
+  // is put there from outside -- a fetch into it -- has to wait for the
+  // owner's device, a forward or two, and holds up everything fetched with
+  // it. It is settled, and first in line, by the time of the next grants.
+  const auto take_unsettled = [&]() {
+    if (settled_only) return false;
+    for (auto it = pool->unsettled.begin(); it != pool->unsettled.end(); ++it) {
+      if (pool->slots[it->second].pins != 0) continue;
+      *slot = it->second;
+      pool->unsettled.erase(it);
+      return true;
+    }
+    return false;
+  };
+  // Asked ahead of need: nothing is evicted, and nothing unsettled given.
   if (evicted == nullptr) return false;
   const auto takeable = [&](const Slot& s) {
     return s.pins == 0 && (!settled_only || Fillable(*pool, s));
@@ -552,7 +598,7 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
       }
     }
   }
-  if (!found) return false;
+  if (!found) return take_unsettled();
   Slot& s = pool->slots[victim];
   *slot = victim;
   UncacheLocked(pool, victim);
@@ -565,7 +611,7 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
           "[L1Pool] evictions pool={} total={} spare_copy={} cached={} last_copies_kept={} "
           "vacant={}",
           pool->id, pool->evicted, pool->evicted_spare, pool->lru.size + pool->kept.size,
-          pool->kept.size, pool->vacant.size());
+          pool->kept.size, pool->vacant.size() + pool->unsettled.size());
     }
   }
   return true;
@@ -574,6 +620,9 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
 bool PoolManager::HasPinnedFreeLocked(const Pool* pool) const {
   for (uint32_t slot : pool->vacant) {
     if (pool->slots[slot].pins != 0) return true;
+  }
+  for (const auto& entry : pool->unsettled) {
+    if (pool->slots[entry.second].pins != 0) return true;
   }
   for (const SlotList* list : {&pool->lru, &pool->kept}) {
     for (uint32_t slot = list->head; slot != kNoSlot; slot = pool->slots[slot].next) {
@@ -809,7 +858,7 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
           UncacheLocked(pool, op.slot);
           HolderUsedLocked(pool, op.slot);
         } else {
-          pool->vacant.erase(op.slot);
+          UnvacateLocked(pool, op.slot);
         }
         s.state = SlotState::kHeld;
         ++pool->held;
@@ -822,8 +871,7 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
           s.state = SlotState::kCached;
           PushBack(pool, &pool->lru, op.slot);
         } else {
-          s.state = SlotState::kVacant;
-          pool->vacant.insert(op.slot);
+          VacateLocked(pool, op.slot);
         }
         break;
       case OpKind::kPublish: {
@@ -845,8 +893,7 @@ Status PoolManager::Apply(const std::string& pool_id, const std::vector<Op>& ops
           old.released = stamp;
           if (old.state == SlotState::kCached) {
             UncacheLocked(pool, old_slot);
-            old.state = SlotState::kVacant;
-            pool->vacant.insert(old_slot);
+            VacateLocked(pool, old_slot);
           }
         }
         s.content = &entry;
@@ -1090,8 +1137,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       ++sources.back().second;
       continue;
     }
-    d.state = SlotState::kVacant;
-    pool->vacant.insert(step.dst_slot);
+    VacateLocked(pool, step.dst_slot);
     if (usable) {
       // Published here while the copy ran; that slot is the one to report.
       result.slots[step.key_index] = existing;
@@ -1137,8 +1183,7 @@ Status PoolManager::Clear(const std::string& pool_id) {
     UnindexLocked(pool, slot);
     if (s.state == SlotState::kCached) {
       UncacheLocked(pool, slot);
-      s.state = SlotState::kVacant;
-      pool->vacant.insert(slot);
+      VacateLocked(pool, slot);
     }
   }
   return Status{};
@@ -1166,7 +1211,7 @@ std::vector<PoolStats> PoolManager::Stats() const {
     stats.num_slots = static_cast<uint32_t>(pool.slots.size());
     stats.held = pool.held;
     stats.cached = pool.lru.size + pool.kept.size;
-    stats.vacant = static_cast<uint32_t>(pool.vacant.size());
+    stats.vacant = static_cast<uint32_t>(pool.vacant.size() + pool.unsettled.size());
     stats.evicted = pool.evicted;
     stats.fetched_in_slots = pool.fetched_in_slots;
     stats.fetched_in_bytes = pool.fetched_in_bytes;
