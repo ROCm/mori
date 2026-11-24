@@ -27,7 +27,8 @@ communicator, like its neighbours here.
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_asyncll.py
 
 Env: HIDDEN, TOPK, EPR, M, LOOP (at least 3), SHAPES to override the swept list,
-TRANSPORT=sdma|lsa, GRAPH_REPLAYS (default 32; 0 skips the graph regression),
+TRANSPORT=sdma|lsa, QUANT (combine quant_type, default none), GRAPH_REPLAYS
+(default 32; 0 skips the graph regression),
 BACK_TO_BACK (rounds with no host sync, default 6; 0 skips) and TWO_OPS (layers
 of the two-op interleave, default 4; 0 skips).
 
@@ -95,6 +96,28 @@ _DEFAULT_SHAPES = [
     (4096, 9, 32, 96),  # 64 % 9 == 1
     (2048, 12, 16, 64),  # 64 % 12 == 4
 ]
+
+
+# QUANT=fp8_blockwise_1x128|fp8_blockwise_1x32 builds the shape, graph and
+# back-to-back ops with the quantized combine and checks their round trips to fp8
+# accuracy instead of exactly.
+_QUANT = os.environ.get("QUANT", "none")
+
+
+def _combine_close(got, want):
+    """(ok, max |diff|) of a combine result against its bf16 reference: exact
+    to bf16 rounding unquantized; every row within the fp8 wire's error
+    otherwise (e4m3 rounds an element by at most 1/16 of its value, so a row's
+    relative error stays below 5% and its direction is kept)."""
+    got, want = got.float(), want.float()
+    diff = (got - want).abs().max().item() if got.numel() else 0.0
+    if _QUANT == "none":
+        return torch.allclose(got, want, atol=1e-2, rtol=1e-2), diff
+    if not got.numel():
+        return True, diff
+    rel = (got - want).norm(dim=1) / want.norm(dim=1).clamp_min(1e-6)
+    cos = torch.nn.functional.cosine_similarity(got, want, dim=1)
+    return bool((rel < 0.05).all() and (cos > 0.998).all()), diff
 
 
 def _shapes():
@@ -233,6 +256,7 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
         kernel_backend="hip",
         async_ll=True,
         async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+        quant_type=_QUANT,
     )
     failures = 0
     with EpDispatchCombineOp(cfg, comm) as op:
@@ -293,12 +317,10 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
                         torch.bfloat16
                     )
                     got = cout[:n].cpu()
-                    if not torch.allclose(
-                        got.float(), want.float(), atol=1e-2, rtol=1e-2
-                    ):
-                        diff = (got.float() - want.float()).abs()
+                    ok, diff = _combine_close(got, want)
+                    if not ok:
                         print(
-                            f"[rank {rank}] {tag}: combine max |diff| {diff.max().item():.4f}",
+                            f"[rank {rank}] {tag}: combine max |diff| {diff:.4f}",
                             flush=True,
                         )
                         failures += 1
@@ -344,6 +366,7 @@ def run_graph(d, comm, empty_all, replays):
         kernel_backend="hip",
         async_ll=True,
         async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+        quant_type=_QUANT,
     )
     # With at least two ranks, peers deterministically route live tokens to rank
     # zero, whose empty weights tensor has a null data_ptr on HIP.
@@ -422,7 +445,12 @@ def run_graph(d, comm, empty_all, replays):
                 )
                 bad += 1
             want = (gathered[d.rank][2].float() * uniq).to(torch.bfloat16)
-            if not torch.equal(last["combined"].cpu(), want):
+            got = last["combined"].cpu()
+            if not (
+                torch.equal(got, want)
+                if _QUANT == "none"
+                else _combine_close(got, want)[0]
+            ):
                 print(
                     f"[rank {d.rank}] {tag}: exact identity round trip failed",
                     flush=True,
@@ -483,6 +511,7 @@ def run_back_to_back(d, comm, rounds):
         kernel_backend="hip",
         async_ll=True,
         async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+        quant_type=_QUANT,
     )
 
     # Every round's inputs, and every rank's view of them, exist before the
@@ -562,8 +591,8 @@ def run_back_to_back(d, comm, rounds):
                 )
                 want = (gathered[rank][2].float() * uniq[:, None]).to(torch.bfloat16)
                 got = snap["combined"].cpu()
-                if not torch.allclose(got.float(), want.float(), atol=1e-2, rtol=1e-2):
-                    diff = (got.float() - want.float()).abs().max().item()
+                ok, diff = _combine_close(got, want)
+                if not ok:
                     print(
                         f"[rank {rank}] {tag}: combine max |diff| {diff:.4f}",
                         flush=True,
@@ -763,6 +792,7 @@ def run_call_order(d, comm):
         kernel_backend="hip",
         async_ll=True,
         async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+        quant_type=_QUANT,
     )
     gen = torch.Generator(device=dev).manual_seed(777 + rank)
     x = torch.randn(m, hidden, generator=gen, device=dev, dtype=torch.bfloat16)

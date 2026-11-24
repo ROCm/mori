@@ -106,6 +106,16 @@ write it into a landing row on the token's own rank; after one barrier that rank
 dequantizes and sums its rows. Both need a bf16 combine and a `hidden_dim` that
 is a multiple of 128.
 
+AsyncLL (`async_ll=True`, hip) also serves `fp8_blockwise_1x32` and
+`fp8_blockwise_1x128` on gfx942/gfx950, with its own gather combine rather than a
+scatter: combine SendCopy quantizes each expert row into its staging slot, the SDMA
+transfer moves the fp8 row and its scales, and combine RecvCopy dequantizes and
+sums. Same codec, same bf16 combine and `hidden_dim % 128` rules; SDMA transport
+on one node only, and not with the segmented receive layout (which sends the
+expert output in place). `supported_quant_types()` reports the intranode
+combines only. Plan field: `combineQGroup` (32 or 128) on the AsyncLL combine
+passes.
+
 Plan requests name the format with fields, not these strings: `combine_fp8` and
 `combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
 the fp4 one into 1x128. `combine_scatter_q_group` (32 or 128) selects the
@@ -609,6 +619,24 @@ because eager passed.
 
 `v1_asyncll` has no row either -- v1 is the shmem path and does not run on this
 arch.
+
+### Single-node, EP8 (MI355X gfx950): quantized combine
+
+hidden 7168, top-k 8, fp8 dispatch, SDMA transport, early notification (the
+gfx950 default), CUDA graph. Rank 0 rocprofv3 kernel trace, median round span
+(dispatch + combine) in us; arms run alternately, two or three clean runs each.
+
+| tok/rank | bf16 combine | `fp8_blockwise_1x128` | `fp8_blockwise_1x32` |
+|---:|---:|---:|---:|
+| 64   |  79.6 |  67.4 (-15.3%) |  68.8 (-13.6%) |
+| 2048 | 695.7 | 538.5 (-22.6%) | 543.8 (-21.8%) |
+
+The gain is the wire: a 7168-element row goes from 14336 B to 7392 B, and the
+combine RecvTransfer at 2048 tokens from 337.6 to 178.2 us -- the SDMA link was
+already at its ceiling, so time tracks bytes. SendCopy gets cheaper too (58.6 to
+48.4 us), but RecvCopy gets slower (38.5 to 42.0 us at 1x128, 50.9 at 1x32): it
+reads eight bytes a lane, and 1x32 its scales a byte at a time. Round-trip error
+of an identity expert: worst row 2.7% (1x128) and 2.8% (1x32) relative L2.
 
 ### Tried and rejected
 

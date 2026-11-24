@@ -445,7 +445,8 @@ class EpDispatchCombineConfig:
         # internode path -- the backend would accept the quant type and then
         # reject the scatter this rule had just set. The internode combine is
         # unquantized, so reject here rather than rely on the scatter rule.
-        if self.quant_type != "none":
+        # AsyncLL quantizes inside its own gather combine; the backend checks it.
+        if self.quant_type != "none" and not self.async_ll:
             if self.is_internode:
                 raise ValueError(
                     f"quant_type={self.quant_type!r} is not supported on the "
