@@ -320,6 +320,27 @@ def _cases():
         "MAXRECV": 1024,
     }
     yield "hip-bf16-stdmoe-cap", dict(hip, DTYPE="bf16", STDMOE=1, MAXRECV=1024)
+    # The LL dispatch body (EpDispatchLLBody), on the axes it splits differently
+    # from the portable one. hip only: the flydsl backend refuses ll_dispatch, so
+    # a case that forgot the backend would error rather than pass without having
+    # run the body under test.
+    ll = dict(hip, LL_DISPATCH=1, DTYPE="bf16")
+    # topk sets the dedup loop's trip count and how many destinations a copy warp
+    # fans to; 16 is past the fixed unroll of 8 that v1 stopped at.
+    for k in (8, 9, 16):
+        yield f"ll-bf16-topk{k}", dict(ll, TOPK=k)
+    # hidden 2880 is 5760 B: five full 1 KB rows and a 640 B tail, so the last row
+    # is partial and the split over copy warps is uneven.
+    yield "ll-bf16-h2880", dict(ll, HIDDEN=2880)
+    # A scale row takes a second control warp -- the role split the derived warp
+    # count has to make room for.
+    yield "ll-bf16-scales", dict(ll, SCALE_DIM=32)
+    # Ragged counts with no self-routing: some ranks send nothing, and no block's
+    # first token is local, which is what the prologue reads before the barrier.
+    yield "ll-bf16-ragged-noself", dict(ll, TOPK=9, RAGGED=1, NOSELF=1)
+    # Both bodies in one op: SWEEP straddles the cap, so a call at or below 128
+    # runs the LL bucket and the larger ones the portable bucket.
+    yield "ll-bf16-bucket-split", dict(ll, LL_MAX_TOK=128)
 
 
 _CASES = dict(_cases())

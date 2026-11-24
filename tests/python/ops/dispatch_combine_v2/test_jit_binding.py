@@ -279,6 +279,62 @@ def test_describe_rejects_what_the_constructor_rejects():
         cb.EpDispatchPlan.describe(hidden_dim=7)
 
 
+# --------------------------------------------------------------------------
+# ll_dispatch: a body swap the Cfg decides, so describe() settles all of it
+# without compiling anything
+# --------------------------------------------------------------------------
+
+_LL_OFF = dict(_SMALL, hidden_dim=7168)
+_LL = dict(_LL_OFF, ll_dispatch=True)
+
+
+def test_ll_dispatch_derives_its_warp_count_from_the_payload():
+    # The warps are the role split, not a geometry: one control warp plus a copy
+    # warp a 1 KB row. hidden 7168 bf16 is 14336 B, so 14 rows and 15 warps.
+    info = cb.EpDispatchPlan.describe(arch="gfx950", **_LL)
+    assert info["warpPerBlock"] == 15
+    # A scale row adds the second control warp, and the rows are unchanged.
+    info = cb.EpDispatchPlan.describe(arch="gfx950", scale_bytes=32, **_LL)
+    assert info["warpPerBlock"] == 16
+    # A warp count the caller pinned is still its own.
+    info = cb.EpDispatchPlan.describe(arch="gfx950", warp_per_block=8, **_LL)
+    assert info["warpPerBlock"] == 8
+
+
+def test_ll_dispatch_is_a_different_cfg_from_the_portable_dispatch():
+    # Same request but for the flag, so whatever differs here is what the cache
+    # key is built from: a schedule holding both bodies gets two kernels.
+    portable = cb.EpDispatchPlan.describe(arch="gfx950", **_LL_OFF)
+    ll = cb.EpDispatchPlan.describe(arch="gfx950", **_LL)
+    assert portable != ll
+
+
+@pytest.mark.parametrize(
+    "extra, match",
+    [
+        # The body is the portable wave64 dispatch's; gfx125x has its own.
+        (dict(arch="gfx1250"), "llDispatch"),
+        # Lane p of the routing warp owns destination p. max_recv follows the
+        # world so this trips the wave check, not the receive cap below it.
+        (dict(arch="gfx950", world_size=128, max_recv=128 * 64), "inconsistent config"),
+        # A control warp and a copy warp do not fit in two warps once a scale row
+        # takes the second control warp.
+        (dict(arch="gfx950", warp_per_block=2, scale_bytes=32), "inconsistent config"),
+        # Neither feature of the portable body is implemented in the LL one.
+        (dict(arch="gfx950", replay=True), "replay"),
+        (dict(arch="gfx950", max_recv=32), "receive cap"),
+    ],
+)
+def test_ll_dispatch_refuses_what_it_cannot_run(extra, match):
+    with pytest.raises(RuntimeError, match=match):
+        cb.EpDispatchPlan.describe(**{**_LL, **extra})
+
+
+def test_ll_dispatch_is_not_a_combine_option():
+    with pytest.raises(RuntimeError, match="llDispatch"):
+        cb.EpCombinePlan.describe(arch="gfx950", **_LL)
+
+
 def _device_arch():
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
