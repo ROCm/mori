@@ -546,6 +546,17 @@ How to choose:
 | full bandwidth | large messages (at least a few hundred KB), and `proxyQpsPerPeer` / `proxyThreadCount` on the host |
 | no NIC atomics | `ccoGda_SignalSet` / `ccoGda_WindowSignalSet` |
 
+- Prefer SPSC queues and one push per wavefront (`ccoCoopWarp`,
+  `ccoCoopBlock`, `ccoCoopLaneMasked`) where your code allows: an SPSC push
+  keeps the queue position in registers and needs no atomic, while each MPSC
+  push claims its lines with a device-memory atomic. `ccoCoopThread` on MPSC
+  is there so thread-style code, such as `ccoGda` code, runs on ccoProxy
+  unchanged.
+- Avoid calling ccoProxy from divergent code. It works with `ccoCoopThread`,
+  but each call pushes on its own, so calls on both sides of a branch claim
+  twice. Compute the per-lane arguments first and call once from converged
+  code, e.g. `put(c ? p1 : p2, ...)`, or use `ccoCoopLaneMasked{active}`.
+
 ### Signal slots
 
 A slot is a 64-bit word that remote signals add to (`SignalInc` /
