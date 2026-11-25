@@ -77,9 +77,8 @@
 #include "../error.hpp"
 #include "address_space.hpp"
 
-// Every device-to-host push is wavefront-collective over 64 lanes, so only the
-// wave64 gfx942/gfx950 can push. Other device targets still compile these
-// headers (cco_scale_out.hpp includes them), but their push entry points trap.
+// Pushes need gfx942/gfx950 (wave64, the targets ccoProxy builds for). Other device targets
+// still compile these headers (cco_scale_out.hpp includes them), with pushes that trap.
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx942__) && !defined(__gfx950__)
 #define MORI_CCO_PROXY_PUSH_UNSUPPORTED 1
 #endif

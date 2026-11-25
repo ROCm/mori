@@ -70,7 +70,7 @@ inline const char* SdmaCompToChar(SdmaComp comp) {
 enum class Transport { kLsa, kIbgda, kSdma, kProxy };
 
 // GDA/proxy signal slot used by the ping-pong latency kernels.
-inline constexpr uint32_t kSlotPing = 0;  // ping-pong: the peer's put/signal landed
+inline constexpr uint32_t kSlotPing = 0;
 inline constexpr int kBenchSignalCount = 4;
 inline constexpr int kDefaultProxyThreads = 4;
 
@@ -117,23 +117,16 @@ struct PerfArgs {
   // bytes/iter either way, so the two runs isolate the doorbell cost.
   bool aggregate = false;
   int agg_depth = 1;
-  // Latency only: ping-pong instead of put + local completion. Both PEs run;
-  // reported latency = round trip / 2. -P carries data (put + SignalInc),
-  // -S is signal-only. ibgda and proxy.
+  // -P / -S (latency): ping-pong, both PEs run.
   bool pingpong = false;
   bool signal_only = false;
-  // proxy: host proxy threads (-Q) and queue kind (-q). SPSC: one queue per
-  // issuing unit (block, or wavefront with -s warp). MPSC: one queue per block,
-  // shared by its wavefronts.
+  // proxy: -Q threads, -q mpsc, -K QPs per peer (0 = engine default).
   int proxy_threads = kDefaultProxyThreads;
   bool proxy_mpsc = false;
-  // proxy (-K): proxyQpsPerPeer; 0 = the engine default.
   int proxy_qps_per_peer = 0;
 };
 
-// SPSC proxy queues needed so that every issuing wavefront owns one: per block,
-// its wavefronts with warp or lane scope (a lane-scope wavefront pushes its
-// lanes' puts together), else 1; times blocks.
+// SPSC queues per block: one per wavefront for -s warp|lane, else one.
 inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
   return scope == PutScope::kWarp || scope == PutScope::kLane
              ? (threads_per_block + warp_size - 1) / warp_size

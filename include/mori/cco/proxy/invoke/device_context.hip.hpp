@@ -110,14 +110,9 @@ class DeviceContext {
       }
     }
 
-    // Invoke a callback from each executing lane, from any subset of the
-    // wavefront (divergent code, a single lane): MPSC only, through
-    // push_active_lanes(). Each lane passes its own callback_id and sends
-    // the first `arg_bytes` bytes of `args`, which must be the callback's
-    // argument size: a callback taking a struct whose prefix is another
-    // callback's argument can share one payload type, e.g. a larger
-    // descriptor that starts with a smaller one. The callbacks run in lane
-    // order. Always returns true.
+    // invoke_lane_masked() over the executing lanes, from divergent code too (MPSC only). Sends
+    // the first `arg_bytes` bytes of `args`, the callback's argument size, so callbacks whose
+    // arguments are prefixes of T can share one T. Always returns true.
     template <typename T>
     __device__ bool invoke_active_lanes(uint8_t callback_id, const T& args, uint32_t arg_bytes) {
       static_assert(std::is_trivially_copyable_v<T>, "invoke arguments are copied bytewise");

@@ -25,12 +25,7 @@
 //   -t lsa   : intra-node flat-VA store loop (no NIC).
 //   -t sdma  : intra-node copy engine via ccoSdma.
 //   -t ibgda : cross-node one-sided RDMA write via ccoGda<PrvdType>.
-//   -t proxy : one-sided RDMA write via ccoProxy (KIWI queue + -Q host proxy
-//              threads). Same split and completion as ibgda: each unit puts its
-//              slice every iteration, then flushes its queue.
-//              -q spsc: one queue per unit (per wavefront with -s thread);
-//              -q mpsc: one queue per block. Small sizes with -s warp or
-//              -s thread and many blocks give the message rate (Mpps column).
+//   -t proxy : one-sided RDMA write via ccoProxy (see README "ccoProxy vs ccoGda").
 //
 // lsa/ibgda split the buffer into `nblocks` chunks (one per block); scope sets
 // the per-chunk cooperation granularity (block/warp/thread). sdma splits over
@@ -113,12 +108,8 @@ __global__ void ibgda_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 #ifdef MORI_CCO_PROXY
-// Proxy: the ibgda kernel's geometry and completion. A unit puts its slice every
-// iteration, then a flush waits until its puts completed (remote ack) -- the
-// counterpart of ibgda's trailing flush. SPSC: wavefront w of block b owns
-// queue b * wavefronts per block + w, or block b owns queue b with
-// ccoCoopBlock; MPSC: the block's wavefronts share queue b. ccoCoopThread
-// (MPSC only) and ccoCoopLaneMasked give every thread its own put.
+// Proxy: ibgda_put_bw's split. SPSC: one queue per wavefront (per block with
+// ccoCoopBlock); MPSC: one per block.
 template <typename Q, typename Coop, ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent>
 __global__ void proxy_put_bw(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t len_doubles,
                              ccoDevComm devComm, int iter) {
@@ -313,8 +304,6 @@ int main(int argc, char** argv) {
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const bool proxy = args.transport == Transport::kProxy;
-  // -s lane (ccoCoopLaneMasked) issues from whole wavefronts; -s thread and
-  // thread_agg (ccoCoopThread) need MPSC queues.
   const bool threadScope =
       args.put_scope == PutScope::kThread || args.put_scope == PutScope::kThreadAgg;
   const char* scopeError = nullptr;

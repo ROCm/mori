@@ -53,15 +53,10 @@ struct ccoProxyEngineConfig {
 
 class ccoProxyEngine;
 
-// Collective over `bootNet`; every rank must pass the same queue, thread and QP
-// counts and signalCount (ccoDevCommCreate checks that first). Call with the comm's HIP device
-// current (the queues and flush counters are allocated on it). Builds the
-// queues, the host-posted RC QPs (on ctx's RDMA device and PD, so cco window
-// MRs are valid on them) and starts the proxy threads. Fills `out` on success;
-// returns nullptr on failure. A failure in any rank's local setup (before the
-// QP exchange) or in connecting and starting makes every rank fail.
-// MORI_CCO_PROXY_TEST_FAIL_CONNECT=<rank> makes that rank fail to connect (test
-// hook).
+// Collective over bootNet; every rank passes the same config (ccoDevCommCreate
+// checks). Call with the comm's HIP device current. Fills `out`, or returns nullptr
+// on every rank if any rank fails.
+// MORI_CCO_PROXY_TEST_FAIL_CONNECT=<rank> fails that rank's connect (test hook).
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out);
@@ -70,12 +65,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
 // HIP-free: safe from any thread while kernels run.
 int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err);
 
-// Local, like the GDA teardown: drains and stops the proxy threads (our WRs
-// complete, or fail after the QP's ACK timeout when the peer is gone), then
-// releases QPs, queues and device copies. Never waits for other ranks. No kernel
-// using the engine may still be running, and no peer should still push to us:
-// their WRs in flight to our destroyed QPs fail. A failed engine stops without
-// waiting for its outstanding WRs. Never throws.
+// Local: drains and stops the threads (a failed engine does not drain), then frees
+// QPs, queues and device memory. No kernel may still use the engine. Never throws.
 void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept;
 
 }  // namespace cco

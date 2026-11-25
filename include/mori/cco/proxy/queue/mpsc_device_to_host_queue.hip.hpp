@@ -38,6 +38,9 @@
  * exception: each active lane pushes its own message, the call claims all of
  * their lines with one fetch-add, and each lane stores all of its own
  * message's chunks.
+ * push_active_lanes() is push_lane_masked() over the executing lanes, from divergent code
+ * too; its first executing lane takes lane 0's role, and it waits for each claim's result
+ * before returning, so its claims also follow the wavefront's program order.
  *
  * Consumer. pop() is the SPSC pop: it keeps its position privately, consumes
  * a message only when every chunk of its lines carries the lap of its own
@@ -95,16 +98,14 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
    * credit cache; any earlier published value is a safe lower bound.
    * Device operations are wavefront-collective: all 64 lanes call them,
    * with identical arguments except push_lane_masked()'s per-lane
-   * arguments. push_active_lanes(), the exception, keeps its own cache,
-   * `divergent_consumer_index_cached`: written from divergent code, it may
-   * differ across lanes, while `consumer_index_cached` stays wave-uniform.
+   * arguments; push_active_lanes() is the exception.
    */
   struct DeviceHandle : detail::PushApi<DeviceHandle> {
     detail::global_ptr<detail::Chunk> chunks;           ///< ring, extended-scope host memory
     detail::global_ptr<const uint64_t> consumer_index;  ///< published consumer line, host memory
     detail::global_ptr<uint64_t> producer_index;        ///< device memory, fetch-add target (lines)
     uint64_t consumer_index_cached;                     ///< credit cache (register)
-    uint64_t divergent_consumer_index_cached;           ///< push_active_lanes()' credit cache
+    uint64_t divergent_consumer_index_cached;           ///< push_active_lanes()' cache, per lane
     uint32_t log2_capacity;                             ///< log2(capacity in lines)
 
     /**
@@ -173,27 +174,15 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
       return push_own_messages</*kFullWave=*/true>(message, bytes, metadata, active);
     }
 
-    /**
-     * @brief Every executing lane pushes its own `message`, from any subset
-     *        of the wavefront
-     *
-     * push_lane_masked() with the lanes that execute the call as the active
-     * ones, so it may be called from divergent code (a branch, a single
-     * lane): the first executing lane claims the lines of all of them with
-     * one fetch-add and waits for credit, then each executing lane stores
-     * its own message, in lane order, before the call returns. Lanes on the
-     * two sides of a branch, which the compiler treats as concurrent threads,
-     * claim disjoint lines through the device-memory atomic; nothing else of
-     * the handle needs to agree across lanes. Always returns true.
-     */
+    /// push_lane_masked() over the executing lanes, so callable from divergent code; the first
+    /// executing lane takes lane 0's role. Always returns true.
     template <typename T>
     __device__ bool push_active_lanes(const T& message, uint32_t bytes, uint32_t metadata) {
       return push_own_messages</*kFullWave=*/false>(message, bytes, metadata, true);
     }
 
    private:
-    // push_lane_masked() (kFullWave: all 64 lanes, lane 0 claims) and
-    // push_active_lanes() (the executing lanes, the first of them claims).
+    // Body of push_lane_masked() (kFullWave) and push_active_lanes().
     template <bool kFullWave, typename T>
     __device__ bool push_own_messages(const T& message, uint32_t bytes, uint32_t metadata,
                                       bool active) {
@@ -206,7 +195,7 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
       if (c.total == 0) {
         return true;  // no active lane: claim nothing
       }
-      // broadcast_lane0() reads the first executing lane: lane 0 in a full wavefront.
+      // With a partial exec, broadcast_lane0() and lane_masked_claim() see only executing lanes.
       uint32_t leader = 0;
       if constexpr (!kFullWave) leader = __builtin_ctzll(__builtin_amdgcn_read_exec());
       uint64_t base = 0;
@@ -215,8 +204,8 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
                                       __HIP_MEMORY_SCOPE_AGENT);
       }
       base = detail::broadcast_lane0(base);
-      // The credit wait of push_lanes(), for the whole claim. Divergent calls
-      // use their own cache, and the leader's copy decides for every lane.
+      // The credit wait of push_lanes(), for the whole claim. Divergent calls keep their own
+      // cache, so consumer_index_cached stays wave-uniform; the leader's copy decides.
       uint64_t& cached = kFullWave ? consumer_index_cached : divergent_consumer_index_cached;
       const uint64_t known = kFullWave ? cached : detail::broadcast_lane0(cached);
       const uint64_t cap = uint64_t{1} << log2_capacity;

@@ -50,10 +50,8 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t lsa -b 1M -e 1G -f 4 -n 20 -w 5
 
 ## ccoProxy vs ccoGda
 
-`-t proxy` runs the ibgda kernels' shape with `ccoProxy`. ibgda's `flush` maps
-to ccoProxy's `flush`, which waits until the proxy has seen every earlier put
-of the queue complete. Its DevComm has proxy QPs to the peers ibgda connects
-(`proxyConnectionType`) and no GDA QPs.
+`-t proxy` runs the ibgda kernels through `ccoProxy` on a proxy-only DevComm
+(proxy QPs to ibgda's peers, no GDA QPs).
 
 - `cco_p2p_put_latency -t proxy`: one put + flush per iteration.
   - `-P` switches ibgda or proxy to a ping-pong: put + SignalInc, PE 1 echoes,
@@ -61,21 +59,15 @@ of the queue complete. Its DevComm has proxy QPs to the peers ibgda connects
   - `-S` is the same ping-pong with bare signals.
 - `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, wavefront with
   `-s warp`, or thread with `-s thread`, `-s thread_agg` or `-s lane`) puts its
-  slice every iteration, then does one flush per launch, as ibgda does with
-  `flush`.
-  - `-s thread` uses `ccoCoopThread` and `-s thread_agg` adds
-    `ccoGdaThreadAggregate`; both need `-q mpsc`.
-  - `-s lane` uses `ccoCoopLaneMasked`: each wavefront pushes its 64 lanes'
-    puts in one push, on SPSC or MPSC queues.
-  - `-q spsc` (default) gives every block (`-s block`) or wavefront its own
-    SPSC queue; `-q mpsc` shares one MPSC queue per block.
-  - `-Q` sets the number of host proxy threads (default 4), `-K` the RC QPs
-    per (proxy thread, peer) (default 4).
+  slice every iteration, then one flush per launch.
+  - `-s thread` and `-s thread_agg` need `-q mpsc`; `-s lane`
+    (`ccoCoopLaneMasked`) needs `-T` in whole wavefronts.
+  - `-h` lists `-q`, `-Q` and `-K`.
 - Message rate: run small sizes with `-s warp`, `-s lane` or `-s thread` and
   many wavefronts. The `Mpps` column gives the per-message issue rate.
 
 ```bash
-cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON -DBUILD_CCO_PROXY=ON
+cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON
 ninja -C build cco_p2p_put_bw cco_p2p_put_latency test_proxy_put
 
 # put + flush latency (proxy vs ibgda)

@@ -446,7 +446,6 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
       reqs.proxyConnectionType = reqs.gdaConnectionType;
       reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
     }
-    // A few slots for the ping-pong latency kernels (kSlotPing).
     reqs.gdaSignalCount = kBenchSignalCount;
     reqs.gdaCounterCount = 0;
     reqs.lsaBarrierCount = 0;

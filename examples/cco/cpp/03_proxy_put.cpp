@@ -20,22 +20,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// CCO C++ example 03 — ccoProxy put (host-proxy RDMA) + SignalSet / wait
+// CCO C++ example 03 — ccoProxy put + SignalSet / wait on a proxy-only DevComm.
 //
-// ccoProxy model: the kernel queues each op and a host proxy thread posts the
-// RDMA work request. Rank 0's block b owns SPSC queue b and sends its chunk to
-// rank 1 in ROUNDS pieces; each piece is followed, on the same queue, by a
-// SignalSet of slot b to the round number (an RDMA write, so no NIC atomics).
-// Rank 1's block b calls waitSignal(b, 1) once per round: each call consumes one.
-//
-// Both kernels use the timeout overloads (flush / waitSignal with timeoutCycles),
-// which return 2 on a failed DevComm instead of trapping: a trap would end the
-// process. The host then prints ccoDevCommGetError's report.
-//
-// The DevComm is proxy-only: gdaConnectionType NONE (no GDA QPs) and
-// proxyConnectionType FULL (a proxy QP to every rank), so the 2 ranks may share
-// a node or sit on separate nodes. Needs a build with the ccoProxy engine
-// (BUILD_CCO_PROXY, gfx942 / gfx950).
+// Rank 0's block b puts ROUNDS pieces on SPSC queue b, each carrying a SignalSet
+// of slot b to the round; rank 1's block b waits once per round. Uses the timeout
+// overloads and prints ccoDevCommGetError. Needs a ccoProxy build (gfx942 /
+// gfx950). Rules: docs/MORI-CCO-GUIDE.md §10.
 //
 //   mpirun -n 2 ./cco_proxy_put     (set MORI_SOCKET_IFNAME=<iface>)
 
@@ -80,9 +70,7 @@ static constexpr uint64_t TIMEOUT_CYCLES = 40ULL * 1000 * 1000 * 1000;
 
 #ifdef MORI_CCO_PROXY
 
-// Rank 0: block b puts piece r of its chunk, then sets slot b to r + 1. The
-// flush makes the sources reusable; status[b] = its result (0 done, 1 timed
-// out, 2 DevComm failed).
+// Rank 0: status[b] = flush's result (0 done, 1 timed out, 2 DevComm failed).
 __global__ void ProxyPutKernel(ccoDevComm devComm, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                int* status) {
   const int b = blockIdx.x;
@@ -97,8 +85,7 @@ __global__ void ProxyPutKernel(ccoDevComm devComm, ccoWindow_t sendWin, ccoWindo
   if (threadIdx.x == 0) status[b] = rc;
 }
 
-// Rank 1: block b waits for each round's piece (consumes one per round).
-// status[b] = the first nonzero result, else 0.
+// Rank 1: status[b] = the first nonzero waitSignal result, else 0.
 __global__ void ProxyWaitKernel(ccoDevComm devComm, int* status) {
   const int b = blockIdx.x;
   ccoProxy<> proxy{devComm, b};  // never pushes: only reads the signal slots
@@ -153,8 +140,6 @@ int main(int argc, char** argv) {
   reqs.gdaSignalCount = BLOCKS;  // the proxy's signal slots
   ccoDevComm devComm{};
   if (ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
-    // Fails on every rank alike: no ccoProxy on this GPU, MORI_CCO_DISABLE_PROXY=1,
-    // no RDMA to the peer, or ranks passing different proxy fields.
     fprintf(stderr, "[rank %d] ccoDevCommCreate failed for a proxy-only DevComm\n", rank);
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
@@ -202,8 +187,7 @@ int main(int argc, char** argv) {
            bad ? "FAILED" : "verified", bad, count, host[0], host[count - 1]);
   }
 
-  // Teardown is local: the barrier above already ensures no peer still pushes
-  // to this rank. A failed DevComm is destroyed the same way.
+  // Teardown is local; the barrier above guards it.
   HIP_CHECK(hipStreamDestroy(stream));
   HIP_CHECK(hipFree(dStatus));
   CCO_CHECK(ccoDevCommDestroy(comm, &devComm));

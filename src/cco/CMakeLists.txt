@@ -30,10 +30,7 @@ target_link_options(mori_cco PRIVATE LINKER:--exclude-libs,ALL)
 
 target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
 
-# ccoProxy host engine (proxy/ holds the device-to-host queue it drains). It is
-# HIP because the queue headers are, and builds only for the wave64 targets the
-# queue supports; without one the engine is left out and ccoDevCommCreate
-# rejects proxy queues. MORI_CCO_PROXY tells callers the engine is built in.
+# ccoProxy host engine (gfx942/gfx950 only); MORI_CCO_PROXY marks it built in.
 if(BUILD_CCO_PROXY)
   set(MORI_CCO_PROXY_HIP_ARCHITECTURES)
   foreach(_arch IN LISTS CMAKE_HIP_ARCHITECTURES)

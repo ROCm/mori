@@ -19,6 +19,17 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+// Copied from AMDResearch/kiwi d7bb0d1 (include/kiwi -> include/mori/cco/proxy,
+// src/queue -> src/cco/proxy). Local changes:
+// - namespace mori::cco::proxy; KIWI_* -> CCO_PROXY_*, KIWI_QUEUE_ASSERT -> CCO_PROXY_ASSERT;
+//   KIWI_QUEUE_VERSION_* dropped; license header, include paths and formatting follow mori.
+// - Only the device-to-host SPSC/MPSC queues and invoke; no host-to-device queues, slot.hip.hpp
+//   or upstream CMake.
+// - Pushes compile only for gfx942/gfx950; elsewhere they trap (MORI_CCO_PROXY_PUSH_UNSUPPORTED).
+// - MPSC push_active_lanes(): push_lane_masked()'s body moved to push_own_messages(), plus
+//   divergent_consumer_index_cached; invoke_active_lanes() in device_context.hip.hpp.
+
 /**
  * @file queue.hpp
  * @brief Main header for queue library
@@ -36,18 +47,6 @@
  * - Full-wavefront (64 threads) cooperative device-side operations
  * - Lap epochs instead of clearing; cached producer/consumer progress to
  *   reduce PCIe traffic
- *
- * Copied from AMDResearch/kiwi d7bb0d1 (include/kiwi -> include/mori/cco/proxy,
- * src/queue -> src/cco/proxy). Local changes: namespace mori::cco::proxy;
- * KIWI_* macros renamed CCO_PROXY_*, and the KIWI_QUEUE_VERSION_* macros
- * dropped; only the device-to-host SPSC/MPSC queues and invoke kept; include
- * paths and formatting follow mori; and pushes need gfx942/gfx950: other
- * device targets, gfx90a included, compile a push that traps
- * (MORI_CCO_PROXY_PUSH_UNSUPPORTED), where upstream accepts any GFX9 target
- * and fails the build on the rest. Added: the MPSC push_active_lanes(), where
- * any subset of a wavefront, in divergent code too, pushes one message per
- * lane through one claim; a compiler fence keeps its stores inside the call,
- * and its own credit cache keeps the full-wavefront pushes' cache uniform.
  *
  * Quick Start:
  * @code

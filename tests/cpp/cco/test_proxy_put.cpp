@@ -21,29 +21,18 @@
 // SOFTWARE.
 //
 
-// test: ccoProxy (host-proxy RDMA over the KIWI queue) put / signal / flush.
+// test: ccoProxy put / putValue / signal / flush, positive and negative cases.
 //
-// FULL connectivity; kSpscQueues SPSC + kMpscQueues MPSC proxy queues polled by
-// kProxyThreads proxy threads, a thread's queues sharing one QP per peer except
-// on dcQps. Block u of a put kernel is a "unit" on queue u (MPSC: modulo the
-// pool) and sends a distinct chunk to every peer; signal slot Slot(src, u) on
-// the receiver counts that chunk's arrival. Each block waits for every sender's
-// chunk, then the host verifies the receive window after a barrier. The kernel
-// and run_test comments say what each case adds; dcSmall and dcThread have
-// small rings so producers wait for ring space. The conn_* cases run on
-// DevComms whose proxy connection type differs from the GDA one.
+// Block u of a put kernel is unit u and sends a distinct chunk to every peer;
+// signal slot Slot(src, u) on the receiver counts it. The host verifies the
+// receive window after a barrier.
 //
-// MORI_CCO_PROXY_TEST_CASES=<list> runs only the listed positive cases ("all",
-// the default, runs every one), where "atomic_free" stands for
-// kAtomicFreeCases; those run first, for NICs whose
-// atomics into GPU memory fail (the first atomic would fail the shared DevComm).
-// MORI_CCO_PROXY_TEST_NEGATIVE=all (or a list such as "n1,n3") adds n1-n9, each
-// on a DevComm of its own (see their runners); put_sig_after then checks that
-// the first DevComm still works.
+// MORI_CCO_PROXY_TEST_CASES=<list> runs only those positive cases (default "all";
+// "atomic_free" = kAtomicFreeCases). MORI_CCO_PROXY_TEST_NEGATIVE=all or ids
+// ("n1,n3") adds n1-n9; put_sig_after then rechecks dc.
 //
-// Launch: `mpirun -np N test_proxy_put` (one rank per MPI process, any number
-// of nodes; built with MORI_WITH_MPI when WITH_MPI=ON), or `test_proxy_put [N]`
-// to fork N local ranks.
+// Launch: `mpirun -np N test_proxy_put`, `test_proxy_put [N]` (fork), or
+// `--gen-uid` then `--rank r --world N --uid-file f` per node.
 
 #include <infiniband/verbs.h>
 
@@ -219,10 +208,9 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   }
 }
 
-// ccoCoopLaneMasked cases: one wavefront per block, block u = unit u on queue u
-// (MPSC: modulo the pool). Lane L owns kLaneSlice bytes at L * kLaneSlice of
-// the unit's chunk to every peer; if ThreadActive(L) it puts the first
-// ThreadBytes(L) of them, else the rest of its slice stays untouched.
+// ccoCoopLaneMasked cases: one wavefront per block. Lane L owns kLaneSlice bytes
+// at L * kLaneSlice of the unit's chunk to every peer; if ThreadActive(L) it puts
+// the first ThreadBytes(L) of them, else the rest of its slice stays untouched.
 static constexpr size_t kLaneSlice = kChunk / 64;
 static constexpr int kThreadCapacity = 128;  // ring lines: 51 lanes' put + signal take 102
 static constexpr int kThreadRounds = 16;     // put rounds on kThreadCapacity-line rings
@@ -258,14 +246,8 @@ __device__ inline int ThreadPeer(int me, int n, int k, int lane) {
   return (me + 1 + (k + lane) % (n - 1)) % n;
 }
 
-// kThreadPutSignal: idle lanes pass a valid put (their whole slice), which must
-// not be issued. The other cases: idle lanes pass garbage that must not be read
-// (an out-of-range peer, null windows, a huge size that would never finish
-// splitting).
-// Round r of unit u writes chunk slot v = u * rounds + r (nUnits * rounds slots
-// per sender). A receiver block checks the data a signal covers right after
-// waiting for it, so a signal that overtakes its data is caught unless the data
-// happens to land first.
+// Idle lanes pass a valid put (kThreadPutSignal) or garbage (other modes): neither
+// may be issued or read. Round r of unit u uses chunk slot u * rounds + r.
 template <typename Q, int Mode>
 __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                   uint32_t* sendLocal, const uint32_t* recvLocal, uint32_t salt,
@@ -330,10 +312,7 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
                    ccoCoopLaneMasked{active});
     }
   }
-  // Consume exactly what the senders' active lanes signalled (leftovers are
-  // checked after the case by ProxyCheckSignalsKernel), then check the data
-  // those signals cover: active lane slices only, as an idle-lane put could
-  // still be in flight (the host checks idle slices after the barrier).
+  // Consume exactly the active lanes' signals, then check their slices.
   auto check = [&](int s, int r) {  // this lane's slice of chunk slot (s, u * rounds + r)
     const int v = u * rounds + r;
     const size_t w0 = ((static_cast<size_t>(s) * nSlices + v) * chunk + lane * kLaneSlice) / 4;
@@ -362,17 +341,13 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
       for (int r = 0; r < rounds; r++) check(s, r);
     }
   }
-  // Complete every work request before the kernel ends, so the checks after
-  // the barrier see all this rank sent (including anything an idle lane might
-  // wrongly have issued).
+  // Complete every WR before exit, for the host checks after the barrier.
   proxy.flush();
 }
 
-// ccoCoopThread cases (MPSC; block u on MPSC queue u mod the pool, so blocks
-// share queues): the ccoCoopLaneMasked cases' layout (lane L of unit u puts the
-// first ThreadBytes(L) bytes of its slice to every peer if ThreadActive(L)),
-// but only the active lanes call, from divergent code. Lane L's k-th put goes
-// to ThreadPeer(me, n, k, L) unless noted.
+// ccoCoopThread cases (MPSC; blocks share queues): the lane-masked layout, but
+// only active lanes call, from divergent code. Lane L's k-th put goes to
+// ThreadPeer(me, n, k, L) unless noted.
 enum ThreadModeCase {
   kTmBranch,           // odd / even active lanes put in the two arms of a branch;
                        // the converged wavefront flushes, then sets Slot(me, u)
@@ -722,14 +697,9 @@ __global__ void ProxyTeamKernel(ccoDevComm dc, int wantRank, int wantRanks, int*
   }
 }
 
-// Every wavefront w (of kStressBlocks x kStressWarps) shares MPSC queue 0. In
-// round r it puts unit u = w * kStressRounds + r to every peer, then flushes in
-// the last round and in two of every three others. A flush covers every
-// earlier put of the wavefront, so it then overwrites the sources of all units
-// since its previous flush. Ticket fetch-adds and FLUSH claims are separate
-// atomics, so under this contention FLUSHes can land in the ring out of ticket
-// order. Finally each wavefront adds 1 to `slot` on every peer, and block 0
-// waits for every peer's wavefronts.
+// All wavefronts share MPSC queue 0; each puts a unit per round, flushes in most
+// rounds and then overwrites every source since its last flush. Contended
+// FLUSHes may land out of ticket order.
 __global__ void ProxyStressKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                   uint32_t* sendLocal, ccoGdaSignal_t slot, int* err) {
   const int lane = __lane_id();
@@ -926,8 +896,6 @@ __global__ void ProxyFailKernel(ccoDevComm dc, int peer, ccoWindow_t dstWin, siz
 // offset of a window, which the slot check must not touch.
 enum BadSlotShape { kBadSignalSet, kBadSignalInc, kBadPutAdd, kBadValueInc, kWindowPastSlots };
 
-// n7: one wavefront pushes `Shape` to `peer` with slot (or window offset)
-// `slot`, then flushes with a timeout. res = {flush}.
 template <int Shape>
 __global__ void ProxyBadSlotKernel(ccoDevComm dc, int peer, ccoGdaSignal_t slot,
                                    ccoWindow_t sendWin, ccoWindow_t recvWin, int* res) {
@@ -948,13 +916,8 @@ __global__ void ProxyBadSlotKernel(ccoDevComm dc, int peer, ccoGdaSignal_t slot,
   if (__lane_id() == 0) res[0] = flushed;
 }
 
-// n3: block u (SPSC queue u, ccoCoopBlock) puts its chunk to every peer, then
-// flushes with a timeout the proxy cannot meet (returns 1), without one (still
-// completes), and with a long one (returns 0); flushDone advances by exactly 3.
-// Then it sets Slot(me, u) to 1 on every peer and, per sender, waits with a
-// timeout for 2 (returns 1, consumes nothing), for 1 (returns 0) and for 1
-// again (returns 1); the slot is left at 0. Every thread checks the results it
-// got.
+// n3: timeout overloads (ccoCoopBlock): flush(100)=1, flush(long)=0, flushDone +3;
+// waitSignal 1/0/1, consuming only on 0.
 __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_t srcWin,
                                    size_t chunk, int* err) {
   const int u = blockIdx.x;
@@ -1008,7 +971,7 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
 }
 
 __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
-  ccoProxy<> proxy{dc, 0};  // no push: reads the slots' signal state only
+  ccoProxy<> proxy{dc, 0};  // no push
   for (int i = threadIdx.x; i < nSlots; i += blockDim.x) {
     proxy.resetSignal(static_cast<ccoGdaSignal_t>(i));
   }
@@ -1020,10 +983,8 @@ static const char* const kAtomicFreeCases[] = {
     "set_window",          "mpsc_set_put",        "conn_set_put", "tm_branch",
     "tm_branch_contended", "tm_single",           "tm_agg_set",   "tm_value_set"};
 
-// MORI_CCO_PROXY_TEST_CASES (same on every rank): unset or "all" runs every
-// positive case; else a comma-separated list of case names, where "atomic_free" stands
-// for kAtomicFreeCases (e.g. on platforms whose NIC atomics into GPU memory
-// fail, which would fail the DevComm the other cases share).
+// MORI_CCO_PROXY_TEST_CASES: unset/"all", or a comma-separated list of names
+// and/or "atomic_free".
 static bool CaseSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_CASES");
   if (env == nullptr || env[0] == '\0' || !strcmp(env, "all")) return true;
@@ -1084,8 +1045,7 @@ struct Ctx {
     Sync();
   }
 
-  // laneSlices: the ccoCoopLaneMasked layout, where only the first ThreadBytes(L)
-  // of an active lane L's slice are written and the rest keeps the fill.
+  // laneSlices: check only active lanes' first ThreadBytes(L).
   int Verify(const char* name, uint32_t salt, size_t chunk, int nUnits, bool laneSlices = false) {
     std::vector<uint32_t> host(bufSize / sizeof(uint32_t));
     HIP_CHECK(hipMemcpy(host.data(), recvBuf, bufSize, hipMemcpyDeviceToHost));
@@ -1305,8 +1265,8 @@ static int RunTimeoutCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return c.Harvest(name, got != 0 || destroyed != 0);
 }
 
-// n4: MORI_CCO_PROXY_TEST_FAIL_CONNECT=1 fails ccoDevCommCreate on every rank;
-// Harvest's barrier checks the comm still works.
+// n4: MORI_CCO_PROXY_TEST_FAIL_CONNECT=1 (rank 1 fails to connect): creation fails
+// on every rank.
 static int RunFailConnectCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   setenv("MORI_CCO_PROXY_TEST_FAIL_CONNECT", "1", 1);
   ccoDevComm d{};
@@ -1348,13 +1308,9 @@ static int RunConnMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return c.Harvest("n6_conn_mismatch", rc == 0);
 }
 
-// n7: rank 0 pushes slot gdaSignalCount (one past the last) to peer 1, once per
-// push shape, each on a DevComm of its own (the first error fails it). The
-// engine rejects it before posting: flush(coop, timeout) returns 2 and
-// ccoDevCommGetError reports BAD_REQUEST for that op with raddr
-// gdaSignalCount * 8. No other rank fails, and peer 1's slots read 0 (the write
-// would have landed on its consumed counts). A window signal at that offset of
-// the receive window still succeeds.
+// n7: rank 0 signals slot gdaSignalCount on peer 1, one push shape per DevComm:
+// BAD_REQUEST before posting, peer 1's slots untouched; a window signal at that
+// offset succeeds.
 template <int Shape>
 static int RunBadSlotShape(Ctx& c, const ccoDevCommRequirements& reqs, const char* name,
                            ccoProxyOp wantOp) {
@@ -1427,7 +1383,7 @@ static int RunSlotCountMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) 
   return c.Harvest("n8_slot_count", rc == 0);
 }
 
-// MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of case names.
+// MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of ids (n1..n9).
 static bool NegativeSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_NEGATIVE");
   if (env == nullptr || env[0] == '\0') return false;
@@ -1499,7 +1455,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   reqs.proxySpscQueueCount = kSpscQueues;
   reqs.proxyMpscQueueCount = kMpscQueues;
   reqs.proxyThreadCount = kProxyThreads;
-  reqs.proxyQpsPerPeer = 1;  // a thread's queues share a QP; dcQps covers one each
+  reqs.proxyQpsPerPeer = 1;
   ccoDevCommRequirements smallReqs = reqs;
   smallReqs.proxyQueueCapacity = kSmallCapacity;
   ccoDevCommRequirements threadReqs = reqs;
@@ -1567,7 +1523,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunSetCase<SPSCD2HQueue, kSetSignal>(c, "set_signal", 35, kSpscQueues);
   fails += RunSetCase<SPSCD2HQueue, kSetWindow>(c, "set_window", 36, kSpscQueues);
   fails += RunSetCase<MPSCD2HQueue, kSetSlot>(c, "mpsc_set_put", 37, kMaxUnits);
-  // ccoCoopThread (MPSC): divergent and single-lane puts, Aggregate, putValue.
   fails += RunThreadModeCase<kTmBranch>(c, "tm_branch", 51);
   fails += RunThreadModeCase<kTmBranchContended>(c, "tm_branch_contended", 59);
   fails += RunThreadModeCase<kTmSingle>(c, "tm_single", 52);
@@ -1604,7 +1559,7 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "split_warp", 17, kChunk,
                                                              kSpscQueues, 64, nullptr, 4096);
   // ccoCoopLaneMasked: per-lane offsets, sizes and signals, idle lanes; 256-byte
-  // split pieces in the *_put_sig cases (lanes need 1 to 4 pieces).
+  // split pieces in the kThreadPutSignal cases (lanes need 1 to 4 pieces).
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutSignal>(c, "thr_put_sig", 18, kSpscQueues, 256);
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutLaneSignal>(c, "thr_lane_sig", 19, kSpscQueues);
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutFlush>(c, "thr_flush", 20, kSpscQueues);
@@ -1617,13 +1572,10 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
                                                          true);
   fails +=
       RunThreadCase<MPSCD2HQueue, kThreadPutSignal>(c, "thr_small_mpsc", 25, kMaxUnits, 256, true);
-  // ccoCoopThread (MPSC): one signal per peer group (also with 256-byte split
-  // pieces), per-lane signal(), putValue with SignalInc.
   fails += RunThreadModeCase<kTmGroupSignal>(c, "tm_group_sig", 53);
   fails += RunThreadModeCase<kTmGroupSignal>(c, "tm_group_split", 54, 256);
   fails += RunThreadModeCase<kTmLaneSignal>(c, "tm_lane_sig", 55);
   fails += RunValueCase<MPSCD2HQueue, ccoCoopThread, false>(c, "tm_value", 57, kMaxUnits);
-  // putValue (1/2/4/8 bytes, with and without SignalInc).
   fails += RunValueCase<SPSCD2HQueue, ccoCoopWarp, false>(c, "put_value", 32, kSpscQueues);
   fails += RunStressCase(c);
   fails += RunSignalCase(c);
@@ -1631,7 +1583,6 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunBlockFlushCase(c);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutPieces>(c, "small_spsc", 14, kChunk,
                                                              kSpscQueues, 64, &c.dcSmall);
-  // kQpsPerPeer QPs per (thread, peer): each of a thread's 3 queues on its own QP.
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "qps_put_sig", 29, kChunk,
                                                              kSpscQueues, 64, &c.dcQps);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopBlock, kPutFlushClobber>(c, "qps_flush", 30, kChunk,

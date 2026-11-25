@@ -45,10 +45,8 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
     uint32_t count;
   };
   ProxyRecvInfo GetProxyRecvInfo(uint32_t qpn) const;
-  // ConnectEndpoint gives each QP a registered receive buffer for the shmem
-  // proxy's SEND_WITH_IMM emulation (GetProxyRecvInfo) unless this is turned
-  // off, e.g. for QPs that never receive. Applies to later ConnectEndpoint
-  // calls. The buffer is freed with its endpoint or with this context.
+  // Off: later ConnectEndpoint calls skip the shmem proxy's receive buffer (for QPs
+  // that never receive).
   void SetProxyRecvBuffersEnabled(bool enabled) { proxyRecvBuffersEnabled = enabled; }
 
  private:

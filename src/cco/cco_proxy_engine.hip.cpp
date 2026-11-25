@@ -23,37 +23,21 @@
 //
 // cco_proxy_engine.hip.cpp — host proxy engine behind ccoProxy.
 //
-// A fixed set of proxy threads. Each owns a subset of the KIWI device-to-host
-// queues (SPSC and MPSC; it is their only consumer) and min(qpsPerPeer, its
-// queue count) host-posted RC QPs, each with its own CQ, per peer. Each owned
-// queue is bound to one QP slot (round robin over the thread's queues), so a
-// queue's ops to one peer share a QP and stay in order. Each queue pool is one
-// KIWI invoke context: a thread drains its queues with Context::progress(),
-// which runs one registered callback (ProxyWorker::On*) per descriptor on that
-// thread. The QPs live on the PD of the comm's RDMA device context, which owns
-// the cco window MRs, so the lkeys/rkeys kernels resolve from ccoWindowDevice
-// are valid on them as-is.
+// Each proxy thread is the only consumer of its share of the KIWI queues and owns
+// min(qpsPerPeer, its queue count) RC QPs (own CQ each) per peer. A queue posts on
+// one QP slot, so its ops to a peer stay in order. Threads drain queues with
+// Context::progress(), which runs one ProxyWorker::On* callback per descriptor.
+// The QPs share the window MRs' PD, so kernel-resolved lkeys/rkeys are valid as-is.
 //
-// Per-QP work-request sequence numbers: the k-th WR posted on a QP has wr_id k.
-// RC completes WRs in order, so a CQE for WR k retires every WR <= k
-// (completedSeq). Every WR is signaled (v1). SQ credit is postedSeq -
-// completedSeq.
+// The k-th WR on a QP has wr_id k; RC completes in order, so a CQE for k retires
+// every WR <= k. Every WR is signaled.
 //
-// Flush: each queue tracks, per peer, the sequence of the last WR it produced
-// (on its QP to that peer).
-// A popped FLUSH first posts its QPs' pending WRs, then becomes a pending flush
-// that waits for this queue's last WR on every peer that still has work
-// outstanding. Pending flushes retire in FIFO order (a later FLUSH never waits
-// for less than an earlier one), and each retired FLUSH adds 1 to
-// flushDone[q]. The GPU side turns that count into "my FLUSH is satisfied"
-// (see cco_scale_out.hpp section 6).
+// A FLUSH posts its queue's pending WRs and retires in FIFO order (flushDone[q] += 1)
+// once that queue's last WR to every peer has completed (GPU side: ccoProxy::flushPush
+// in cco_scale_out.hpp).
 //
-// Failure: the first error (a descriptor the proxy cannot post, a failed post
-// or completion, a corrupted queue) is recorded once per engine and printed on
-// stderr. Every worker then drains and drops: it keeps popping its queues so
-// producers never wedge, posts nothing more, and sets ccoProxyFailedBit in its
-// queues' flushDone words, so a waiting flush returns or traps. The DevComm
-// stays failed until it is destroyed (see ccoDevCommGetError).
+// The first error fails the engine for good (Raise); workers then drain and drop
+// (EnterFailed).
 
 // cco headers first: core/utils.hpp (pulled in by the application headers)
 // defines a `warpSize` macro that would break cco.hpp's impl::warpSize().
@@ -194,22 +178,10 @@ std::string DescribeError(const ccoDevCommError& e, const char* tail) {
   return line + "; " + tail;
 }
 
-// Proxy thread CPU placement. Each proxy thread busy-polls, so it gets a core of
-// its own:
-//  1. MORI_CCO_PROXY_CPUS (a Linux cpulist, e.g. "8-11" or "8,9,10,11") wins:
-//     thread t runs on entry t % size. It applies to every rank in the process
-//     tree, so with several ranks per node set it per rank.
-//  2. Otherwise the candidates are the CPUs in the calling thread's affinity
-//     mask that are local to the current GPU (ccoCommCreate already narrowed
-//     the mask to this GPU's share of its NUMA node's cores), or the whole
-//     mask if none of them is GPU-local.
-//  3. The candidates are grouped into physical cores. The core holding CPU 0
-//     (kernel housekeeping: IRQs, softirqs, kworkers) is dropped unless it is
-//     the only one. Cores are taken from the END of the list, one thread per
-//     core (its first sibling), so proxy threads stay off the low CPUs the
-//     rank's own threads and the system favour, and off each other's SMT
-//     siblings. With more threads than cores they wrap onto the remaining
-//     siblings, then around again.
+// CPUs for the busy-polling proxy threads: MORI_CCO_PROXY_CPUS (thread t on entry
+// t % size), else the GPU-local CPUs in the affinity mask (or the whole mask), one
+// physical core per thread from the highest, skipping CPU 0's core, then wrapping
+// onto SMT siblings.
 std::vector<int> ChooseProxyCpus(int numThreads, std::string* source) {
   std::vector<int> order;
   if (const char* env = std::getenv("MORI_CCO_PROXY_CPUS"); env != nullptr && env[0] != '\0') {
@@ -525,8 +497,6 @@ class ProxyWorker {
     if (err_->state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
       err_->info = e;
       err_->state.store(2, std::memory_order_release);
-      // While destroying, the likely cause is a peer that destroyed first: its
-      // QPs are gone, so our WRs still in flight to it fail.
       const bool destroying = stop_ != nullptr && stop_->load(std::memory_order_acquire);
       std::fprintf(
           stderr, "%s\n",
@@ -614,7 +584,6 @@ class ProxyWorker {
   void OnPutSignal(const ccoProxyPutSignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutSignal);
-    // Both in one chain: data, then the atomic, on the same QP.
     if (qp == nullptr || !SignalValid(d.signal, ccoProxyOpPutSignal) || !Reserve(*qp, 2)) {
       return;
     }
@@ -649,8 +618,6 @@ class ProxyWorker {
   void OnFlush() {
     if (failed_) return;  // the poisoned flushDone answers it
     OwnedQueue& oq = *cur_;
-    // Everything before the FLUSH is popped; post it, then wait for this
-    // queue's last WR on every peer that still has one outstanding.
     PendingFlush f;
     for (int p : activePeers_) {
       ProxyQp& qp = Qp(p, oq.qpSlot);
@@ -783,7 +750,7 @@ class ProxyWorker {
     return seq;
   }
 
-  // Post the pending chain with one ibv_post_send. Every WR is signaled (v1).
+  // Posts the pending chain with one ibv_post_send.
   void PostChain(ProxyQp& qp) {
     const size_t n = qp.wrs.size();
     if (n == 0) return;
@@ -890,8 +857,8 @@ class ccoProxyEngine {
   ProxyErrorState err;
   int rank{0};
   void* scratch{nullptr};
-  uint64_t* flushDone{nullptr};    // fine-grained device [numSpsc + numMpsc]
-  uint64_t* flushTicket{nullptr};  // device [numSpsc + numMpsc]
+  uint64_t* flushDone{nullptr};    // [numSpsc + numMpsc]
+  uint64_t* flushTicket{nullptr};  // [numSpsc + numMpsc]
   std::atomic<bool> stop{false};
 };
 
@@ -930,8 +897,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   std::vector<int> qpBase;
   int qpsPerRank = 0;  // QPs to one peer, summed over the threads
 
-  // Local setup: everything up to the QP handle exchange. A failure here is
-  // reported to every rank by the Allgather below, so all ranks fail together.
+  // Local setup, up to the QP handle exchange.
   ProxyCreateInfo mine{};
   std::string error;
   std::vector<application::RdmaEndpointHandle> local;
@@ -961,8 +927,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
       throw std::runtime_error("queue capacity must be a power of two >= the largest descriptor");
     }
-    // The proxy threads store the flush counters into fine-grained VRAM, so the
-    // CPU must be able to map device memory (large BAR).
     int dev = -1, largeBar = 0;
     HipOrThrow(hipGetDevice(&dev), "hipGetDevice");
     HipOrThrow(hipDeviceGetAttribute(&largeBar, hipDeviceAttributeIsLargeBar, dev),
@@ -982,11 +946,11 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     epConfig.maxMsgsNum = kSqDepth;
     epConfig.maxCqeNum = kSqDepth;
     epConfig.maxRecvWr = 1;
-    epConfig.maxInlineData = kInlineBytes;  // putValue, SignalSet
+    epConfig.maxInlineData = kInlineBytes;
     epConfig.onGpu = false;
     epConfig.withCompChannel = false;
     epConfig.enableSrq = false;
-    epConfig.atomicIbufSlots = 0;  // atomics return into the per-thread scratch slot below
+    epConfig.atomicIbufSlots = 0;
     const ibv_port_attr* portAttr = devCtx->GetRdmaDevice()->GetPortAttr(epConfig.portId);
     if (portAttr == nullptr || portAttr->max_msg_sz == 0) {
       throw std::runtime_error("port " + std::to_string(epConfig.portId) + " max_msg_sz unknown");
@@ -1008,9 +972,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       engine->workers.push_back(std::move(w));
     }
 
-    // flushDone: fine-grained device memory (the GPU polls it locally, the
-    // proxy writes it over PCIe). Flush tickets: plain device memory, only
-    // touched by GPU atomics.
     HipOrThrow(hipExtMallocWithFlags(reinterpret_cast<void**>(&engine->flushDone),
                                      sizeof(uint64_t) * numQueues, hipDeviceMallocFinegrained),
                "hipExtMallocWithFlags");
@@ -1067,10 +1028,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     error = e.what();
   }
 
-  // Every rank must have set up before the exchange. All ranks see the same
-  // table, so they all fail or all go on. (The caller has already checked that
-  // every rank passed the same queue, thread and QP counts, so qpsPerRank,
-  // the handles sent per peer, matches.) One RDMA write must fit every port.
+  // All ranks see the same table, so all fail or all go on. One RDMA write must
+  // fit every port.
   mine.ok = error.empty() ? 1 : 0;
   std::vector<ProxyCreateInfo> all(worldSize);
   bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
@@ -1178,7 +1137,7 @@ int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err) {
 
 void ccoProxyEngineDestroy(ccoProxyEngine* engine) noexcept {
   if (engine == nullptr) return;
-  engine->StopAndJoin();  // drain: every WR we posted completed, every FLUSH answered
+  engine->StopAndJoin();
   ccoDevCommError err;
   if (ccoProxyEngineGetError(engine, &err)) {
     std::fprintf(stderr,

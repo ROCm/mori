@@ -392,30 +392,17 @@ struct ccoSdmaContext {
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
-// ccoProxy context (host-proxy RDMA; see cco_scale_out.hpp section 6). Kernels invoke host
-// callbacks (KIWI invoke) with descriptors, keys already resolved (the same
-// window addressing as GDA, offset + iovaBias). A fixed set of host proxy threads polls the
-// queues and posts the RDMA work requests on host-created RC QPs,
-// proxyQpsPerPeer per (proxy thread, peer). Two queue pools: SPSC (one
-// wavefront at a time per queue) and MPSC. Empty when both pools are empty.
-//
-// Each pool is one KIWI invoke context; its device context is opaque here so
-// this header stays free of KIWI headers (cco_scale_out.hpp casts it back).
+// ccoProxy device context (cco_scale_out.hpp section 6). Each pool's KIWI
+// DeviceContext is opaque here so cco.hpp needs no KIWI headers.
 struct ccoProxyContext {
   int numSpscQueues;
   int numMpscQueues;
-  void* spscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<SPSCD2HQueue>*; null if no SPSC
-                      // queues
-  void* mpscContext;  // GPU mori::cco::proxy::invoke::DeviceContext<MPSCD2HQueue>*; null if no MPSC
-                      // queues
-  // [numSpscQueues + numMpscQueues] (SPSC pool, then MPSC pool) FLUSHes the
-  // proxy has satisfied per queue. Fine-grained device memory, written only by
-  // the proxy, never decreases; bit 63 (ccoProxyFailedBit) = DevComm failed.
+  void* spscContext;  // DeviceContext<SPSCD2HQueue>* (device); null without SPSC queues
+  void* mpscContext;  // DeviceContext<MPSCD2HQueue>* (device); null without MPSC queues
+  // [SPSC pool, then MPSC pool] FLUSHes satisfied, written by the proxy
+  // (fine-grained device memory); bit 63 = ccoProxyFailedBit.
   uint64_t* flushDone;
-  // [numSpscQueues + numMpscQueues] (indexed like flushDone) flush tickets taken
-  // per queue. Device memory, written only by kernels (atomic fetch-add), never
-  // decreases.
-  uint64_t* flushTicket;
+  uint64_t* flushTicket;  // [as flushDone] flush tickets taken (kernel fetch-adds)
   // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
   // max_msg_sz of any rank's port. put() splits larger transfers.
   uint32_t maxPutBytes;
@@ -551,39 +538,17 @@ struct ccoDevCommRequirements {
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
 
-  // ccoProxy (host-proxy RDMA; the host engine is built by default for gfx942/gfx950
-  // and MORI_CCO_DISABLE_PROXY=1 turns it off at run time). Separate SPSC and
-  // MPSC queue pools (ccoProxy<> and
-  // ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> index their own pool),
-  // polled by proxyThreadCount host threads. Proxy QPs go to the peers
-  // of proxyConnectionType; signals use the GDA signal slots (gdaSignalCount).
-  // Every rank must pass the same queue, thread and QP counts, connection type
-  // and gdaSignalCount (checked; creation fails otherwise), and the GPU's VRAM must be
-  // host-mapped (large BAR). Each DevComm with proxy queues starts its own
-  // busy-polling threads, pinned by the same policy (MORI_CCO_PROXY_CPUS or the
-  // GPU-local cores), so several such DevComms oversubscribe the same CPUs;
-  // prefer one per comm. MORI_CCO_PROXY_CPUS applies to the whole process tree:
-  // with several ranks per node, set it per rank.
+  // ccoProxy (cco_scale_out.hpp section 6; rules: MORI-CCO-GUIDE.md §10). Every
+  // rank must pass the same queue, thread and QP counts, connection type and
+  // gdaSignalCount (signals use the GDA slots); creation fails otherwise.
   int proxySpscQueueCount;  // 0 = no SPSC pool
   int proxyMpscQueueCount;  // 0 = no MPSC pool
   int proxyThreadCount;     // host proxy threads (0 = 4), capped at the total queue count
-  int proxyQueueCapacity;   // ring capacity in 64-byte lines (power of two); 0 = default.
-                            // ccoProxy lane-masked ops (ccoCoopLaneMasked) need up to 2
-                            // lines per active lane (128 for a full wavefront of
-                            // put+signal); smaller rings trap.
-  // RC QPs per (proxy thread, peer); 0 = 4.
-  // Each queue posts on one of its thread's QPs per peer (round robin over the
-  // thread's queues); a thread creates no more than it owns queues. Several QPs
-  // let NICs that serve each QP serially (e.g. ionic) run a thread's queues in
-  // parallel; the default 4 does no harm on mlx5. Same on every rank.
-  int proxyQpsPerPeer;
-  // Peers that get proxy QPs, as a ccoGdaConnectionType resolved like
-  // gdaConnectionType (CROSSNODE on one node, no RDMA or no matching peer ->
-  // NONE; proxy queues then fail creation). CCO_PROXY_CONNECTION_FOLLOW_GDA
-  // (-1, the default) follows gdaConnectionType.
-  // Independent of the GDA QPs: gdaConnectionType NONE + proxyConnectionType
-  // FULL gives a proxy-only DevComm. ccoProxy's CCO_TEAM_GDA peers index this
-  // type's team, as ccoGda's index gdaConnectionType's.
+  int proxyQueueCapacity;   // ring size in 64-byte lines, power of two; 0 = 4096
+  int proxyQpsPerPeer;      // RC QPs per (proxy thread, peer); 0 = 4
+  // Peers with proxy QPs: a ccoGdaConnectionType resolved like gdaConnectionType,
+  // independent of the GDA QPs (CCO_TEAM_GDA peers index its team), or
+  // CCO_PROXY_CONNECTION_FOLLOW_GDA (default).
   int proxyConnectionType;
 };
 
@@ -656,13 +621,8 @@ struct ccoCoopBlock {
   __device__ void sync() { impl::syncThreads(); }
 };
 
-// ccoProxy's per-lane Coop for put / putValue / signal: all 64 lanes call from
-// converged code and each lane with `active` true issues its own op (see
-// cco_scale_out.hpp section 6), e.g.
-//   proxy.put(peer, dstWin, dstOff, srcWin, srcOff, bytes, ccoGda_NoSignal{},
-//             ccoCoopLaneMasked{i < n});
-// As a group it is a single thread (thread_rank 0, size 1, no-op sync).
-// ccoProxy only: ccoGda rejects it at compile time.
+// ccoProxy only (ccoGda rejects it): all 64 lanes call from converged code and
+// each lane with `active` issues its own op. As a group it is one thread.
 struct ccoCoopLaneMasked {
   bool active = true;
   __device__ int thread_rank() const { return 0; }
@@ -1122,23 +1082,14 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // outDevComm is a caller-provided host struct filled in place (it holds device
 // pointers but lives on the host). Pass it by value into kernels — it lands in
 // kernel-arg space, no per-access GPU-memory dereference. The device resources
-// it references are released by ccoDevCommDestroy(comm, &devComm), on the
-// struct ccoDevCommCreate filled (not a copy), once. Destroy is local: it never
-// waits for other ranks. With ccoProxy queues, no peer may still push to this
-// rank: end the last kernels with flush(), synchronize, then barrier the ranks
-// (ccoBarrierAll) before destroying; a peer's op still in flight fails.
+// it references are released by ccoDevCommDestroy(comm, &devComm), once, on
+// this struct (not a copy). Destroy is local; with ccoProxy, quiesce peers
+// first (MORI-CCO-GUIDE.md §10).
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
-// A DevComm fails for good at its first ccoProxy error, seen only by the rank
-// that hit it (peers are not told). ccoProxy calls that trap on it (flush(),
-// waitSignal()) end the process: HIP reports the queue error and aborts. To
-// keep the process, wait with ccoProxy::flush(coop, timeoutCycles) /
-// waitSignal(..., timeoutCycles) (2 = failed) or poll failed(), and read the
-// cause with ccoDevCommGetError; receivers need their own timeout, since a
-// failed sender sends nothing more. Recovery: agree out of band, then every
-// rank calls ccoDevCommDestroy and creates the DevComm again.
-// Other DevComms are unaffected.
+// The first ccoProxy error fails a DevComm for good, on this rank only;
+// detection and recovery: MORI-CCO-GUIDE.md §10.
 enum ccoDevCommErrorCode {
   CCO_DEVCOMM_OK = 0,
   CCO_PROXY_ERR_BAD_REQUEST = 1,  // an op the proxy cannot post (no QP to the peer, bad descriptor)

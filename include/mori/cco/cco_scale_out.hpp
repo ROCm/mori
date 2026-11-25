@@ -39,7 +39,7 @@
 #include "mori/core/transport/rdma/rdma_device.hpp"
 #endif
 
-// ccoProxy pushes its ops through the KIWI device-to-host queues (copied into
+// ccoProxy pushes its ops through the KIWI device-to-host queues (vendored in
 // mori/cco/proxy); device-only.
 #if defined(__HIPCC__)
 #include "mori/cco/proxy/invoke/device_context.hip.hpp"
@@ -162,17 +162,8 @@ struct ccoGda_WindowSignalAdd {
       : win(w), offset(off), value(val) {}
 };
 
-// Atomic-free signal (ccoProxy only; ccoGda rejects it at compile time): an
-// 8-byte RDMA write of `value` into the signal slot, after the data on the same
-// QP. Writes are ordered only within one queue, so the contract is: every set
-// of a slot goes through one queue (one ccoProxy handle, or SPSC handles
-// handed off in turn), values only increase in that queue's order, and no
-// SignalInc / SignalAdd to the same slot. Sets of one slot through two queues
-// can land out of order and move it back. The slot then reads the last value
-// set (minus what waitSignal consumed): set 1, 2, 3, ... and call
-// waitSignal(id, 1) once per value. Data before the set is visible first only
-// if the NIC-to-GPU path keeps PCIe write order (no relaxed ordering on the
-// MRs, and also under VFs / passthrough).
+// Atomic-free signal (ccoProxy only): an 8-byte RDMA write of `value` into the
+// slot, after the data on the same QP. Contract: MORI-CCO-GUIDE.md §10.
 struct ccoGda_SignalSet {
   ccoGdaSignal_t signalId;
   uint64_t value;
@@ -382,7 +373,6 @@ __device__ inline void checkGdaRemoteAction() {
                 "or ccoGda_WindowSignalAdd");
 }
 
-// ccoCoopLaneMasked is ccoProxy's: ccoGda would ignore `active`.
 template <typename Coop>
 __device__ inline void checkGdaCoop() {
   static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
@@ -1777,7 +1767,6 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localActi
   coop.sync();
 }
 
-// readSignal: the slot's unconsumed amount
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t signalId,
                                                                   int bits) {
@@ -1785,7 +1774,6 @@ __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t
   return impl::readSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, signalId, bits);
 }
 
-// waitSignal: wait for `least` unconsumed, then consume them
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitSignal(ccoGdaSignal_t signalId,
@@ -1917,112 +1905,20 @@ __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBa
  *  6. ccoProxy: host-proxy RDMA transport with the ccoGda window API.
  * ════════════════════════════════════════════════════════════════════════════ */
 
-// Kernels invoke host callbacks through KIWI invoke (the GPU->CPU callback
-// layer on the KIWI device-to-host queues): each op is one fixed-size
-// descriptor; host proxy threads run the callbacks, which post ibverbs work
-// requests on host-created RC QPs, proxyQpsPerPeer per (proxy thread, peer),
-// on the PD that owns the cco window MRs. Keys and remote addresses are
-// resolved on the GPU exactly like ccoGda (raddr = window offset + iovaBias),
-// so the proxy needs no key tables.
-//
-// Queues: ccoProxy<> (mori::cco::proxy::queue::SPSCD2HQueue) indexes the
-// DevComm's SPSC pool, ccoProxy<mori::cco::proxy::queue::MPSCD2HQueue> its MPSC
-// pool; each pool is one KIWI invoke context.
-// An MPSC queueIndex is taken modulo the pool size, like ccoGda's
-// contextIndex; an SPSC one must be in [0, proxySpscQueueCount), since
-// wrapping would let two wavefronts share an SPSC queue and corrupt it.
-// Only one wavefront may use an SPSC queue at a time: its producer state lives
-// in the context's device handle, loaded by the constructor and saved back by
-// the destructor (or release()). Handing an SPSC queue to another wavefront of
-// the same kernel needs a release/acquire between them: release() (or the
-// destructor) then an agent-scope release (e.g. a flag store) in the old owner,
-// and an agent-scope acquire of it before the new owner constructs its
-// ccoProxy (__syncthreads() suffices within one block). Across kernel launches
-// stream order is enough; concurrent kernels need different SPSC queues. If
-// you only call readSignal, waitSignal, resetSignal or failed on a handle, you
-// may construct it with any queue index, even one another wavefront is pushing
-// to.
-//
-// Usage errors trap instead of corrupting a queue or faulting: an empty pool,
-// an SPSC queueIndex out of range, a push from a partial wavefront and (builds
-// without NDEBUG) differing arguments across the issuing lanes. Builds without
-// NDEBUG print the reason first; release builds only trap, since an inlined
-// device printf would add registers to every kernel using ccoProxy.
-//
-// Ordering: ops pushed by one wavefront to one queue are popped in program
-// order and land on one QP per peer, so a put followed by a signal (or a put
-// carrying a signal) to the same peer through the same queue is delivered in
-// order -- the same guarantee ccoGda gives within one context. Different queues
-// are unordered, as different ccoGda contexts are, and so are ccoProxy and
-// ccoGda ops.
-//
-// Proxy QPs go to the peers of proxyConnectionType (ccoDevCommRequirements),
-// independent of the GDA QPs. Signals land in the ccoGda signal slots
-// (devComm.ibgda.signalBuf), which exist when the GDA or the proxy connection
-// resolves to non-NONE; the engine rejects a slot id >= gdaSignalCount
-// (BAD_REQUEST). SignalInc / SignalAdd / WindowSignalAdd are NIC atomic
-// fetch-adds; SignalSet / WindowSignalSet are 8-byte inline RDMA writes for NICs
-// whose atomics into GPU memory fail (see ccoGda_SignalSet), and, like a putValue
-// used as a flag, need window MRs without relaxed ordering.
-//
-// Flush: the proxy satisfies each queue's FLUSHes in queue order and adds 1 to
-// that queue's flushDone per FLUSH satisfied (it is the only writer). A flush
-// takes a ticket t from the queue's flushTicket counter right before pushing
-// and waits for flushDone >= t, so it never needs its FLUSH's ring position
-// and an earlier FLUSH need not have been waited for.
-//
-// Failure: the DevComm fails for good at the first proxy error (see
-// ccoDevCommGetError): the proxy drops every later op and sets
-// ccoProxyFailedBit in each queue's flushDone. failed() then returns true,
-// flush(coop, timeoutCycles) and waitSignal(..., timeoutCycles) return 2, an
-// SPSC push waiting for ring space drops its op, and flush() / waitSignal()
-// trap (waitSignal within 256 polls). A trap, like any usage-error trap, ends
-// the process: HIP reports the queue error and aborts. Only this rank sees the
-// failure; peers are not told, so a receiver needs its own timeout
-// (waitSignal(..., timeoutCycles)). Recovery: detect it (2, failed(), or
-// ccoDevCommGetError), agree out of band, then every rank calls
-// ccoDevCommDestroy and creates a new DevComm. Not covered: an
-// MPSC push waiting for ring space (only after a corrupted ring).
-//
-// Fences: each put / putValue / signal does a system-scope release fence
-// before its push, so the data it sends (and every earlier store) is visible
-// to the NIC. Reads of NIC-written memory need an acquire: waitSignal() and
-// flush() end with a system-scope one; after readSignal() or a poll of a
-// caller window, issue it yourself.
-//
-// Calling convention: put / putValue / signal take no default Coop (ccoGda's
-// default is ccoCoopThread).
-// - ccoCoopWarp / ccoCoopBlock: the whole group calls from converged code and
-//   issues one op; the issuing wavefront (the calling one for ccoCoopWarp,
-//   wavefront 0 -- linear thread ids 0..63, also in 2-D and 3-D blocks -- for
-//   ccoCoopBlock) must have all 64 lanes active, and every issuing lane must
-//   pass identical arguments (lane i writes word i of the descriptor; only
-//   builds without NDEBUG check it); ccoGda reads only thread_rank 0's.
-// - ccoCoopLaneMasked{active}: all 64 lanes call from converged code (a call
-//   from a divergent branch traps) and each lane with `active` true issues its
-//   own op, all in one push, in lane order. Every lane signals for itself.
-// - ccoCoopThread (MPSC queues only; SPSC rejects it at compile time, as an
-//   SPSC producer index lives in registers): any lanes may call, from divergent
-//   code or alone, and each issues its own op, as in ccoGda. The executing lanes
-//   of a call push together, in lane order, through one claim. As ccoGda's
-//   put / putValue with a signal, the executing lanes are grouped by peer and
-//   each group signals once, after all of its data, with the arguments of its
-//   highest lane; ccoGdaThreadAggregate promises one peer for all of them and
-//   skips the grouping (builds without NDEBUG check it). signal() signals per
-//   lane, as in ccoGda.
-// A put larger than maxPutBytes is split; the signal rides the last piece.
-// flush() takes ccoCoopWarp or ccoCoopBlock, as in ccoGda: after lane-masked or
-// thread ops, flush from the converged wavefront.
-//
-// Requires a BUILD_CCO_PROXY build and a wave64 GFX9 target (KIWI push).
+// Kernels push each op as one fixed-size descriptor through KIWI invoke; host
+// proxy threads post it as an ibverbs WR on host-created RC QPs. Keys and
+// remote addresses are resolved on the GPU as in ccoGda (window offset +
+// iovaBias), so the proxy needs no key tables. ccoProxy<> uses the DevComm's
+// SPSC pool, ccoProxy<MPSCD2HQueue> its MPSC pool.
+// Caller rules: docs/MORI-CCO-GUIDE.md §10.
+// Requires a BUILD_CCO_PROXY build and a gfx942/gfx950 target.
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  Wire format (shared by the device API and the host proxy engine)
  *
  *  Each op is one KIWI invoke callback: the op is the callback id and the
  *  descriptor below its single argument (FLUSH has none). The host engine
- *  registers the callbacks in enum order, so the ids match; the op enum stays
- *  open for later ops.
+ *  registers the callbacks in enum order, so the ids match.
  * ──────────────────────────────────────────────────────────────────────────── */
 
 enum ccoProxyOp : uint8_t {
@@ -2050,7 +1946,7 @@ struct ccoProxySignalDesc {
   uint32_t rkey;
   uint32_t peer;  // world rank
   uint32_t set;   // 0: atomic fetch-add; 1: 8-byte inline write of value
-  uint32_t slot;  // 1: raddr is signal slot raddr / 8; the engine checks it < gdaSignalCount
+  uint32_t slot;  // 1: raddr = slot id * 8; the engine checks id < gdaSignalCount
 };
 
 struct ccoProxyPutSignalDesc {
@@ -2078,9 +1974,7 @@ static_assert(sizeof(ccoProxyPutSignalDesc) == 64, "two queue lines");
 static_assert(sizeof(ccoProxyPutValueDesc) == 32, "one queue line");
 static_assert(sizeof(ccoProxyPutValueSignalDesc) == 64, "two queue lines");
 
-// Upper bound on the bytes of one RDMA write a descriptor carries. The engine
-// lowers it to the port's max_msg_sz (ccoProxyContext::maxPutBytes), and put()
-// splits larger transfers into pieces of that size.
+// Cap on one RDMA write; see ccoProxyContext::maxPutBytes.
 inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
 static_assert(ccoProxyMaxPutBytes <= UINT32_MAX, "ccoProxyContext::maxPutBytes is 32-bit");
 
@@ -2091,7 +1985,8 @@ inline constexpr uint64_t ccoProxyFailedBit = 1ull << 63;
 #if defined(__HIPCC__)
 
 // Usage error or failed DevComm: print the message from the lanes where `who`
-// holds (builds without NDEBUG only; see the section 6 comment), then trap.
+// holds (builds without NDEBUG only: a device printf adds registers to every
+// kernel), then trap.
 #ifndef NDEBUG
 #define CCO_PROXY_TRAP(who, ...)  \
   do {                            \
@@ -2194,18 +2089,14 @@ struct ccoProxy {
   bool unflushed;         // pushed since the last completed flush (or construction)
   typename DeviceContext::DeviceHandle handle;
 
-  // SPSC: queueIndex must be in [0, numSpscQueues); MPSC: taken modulo the pool
-  // size, like ccoGda's contextIndex. Traps if this pool is empty or (SPSC) the
-  // index is out of range.
+  // Traps if the pool is empty or an SPSC queueIndex is out of range; MPSC wraps.
   __device__ inline ccoProxy(ccoDevComm const& comm_, int queueIndex);
   __device__ inline ~ccoProxy() { release(); }
   ccoProxy(const ccoProxy&) = delete;
   ccoProxy& operator=(const ccoProxy&) = delete;
 
-  // SPSC: save the handle (producer state) back so the next ccoProxy on this
-  // queue (later in the kernel, after the release/acquire described in the
-  // section 6 comment, or in a later launch) continues from it. Called by the
-  // destructor; a no-op for MPSC and for wavefronts that never pushed.
+  // SPSC: save the producer state for the queue's next owner; called by the
+  // destructor, no-op for MPSC or if nothing was pushed.
   __device__ inline void release() {
     if constexpr (kSpsc) {
       if (dirty) ctx->save_device_handle(queueId, handle);
@@ -2222,20 +2113,15 @@ struct ccoProxy {
     }
   }
 
-  // RDMA write of [srcWin+srcOffset, +bytes) to peer's [dstWin+dstOffset, ...),
-  // optionally followed (same QP, so after the data) by a remote signal.
-  // Template parameters follow ccoGda::put; ThreadMode applies to ccoCoopThread.
-  // Coop has no default (ccoGda's is ccoCoopThread): ccoCoopWarp, ccoCoopBlock,
-  // ccoCoopLaneMasked, or (MPSC) ccoCoopThread; see the section 6 comment.
+  // As ccoGda::put, but Coop has no default: ccoCoopWarp, ccoCoopBlock,
+  // ccoCoopLaneMasked or (MPSC) ccoCoopThread.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
             ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename RemoteAction,
             typename Coop>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, RemoteAction remoteAction, Coop coop);
 
-  // Inline RDMA write of `value` (sizeof(T) <= 8 bytes, no padding) to peer's
-  // [dstWin+dstOffset, ...), optionally followed by a remote signal, as put().
-  // Template parameters follow ccoGda::putValue; Coop as in put().
+  // As ccoGda::putValue (T: 1..8 bytes, no padding); Coop as in put().
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
             ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
             typename RemoteAction, typename Coop>
@@ -2246,12 +2132,9 @@ struct ccoProxy {
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction, typename Coop>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop);
 
-  // Push a FLUSH and wait until every work request this queue posted before it
-  // has completed, on every peer: the sources of earlier puts are reusable
-  // (see the section 6 comment). Waits only for this queue; with ccoCoopBlock, also
-  // for the queue of every wavefront whose handle pushed since its last
-  // completed flush. Coop: ccoCoopWarp or ccoCoopBlock (after lane-masked ops,
-  // flush() from all 64 lanes).
+  // Wait until every op this queue pushed earlier has completed on every peer
+  // (sources reusable); ccoCoopBlock also flushes each wavefront that pushed
+  // since its last flush. Traps once the DevComm failed.
   template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
   __device__ inline void flush(Coop coop = Coop{});
 
@@ -2269,7 +2152,7 @@ struct ccoProxy {
             ccoProxyFailedBit) != 0;
   }
 
-  // Waits at least for `peer`'s ops; today it waits for every peer, as flush().
+  // Waits for every peer, as flush(); `peer` keeps ccoGda's signature.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
   __device__ inline void flush(int peer, Coop coop = Coop{}) {
     (void)peer;
@@ -2281,11 +2164,8 @@ struct ccoProxy {
     return impl::readSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf,
                                                         comm.ibgda.signalShadows, signalId, bits);
   }
-  // As ccoGda::waitSignal: waits until `least` more than already consumed have
-  // arrived, then consumes them (readSignal returns the unconsumed amount); one
-  // waiter per slot at a time. Also traps once the DevComm failed, and acquires.
-  // One thread of the group waits (lane 0 / linear thread 0 for ccoCoopWarp /
-  // ccoCoopBlock, also in 2-D and 3-D blocks). Full 64-bit slots (no `bits`).
+  // As ccoGda::waitSignal (64-bit slots, no `bits`), ending with an acquire;
+  // traps once the DevComm failed.
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{}) {
     static_assert(!std::is_same_v<Coop, ccoCoopLaneMasked>,
@@ -2324,9 +2204,8 @@ struct ccoProxy {
                   "ccoProxy supports ccoCoopWarp, ccoCoopBlock, ccoCoopLaneMasked and (MPSC) "
                   "ccoCoopThread");
     if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
-      // Wavefront 0, by linear id: in a 2-D block threadIdx.x < 64 spans
-      // several wavefronts. (Not impl::warpSize(): core/utils.hpp, pulled in
-      // by cco_scale_out.hpp, defines a `warpSize` macro.)
+      // Wavefront 0 by linear id. Not impl::warpSize(): core/utils.hpp defines
+      // a `warpSize` macro.
       return impl::proxyLinearTid() < static_cast<unsigned>(__builtin_amdgcn_wavefrontsize());
     } else {
       return true;  // the calling wavefront
@@ -2358,8 +2237,6 @@ struct ccoProxy {
     }
   }
 
-  // Whether this lane issues an op: coop.active for ccoCoopLaneMasked; true
-  // for the group Coops, whose group issues one op.
   template <typename Coop>
   __device__ static inline bool laneActive(const Coop& coop) {
     if constexpr (std::is_same_v<Coop, ccoCoopLaneMasked>) {
@@ -2380,14 +2257,10 @@ struct ccoProxy {
     }
   }
 
-  // Invoke callback `op` with its descriptor, if any (whole wavefront):
-  // kLaneMasked (ccoCoopLaneMasked): every lane with `active` sends its own
-  // descriptor; otherwise the wavefront sends one, and `active` is true. An
-  // SPSC push on a full ring retries (a lane-masked push writes all of the
-  // active lanes' messages or none), and drops the op once the DevComm failed;
-  // an MPSC push waits inside KIWI (and always succeeds). Traps on a partial
-  // wavefront, which KIWI does not check in release builds, and (builds without
-  // NDEBUG, not kLaneMasked) on lanes passing differing descriptors.
+  // Push `op` from the full wavefront: one descriptor, or (kLaneMasked) one per
+  // active lane. A full SPSC ring is retried, and the op dropped once the
+  // DevComm failed. MPSC waits inside KIWI; a failure does not end that wait,
+  // but the proxy keeps draining, so only a corrupted ring stalls it.
   template <bool kLaneMasked, typename... Desc>
   __device__ inline void invoke([[maybe_unused]] bool active, ccoProxyOp op, const Desc&... desc) {
     impl::proxyCheckTarget();  // before the exec check, which misfires on wave32
@@ -2398,7 +2271,7 @@ struct ccoProxy {
                      "all 64 lanes of the issuing wavefront must call it\n",
                      static_cast<unsigned long long>(exec));
     }
-#ifndef NDEBUG  // see the section 6 comment
+#ifndef NDEBUG
     if constexpr (!kLaneMasked) (checkUniformDesc(op, desc), ...);
 #endif
     auto push = [&] {
@@ -2410,7 +2283,6 @@ struct ccoProxy {
     };
     if constexpr (kSpsc) {
       while (!push()) {
-        // A failed proxy may have stopped popping: drop the op.
         if (__builtin_amdgcn_readfirstlane(failed() ? 1 : 0)) return;
         __builtin_amdgcn_s_sleep(1);
       }
@@ -2456,8 +2328,10 @@ struct ccoProxy {
     return flushWait<kTimeout>(flushDone, flushPush(), timeoutCycles);
   }
 
-  // Take a ticket and push a FLUSH (issuing wavefront, all 64 lanes). Returns,
-  // in lane 0, the flushDone value that proves it satisfied.
+  // Take ticket t and push a FLUSH (issuing wavefront, all 64 lanes); returns t
+  // in lane 0. The proxy adds 1 to flushDone per satisfied FLUSH, in queue
+  // order, so flushDone >= t proves this FLUSH (or a later one covering it)
+  // done; earlier FLUSHes need not have been waited for.
   __device__ inline uint64_t flushPush();
 
   // Lane 0 waits until *done >= target, then the wavefront acquires. Returns
@@ -2471,10 +2345,8 @@ struct ccoProxy {
   __device__ inline int waitSignalLeader(ccoGdaSignal_t signalId, uint64_t least,
                                          uint64_t timeoutCycles);
 
-  // invoke() for a data-carrying op: first make the source data (and any
-  // earlier stores the peer will read) visible to the NIC, since the proxy may
-  // post the WR as soon as the descriptor lands. Release only: nothing here
-  // reads NIC-written memory (waitSignal and flush acquire).
+  // System-scope release, then invoke(): the proxy may post the WR as soon as
+  // the descriptor lands.
   template <bool kLaneMasked, typename Desc>
   __device__ inline void fenceAndInvoke(bool active, ccoProxyOp op, const Desc& desc) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
@@ -2484,8 +2356,7 @@ struct ccoProxy {
 
   // fenceAndInvoke() for ccoCoopThread (MPSC): every executing lane pushes op
   // with the first `bytes` bytes of `desc`, from any subset of the wavefront.
-  // The MPSC push waits for space inside KIWI, so it always succeeds. The
-  // claim's result is waited for before the wavefront goes on, so a later
+  // The claim's result is waited for before the wavefront goes on, so a later
   // flush() ticket follows it.
   template <typename Desc>
   __device__ inline void fenceAndInvokeThread(ccoProxyOp op, const Desc& desc, uint32_t bytes) {
@@ -2582,7 +2453,7 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
   static_assert(ThreadMode == ccoGdaThreadIndependent || kThread,
                 "ccoGdaThreadAggregate requires ccoCoopThread, as in ccoGda");
   if constexpr (kThread) {
-    // Each executing lane puts its own (MPSC; see the section 6 comment).
+    // Each executing lane puts its own (MPSC).
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
     const ccoWindowDevice* sw = reinterpret_cast<ccoWindowDevice*>(srcWin);
     const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
@@ -2615,7 +2486,7 @@ __device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t
   } else {
     constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
     coop.sync();
-    const bool on = laneActive(coop);  // constant true unless kLaneMasked
+    const bool on = laneActive(coop);
     if (issuingWave<Coop>()) {
       int worldPeer = 0;
       ccoProxyPutDesc d{};
@@ -2673,7 +2544,7 @@ __device__ inline void ccoProxy<Queue>::putValue(int peer, ccoWindow_t dstWin, s
   static_assert(ThreadMode == ccoGdaThreadIndependent || kThread,
                 "ccoGdaThreadAggregate requires ccoCoopThread, as in ccoGda");
   if constexpr (kThread) {
-    // Each executing lane writes its own value (MPSC; see the section 6 comment).
+    // Each executing lane writes its own value (MPSC).
     const int worldPeer = resolveWorldPeer<TeamMode>(peer);
     const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
     ccoProxyPutValueDesc d{};
@@ -2695,7 +2566,7 @@ __device__ inline void ccoProxy<Queue>::putValue(int peer, ccoWindow_t dstWin, s
   } else {
     constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
     coop.sync();
-    const bool on = laneActive(coop);  // constant true unless kLaneMasked
+    const bool on = laneActive(coop);
     if (issuingWave<Coop>()) {
       int worldPeer = 0;
       ccoProxyPutValueDesc d{};
@@ -2734,7 +2605,7 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
   } else {
     constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
     coop.sync();
-    const bool on = laneActive(coop);  // constant true unless kLaneMasked
+    const bool on = laneActive(coop);
     if (issuingWave<Coop>()) {
       ccoProxySignalDesc s{};
       if (on) s = impl::proxyResolveSignal(comm, resolveWorldPeer<TeamMode>(peer), remoteAction);
@@ -2746,8 +2617,6 @@ __device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteActi
 
 template <typename Queue>
 __device__ inline uint64_t ccoProxy<Queue>::flushPush() {
-  // Lane 0 picks the flushDone value that proves our FLUSH (or a later one
-  // that covers it) is satisfied.
   uint64_t target = 0;
   if (__lane_id() == 0) {
     if constexpr (kSpsc) {
@@ -2757,25 +2626,10 @@ __device__ inline uint64_t ccoProxy<Queue>::flushPush() {
                                       __HIP_MEMORY_SCOPE_AGENT) +
                1;
     } else {
-      // Ticket t: we wait for flushDone >= t, i.e. for the first t FLUSHes of
-      // this queue (in queue order) to be satisfied. Those t FLUSHes hold t
-      // distinct tickets, so at least one of them holds a ticket t' >= t: ours
-      // (t' == t), or one whose caller took its ticket after us (t' > t).
-      // That FLUSH was claimed after our puts, so it covers them: the proxy
-      // pops the queue in order, so it has posted our puts by the time it
-      // pops that FLUSH, and the FLUSH waits for the queue's last WR per QP
-      // as of that pop.
-      //
-      // Why that FLUSH was claimed after our puts: every ticket fetch-add is
-      // acq_rel (agent scope: all producers of a queue run on this GPU). The
-      // later caller's fetch-add reads ours (or a later RMW of the same
-      // release sequence), so our release synchronizes with its acquire:
-      // our put claims (relaxed fetch-adds on the ring's producer index,
-      // earlier in program order) happen before its ticket, which comes
-      // before its FLUSH claim in program order (and, by the acquire, is
-      // complete before that claim issues). Coherence on the producer index
-      // then puts our puts earlier in the ring. seq_cst would add nothing:
-      // the argument uses only this one release/acquire pair per caller.
+      // Of the first t FLUSHes, one holds a ticket >= t, so it was claimed after
+      // our puts and covers them: acq_rel (agent scope; all producers are on
+      // this GPU) orders our put claims before any later caller's ticket and
+      // FLUSH claim.
       target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_ACQ_REL,
                                       __HIP_MEMORY_SCOPE_AGENT) +
                1;

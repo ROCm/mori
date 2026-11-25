@@ -25,8 +25,7 @@
 //   -t lsa   : single flat-VA store of the whole buffer + system fence.
 //   -t sdma  : single copy-engine put + completion wait (-C quiet | signal).
 //   -t ibgda : single RDMA write + flush per iteration.
-//   -t proxy : ccoProxy (KIWI queue + host proxy): single put + flush per
-//              iteration, the counterpart of ibgda's put + flush.
+//   -t proxy : single ccoProxy put + flush per iteration.
 //
 // -P / -S (ibgda, proxy): ping-pong instead -- PE 0 sends put + SignalInc (-P)
 // or a bare signal (-S), PE 1 echoes it back; latency = round trip / 2.
@@ -124,9 +123,7 @@ __global__ void sdma_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
 }
 
 #ifdef MORI_CCO_PROXY
-// Proxy: one put of the whole buffer + flush (the put completed, remote side
-// acknowledged) per iteration, on SPSC queue 0. Coop is the issue
-// scope (warp / block).
+// Proxy: put + flush per iteration on SPSC queue 0.
 template <typename Coop>
 __global__ void proxy_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t bytes,
                               ccoDevComm devComm, int iter) {
@@ -141,10 +138,8 @@ __global__ void proxy_put_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin
 }
 #endif
 
-// Ping-pong: PE 0 sends, PE 1 echoes. A send is put + SignalInc (a bare signal
-// when SignalOnly) into the peer's kSlotPing; each side then waits for
-// (consumes) the other's. Xport is ccoGda<P> or ccoProxy -- same put / signal /
-// waitSignal API -- so both transports run the identical kernel.
+// Ping-pong: PE 0 sends (put + SignalInc, or a bare signal), PE 1 echoes.
+// Xport: ccoGda<P> or ccoProxy<>.
 template <typename Xport, typename Coop, bool SignalOnly>
 __global__ void pingpong_lat(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin, size_t bytes,
                              ccoDevComm devComm, int iter) {
@@ -263,8 +258,7 @@ int main(int argc, char** argv) {
     const bool scope_ok = args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
     if (!rdma || !scope_ok) {
       if (my_pe == 0) {
-        std::fprintf(stderr,
-                     "ping-pong (-P / -S, -t proxy) needs -t ibgda|proxy and -s warp|block\n");
+        std::fprintf(stderr, "ping-pong (-P / -S) needs -t ibgda|proxy and -s warp|block\n");
       }
       PerfFinalize(&ctx);
       return 1;

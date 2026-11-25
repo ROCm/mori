@@ -224,8 +224,7 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
 /* -------------------------------------------------------------------------- */
 class RdmaDeviceContext {
  public:
-  // ownsPd=false wraps a PD owned by another context (e.g. host-posted ibverbs QPs that must
-  // share the PD of an existing context's MRs); the destructor then leaves the PD alone.
+  // ownsPd=false: the PD belongs to another context; the destructor leaves it alone.
   RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd, bool ownsPd = true);
   virtual ~RdmaDeviceContext();
 

@@ -777,11 +777,9 @@ int ccoCommDestroy(ccoComm* comm) {
 
   MORI_SHMEM_TRACE("ccoCommDestroy: rank={}", comm->rank);
 
-  // Safety net for DevComms with ccoProxy queues that were never destroyed:
-  // their proxy threads would keep polling and posting against the windows,
-  // QPs and bootstrap torn down below. Stop and free them first, locally, as
-  // ccoDevCommDestroy would. The DevComms' other resources stay allocated until
-  // ccoDevCommDestroy(nullptr, &dc), which skips the freed engines.
+  // Stop engines of DevComms never destroyed: their threads post against the
+  // windows, QPs and bootstrap freed below. ccoDevCommDestroy(nullptr, &dc) frees
+  // the rest.
 #ifdef MORI_CCO_PROXY
   for (void* engine : comm->proxyEngines) {
     MORI_SHMEM_WARN(
@@ -1788,16 +1786,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   core::RdmaEndpointDevice* epsGpu = nullptr;
 
-  // ccoProxy: proxy threads + host-posted QPs to the proxy peer set, sharing the
-  // GDA signal slots. The proxy fields sit at the tail of reqs; read them only
-  // when the caller's struct has them. proxyConnectionType fills tail padding,
-  // so this gate only separates callers that predate all proxy fields.
+  // Read the proxy fields only if reqs has them (proxyConnectionType sits in tail
+  // padding, so this only rejects callers that predate all of them).
   const bool reqsHaveProxy =
       reqs->size >= offsetof(ccoDevCommRequirements, proxyConnectionType) + sizeof(int);
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  // QPs per (proxy thread, peer): the field, else 4.
   const int proxyQpsPerPeer =
       (reqsHaveProxy && reqs->proxyQpsPerPeer > 0) ? reqs->proxyQpsPerPeer : 4;
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
@@ -1971,7 +1966,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   int nNodes = comm->worldSize / comm->lsaSize;
   bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
 
-  // GDA and ccoProxy share the user signal / counter slots.
+  // User signal and counter slots exist when GDA or ccoProxy connects; ccoProxy
+  // signals use the signal slots.
   const bool anyRdma =
       connType != CCO_GDA_CONNECTION_NONE || proxyConnType != CCO_GDA_CONNECTION_NONE;
   int signalCountUser = anyRdma ? reqs->gdaSignalCount : 0;
@@ -2104,9 +2100,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       std::lock_guard<std::mutex> lock(comm->allocMutex);
       comm->proxyEngines.push_back(engine);
     }
-    // SignalSet and a putValue flag rely on one QP's writes landing in
-    // order, which relaxed-ordering window MRs do not promise. Asks the MR
-    // registration itself, not the env: a build may ignore the env.
+    // Ask the MR flag helper, not the env: a build may ignore the env.
     static std::once_flag relaxedWarned;
     if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
       std::call_once(relaxedWarned, [] {
@@ -2363,8 +2357,7 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   ccoDevComm& hostShadow = *devComm;
 
   // ccoProxy first: its threads post against the windows, MRs and QPs freed below.
-  // comm owns the engines: only one still listed on it is alive. With comm ==
-  // nullptr, ccoCommDestroy has already freed them all.
+  // With comm == nullptr, ccoCommDestroy already freed it.
 #ifdef MORI_CCO_PROXY
   if (hostShadow.proxy.engine && comm) {
     bool owned = false;

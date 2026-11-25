@@ -715,7 +715,7 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
       HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
-    # 60 for the EP steps plus the ccoProxy step's own 15.
+    # EP steps plus the ccoProxy step.
     timeout-minutes: 75
     steps:
       - name: Checkout
@@ -907,14 +907,10 @@ jobs:
           wait "$NODE2_PID"
 
       - name: ccoProxy across nodes (1+1, atomic-free and negative cases)
-        # The unit job's fork mode SKIPs test_proxy_put (MORI_CCO_SKIP_GDA_FULL);
-        # MI300X's internode job runs it too, with every case. Runs after the EP
-        # steps whatever they did, so a ccoProxy failure costs them nothing. A
-        # change to tests/cpp/cco alone does not start this job (scope group cco
-        # without epv2).
+        # The unit job's fork mode SKIPs test_proxy_put (MORI_CCO_SKIP_GDA_FULL).
+        # Runs whatever the EP steps did.
         if: ${{ !cancelled() && contains(fromJSON(inputs.groups), 'cco') }}
         timeout-minutes: 20
-        # Atomic-free positive cases (no NIC atomics needed) and every negative case.
         run: bash tools/run_cco_proxy_internode.sh --cases atomic_free
 
       - name: Cleanup node1

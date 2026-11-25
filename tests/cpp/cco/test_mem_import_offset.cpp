@@ -29,8 +29,8 @@
 //   2. LSA: every peer's alias (ccoGetPeerPtr) reads that peer's data;
 //   3. GDA: an all-to-all put between two imported windows lands at the data, canary intact. The
 //      send window's MR is back-filled by ccoDevCommCreate, the recv window's is registered after.
-//   4. ccoProxy (proxy builds, gfx942/gfx950): the same all-to-all through the host proxy, plus a
-//      WindowSignalSet and a putValue into a third imported window, all at offset + iovaBias.
+//   4. ccoProxy (gfx942/gfx950 proxy builds): the same all-to-all plus WindowSignalSet/putValue
+//      into a third imported window.
 // Then rank 0 imports at a different offset than the others: register must fail on every rank.
 
 #include "cco_test_harness.hpp"
@@ -60,8 +60,8 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindow_t sendWin, mori::cco::cco
 }
 
 #ifdef MORI_CCO_PROXY
-// Proxy all-to-all: put + WindowSignalSet (sigWin slot me*16), putValue (slot me*16 + 8), then a
-// SignalSet the peer waits on; one queue, so all of a source's writes land before its SignalSet.
+// put carrying WindowSignalSet (sigWin offset me*16), then putValue (offset me*16 + 8) carrying
+// SignalSet{me}; one queue, so the SignalSet lands last.
 __global__ void ProxyAlltoAllKernel(mori::cco::ccoWindow_t sendWin, mori::cco::ccoWindow_t recvWin,
                                     mori::cco::ccoWindow_t sigWin, size_t perPairBytes,
                                     mori::cco::ccoDevComm devComm) {
