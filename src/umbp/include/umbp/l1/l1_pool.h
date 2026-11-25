@@ -174,6 +174,10 @@ struct DramTierOptions {
   // thread, so the eviction does not wait for the copy. 0 writes only at
   // eviction, inside the Allocate that evicts.
   double ahead = 0.0;
+  // Whether an eviction copies a last copy that was not written ahead before
+  // it hands the slot out. Off, the engine never waits for DRAM: such content
+  // is lost (and counted), which is the trade when the copy is slow.
+  bool write_at_eviction = true;
   // Slots of one extent: the unit the ring reuses, and the longest run of
   // slots one copy moves.
   uint32_t extent_slots = 64;
@@ -317,7 +321,8 @@ class PoolManager {
   // 0 is plain least-recently-released).
   void SetEvictionPolicy(uint32_t keep_copies);
   // Put DRAM under the pools. Before any pool is bound; read at construction
-  // from UMBP_L1_DRAM_BYTES (with UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_PINNED).
+  // from UMBP_L1_DRAM_BYTES (with UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_PINNED,
+  // UMBP_L1_DRAM_WRITE_AT_EVICTION).
   void SetDramTier(const DramTierOptions& options);
 
  private:

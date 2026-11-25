@@ -974,12 +974,13 @@ class L1TierTest : public L1PoolTest {
 
   static constexpr uint64_t kSlotBytes = kUnitA + kUnitB;
 
-  void Bring(uint32_t records, double ahead = 0.0) {
+  void Bring(uint32_t records, double ahead = 0.0, bool write_at_eviction = true) {
     api = std::make_shared<RecordingApi>();
     manager = std::make_unique<PoolManager>(api);
     DramTierOptions options;
     options.capacity_bytes = records * kSlotBytes;
     options.ahead = ahead;
+    options.write_at_eviction = write_at_eviction;
     options.extent_slots = 4;
     options.chunk_bytes = 4 * kSlotBytes;  // one extent an allocation
     options.pinned = false;
@@ -1146,6 +1147,17 @@ TEST_F(L1TierTest, WritingAheadSkipsWhatItsOwnerIsStillWriting) {
   FetchResult fetched = manager->Fetch("p1", {"late"});
   ASSERT_EQ(fetched.slots.size(), 1u);
   EXPECT_TRUE(Holds(1, fetched.slots[0], 9));
+}
+
+TEST_F(L1TierTest, AnEvictionThatMayNotWaitForDramLosesWhatWasNotWrittenAhead) {
+  Bring(16, /*ahead=*/0.0, /*write_at_eviction=*/false);
+  Cache(0, {"a", "b"}, 1);
+  const int copies = api->copies;
+  EvictAll(0);
+  EXPECT_EQ(api->copies, copies);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 2u);
+  EXPECT_EQ(StatsOf("p0").tier_records, 0u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
 }
 
 TEST_F(L1TierTest, AWriteBackThatFailsLosesTheContentAndSaysSo) {

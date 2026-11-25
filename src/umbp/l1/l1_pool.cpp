@@ -461,6 +461,7 @@ PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api)) 
   tier.capacity_bytes = EnvBytes("UMBP_L1_DRAM_BYTES");
   tier.ahead = EnvFraction("UMBP_L1_DRAM_AHEAD", 0.0);
   tier.pinned = EnvCount("UMBP_L1_DRAM_PINNED", 1) != 0;
+  tier.write_at_eviction = EnvCount("UMBP_L1_DRAM_WRITE_AT_EVICTION", 1) != 0;
   if (tier.capacity_bytes != 0) SetDramTier(tier);
 }
 
@@ -469,8 +470,10 @@ void PoolManager::SetDramTier(const DramTierOptions& options) {
   tier_options_ = options;
   tier_options_.extent_slots = std::max<uint32_t>(1, options.extent_slots);
   MORI_UMBP_INFO(
-      "[L1Pool] DRAM tier: {} bytes a group, written at the eviction of a key's last L1 copy{}",
-      tier_options_.capacity_bytes, tier_options_.ahead > 0 ? " and ahead of it" : "");
+      "[L1Pool] DRAM tier: {} bytes a group, a key's last L1 copy written {}{}",
+      tier_options_.capacity_bytes,
+      tier_options_.write_at_eviction ? "at its eviction" : "only ahead of its eviction",
+      tier_options_.write_at_eviction && tier_options_.ahead > 0 ? " and ahead of it" : "");
   if (tier_options_.capacity_bytes != 0 && tier_options_.ahead > 0 && tier_threads_.empty()) {
     tier_threads_.emplace_back(&PoolManager::TierWorker, this);
   }
@@ -991,8 +994,9 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
   if (s.has_key) {
     if (copies(s) > 1) ++pool->evicted_spare;
     if (victims != nullptr && NeedsWriteBackLocked(pool, s)) {
-      // Content its owner is still writing cannot be read out: it is lost.
-      if (Readable(*pool, s)) {
+      // Content its owner is still writing cannot be read out: it is lost. So
+      // is content not written ahead when evictions do not wait for DRAM.
+      if (tier_options_.write_at_eviction && Readable(*pool, s)) {
         victims->push_back(TierSlot{victim, s.key});
       } else {
         ++pool->lost_slots;
