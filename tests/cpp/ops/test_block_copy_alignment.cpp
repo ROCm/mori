@@ -48,6 +48,11 @@ constexpr int kGridSize = 4;
 constexpr int kBlockSize = 256;
 constexpr size_t kCopyTileBytes = 1ULL << 20;
 constexpr uint32_t kAlignments[] = {1, 2, 3, 4, 5, 6, 7, 8, 16};
+// Extra bytes allocated after the copy region. The destination is memset to zero over
+// [0, bytes + kDstGuardBytes); the copy must only touch [offset, offset + bytes), so the
+// leading guard [0, offset) and trailing guard [offset + bytes, bytes + kDstGuardBytes) must
+// stay zero. ExpectedByte always sets bit 0, so a copied byte can never be mistaken for a guard.
+constexpr size_t kDstGuardBytes = 16;
 
 __host__ __device__ uint8_t ExpectedByte(size_t index, int sourcePe) {
   return static_cast<uint8_t>(
@@ -145,6 +150,22 @@ __global__ void CheckPatternKernel(const uint8_t* buffer, size_t bytes, int sour
   }
 }
 
+// Verifies buffer[index] == 0 for index in [begin, end); flags *mismatch on the first offender.
+// Used to prove a copy never wrote outside its destination range (overrun / underrun).
+__global__ void CheckGuardKernel(const uint8_t* buffer, size_t begin, size_t end, int* mismatch) {
+  const size_t threadId = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (size_t index = begin + threadId; index < end; index += stride) {
+    if (buffer[index] != 0) {
+      if (atomicCAS(mismatch, 0, 1) == 0) {
+        printf("Destination guard byte %zu modified: got 0x%02x, expected 0x00\n", index,
+               static_cast<uint32_t>(buffer[index]));
+      }
+      return;
+    }
+  }
+}
+
 size_t CopyBytes() {
   const char* value = std::getenv("MORI_BLOCKCOPY_TEST_BYTES");
   if (value == nullptr) return kDefaultCopyBytes;
@@ -174,7 +195,7 @@ CaseResult RunCase(const char* name, uint32_t offset, size_t bytes, int myPe, in
   const uint32_t expectedMod16 = offset & 0xFU;
 
   InitPatternKernel<<<kGridSize, kBlockSize>>>(src, bytes, myPe);
-  HIP_RUNTIME_CHECK(hipMemset(dstBase, 0, bytes + 16));
+  HIP_RUNTIME_CHECK(hipMemset(dstBase, 0, bytes + kDstGuardBytes));
   HIP_RUNTIME_CHECK(hipMemset(deviceError, 0, sizeof(int)));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
   MPI_Barrier(MPI_COMM_WORLD);
@@ -202,6 +223,11 @@ CaseResult RunCase(const char* name, uint32_t offset, size_t bytes, int myPe, in
 
   const int sourcePe = (myPe - 1 + npes) % npes;
   CheckPatternKernel<<<kGridSize, kBlockSize>>>(dst, bytes, sourcePe, deviceError);
+  // The peer must have written only [offset, offset + bytes) of our dstBase. Confirm the leading
+  // and trailing guard regions are still zero, so a misaligned vector store never overran dst.
+  CheckGuardKernel<<<kGridSize, kBlockSize>>>(dstBase, 0, offset, deviceError);
+  CheckGuardKernel<<<kGridSize, kBlockSize>>>(dstBase, offset + bytes, bytes + kDstGuardBytes,
+                                              deviceError);
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
@@ -259,12 +285,11 @@ int main() {
   HIP_RUNTIME_CHECK(hipGetDeviceProperties(&properties, deviceId));
 
   const size_t bytes = CopyBytes();
-  constexpr size_t kAlignmentPadding = 16;
-  auto* srcBase = static_cast<uint8_t*>(ShmemMalloc(bytes + kAlignmentPadding));
-  auto* dstBase = static_cast<uint8_t*>(ShmemMalloc(bytes + kAlignmentPadding));
+  auto* srcBase = static_cast<uint8_t*>(ShmemMalloc(bytes + kDstGuardBytes));
+  auto* dstBase = static_cast<uint8_t*>(ShmemMalloc(bytes + kDstGuardBytes));
   if (srcBase == nullptr || dstBase == nullptr) {
     std::fprintf(stderr, "PE %d failed to allocate two %zu-byte symmetric buffers\n", myPe,
-                 bytes + kAlignmentPadding);
+                 bytes + kDstGuardBytes);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
   }
 
