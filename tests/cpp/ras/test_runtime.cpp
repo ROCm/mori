@@ -160,7 +160,8 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
   int fdsOfOneRuntime = RunInChild([] {
     size_t before = ras_test::SocketLikeFds().size();
     setenv("MORI_RAS_ENABLE", "1", 1);
-    if (RasRuntime::EnsureStarted(Params()) == nullptr) return 0;
+    RasRuntime* r = RasRuntime::EnsureStarted(Params());
+    if (r == nullptr || !ras_test::WaitUntilStarted(*r)) return 0;
     return static_cast<int>(ras_test::SocketLikeFds().size() - before);
   });
   ASSERT_GT(fdsOfOneRuntime, 0);
@@ -188,6 +189,7 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
                 CHILD_CHECK(got[0] != nullptr);
                 for (RasRuntime* r : got) CHILD_CHECK(r == got[0]);
                 CHILD_CHECK(RasRuntime::Status().state == RunState::kRunning);
+                CHILD_CHECK(ras_test::WaitUntilStarted(*got[0]));
                 CHILD_CHECK(static_cast<int>(ras_test::SocketLikeFds().size() - before) ==
                             fdsOfOneRuntime);
                 // The thread names itself once it is configured, so give a second one time to.

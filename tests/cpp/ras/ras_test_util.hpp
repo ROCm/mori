@@ -139,6 +139,15 @@ inline uint16_t HoldPorts(const std::string& host, int count, std::vector<int>* 
 }
 
 // This process's sockets and anonymous-inode fds (epoll, eventfd): the kinds RAS opens.
+// True once `runtime`'s RAS thread has started and published its identity. While it starts,
+// it opens and closes fds of its own, such as the netlink socket getifaddrs uses for each
+// RDMA port, so a count of a runtime's fds waits for this first.
+template <class Runtime>
+bool WaitUntilStarted(const Runtime& runtime, int timeoutMs = 2000) {
+  return WaitFor([&] { return runtime.Snapshot().self.uuid == runtime.Endpoint().uuid; },
+                 timeoutMs);
+}
+
 inline std::set<int> SocketLikeFds() {
   std::set<int> fds;
   std::error_code ec;
