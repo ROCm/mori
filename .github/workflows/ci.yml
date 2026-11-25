@@ -785,12 +785,14 @@ jobs:
             timeout 60 pytest tests/python/umbp/ -v
           "
 
+      # Every test registered under tests/cpp/umbp, selected by directory and
+      # not by name.  A name filter ('^umbp_') silently skipped each test whose
+      # add_test() name lacked the prefix: they were built here and never run.
       - name: UMBP C++ unit tests (local + distributed)
         run: |
           $CT exec -e MORI_UMBP_LOG_LEVEL=warn $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE/build
-            timeout 300 ctest --output-on-failure \
-              -R '^(umbp_|test_dummy_ssd_tier|test_ssd_tier)'
+            cd $GITHUB_WORKSPACE/build/tests/cpp/umbp &&
+            timeout 300 ctest --output-on-failure --no-tests=error
           "
 
       # Five client primitives -- put / get / exists / put_ranges / get_ranges
