@@ -486,9 +486,9 @@ std::optional<bool> HbmCopyEngine::CopyPagedRanges(
     const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& offsets, int device) {
-    // TODO(Badr): Allow striped restores to use the PagedGather kernel!!
   if (GatherDisabled().load(std::memory_order_relaxed) || !DeviceGatherEnabled() ||
-      StripedRestoreEnabled() || device < 0) return std::nullopt;
+      device < 0) return std::nullopt;
+  const bool striped = StripedRestoreEnabled();
   const size_t page_size = backend.PageSize();
   // PoolClient already validated these resolved objects and holds their pages.
   // Build kernel metadata here, translating each page directly to a GPU address.
@@ -512,7 +512,8 @@ std::optional<bool> HbmCopyEngine::CopyPagedRanges(
                      const auto buffer = backend.BufferRef(page.buffer_index);
                      const auto* source = static_cast<const char*>(buffer.host_ptr) +
                                           page.page_index * page_size;
-                     return HostRegionDeviceAddress(source, page_size, device);
+                     return striped ? static_cast<const void*>(source)
+                                    : HostRegionDeviceAddress(source, page_size, device);
                    });
     for (size_t j = 0; j < sizes[i].size(); ++j) {
       if (sizes[i][j] != 0)
@@ -523,6 +524,15 @@ std::optional<bool> HbmCopyEngine::CopyPagedRanges(
       !std::all_of(page_addresses.begin(), page_addresses.end(), [](const void* address) {
         return address && reinterpret_cast<uintptr_t>(address) % 16 == 0;
       })) return std::nullopt;
+  if (striped) {
+    auto map_host = [this](const void* ptr, size_t bytes, int helper) {
+      return HostRegionDeviceAddress(ptr, bytes, helper);
+    };
+    if (TryStripedRestore(object_page_offsets, page_size, page_addresses, ranges,
+                              device, map_host, RestoreChunkBytes())) return true;
+    // The scheduler drains failed chunks before the existing path retries.
+    return std::nullopt;
+  }
   ScopedHipDevice device_guard(device);
   if (!device_guard.IsValid()) return std::nullopt;
   hipStream_t stream = GatherStreamPool::Instance().Acquire(device);

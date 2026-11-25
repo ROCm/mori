@@ -63,12 +63,15 @@ void ConfigurePollingThread() {
 }
 
 struct RestoreRequest {
-  std::vector<DeviceGatherFragment> fragments;
+  std::vector<size_t> object_page_offsets;
+  std::vector<const void*> pages;
+  std::vector<DeviceGatherRange> ranges;
+  size_t page_size = 0;
   HostMapper map_host;
   int destination = -1;
   size_t unassigned_bytes = 0;
-  size_t fragment_index = 0;
-  size_t fragment_offset = 0;
+  size_t range_index = 0;
+  size_t range_offset = 0;
   size_t in_flight = 0;
   bool failed = false;
   bool finished = false;
@@ -81,6 +84,9 @@ struct RestoreWorker {
   hipEvent_t complete = nullptr;
   std::shared_ptr<RestoreRequest> request;
   std::vector<DeviceGatherFragment> fragments;
+  std::vector<size_t> object_page_offsets;
+  std::vector<const void*> pages;
+  std::vector<DeviceGatherRange> ranges;
   size_t bytes = 0;
 };
 
@@ -170,33 +176,62 @@ class RestoreScheduler {
     if (worker.complete == nullptr &&
         hipEventCreateWithFlags(&worker.complete, hipEventDisableTiming) != hipSuccess)
       return false;
-    for (auto& fragment : worker.fragments) {
-      fragment.src = request.map_host(fragment.src, fragment.bytes, worker.device);
-      if (fragment.src == nullptr) return false;
+    bool launched;
+    if (request.page_size != 0) {
+      launched = LaunchPagedChunk(worker);
+    } else {
+      worker.fragments.clear();
+      for (const auto& range : worker.ranges) {
+        const auto* source = static_cast<const char*>(request.pages[range.object]) + range.offset;
+        const void* mapped = request.map_host(source, range.bytes, worker.device);
+        if (!mapped) return false;
+        worker.fragments.push_back({mapped, range.dst, range.bytes});
+      }
+      launched = LaunchDeviceGather(worker.fragments.data(), worker.fragments.size(),
+                                    worker.device, worker.stream);
     }
-    if (!LaunchDeviceGather(worker.fragments.data(), worker.fragments.size(), worker.device,
-                            worker.stream))
-      return false;
-    return hipEventRecord(worker.complete, worker.stream) == hipSuccess;
+    return launched && hipEventRecord(worker.complete, worker.stream) == hipSuccess;
   }
 
-  // Advance the request cursor across ranges, reusing this GPU's descriptor
-  // storage. A chunk may end partway through a range.
+  // Map only the pages touched by this chunk, leaving page expansion to the kernel.
+  bool LaunchPagedChunk(RestoreWorker& worker) {
+    auto& request = *worker.request;
+    worker.object_page_offsets.clear();
+    worker.pages.clear();
+    for (auto& range : worker.ranges) {
+      const size_t first = request.object_page_offsets[range.object] + range.offset / request.page_size;
+      range.offset %= request.page_size;
+      const size_t count = 1 + (range.offset + range.bytes - 1) / request.page_size;
+      range.object = worker.object_page_offsets.size();
+      worker.object_page_offsets.push_back(worker.pages.size());
+      for (size_t p = first; p < first + count; ++p) {
+        const void* mapped = request.map_host(request.pages[p], request.page_size, worker.device);
+        if (!mapped) return false;
+        worker.pages.push_back(mapped);
+      }
+    }
+    return LaunchDevicePagedGather(
+        worker.object_page_offsets.data(), worker.object_page_offsets.size(), request.page_size,
+        worker.pages.data(), worker.pages.size(), worker.ranges.data(), worker.ranges.size(),
+        worker.device, worker.stream);
+  }
+
+  // Split logical ranges by byte count, independent of the source layout.
   void PrepareChunk(RestoreWorker& worker) {
     auto& request = *worker.request;
-    worker.fragments.clear();
+    worker.ranges.clear();
     size_t remaining = worker.bytes;
     while (remaining != 0) {
-      const auto& fragment = request.fragments[request.fragment_index];
-      const auto bytes = std::min(remaining, fragment.bytes - request.fragment_offset);
-      worker.fragments.push_back({static_cast<const char*>(fragment.src) + request.fragment_offset,
-                                  static_cast<char*>(fragment.dst) + request.fragment_offset,
-                                  bytes});
+      const auto& range = request.ranges[request.range_index];
+      const auto bytes = std::min(remaining, range.bytes - request.range_offset);
+      const size_t offset = range.offset + request.range_offset;
+      auto* dst = static_cast<char*>(range.dst) + request.range_offset;
+      worker.ranges.push_back({dst, range.object, offset, bytes});
       remaining -= bytes;
-      request.fragment_offset += bytes;
-      if (request.fragment_offset == fragment.bytes) {
-        ++request.fragment_index;
-        request.fragment_offset = 0;
+      request.range_offset += bytes;
+      if (request.range_offset == range.bytes) {
+        ++request.range_index;
+        request.range_offset = 0;
       }
     }
   }
@@ -280,49 +315,9 @@ class RestoreScheduler {
   bool stopping_ = false;
   std::thread thread_;
 };
-}  // namespace
 
-bool TryStripedRestore(const std::vector<TransferPlan>& plans, const HostMapper& map_host,
-                       size_t chunk_bytes) {
-  if (plans.empty() || chunk_bytes == 0 || !DeviceGatherEnabled()) return false;
-  auto request = std::make_shared<RestoreRequest>();
-  request->map_host = map_host;
-  size_t fragment_count = 0;
-  for (const auto& plan : plans) {
-    if (plan.src.loc != mori::io::MemoryLocationType::CPU ||
-        plan.dst.loc != mori::io::MemoryLocationType::GPU || plan.dst.device < 0 ||
-        (request->destination >= 0 && request->destination != plan.dst.device))
-      return false;
-    if (plan.src.host_ptr == nullptr || plan.dst.host_ptr == nullptr ||
-        plan.src_offsets.size() != plan.sizes.size() ||
-        plan.dst_offsets.size() != plan.sizes.size())
-      return false;
-    request->destination = plan.dst.device;
-    if (plan.sizes.size() > request->fragments.max_size() - fragment_count) return false;
-    fragment_count += plan.sizes.size();
-  }
-  // Allocate descriptor storage once. Zero-byte ranges are skipped below, so
-  // the total range count is an upper bound on the number of fragments.
-  request->fragments.reserve(fragment_count);
-  for (const auto& plan : plans) {
-    for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      const size_t bytes = plan.sizes[i];
-      if (bytes == 0) continue;
-      if (bytes > std::numeric_limits<size_t>::max() - request->unassigned_bytes) return false;
-      request->unassigned_bytes += bytes;
-      request->fragments.push_back(
-          {static_cast<const char*>(plan.src.host_ptr) + plan.src_offsets[i],
-           static_cast<char*>(plan.dst.host_ptr) + plan.dst_offsets[i], bytes});
-    }
-  }
-  if (request->unassigned_bytes == 0) return false;
-  // One process-wide scheduler owns all restore streams. Configuration is fixed
-  // for the process, like the existing environment-based gather dispatch.
-  //
-  // The scheduler cannot start without peer access between every pair of GPUs,
-  // but the caller's direct path needs none. A failed start is therefore kept
-  // as the answer for the process: every restore is declined, and the caller
-  // copies through its direct path instead of seeing an exception.
+bool SubmitRestore(std::shared_ptr<RestoreRequest> request, size_t chunk_bytes) {
+  // Both descriptor formats share one queue, worker pool and failure handling.
   static const std::unique_ptr<RestoreScheduler> scheduler =
       [chunk_bytes]() -> std::unique_ptr<RestoreScheduler> {
     try {
@@ -334,5 +329,74 @@ bool TryStripedRestore(const std::vector<TransferPlan>& plans, const HostMapper&
     }
   }();
   return scheduler != nullptr && scheduler->Restore(std::move(request));
+}
+}  // namespace
+
+bool TryStripedRestore(const std::vector<TransferPlan>& plans, const HostMapper& map_host,
+                       size_t chunk_bytes) {
+  if (plans.empty() || chunk_bytes == 0 || !DeviceGatherEnabled()) return false;
+  auto request = std::make_shared<RestoreRequest>();
+  request->map_host = map_host;
+  size_t range_count = 0;
+  for (const auto& plan : plans) {
+    if (plan.src.loc != mori::io::MemoryLocationType::CPU ||
+        plan.dst.loc != mori::io::MemoryLocationType::GPU || plan.dst.device < 0 ||
+        (request->destination >= 0 && request->destination != plan.dst.device))
+      return false;
+    if (plan.src.host_ptr == nullptr || plan.dst.host_ptr == nullptr ||
+        plan.src_offsets.size() != plan.sizes.size() ||
+        plan.dst_offsets.size() != plan.sizes.size())
+      return false;
+    request->destination = plan.dst.device;
+    if (plan.sizes.size() > request->ranges.max_size() - range_count) return false;
+    range_count += plan.sizes.size();
+  }
+  // Allocate descriptor storage once. Zero-byte ranges are skipped below, so
+  // the total range count is an upper bound on the number of descriptors.
+  request->ranges.reserve(range_count);
+  request->pages.reserve(plans.size());
+  for (const auto& plan : plans) {
+    const size_t object = request->pages.size();
+    request->pages.push_back(plan.src.host_ptr);
+    for (size_t i = 0; i < plan.sizes.size(); ++i) {
+      const size_t bytes = plan.sizes[i];
+      if (bytes == 0) continue;
+      if (bytes > std::numeric_limits<size_t>::max() - request->unassigned_bytes) return false;
+      request->unassigned_bytes += bytes;
+      request->ranges.push_back(
+          {static_cast<char*>(plan.dst.host_ptr) + plan.dst_offsets[i], object,
+           plan.src_offsets[i], bytes});
+    }
+  }
+  if (request->unassigned_bytes == 0) return false;
+  // One process-wide scheduler owns all restore streams. Configuration is fixed
+  // for the process, like the existing environment-based gather dispatch.
+  //
+  // The scheduler cannot start without peer access between every pair of GPUs,
+  // but the caller's direct path needs none. A failed start is therefore kept
+  // as the answer for the process: every restore is declined, and the caller
+  // copies through its direct path instead of seeing an exception.
+  return SubmitRestore(std::move(request), chunk_bytes);
+}
+
+bool TryStripedRestore(
+    const std::vector<size_t>& object_page_offsets, size_t page_size,
+    const std::vector<const void*>& pages, const std::vector<DeviceGatherRange>& ranges,
+    int destination, const HostMapper& map_host, size_t chunk_bytes) {
+  if (ranges.empty() || page_size == 0 || chunk_bytes == 0 || destination < 0 ||
+      !DeviceGatherEnabled()) return false;
+  auto request = std::make_shared<RestoreRequest>();
+  request->object_page_offsets = object_page_offsets;
+  request->pages = pages;
+  request->page_size = page_size;
+  request->destination = destination;
+  request->map_host = map_host;
+  for (const auto& range : ranges) {
+    if (range.bytes == 0) continue;
+    if (range.bytes > std::numeric_limits<size_t>::max() - request->unassigned_bytes) return false;
+    request->ranges.push_back(range);
+    request->unassigned_bytes += range.bytes;
+  }
+  return request->unassigned_bytes != 0 && SubmitRestore(std::move(request), chunk_bytes);
 }
 }  // namespace mori::umbp

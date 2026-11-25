@@ -210,12 +210,16 @@ For standalone mode set it on the UMBP server, not just the Python client.
 
 The kernel requires one DRAM backend, a common page size, complete local
 hits, registered destinations on one GPU, and kernel-addressable host pages.
-Helpers must be off (`UMBP_HBM_RESTORE_SCHEDULER=off`). Unsupported batches
-use the existing path; an execution failure is reported as a failed restore,
-not retried as an unsupported batch. CPU validation, object resolution, and
+With `UMBP_HBM_RESTORE_SCHEDULER=round_robin`, the existing helper scheduler splits
+logical ranges into chunks and launches the paged kernel on peer GPUs, all
+writing directly to the destination. Otherwise the destination GPU runs the
+kernel itself. Unsupported batches use the existing path. Failed striped
+attempts are drained before falling back, matching the existing scheduler;
+a direct kernel execution failure is reported as a failed restore.
+CPU validation, object resolution, and
 source-page lifetime holds remain in place through kernel completion.
 
-If stream synchronization fails, the failed stream is discarded and the same
+If direct-path stream synchronization fails, the failed stream is discarded and the same
 process-wide failure latch used by the existing gather kernel is set. Subsequent
 restores skip both gather kernels and use the existing copy fallback.
 
