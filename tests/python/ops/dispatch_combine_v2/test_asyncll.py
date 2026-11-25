@@ -115,6 +115,17 @@ def _combine_close(got, want):
         return torch.allclose(got, want, atol=1e-2, rtol=1e-2), diff
     if not got.numel():
         return True, diff
+    # A row whose reference is all zeros has to be held to exactly 0 instead: the
+    # relative checks below cannot see it, since cosine_similarity returns 0 for a
+    # zero vector and rel divides by the 1e-6 clamp, so such a row fails whatever
+    # came back. No shape in this file produces one today; a routing with dropped
+    # slots does, because a padding row combines to zero.
+    zero = want.abs().amax(dim=1) == 0
+    if (got[zero] != 0).any():
+        return False, diff
+    got, want = got[~zero], want[~zero]
+    if not got.numel():
+        return True, diff
     rel = (got - want).norm(dim=1) / want.norm(dim=1).clamp_min(1e-6)
     cos = torch.nn.functional.cosine_similarity(got, want, dim=1)
     return bool((rel < 0.05).all() and (cos > 0.998).all()), diff
