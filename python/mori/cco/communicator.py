@@ -335,8 +335,11 @@ class DevCommHandle(CCOResource):
     def sdma_num_queue(self) -> int:
         """SDMA queues per peer this communicator actually connected.
 
-        Not the requested count: cco adopts what was really set up. It is 0 when
-        ``sdma_queue_count`` is 0, and also -- with a logged error but no
+        Not the requested count: queues belong to the communicator, and the
+        first device communicator on it that asks for queues fixes their count;
+        later ones, including those asking for 0, report and use that count.
+        It is 0 when no device communicator on the communicator has asked
+        (``sdma_queue_count`` 0), and also -- with a logged error but no
         failure -- when the library was built BUILD_CCO_SDMA=OFF,
         MORI_ENABLE_SDMA is unset, or no peer reports SDMA. Every ccoSdma put on
         such a communicator moves no bytes.

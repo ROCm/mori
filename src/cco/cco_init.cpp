@@ -84,7 +84,8 @@ void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
 
 void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
-  // Idempotent: first DevComm fixes the channel count; later ones reuse it.
+  // Idempotent: the first DevComm that asks fixes the channel count; later ones,
+  // including those that ask for 0, reuse it.
   if (comm->sdmaDevHandles != nullptr) {
     int want = std::min(requestedChannels, anvil::kMaxSdmaChannelsPerPair);
     if (want > 0 && want != comm->sdmaNumQueue) {

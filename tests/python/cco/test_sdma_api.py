@@ -203,10 +203,12 @@ def _worker_put(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
-def _kfd_sdma_queue_count():
-    """SDMA queues KFD holds on this GPU across all processes, or None if sysfs
-    cannot tell. Callers compare it around their own queue creation (the pid
-    in sysfs is not this process's pid inside a container)."""
+def _kfd_sdma_queues():
+    """The SDMA queues KFD holds on this GPU across all processes, as a set of
+    (proc dir, queue id), or None if sysfs cannot tell. Callers diff it around
+    their own queue creation (the pid in sysfs is not this process's pid inside
+    a container); only new entries count, so another process releasing queues
+    meanwhile cannot fail the check."""
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     loc = (props.pci_bus_id << 8) | (props.pci_device_id << 3)
     nodes = "/sys/class/kfd/kfd/topology/nodes"
@@ -228,7 +230,7 @@ def _kfd_sdma_queue_count():
     procs = "/sys/class/kfd/kfd/proc"
     if gpu_id is None or not os.path.isdir(procs):
         return None
-    total = 0
+    found = set()
     for p in os.listdir(procs):
         qdir = f"{procs}/{p}/queues"
         try:
@@ -236,10 +238,11 @@ def _kfd_sdma_queue_count():
                 if open(f"{qdir}/{q}/gpuid").read().strip() != gpu_id:
                     continue
                 # KFD_QUEUE_TYPE_SDMA = 1, KFD_QUEUE_TYPE_SDMA_XGMI = 4
-                total += open(f"{qdir}/{q}/type").read().strip() in ("1", "4")
+                if open(f"{qdir}/{q}/type").read().strip() in ("1", "4"):
+                    found.add((p, q))
         except OSError:
             continue
-    return total
+    return found
 
 
 def _worker_queue_count(rank, world_size, uid_path, coop_name, results_path):
@@ -262,14 +265,16 @@ def _worker_queue_count(rank, world_size, uid_path, coop_name, results_path):
             r.sdma_queue_count = n
             return r
 
-        before = _kfd_sdma_queue_count()
+        before = _kfd_sdma_queues()
         dc0 = comm.create_dev_comm(reqs(0))
-        after0 = _kfd_sdma_queue_count()
+        after0 = _kfd_sdma_queues()
         dc2 = comm.create_dev_comm(reqs(2))
-        after2 = _kfd_sdma_queue_count()
+        after2 = _kfd_sdma_queues()
+        new0 = None if before is None else len(after0 - before)
+        new2 = None if before is None else len(after2 - after0)
         print(
             f"[rank {rank}] sdma_num_queue {dc0.sdma_num_queue} / {dc2.sdma_num_queue},"
-            f" KFD SDMA queues on this GPU {before} -> {after0} -> {after2}",
+            f" new KFD SDMA queues on this GPU: {new0} with count 0, {new2} with count 2",
             flush=True,
         )
         if dc0.sdma_num_queue != 0:
@@ -277,14 +282,10 @@ def _worker_queue_count(rank, world_size, uid_path, coop_name, results_path):
         if dc2.sdma_num_queue != 2:
             raise AssertionError(f"count 2 gave {dc2.sdma_num_queue} queues per peer")
         if before is not None:
-            if after0 != before:
-                raise AssertionError(
-                    f"count 0 created {after0 - before} KFD SDMA queues"
-                )
-            if after2 < before + 2 * (world_size - 1):
-                raise AssertionError(
-                    f"count 2 created only {after2 - before} KFD SDMA queues"
-                )
+            if new0:
+                raise AssertionError(f"count 0 created {new0} KFD SDMA queues")
+            if new2 < 2 * (world_size - 1):
+                raise AssertionError(f"count 2 created only {new2} KFD SDMA queues")
         comm.barrier()
         comm.destroy()
     except Exception:
