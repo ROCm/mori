@@ -437,6 +437,13 @@ jobs:
           # Both group sizes run: 1x128 and 1x32 take different paths through the
           # codec, and a regression in either would otherwise go unseen.
           #
+          # BACK_TO_BACK=0 because of this runner, not because of the combine. The
+          # comment on cco-v2-test records why that job exists at all: "on
+          # MI355X-AINIC-PIT-G17, test_asyncll's back_to_back check fails", and
+          # PIT-G17 is the runner this job uses. Everything else the script checks
+          # still runs -- shapes, graph replays, two-op layers, call order, the
+          # segmented receive layouts.
+          #
           # MORI_ENABLE_SDMA=1 matters: without SDMA queues every put is a no-op and
           # the receiver spins until the timeout, so a runner that quietly lost SDMA
           # shows up as this step timing out rather than passing.
@@ -446,7 +453,8 @@ jobs:
           for quant in fp8_blockwise_1x128 fp8_blockwise_1x32; do
             echo "== test_asyncll QUANT=$quant"
             $CT exec -e MORI_ENABLE_SDMA=1 -e TRANSPORT=sdma -e QUANT=$quant \
-                     -e SHAPES=7168,8,32,128 -e GRAPH_REPLAYS=4 $CONTAINER bash -c "\
+                     -e SHAPES=7168,8,32,128 -e GRAPH_REPLAYS=4 -e BACK_TO_BACK=0 \
+                     $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
               out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
                 { echo \"\$out\"; exit 1; }; \
