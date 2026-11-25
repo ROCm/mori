@@ -358,6 +358,8 @@ _CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
 # The gfx942/gfx950 scatter combine's wires (combine_scatter_q_group); e2m1 needs gfx950.
 _SCATTER_QUANT_TYPES = ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
 _SCATTER_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
+# The AsyncLL combine's fp8 wires: elements per scale (EpInterNodeKernelCfg.combineQGroup).
+_ASYNCLL_QUANT_GROUPS = {"fp8_blockwise_1x32": 32, "fp8_blockwise_1x128": 128}
 
 
 def _card_layout(cfg):
@@ -1121,9 +1123,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the AsyncLL path)")
         if cfg.quant_type != "none":
-            bad.append(
-                f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
-            )
+            bad.extend(self._asyncll_quant_unsupported(cfg))
         if cfg.async_ll_transport not in ("sdma", "lsa"):
             bad.append(
                 f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
@@ -1233,8 +1233,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    def _asyncll_quant_unsupported(self, cfg) -> list[str]:
+        """The quantized AsyncLL combine: the scatter's fp8 wire codec in the
+        compact SDMA combine's SendCopy / RecvCopy, on one wave64 node."""
+        q = cfg.quant_type
+        if q not in _ASYNCLL_QUANT_GROUPS or not self._arch.startswith(
+            ("gfx942", "gfx950")
+        ):
+            return [
+                f"quant_type={q!r} on {self._arch} (AsyncLL serves "
+                f"{', '.join(_ASYNCLL_QUANT_GROUPS)} on gfx942/gfx950)"
+            ]
+        bad = []
+        if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
+            bad.append(
+                f"quant_type={q!r} needs async_ll_transport='sdma' on one node: only "
+                "that combine quantizes"
+            )
+        if cfg.combine_dtype != torch.bfloat16:
+            bad.append(
+                f"quant_type={q!r} with combine dtype {cfg.combine_dtype} (bf16 only)"
+            )
+        if cfg.hidden_dim % 128:
+            bad.append(
+                f"quant_type={q!r} needs hidden_dim % 128 == 0, got {cfg.hidden_dim}"
+            )
+        return bad
+
     def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
         bad = []
+        if cfg.quant_type != "none":
+            bad.append(
+                "async_ll_recv_layout='segmented' with a quant_type: the segmented "
+                "combine sends the expert output in place, with no pass to quantize it"
+            )
         if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
             bad.append(
                 "async_ll_recv_layout='segmented' needs async_ll_transport='sdma' on one node: its "
@@ -1658,9 +1690,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             for name in names:
                 if name in plans_by_pass:
                     continue
+                leg = self._asyncll_leg(group)
                 request = self._asyncll_request(
-                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
+                    cfg, leg_dtype[leg], block_num, warp_per_block
                 )
+                # AsyncLL's kernels never read quantType; a quantized op tells
+                # only its combine passes the wire's group size, so the dispatch
+                # passes keep their modules.
+                request["quantType"] = "none"
+                if leg == "combine":
+                    request["combineQGroup"] = _ASYNCLL_QUANT_GROUPS.get(
+                        cfg.quant_type, 0
+                    )
                 plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the

@@ -40,6 +40,7 @@
 #include "mori/cco/cco.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
+#include "src/ops/dispatch_combine_v2/ep_scatter_quant.hpp"
 
 namespace mori {
 namespace ops {
@@ -511,116 +512,6 @@ __device__ void EpCombineBody(EpArgs args) {
 /* ------------------------------------------------------------------------- */
 /*                  Scatter combine, quantized or not                         */
 /* ------------------------------------------------------------------------- */
-// The arch's own e4m3: fnuz on gfx94x, OCP elsewhere.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-constexpr float kEpScatterFp8Max = 240.0f;
-#else
-constexpr float kEpScatterFp8Max = 448.0f;
-#endif
-
-// Elements a lane handles per step: one 16 B load of bf16.
-constexpr int kEpScatterLaneElems = 8;
-
-__device__ __forceinline__ void EpBf16x8ToF32(uint4 v, float (&f)[8]) {
-  const unsigned w[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    f[2 * i] = __uint_as_float(w[i] << 16);
-    f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
-  }
-}
-
-// e2m1's largest finite value.
-constexpr float kEpScatterFp4Max = 6.0f;
-
-// The group's scale and its reciprocal. 1x32: E8M0, the smallest power of two that
-// keeps amax within the element max (RoundUp, as the gfx125x push and aiter pick it).
-// 1x128: amax / max exactly, so every block uses the whole element range; a block
-// whose amax is below max * 2^-126 keeps scale 1, since its scale would be subnormal
-// and max / amax can overflow (0 * inf = NaN), as FlyDSL's _block_scale does.
-template <int kGroup, float kMax>
-__device__ __forceinline__ void EpScatterScale(float amax, float& scale, float& inv,
-                                               unsigned& e8m0) {
-  if constexpr (kGroup == 32) {
-    const unsigned bits = __float_as_uint(amax * (1.0f / kMax));
-    unsigned e = ((bits & 0x7fffffffu) + 0x7fffffu) >> 23;
-    e = e < 1u ? 1u : (e > 254u ? 254u : e);
-    e8m0 = e;
-    scale = __uint_as_float(e << 23);
-    inv = __uint_as_float((254u - e) << 23);
-  } else {
-    const bool tiny = !(amax >= kMax * 0x1p-126f);
-    scale = tiny ? 1.0f : amax * (1.0f / kMax);
-    inv = tiny ? 1.0f : kMax / amax;
-    e8m0 = 0;
-  }
-}
-
-// Eight elements at 1/inv scale into the wire, and back. fp8: 8 bytes; e2m1: 4 bytes,
-// element 2i in the low nibble.
-template <bool kFp4>
-__device__ __forceinline__ void EpScatterPack(char* dst, const float (&f)[8], float inv) {
-  if constexpr (kFp4) {
-#if defined(__gfx950__)
-    float q[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      q[i] = __builtin_amdgcn_fmed3f(f[i] * inv, kEpScatterFp4Max, -kEpScatterFp4Max);
-    unsigned u = 0;
-    u = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u, q[0], q[1], 1.0f, 0);
-    u = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u, q[2], q[3], 1.0f, 1);
-    u = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u, q[4], q[5], 1.0f, 2);
-    u = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(u, q[6], q[7], 1.0f, 3);
-    *reinterpret_cast<unsigned*>(dst) = u;
-#endif
-  } else {
-    float q[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      q[i] = __builtin_amdgcn_fmed3f(f[i] * inv, kEpScatterFp8Max, -kEpScatterFp8Max);
-    unsigned lo = __builtin_amdgcn_cvt_pk_fp8_f32(q[0], q[1], 0, false);
-    lo = __builtin_amdgcn_cvt_pk_fp8_f32(q[2], q[3], lo, true);
-    unsigned hi = __builtin_amdgcn_cvt_pk_fp8_f32(q[4], q[5], 0, false);
-    hi = __builtin_amdgcn_cvt_pk_fp8_f32(q[6], q[7], hi, true);
-    *reinterpret_cast<uint2*>(dst) = make_uint2(lo, hi);
-  }
-}
-
-// What a lane loads per step: eight fp8 or eight e2m1.
-template <bool kFp4>
-using EpScatterWire = std::conditional_t<kFp4, unsigned, uint2>;
-
-template <bool kFp4>
-__device__ __forceinline__ void EpScatterAcc(EpScatterWire<kFp4> q, float scale, float (&acc)[8]) {
-  if constexpr (kFp4) {
-#if defined(__gfx950__)
-    const auto a = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(q, 1.0f, 0);
-    const auto b = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(q, 1.0f, 1);
-    const auto c = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(q, 1.0f, 2);
-    const auto d = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(q, 1.0f, 3);
-    acc[0] += a[0] * scale;
-    acc[1] += a[1] * scale;
-    acc[2] += b[0] * scale;
-    acc[3] += b[1] * scale;
-    acc[4] += c[0] * scale;
-    acc[5] += c[1] * scale;
-    acc[6] += d[0] * scale;
-    acc[7] += d[1] * scale;
-#endif
-  } else {
-    const unsigned w[2] = {q.x, q.y};
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const auto a = __builtin_amdgcn_cvt_pk_f32_fp8(w[h], false);
-      const auto b = __builtin_amdgcn_cvt_pk_f32_fp8(w[h], true);
-      acc[4 * h + 0] += a[0] * scale;
-      acc[4 * h + 1] += a[1] * scale;
-      acc[4 * h + 2] += b[0] * scale;
-      acc[4 * h + 3] += b[1] * scale;
-    }
-  }
-}
-
 // 16 B of T (eight bf16 or four f32) as f32, and back.
 template <typename T>
 __device__ __forceinline__ void EpVecToF32(uint4 v, float (&f)[16 / sizeof(T)]) {
