@@ -173,6 +173,13 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
       out->set_served_out_slots(stats.served_out_slots);
       out->set_copy_micros(stats.copy_micros);
       out->set_parts(stats.parts);
+      out->set_written_back_slots(stats.written_back_slots);
+      out->set_written_ahead_slots(stats.written_ahead_slots);
+      out->set_loaded_slots(stats.loaded_slots);
+      out->set_lost_slots(stats.lost_slots);
+      out->set_tier_micros(stats.tier_micros);
+      out->set_tier_records(stats.tier_records);
+      out->set_tier_capacity(stats.tier_capacity);
     }
     return grpc::Status::OK;
   }
@@ -401,6 +408,13 @@ Status L1Client::Stats(std::vector<PoolStats>* out) {
     stats.served_out_slots = in.served_out_slots();
     stats.copy_micros = in.copy_micros();
     stats.parts = std::max<uint32_t>(in.parts(), 1);
+    stats.written_back_slots = in.written_back_slots();
+    stats.written_ahead_slots = in.written_ahead_slots();
+    stats.loaded_slots = in.loaded_slots();
+    stats.lost_slots = in.lost_slots();
+    stats.tier_micros = in.tier_micros();
+    stats.tier_records = in.tier_records();
+    stats.tier_capacity = in.tier_capacity();
     out->push_back(std::move(stats));
   }
   return Status{};

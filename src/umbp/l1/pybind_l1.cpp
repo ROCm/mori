@@ -240,6 +240,13 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           d["fetched_in_bytes"] = stats.fetched_in_bytes;
           d["served_out_slots"] = stats.served_out_slots;
           d["copy_micros"] = stats.copy_micros;
+          d["written_back_slots"] = stats.written_back_slots;
+          d["written_ahead_slots"] = stats.written_ahead_slots;
+          d["loaded_slots"] = stats.loaded_slots;
+          d["lost_slots"] = stats.lost_slots;
+          d["tier_micros"] = stats.tier_micros;
+          d["tier_records"] = stats.tier_records;
+          d["tier_capacity"] = stats.tier_capacity;
           out.append(std::move(d));
         }
         return out;

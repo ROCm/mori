@@ -22,6 +22,8 @@
 #include "umbp/l1/l1_pool.h"
 
 #include <hip/hip_runtime.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -209,6 +211,35 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
+  // Pinned, so a copy to or from a device goes straight to these pages. The
+  // runtime's lock is taken shared: this pins gigabytes, and the copies the
+  // pools are serving must not wait for it.
+  void* AllocateHost(uint64_t bytes, bool pinned, std::string* error) override {
+    if (!pinned) return MemoryApi::AllocateHost(bytes, false, error);
+    std::shared_lock<std::shared_mutex> shared(hip_mutex_);
+    void* ptr = nullptr;
+    const hipError_t err = hipHostMalloc(&ptr, static_cast<size_t>(bytes), hipHostMallocDefault);
+    if (err != hipSuccess || ptr == nullptr) {
+      *error = HipError("hipHostMalloc", err);
+      return nullptr;
+    }
+    return ptr;
+  }
+
+  void FreeHost(void* base, uint64_t bytes, bool pinned) override {
+    if (!pinned) return MemoryApi::FreeHost(base, bytes, false);
+    std::shared_lock<std::shared_mutex> shared(hip_mutex_);
+    (void)hipHostFree(base);
+  }
+
+  bool CopyToHost(int device, const std::vector<Fragment>& fragments, std::string* error) override {
+    return HostCopy(device, fragments, hipMemcpyDeviceToHost, error);
+  }
+  bool CopyFromHost(int device, const std::vector<Fragment>& fragments,
+                    std::string* error) override {
+    return HostCopy(device, fragments, hipMemcpyHostToDevice, error);
+  }
+
   // A device-to-device copy is not guaranteed to have landed when hipMemcpy
   // returns, and the caller hands these bytes to another process next.
   bool Synchronize(int device, std::string* error) override {
@@ -223,6 +254,39 @@ class HipMemoryApi final : public MemoryApi {
   }
 
  private:
+  // Every fragment on the device's own stream, waited for once, as CopyBatch.
+  bool HostCopy(int device, const std::vector<Fragment>& fragments, hipMemcpyKind kind,
+                std::string* error) {
+    if (fragments.empty()) return true;
+    std::shared_lock<std::shared_mutex> shared(hip_mutex_);
+    std::lock_guard<std::mutex> device_lock(DeviceMutex(device));
+    ScopedDevice scope(device);
+    if (!scope.ok()) {
+      *error = "hipSetDevice(" + std::to_string(device) + ") failed";
+      return false;
+    }
+    hipStream_t stream = StreamFor(device);
+    if (stream == nullptr) {
+      *error = "no copy stream on device " + std::to_string(device);
+      return false;
+    }
+    for (const Fragment& f : fragments) {
+      const hipError_t err =
+          hipMemcpyAsync(f.dst, f.src, static_cast<size_t>(f.bytes), kind, stream);
+      if (err != hipSuccess) {
+        *error = HipError("hipMemcpyAsync", err);
+        (void)hipStreamSynchronize(stream);
+        return false;
+      }
+    }
+    const hipError_t err = hipStreamSynchronize(stream);
+    if (err != hipSuccess) {
+      *error = HipError("hipStreamSynchronize", err);
+      return false;
+    }
+    return true;
+  }
+
   std::mutex& DeviceMutex(int device) {
     std::lock_guard<std::mutex> lock(table_mutex_);
     return device_mutex_[device];
@@ -305,6 +369,32 @@ bool MemoryApi::CopyBatch(int dst_device, const std::vector<Fragment>& fragments
   return fragments.empty() || Synchronize(dst_device, error);
 }
 
+void* MemoryApi::AllocateHost(uint64_t bytes, bool /*pinned*/, std::string* error) {
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, size_t{2} << 20, static_cast<size_t>(bytes)) != 0 || ptr == nullptr) {
+    *error = "host allocation of " + std::to_string(bytes) + " bytes failed";
+    return nullptr;
+  }
+  return ptr;
+}
+
+void MemoryApi::FreeHost(void* base, uint64_t /*bytes*/, bool /*pinned*/) { std::free(base); }
+
+bool MemoryApi::CopyToHost(int device, const std::vector<Fragment>& fragments, std::string* error) {
+  for (const Fragment& f : fragments) {
+    if (!Copy(device, f.dst, device, f.src, f.bytes, error)) return false;
+  }
+  return true;
+}
+
+bool MemoryApi::CopyFromHost(int device, const std::vector<Fragment>& fragments,
+                             std::string* error) {
+  for (const Fragment& f : fragments) {
+    if (!Copy(device, f.dst, device, f.src, f.bytes, error)) return false;
+  }
+  return true;
+}
+
 std::shared_ptr<MemoryApi> MakeHipMemoryApi() { return std::make_shared<HipMemoryApi>(); }
 std::shared_ptr<MemoryApi> MakeHostMemoryApi() { return std::make_shared<HostMemoryApi>(); }
 
@@ -318,9 +408,41 @@ uint32_t EnvCount(const char* name, uint32_t fallback) {
   return (end == raw || *end != '\0') ? fallback : static_cast<uint32_t>(value);
 }
 
+uint64_t EnvBytes(const char* name) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') return 0;
+  char* end = nullptr;
+  const unsigned long long value = std::strtoull(raw, &end, 10);
+  return end == raw ? 0 : static_cast<uint64_t>(value);
+}
+
+double EnvFraction(const char* name, double fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') return fallback;
+  char* end = nullptr;
+  const double value = std::strtod(raw, &end);
+  return end == raw ? fallback : std::min(1.0, std::max(0.0, value));
+}
+
+// The DRAM tier's memory is touched by the thread that allocates it: spread it
+// over the NUMA nodes, since the pools it serves are on devices of all of them
+// and one node cannot hold a tier sized for the machine. Best effort.
+void InterleaveThisThreadsMemory() {
+#ifdef SYS_set_mempolicy
+  constexpr int kInterleave = 3;  // MPOL_INTERLEAVE
+  unsigned long nodes[16];
+  std::fill(std::begin(nodes), std::end(nodes), ~0UL);
+  (void)syscall(SYS_set_mempolicy, kInterleave, nodes, sizeof(nodes) * 8);
+#endif
+}
+
 // One line per this many evictions of a pool: how much it evicts and how much
 // of that another pool still holds.
 constexpr uint64_t kEvictionLogEvery = 16384;
+// One line per this many records written to a group's DRAM.
+constexpr uint64_t kTierLogEvery = 8192;
+// Slots one round of writing ahead copies.
+constexpr size_t kAheadBatch = 128;
 
 }  // namespace
 
@@ -328,6 +450,36 @@ PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api)) 
   // On by default: with ranks copying each other's prefixes, plain LRU evicts
   // a conversation's only up-to-date copy while older duplicates of it stay.
   SetEvictionPolicy(EnvCount("UMBP_L1_KEEP_COPIES", 1));
+  DramTierOptions tier;
+  tier.capacity_bytes = EnvBytes("UMBP_L1_DRAM_BYTES");
+  tier.ahead = EnvFraction("UMBP_L1_DRAM_AHEAD", 0.0);
+  tier.pinned = EnvCount("UMBP_L1_DRAM_PINNED", 1) != 0;
+  if (tier.capacity_bytes != 0) SetDramTier(tier);
+}
+
+void PoolManager::SetDramTier(const DramTierOptions& options) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  tier_options_ = options;
+  tier_options_.extent_slots = std::max<uint32_t>(1, options.extent_slots);
+  MORI_UMBP_INFO(
+      "[L1Pool] DRAM tier: {} bytes a group, written at the eviction of a key's last L1 copy{}",
+      tier_options_.capacity_bytes, tier_options_.ahead > 0 ? " and ahead of it" : "");
+  if (tier_options_.capacity_bytes != 0 && tier_options_.ahead > 0 && tier_threads_.empty()) {
+    tier_threads_.emplace_back(&PoolManager::TierWorker, this);
+  }
+}
+
+void PoolManager::StopTierThreads() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+  }
+  tier_wake_.notify_all();
+  idle_.notify_all();
+  for (std::thread& thread : tier_threads_) {
+    if (thread.joinable()) thread.join();
+  }
+  tier_threads_.clear();
 }
 
 void PoolManager::SetEvictionPolicy(uint32_t keep_copies) {
@@ -392,9 +544,318 @@ void PoolManager::HolderUsedLocked(Pool* pool, uint32_t slot) {
 }
 
 PoolManager::~PoolManager() {
+  StopTierThreads();
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& entry : pools_) ReleaseMemoryLocked(entry.second.get());
   pools_.clear();
+  for (auto& entry : groups_) {
+    Tier* tier = entry.second.tier.get();
+    if (tier == nullptr) continue;
+    for (size_t p = 0; p < tier->chunks.size(); ++p) {
+      const uint64_t bytes = tier->chunk_extents * tier->extent_bytes[p];
+      for (void* chunk : tier->chunks[p]) api_->FreeHost(chunk, bytes, tier_options_.pinned);
+    }
+  }
+}
+
+// ------------------------------- DRAM tier -------------------------------- //
+
+PoolManager::Tier* PoolManager::TierOfLocked(const Pool* pool) const {
+  const auto group = groups_.find(pool->group);
+  if (group == groups_.end() || group->second.tier == nullptr) return nullptr;
+  Tier* tier = group->second.tier.get();
+  // A pool whose slots are cut differently has no records there.
+  if (tier->unit_bytes.size() != pool->parts.size()) return nullptr;
+  for (size_t p = 0; p < pool->parts.size(); ++p) {
+    const std::vector<Region>& regions = pool->parts[p].layout.regions;
+    if (regions.size() != tier->unit_bytes[p].size()) return nullptr;
+    for (size_t r = 0; r < regions.size(); ++r) {
+      if (regions[r].unit_bytes != tier->unit_bytes[p][r]) return nullptr;
+    }
+  }
+  return tier;
+}
+
+void PoolManager::MakeTierLocked(Pool* pool) {
+  if (tier_options_.capacity_bytes == 0 || stopping_) return;
+  Group& group = groups_[pool->group];
+  if (group.tier != nullptr) return;
+  auto tier = std::make_unique<Tier>();
+  tier->extent_slots = tier_options_.extent_slots;
+  uint64_t slot_bytes = 0;
+  uint64_t largest_extent = 0;
+  for (const Part& part : pool->parts) {
+    std::vector<uint64_t> starts;
+    std::vector<uint64_t> units;
+    uint64_t record = 0;
+    for (const Region& region : part.layout.regions) {
+      starts.push_back(record * tier->extent_slots);
+      units.push_back(region.unit_bytes);
+      record += region.unit_bytes;
+    }
+    tier->region_start.push_back(std::move(starts));
+    tier->unit_bytes.push_back(std::move(units));
+    tier->extent_bytes.push_back(record * tier->extent_slots);
+    largest_extent = std::max(largest_extent, record * tier->extent_slots);
+    slot_bytes += record;
+  }
+  tier->chunk_extents = static_cast<uint32_t>(
+      std::max<uint64_t>(1, tier_options_.chunk_bytes / std::max<uint64_t>(1, largest_extent)));
+  const uint64_t chunk_records = uint64_t{tier->chunk_extents} * tier->extent_slots;
+  const uint64_t chunks = tier_options_.capacity_bytes / (chunk_records * slot_bytes);
+  tier->max_records = static_cast<uint32_t>(std::min<uint64_t>(chunks * chunk_records, UINT32_MAX));
+  tier->keys.resize(tier->max_records);
+  tier->busy.assign(tier->max_records / tier->extent_slots, 0);
+  tier->chunks.resize(pool->parts.size());
+  // Never reallocated: copies read the chunks already there while more come.
+  for (std::vector<void*>& part_chunks : tier->chunks) part_chunks.reserve(chunks);
+  MORI_UMBP_INFO(
+      "[L1Pool] DRAM tier of group {}: room for {} slots of {} bytes ({} parts), in extents of {}",
+      pool->group, tier->max_records, slot_bytes, pool->parts.size(), tier->extent_slots);
+  group.tier = std::move(tier);
+  if (group.tier->max_records != 0) {
+    tier_threads_.emplace_back(&PoolManager::GrowTier, this, pool->group);
+  }
+}
+
+// Brings the tier's memory in, an allocation at a time: the ring uses what is
+// there, so the pools serve from the start and the tier fills as it grows.
+void PoolManager::GrowTier(std::string group_id) {
+  InterleaveThisThreadsMemory();
+  std::unique_lock<std::mutex> lock(mutex_);
+  Tier* tier = groups_[group_id].tier.get();
+  const uint32_t chunk_records = tier->chunk_extents * tier->extent_slots;
+  const auto started = std::chrono::steady_clock::now();
+  while (!stopping_ && tier->ready_records < tier->max_records) {
+    lock.unlock();
+    std::vector<void*> got;
+    std::string error;
+    for (size_t p = 0; p < tier->extent_bytes.size(); ++p) {
+      void* chunk = api_->AllocateHost(tier->chunk_extents * tier->extent_bytes[p],
+                                       tier_options_.pinned, &error);
+      if (chunk == nullptr) break;
+      // Pageable memory is placed when first written: here, not by a copy.
+      if (!tier_options_.pinned) std::memset(chunk, 0, tier->chunk_extents * tier->extent_bytes[p]);
+      got.push_back(chunk);
+    }
+    lock.lock();
+    if (got.size() != tier->extent_bytes.size()) {
+      for (size_t p = 0; p < got.size(); ++p) {
+        api_->FreeHost(got[p], tier->chunk_extents * tier->extent_bytes[p], tier_options_.pinned);
+      }
+      MORI_UMBP_ERROR("[L1Pool] DRAM tier of group {} stops at {} of {} slots: {}", group_id,
+                      tier->ready_records, tier->max_records, error);
+      return;
+    }
+    for (size_t p = 0; p < got.size(); ++p) tier->chunks[p].push_back(got[p]);
+    tier->ready_records += chunk_records;
+  }
+  MORI_UMBP_INFO(
+      "[L1Pool] DRAM tier of group {}: memory for {} slots is in ({} s)", group_id,
+      tier->ready_records,
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started)
+          .count());
+}
+
+void* PoolManager::RecordAddress(const Tier& tier, size_t part, size_t region, uint32_t record) {
+  const uint32_t extent = record / tier.extent_slots;
+  const uint32_t row = record % tier.extent_slots;
+  char* chunk = static_cast<char*>(tier.chunks[part][extent / tier.chunk_extents]);
+  return chunk + uint64_t{extent % tier.chunk_extents} * tier.extent_bytes[part] +
+         tier.region_start[part][region] + uint64_t{row} * tier.unit_bytes[part][region];
+}
+
+bool PoolManager::LastCopyLocked(const Pool* pool, const Slot& slot) const {
+  if (!slot.has_key) return false;
+  const auto group = groups_.find(pool->group);
+  if (group == groups_.end()) return true;
+  const auto holders = group->second.holders.find(slot.key);
+  return holders == group->second.holders.end() || holders->second.size() <= 1;
+}
+
+bool PoolManager::NeedsWriteBackLocked(const Pool* pool, const Slot& slot) const {
+  const Tier* tier = TierOfLocked(pool);
+  return tier != nullptr && LastCopyLocked(pool, slot) && tier->index.count(slot.key) == 0;
+}
+
+uint32_t PoolManager::ReserveRecordsLocked(Tier* tier, uint32_t count, uint32_t* first) {
+  const uint32_t extent_slots = tier->extent_slots;
+  const uint32_t extents = tier->ready_records / extent_slots;
+  for (uint32_t attempt = 0; attempt < extents; ++attempt) {
+    if (tier->cursor >= tier->ready_records) tier->cursor = 0;
+    const uint32_t extent = tier->cursor / extent_slots;
+    const uint32_t row = tier->cursor % extent_slots;
+    if (row == 0) {
+      // The ring comes round to this extent: it is reused whole, unless a
+      // copy is still reading or writing it.
+      if (tier->busy[extent] != 0) {
+        tier->cursor = (extent + 1) * extent_slots;
+        continue;
+      }
+      for (uint32_t record = tier->cursor; record < tier->cursor + extent_slots; ++record) {
+        std::string& key = tier->keys[record];
+        if (key.empty()) continue;
+        const auto indexed = tier->index.find(key);
+        if (indexed != tier->index.end() && indexed->second == record) tier->index.erase(indexed);
+        key.clear();
+        ++tier->overwritten;
+      }
+    }
+    const uint32_t got = std::min(count, extent_slots - row);
+    *first = tier->cursor;
+    tier->cursor += got;
+    ++tier->busy[extent];
+    return got;
+  }
+  return 0;
+}
+
+size_t PoolManager::WriteBack(Pool* pool, const std::vector<TierSlot>& unordered, bool ahead) {
+  if (unordered.empty()) return 0;
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<TierSlot> slots = unordered;
+  std::sort(slots.begin(), slots.end(),
+            [](const TierSlot& a, const TierSlot& b) { return a.slot < b.slot; });
+  // Neighbouring slots go to neighbouring records of one extent: a run.
+  struct Run {
+    size_t first = 0;  // in `slots`
+    uint32_t count = 0;
+    uint32_t record = 0;
+  };
+  std::vector<Run> runs;
+  Tier* tier = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tier = TierOfLocked(pool);
+    size_t i = 0;
+    while (tier != nullptr && i < slots.size()) {
+      size_t n = 1;
+      while (i + n < slots.size() && slots[i + n].slot == slots[i + n - 1].slot + 1) ++n;
+      size_t done = 0;
+      while (done < n) {
+        uint32_t record = 0;
+        const uint32_t got = ReserveRecordsLocked(tier, static_cast<uint32_t>(n - done), &record);
+        if (got == 0) break;
+        runs.push_back(Run{i + done, got, record});
+        done += got;
+      }
+      if (done < n) break;  // no memory in the tier yet, or every extent busy
+      i += n;
+    }
+  }
+  const size_t num_parts = pool->parts.size();
+  std::vector<char> landed(num_parts, 1);
+  std::vector<std::string> errors(num_parts);
+  if (!runs.empty()) {
+    const auto copy_part = [&](size_t p) {
+      const Part& part = pool->parts[p];
+      std::vector<MemoryApi::Fragment> fragments;
+      fragments.reserve(runs.size() * part.layout.regions.size());
+      for (const Run& run : runs) {
+        for (size_t r = 0; r < part.layout.regions.size(); ++r) {
+          const Region& region = part.layout.regions[r];
+          const void* src = static_cast<const char*>(part.base) + region.offset +
+                            uint64_t{slots[run.first].slot} * region.unit_bytes;
+          fragments.push_back(MemoryApi::Fragment{RecordAddress(*tier, p, r, run.record), src,
+                                                  run.count * region.unit_bytes, part.device});
+        }
+      }
+      landed[p] = api_->CopyToHost(part.device, fragments, &errors[p]) ? 1 : 0;
+    };
+    std::vector<std::thread> workers;
+    for (size_t p = 1; p < num_parts; ++p) workers.emplace_back(copy_part, p);
+    copy_part(0);
+    for (std::thread& worker : workers) worker.join();
+  }
+  const bool ok = std::all_of(landed.begin(), landed.end(), [](char v) { return v != 0; });
+  size_t written = 0;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const Run& run : runs) {
+    --tier->busy[run.record / tier->extent_slots];
+    if (!ok) continue;
+    for (uint32_t k = 0; k < run.count; ++k) {
+      const std::string& key = slots[run.first + k].key;
+      const uint32_t record = run.record + k;
+      // The same key written twice (two pools evicting it at once): the newer
+      // record is the one found.
+      const auto old = tier->index.find(key);
+      if (old != tier->index.end()) tier->keys[old->second].clear();
+      tier->keys[record] = key;
+      tier->index[key] = record;
+      ++written;
+      if (++tier->written % kTierLogEvery == 0) {
+        MORI_UMBP_INFO(
+            "[L1Pool] DRAM tier group={} holds={} of {} (memory in for {}) written={} "
+            "loaded={} overwritten={}",
+            pool->group, tier->index.size(), tier->max_records, tier->ready_records, tier->written,
+            tier->loaded, tier->overwritten);
+      }
+    }
+  }
+  if (!ok) {
+    const auto bad = std::find(landed.begin(), landed.end(), 0) - landed.begin();
+    MORI_UMBP_ERROR("[L1Pool] write-back of {} slots of pool={} failed: {}", slots.size(), pool->id,
+                    errors[static_cast<size_t>(bad)]);
+  }
+  (ahead ? pool->written_ahead_slots : pool->written_back_slots) += written;
+  if (!ahead) pool->lost_slots += slots.size() - written;
+  pool->tier_micros += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - started)
+                                                 .count());
+  return written;
+}
+
+// The slots an eviction takes next are a pool's coldest last copies: write the
+// content of up to `ahead` of its slots to DRAM before they are asked for, so
+// the Allocate that evicts them has nothing to copy.
+bool PoolManager::WriteAhead() {
+  Pool* chosen = nullptr;
+  std::vector<TierSlot> slots;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& entry : pools_) {
+      Pool* pool = entry.second.get();
+      const Tier* tier = pool->bound ? TierOfLocked(pool) : nullptr;
+      if (tier == nullptr || tier->ready_records == 0) continue;
+      size_t budget = static_cast<size_t>(tier_options_.ahead * pool->num_slots);
+      // In the order an eviction takes last copies: those it has passed over
+      // first, then the coldest of the rest.
+      for (const std::list<uint32_t>* list : {&pool->kept, &pool->lru}) {
+        for (uint32_t slot : *list) {
+          if (budget == 0 || slots.size() >= kAheadBatch) break;
+          const Slot& s = pool->slots[slot];
+          // A copy another pool also holds is dropped at eviction, not written.
+          if (!LastCopyLocked(pool, s)) continue;
+          --budget;
+          if (s.pins != 0 || !Readable(*pool, s) || tier->index.count(s.key) != 0) continue;
+          slots.push_back(TierSlot{slot, s.key});
+        }
+      }
+      if (slots.empty()) continue;
+      // Pinned: an eviction leaves them alone until the copy is out.
+      for (const TierSlot& slot : slots) ++pool->slots[slot.slot].pins;
+      ++pool->busy;
+      chosen = pool;
+      break;
+    }
+  }
+  if (chosen == nullptr) return false;
+  WriteBack(chosen, slots, /*ahead=*/true);
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (const TierSlot& slot : slots) --chosen->slots[slot.slot].pins;
+  --chosen->busy;
+  idle_.notify_all();
+  return true;
+}
+
+void PoolManager::TierWorker() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (!stopping_) {
+    lock.unlock();
+    const bool worked = WriteAhead();
+    lock.lock();
+    if (!worked && !stopping_) tier_wake_.wait_for(lock, std::chrono::milliseconds(5));
+  }
 }
 
 void PoolManager::ReleasePart(const Part& part) {
@@ -456,7 +917,7 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
 }
 
 bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
-                                 bool settled_only) {
+                                 bool settled_only, std::vector<TierSlot>* victims) {
   for (auto it = pool->vacant.begin(); it != pool->vacant.end(); ++it) {
     if (pool->slots[*it].pins != 0) continue;
     if (settled_only && !Fillable(*pool, pool->slots[*it])) continue;
@@ -515,6 +976,14 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
   UncacheLocked(pool, victim);
   if (s.has_key) {
     if (copies(s) > 1) ++pool->evicted_spare;
+    if (victims != nullptr && NeedsWriteBackLocked(pool, s)) {
+      // Content its owner is still writing cannot be read out: it is lost.
+      if (Readable(*pool, s)) {
+        victims->push_back(TierSlot{victim, s.key});
+      } else {
+        ++pool->lost_slots;
+      }
+    }
     evicted->push_back(s.key);
     UnindexLocked(pool, *slot);
     if (++pool->evicted % kEvictionLogEvery == 0) {
@@ -727,6 +1196,7 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout,
                  pool->bound ? "" : " (waiting for the other parts)");
   if (!pool->bound) return Status{};
   pool->num_slots = layout.num_slots;
+  MakeTierLocked(pool);
   pool->slots.assign(layout.num_slots, Slot{});
   ResetSlotsLocked(pool);
   return Status{};
@@ -760,10 +1230,14 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
     return result;
   }
   const auto deadline = std::chrono::steady_clock::now() + kPinnedWait;
+  // Evicted slots whose content has to reach DRAM before the owner is given
+  // them: until this call returns they are held, and nobody writes them.
+  std::vector<TierSlot> victims;
   while (result.slots.size() < count) {
     uint32_t slot = 0;
     const bool required = result.slots.size() < min_count;
-    if (TakeFreeLocked(pool, &slot, required ? &result.evicted_keys : nullptr)) {
+    if (TakeFreeLocked(pool, &slot, required ? &result.evicted_keys : nullptr,
+                       /*settled_only=*/false, &victims)) {
       pool->slots[slot].state = SlotState::kHeld;
       ++pool->held;
       result.slots.push_back(slot);
@@ -778,6 +1252,14 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
       result.status = Status::Error("pool " + pool_id + " was detached");
       return result;
     }
+  }
+  if (!victims.empty()) {
+    ++pool->busy;  // Open, a re-bind and Detach wait for the copy
+    lock.unlock();
+    WriteBack(pool, victims, /*ahead=*/false);
+    lock.lock();
+    --pool->busy;
+    idle_.notify_all();
   }
   return result;
 }
@@ -896,9 +1378,22 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     return nullptr;
   };
 
+  // The group's DRAM holds `key`, a record nothing is overwriting.
+  Tier* tier = TierOfLocked(pool);
+  auto in_tier = [&](const std::string& key, uint32_t* record) {
+    if (tier == nullptr) return false;
+    const auto found = tier->index.find(key);
+    if (found == tier->index.end()) return false;
+    if (record != nullptr) *record = found->second;
+    return true;
+  };
+
   if (options.probe_only) {
     for (const std::string& key : keys) {
-      if (pool->index.find(key) == pool->index.end() && source_of(key) == nullptr) break;
+      if (pool->index.find(key) == pool->index.end() && source_of(key) == nullptr &&
+          !in_tier(key, nullptr)) {
+        break;
+      }
       ++result.available;
     }
     return result;
@@ -933,6 +1428,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   // the sources, and take the destinations off the free lists -- or, copying
   // into the caller's slots, check that it holds them.
   std::vector<CopyStep> steps;
+  std::vector<TierSlot> victims;  // slots evicted for this call, bound for DRAM
   std::vector<uint32_t> local_pins;
   if (!into) {
     // Every key of the call this pool already holds is pinned before any
@@ -955,17 +1451,24 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
         break;
       }
       const Holder* source = source_of(key);
-      if (source == nullptr) break;
+      uint32_t record = 0;
+      if (source == nullptr && !in_tier(key, &record)) break;
       if (!Fillable(*pool, pool->slots[dst])) {
         // Allocate may regrant a slot before its owner's writes complete:
         // owner-local reuse is ordered on that stream, but this copy is not.
         // Stop at the landed prefix; the caller still holds every destination.
         break;
       }
-      ++source->pool->slots[source->slot].pins;
-      ++source->pool->busy;
+      if (source != nullptr) {
+        ++source->pool->slots[source->slot].pins;
+        ++source->pool->busy;
+        steps.push_back(CopyStep{source->pool, source->slot, dst, i, 0});
+      } else {
+        // From DRAM: the record's extent is not reused while the copy reads it.
+        ++tier->busy[record / tier->extent_slots];
+        steps.push_back(CopyStep{nullptr, record, dst, i, record});
+      }
       ++pool->busy;
-      steps.push_back(CopyStep{source->pool, source->slot, dst, i});
       result.slots.push_back(dst);
       continue;
     }
@@ -986,14 +1489,20 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
         }
       }
     }
-    if (source == nullptr) break;
+    uint32_t record = 0;
+    if (source == nullptr && !in_tier(key, &record)) break;
     uint32_t dst = 0;
-    if (!TakeFreeLocked(pool, &dst, &result.evicted_keys, /*settled_only=*/true)) break;
+    if (!TakeFreeLocked(pool, &dst, &result.evicted_keys, /*settled_only=*/true, &victims)) break;
     pool->slots[dst].state = SlotState::kFilling;
-    ++source->pool->slots[source->slot].pins;
-    ++source->pool->busy;
+    if (source != nullptr) {
+      ++source->pool->slots[source->slot].pins;
+      ++source->pool->busy;
+      steps.push_back(CopyStep{source->pool, source->slot, dst, i, 0});
+    } else {
+      ++tier->busy[record / tier->extent_slots];
+      steps.push_back(CopyStep{nullptr, record, dst, i, record});
+    }
     ++pool->busy;
-    steps.push_back(CopyStep{source->pool, source->slot, dst, i});
     result.slots.push_back(dst);
   }
 
@@ -1009,29 +1518,41 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   // Part p of the source slots to part p of the destination slots.
   const size_t num_parts = pool->parts.size();
   std::vector<std::vector<MemoryApi::Fragment>> fragments(num_parts);
+  // And the same from DRAM records, which are host memory.
+  std::vector<std::vector<MemoryApi::Fragment>> host_fragments(num_parts);
+  // The slots this call evicted to make room go to DRAM before it fills them.
+  if (!victims.empty()) WriteBack(pool, victims, /*ahead=*/false);
   size_t run_start = 0;
   bool failed = false;
   while (run_start < steps.size()) {
     size_t run_end = run_start + 1;
+    // A run from DRAM stays inside one extent, where records are neighbours.
     while (run_end < steps.size() && steps[run_end].src == steps[run_start].src &&
            steps[run_end].src_slot == steps[run_end - 1].src_slot + 1 &&
-           steps[run_end].dst_slot == steps[run_end - 1].dst_slot + 1) {
+           steps[run_end].dst_slot == steps[run_end - 1].dst_slot + 1 &&
+           (steps[run_start].src != nullptr || steps[run_end].record / tier->extent_slots ==
+                                                   steps[run_start].record / tier->extent_slots)) {
       ++run_end;
     }
     const CopyStep& first = steps[run_start];
     const uint64_t run_slots = run_end - run_start;
     for (size_t p = 0; p < num_parts; ++p) {
       const Part& dst_part = pool->parts[p];
-      const Part& src_part = first.src->parts[p];
       for (size_t r = 0; r < dst_part.layout.regions.size(); ++r) {
         const Region& dst_region = dst_part.layout.regions[r];
-        const Region& src_region = src_part.layout.regions[r];
         const uint64_t unit = dst_region.unit_bytes;
         void* dst =
             static_cast<char*>(dst_part.base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
-        const void* src = static_cast<const char*>(src_part.base) + src_region.offset +
-                          uint64_t{first.src_slot} * unit;
-        fragments[p].push_back(MemoryApi::Fragment{dst, src, run_slots * unit, src_part.device});
+        if (first.src == nullptr) {
+          host_fragments[p].push_back(MemoryApi::Fragment{
+              dst, RecordAddress(*tier, p, r, first.record), run_slots * unit, dst_part.device});
+        } else {
+          const Part& src_part = first.src->parts[p];
+          const Region& src_region = src_part.layout.regions[r];
+          const void* src = static_cast<const char*>(src_part.base) + src_region.offset +
+                            uint64_t{first.src_slot} * unit;
+          fragments[p].push_back(MemoryApi::Fragment{dst, src, run_slots * unit, src_part.device});
+        }
         result.copied_bytes += run_slots * unit;
       }
     }
@@ -1045,7 +1566,11 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     std::vector<std::string> errors(num_parts);
     std::vector<char> landed(num_parts, 0);
     const auto copy_part = [&](size_t p) {
-      landed[p] = api_->CopyBatch(pool->parts[p].device, fragments[p], &errors[p]) ? 1 : 0;
+      const int device = pool->parts[p].device;
+      landed[p] = (fragments[p].empty() || api_->CopyBatch(device, fragments[p], &errors[p])) &&
+                          api_->CopyFromHost(device, host_fragments[p], &errors[p])
+                      ? 1
+                      : 0;
     };
     std::vector<std::thread> workers;
     for (size_t p = 1; p < num_parts; ++p) workers.emplace_back(copy_part, p);
@@ -1069,22 +1594,34 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   std::vector<std::pair<std::string, uint32_t>> sources;  // runs, for the log
   for (size_t i = 0; i < steps.size(); ++i) {
     const CopyStep& step = steps[i];
-    --step.src->slots[step.src_slot].pins;
-    --step.src->busy;
+    if (step.src != nullptr) {
+      --step.src->slots[step.src_slot].pins;
+      --step.src->busy;
+    } else {
+      --tier->busy[step.record / tier->extent_slots];
+    }
     --pool->busy;
+    // Who a landed slot came from: another pool, or DRAM.
+    const auto count_source = [&] {
+      const std::string from = step.src != nullptr ? step.src->id : std::string("dram");
+      if (step.src != nullptr) {
+        ++step.src->served_out_slots;
+      } else {
+        ++pool->loaded_slots;
+        ++tier->loaded;
+      }
+      if (sources.empty() || sources.back().first != from) sources.emplace_back(from, 0u);
+      ++sources.back().second;
+    };
     Slot& d = pool->slots[step.dst_slot];
     const std::string& key = keys[step.key_index];
     const bool usable = copied[i] && step.key_index < valid_keys;
     if (into) {
       // The caller's slot, which it publishes itself: only the count moves.
       if (usable) {
-        ++step.src->served_out_slots;
+        count_source();
         ++pool->fetched_in_slots;
         ++result.copied_slots;
-        if (sources.empty() || sources.back().first != step.src->id) {
-          sources.emplace_back(step.src->id, 0u);
-        }
-        ++sources.back().second;
       } else {
         valid_keys = std::min(valid_keys, step.key_index);
       }
@@ -1102,13 +1639,9 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
       pool->index[key] = step.dst_slot;
       group.holders[key].push_back(Holder{pool, step.dst_slot});
       HolderAddedLocked(&group, key);
-      ++step.src->served_out_slots;
+      count_source();
       ++pool->fetched_in_slots;
       ++result.copied_slots;
-      if (sources.empty() || sources.back().first != step.src->id) {
-        sources.emplace_back(step.src->id, 0u);
-      }
-      ++sources.back().second;
       continue;
     }
     d.state = SlotState::kVacant;
@@ -1161,6 +1694,12 @@ Status PoolManager::Clear(const std::string& pool_id) {
       pool->vacant.insert(slot);
     }
   }
+  // What the owner asked to forget must not come back from DRAM either (an
+  // engine clears its pool when the content no longer matches its weights).
+  if (Tier* tier = TierOfLocked(pool)) {
+    for (const auto& entry : tier->index) tier->keys[entry.second].clear();
+    tier->index.clear();
+  }
   return Status{};
 }
 
@@ -1193,6 +1732,15 @@ std::vector<PoolStats> PoolManager::Stats() const {
     stats.fetched_in_bytes = pool.fetched_in_bytes;
     stats.served_out_slots = pool.served_out_slots;
     stats.copy_micros = pool.copy_micros;
+    stats.written_back_slots = pool.written_back_slots;
+    stats.written_ahead_slots = pool.written_ahead_slots;
+    stats.loaded_slots = pool.loaded_slots;
+    stats.lost_slots = pool.lost_slots;
+    stats.tier_micros = pool.tier_micros;
+    if (const Tier* tier = TierOfLocked(&pool)) {
+      stats.tier_records = tier->index.size();
+      stats.tier_capacity = tier->ready_records;
+    }
     out.push_back(std::move(stats));
   }
   std::sort(out.begin(), out.end(),

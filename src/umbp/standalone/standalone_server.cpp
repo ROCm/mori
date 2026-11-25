@@ -492,6 +492,20 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
   bool Synchronize(int device, std::string* error) override {
     return inner_->Synchronize(device, error);
   }
+  // The DRAM tier's memory and its copies are the device runtime's.
+  void* AllocateHost(uint64_t bytes, bool pinned, std::string* error) override {
+    return inner_->AllocateHost(bytes, pinned, error);
+  }
+  void FreeHost(void* base, uint64_t bytes, bool pinned) override {
+    inner_->FreeHost(base, bytes, pinned);
+  }
+  bool CopyToHost(int device, const std::vector<Fragment>& fragments, std::string* error) override {
+    return inner_->CopyToHost(device, fragments, error);
+  }
+  bool CopyFromHost(int device, const std::vector<Fragment>& fragments,
+                    std::string* error) override {
+    return inner_->CopyFromHost(device, fragments, error);
+  }
 
   bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
                  std::string* error) override {

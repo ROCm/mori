@@ -966,6 +966,248 @@ TEST_F(L1PartsTest, DetachReleasesEveryPart) {
   EXPECT_EQ(api->frees, frees + 2);
 }
 
+// DRAM under the pools: the last L1 copy of a key is written there when its
+// slot is taken, and a fetch finds it there when no pool holds it.
+class L1TierTest : public L1PoolTest {
+ protected:
+  void SetUp() override {}  // each test brings its own tier
+
+  static constexpr uint64_t kSlotBytes = kUnitA + kUnitB;
+
+  void Bring(uint32_t records, double ahead = 0.0) {
+    api = std::make_shared<RecordingApi>();
+    manager = std::make_unique<PoolManager>(api);
+    DramTierOptions options;
+    options.capacity_bytes = records * kSlotBytes;
+    options.ahead = ahead;
+    options.extent_slots = 4;
+    options.chunk_bytes = 4 * kSlotBytes;  // one extent an allocation
+    options.pinned = false;
+    manager->SetDramTier(options);
+    for (int device : {0, 1}) {
+      const std::string id = "p" + std::to_string(device);
+      ASSERT_TRUE(manager->Attach(id, "g", device, kBytes).status.ok);
+      ASSERT_TRUE(manager->BindLayout(id, TestLayout()).ok);
+      ASSERT_EQ(manager->Open(id).num_slots, kSlots);
+    }
+    // The tier's memory comes in behind the pools.
+    ASSERT_TRUE(Eventually([&] { return StatsOf("p0").tier_capacity == records; }));
+  }
+
+  template <typename Fn>
+  static bool Eventually(Fn&& done) {
+    for (int i = 0; i < 5000; ++i) {
+      if (done()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  }
+
+  // Take every slot of the pool, which evicts all it caches, and give the
+  // slots back empty.
+  void EvictAll(int device) {
+    const std::string id = "p" + std::to_string(device);
+    AllocateResult got = manager->Allocate(id, kSlots);
+    ASSERT_EQ(got.slots.size(), kSlots);
+    std::vector<Op> ops;
+    for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+    ASSERT_TRUE(manager->Apply(id, ops).ok);
+  }
+
+  uint64_t Written() { return StatsOf("p0").written_back_slots + StatsOf("p1").written_back_slots; }
+};
+
+TEST_F(L1TierTest, ContentAnEngineJustComputedIsNotWrittenToDram) {
+  Bring(16);
+  Cache(0, {"a", "b", "c"}, 1);
+  EXPECT_EQ(StatsOf("p0").tier_records, 0u);
+  EXPECT_EQ(Written(), 0u);
+}
+
+TEST_F(L1TierTest, AnEvictedLastCopyGoesToDramAndComesBackOnFetch) {
+  Bring(16);
+  Cache(0, {"a", "b"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 2u);
+  EXPECT_EQ(StatsOf("p0").tier_records, 2u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
+  std::memset(api->bases[0], 0xEE, kBytes);  // the engine has since reused its pool
+  FetchResult fetched = manager->Fetch("p1", {"a", "b", "missing"});
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  ASSERT_EQ(fetched.slots.size(), 2u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
+  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_EQ(fetched.copied_bytes, 2 * kSlotBytes);
+  EXPECT_EQ(StatsOf("p1").loaded_slots, 2u);
+  // The pool that evicted it finds it there too.
+  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
+}
+
+TEST_F(L1TierTest, ACopyAnotherPoolStillHoldsIsDroppedNotWritten) {
+  Bring(16);
+  Cache(0, {"a"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // two pools hold "a"
+  EvictAll(0);
+  EXPECT_EQ(Written(), 0u);
+  EXPECT_EQ(StatsOf("p0").tier_records, 0u);
+  // p1's is the last copy in L1 now: that one goes to DRAM.
+  EvictAll(1);
+  EXPECT_EQ(StatsOf("p1").written_back_slots, 1u);
+  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
+}
+
+TEST_F(L1TierTest, AKeyDramAlreadyHoldsIsNotWrittenAgain) {
+  Bring(16);
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // back in L1, still in DRAM
+  EvictAll(1);
+  EXPECT_EQ(Written(), 1u);
+  EXPECT_EQ(StatsOf("p0").tier_records, 1u);
+}
+
+TEST_F(L1TierTest, FetchIntoHeldSlotsFillsThemFromDram) {
+  Bring(16);
+  Cache(0, {"a", "b"}, 5);
+  EvictAll(0);
+  AllocateResult held = manager->Allocate("p1", 2);
+  FetchOptions into;
+  into.dst_slots = held.slots;
+  FetchResult fetched = manager->Fetch("p1", {"a", "b"}, into);
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_TRUE(Holds(1, held.slots[0], 5));
+  EXPECT_TRUE(Holds(1, held.slots[1], 6));
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("p1", {"a", "b", "missing"}, probe).available, 2u);
+}
+
+TEST_F(L1TierTest, AFetchTakesWhatPoolsHoldFromThemAndTheRestFromDram) {
+  Bring(16);
+  Cache(0, {"a"}, 1);
+  EvictAll(0);         // "a" is in DRAM only
+  Cache(0, {"b"}, 2);  // "b" is in p0 only
+  FetchResult fetched = manager->Fetch("p1", {"a", "b"});
+  ASSERT_EQ(fetched.slots.size(), 2u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
+  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
+  EXPECT_EQ(StatsOf("p1").loaded_slots, 1u);
+  EXPECT_EQ(StatsOf("p0").served_out_slots, 1u);
+}
+
+TEST_F(L1TierTest, TheRingOverwritesItsOldestExtentFirst) {
+  Bring(12);  // three extents of four
+  Cache(0, {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"}, 1);
+  EvictAll(0);
+  Cache(0, {"b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"}, 21);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 16u);
+  EXPECT_EQ(StatsOf("p0").tier_records, 12u);
+  // The first extent written was reused for the last four of the second batch.
+  EXPECT_TRUE(manager->Fetch("p1", {"a0"}).slots.empty());
+  FetchResult kept = manager->Fetch("p1", {"a5", "b0", "b7"});
+  ASSERT_EQ(kept.slots.size(), 3u);
+  EXPECT_TRUE(Holds(1, kept.slots[0], 6));
+  EXPECT_TRUE(Holds(1, kept.slots[1], 21));
+  EXPECT_TRUE(Holds(1, kept.slots[2], 28));
+}
+
+TEST_F(L1TierTest, WritingAheadLeavesTheEvictionNothingToCopy) {
+  Bring(16, /*ahead=*/1.0);
+  Cache(0, {"a", "b", "c"}, 1);
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 3; }));
+  EXPECT_EQ(StatsOf("p0").tier_records, 3u);
+  const int copies = api->copies;
+  EvictAll(0);
+  EXPECT_EQ(api->copies, copies);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
+  FetchResult fetched = manager->Fetch("p1", {"a", "b", "c"});
+  ASSERT_EQ(fetched.slots.size(), 3u);
+  EXPECT_TRUE(Holds(1, fetched.slots[2], 3));
+}
+
+TEST_F(L1TierTest, WritingAheadSkipsWhatItsOwnerIsStillWriting) {
+  Bring(16, /*ahead=*/1.0);
+  AllocateResult got = manager->Allocate("p0", 1);
+  ASSERT_TRUE(manager
+                  ->Apply("p0",
+                          {Op{OpKind::kPublish, got.slots[0], "late"},
+                           Op{OpKind::kRelease, got.slots[0], ""}},
+                          /*stamp=*/900)
+                  .ok);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(StatsOf("p0").written_ahead_slots, 0u);
+  Fill(0, got.slots[0], 9);  // the forward lands
+  ASSERT_TRUE(manager->Commit("p0", 900).ok);
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 1; }));
+  EvictAll(0);
+  FetchResult fetched = manager->Fetch("p1", {"late"});
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 9));
+}
+
+TEST_F(L1TierTest, AWriteBackThatFailsLosesTheContentAndSaysSo) {
+  Bring(16);
+  Cache(0, {"a"}, 1);
+  api->fail_copies = true;
+  EvictAll(0);
+  api->fail_copies = false;
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 1u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1TierTest, ClearingAPoolForgetsWhatDramHolds) {
+  Bring(16);
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  ASSERT_TRUE(manager->Clear("p0").ok);
+  EXPECT_EQ(StatsOf("p0").tier_records, 0u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1TierTest, WithoutATierAnEvictedSlotIsGone) {
+  api = std::make_shared<RecordingApi>();
+  manager = std::make_unique<PoolManager>(api);
+  L1PoolTest::SetUp();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").tier_capacity, 0u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+// The tier under pools of two parts: a record is a piece per part.
+TEST_F(L1PartsTest, EveryPartOfAnEvictedSlotGoesToDramAndBack) {
+  api = std::make_shared<RecordingApi>();
+  manager = std::make_unique<PoolManager>(api);
+  DramTierOptions options;
+  options.capacity_bytes = 8 * (kUnitA + kUnitB + kUnitC);
+  options.extent_slots = 4;
+  options.chunk_bytes = 4 * (kUnitA + kUnitB);
+  options.pinned = false;
+  manager->SetDramTier(options);
+  Bring(0);
+  Bring(1);
+  for (int i = 0; i < 5000 && StatsOf("r0").tier_capacity != 8; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(StatsOf("r0").tier_capacity, 8u);
+  CacheOne(0, "k", 7);
+  AllocateResult all = manager->Allocate("r0", kSlots);  // evicts "k", the last copy
+  ASSERT_EQ(all.slots.size(), kSlots);
+  EXPECT_EQ(StatsOf("r0").written_back_slots, 1u);
+  std::memset(api->bases[Device(0, 0)], 0xEE, kBytes);
+  std::memset(api->bases[Device(0, 1)], 0xEE, kBytesC);
+  FetchResult fetched = manager->Fetch("r1", {"k"});
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(Device(1, 0), fetched.slots[0], 7));
+  EXPECT_TRUE(ShardHolds(1, fetched.slots[0], 57));
+  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
+  EXPECT_EQ(StatsOf("r1").loaded_slots, 1u);
+}
+
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
   const std::string path = "/tmp/umbp_l1_test_" + std::to_string(getpid()) + ".sock";
   unlink(path.c_str());
