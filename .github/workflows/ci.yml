@@ -717,6 +717,14 @@ jobs:
             timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
           "
 
+      - name: MORI-EP JAX MoE example
+        run: |
+          $CT exec ${CONTAINER}_jax bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+            timeout 300 python3 examples/ops/dispatch_combine/moe_block_jax.py
+          "
+
       - name: Cleanup
         if: always()
         run: |
