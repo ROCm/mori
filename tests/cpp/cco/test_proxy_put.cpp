@@ -37,7 +37,9 @@
 #include <infiniband/verbs.h>
 
 #include <chrono>
+#include <functional>
 #include <string>
+#include <utility>
 
 #include "cco_test_harness.hpp"
 #include "mori/cco/cco_scale_out.hpp"
@@ -105,6 +107,27 @@ __device__ inline bool WaitFlag(P& proxy, const uint64_t* flag, uint64_t least) 
   return __builtin_amdgcn_readfirstlane(ok) != 0;
 }
 
+// A queue's satisfied-FLUSH count.
+__device__ inline uint64_t FlushDone(const uint64_t* flushDone) {
+  return __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Flags `err` unless the count moved from `before` by exactly `want`; `what`
+// names the case and the kind of `idx` (e.g. "n3: unit").
+__device__ inline void CheckFlushDone(const uint64_t* flushDone, uint64_t before, uint64_t want,
+                                      const char* what, int idx, int me, int* err) {
+  const uint64_t after = FlushDone(flushDone);
+  if (after == before + want) return;
+  printf("[rank %d] %s %d flushDone %llu -> %llu, want +%llu\n", me, what, idx,
+         (unsigned long long)before, (unsigned long long)after, (unsigned long long)want);
+  atomicExch(err, 1);
+}
+
+// Overwrites words first, first + stride, ... below `words` of `src`.
+__device__ inline void ClobberChunk(uint32_t* src, size_t words, size_t first, size_t stride) {
+  for (size_t i = first; i < words; i += stride) src[i] = kClobber;
+}
+
 // Block u = unit u on queue u (MPSC: modulo the pool). Sends one chunk to every peer,
 // then waits for every sender's chunk on this unit (signal slot or flag word).
 template <typename Q, typename Coop, int Mode>
@@ -162,27 +185,20 @@ __global__ void ProxyPutKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_t r
   }
   if constexpr (Mode == kPutFlushCount) {
     uint64_t before = 0;
-    if constexpr (ccoProxy<Q>::kSpsc) {
-      before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+    if constexpr (ccoProxy<Q>::kSpsc) before = FlushDone(proxy.flushDone);
     proxy.flush(Coop{});
+    // This wavefront owns the queue: its FLUSH is the only one in flight.
     if constexpr (ccoProxy<Q>::kSpsc) {
-      // This wavefront owns the queue: its FLUSH is the only one in flight.
-      const uint64_t after =
-          __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      if (tid == 0 && after != before + 1) {
-        printf("[rank %d] flush_count: unit %d flushDone %llu -> %llu\n", me, u,
-               (unsigned long long)before, (unsigned long long)after);
-        atomicExch(err, 1);
-      }
+      if (tid == 0) CheckFlushDone(proxy.flushDone, before, 1, "flush_count: unit", u, me, err);
     }
   } else if constexpr (Mode == kPutFlushClobber) {
     proxy.flush(Coop{});
     // Every put of this unit completed: its sources may be reused right away.
     for (int p = 0; p < n; p++) {
-      if (p == me) continue;
-      uint32_t* src = sendLocal + srcOff(p) / sizeof(uint32_t);
-      for (size_t i = tid; i < chunk / sizeof(uint32_t); i += nThreads) src[i] = kClobber;
+      if (p != me) {
+        ClobberChunk(sendLocal + srcOff(p) / sizeof(uint32_t), chunk / sizeof(uint32_t), tid,
+                     nThreads);
+      }
     }
     __threadfence_system();
     __syncthreads();
@@ -246,6 +262,24 @@ __device__ inline int ThreadPeer(int me, int n, int k, int lane) {
   return (me + 1 + (k + lane) % (n - 1)) % n;
 }
 
+// Checks this lane's written words of chunk slot (s, v), nSlots slots per sender.
+__device__ inline void CheckLaneSlice(const uint32_t* recvLocal, uint32_t salt, int s, int me,
+                                      int v, int nSlots, size_t chunk, int lane, const char* what,
+                                      int* err) {
+  const size_t w0 = ((static_cast<size_t>(s) * nSlots + v) * chunk + lane * kLaneSlice) / 4;
+  for (size_t i = 0; i < ThreadBytes(lane) / 4; i++) {
+    const uint32_t got =
+        __hip_atomic_load(recvLocal + w0 + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    const uint32_t want = Pattern(salt, s, me, v, lane * kLaneSlice / 4 + i);
+    if (got != want) {
+      printf("[rank %d] %s: src=%d slot=%d lane %d word %zu: got %08x want %08x\n", me, what, s, v,
+             lane, i, got, want);
+      atomicExch(err, 1);
+      return;
+    }
+  }
+}
+
 // Idle lanes pass a valid put (kThreadPutSignal) or garbage (other modes): neither
 // may be issued or read. Round r of unit u uses chunk slot u * rounds + r.
 template <typename Q, int Mode>
@@ -282,24 +316,14 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
   }
   if constexpr (Mode == kThreadPutFlush) {
     uint64_t before = 0;
-    if constexpr (ccoProxy<Q>::kSpsc) {
-      before = __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+    if constexpr (ccoProxy<Q>::kSpsc) before = FlushDone(proxy.flushDone);
     proxy.flush();  // one flush for the wavefront
     if constexpr (ccoProxy<Q>::kSpsc) {
-      const uint64_t after =
-          __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      if (lane == 0 && after != before + 1) {
-        printf("[rank %d] thread flush: unit %d flushDone %llu -> %llu\n", me, u,
-               (unsigned long long)before, (unsigned long long)after);
-        atomicExch(err, 1);
-      }
+      if (lane == 0) CheckFlushDone(proxy.flushDone, before, 1, "thread flush: unit", u, me, err);
     }
     // Every lane's puts completed: each lane overwrites its own sources.
     for (int p = 0; p < n; p++) {
-      if (p == me) continue;
-      uint32_t* s = sendLocal + off(p, 0) / sizeof(uint32_t);
-      for (size_t i = 0; i < kLaneSlice / sizeof(uint32_t); i++) s[i] = kClobber;
+      if (p != me) ClobberChunk(sendLocal + off(p, 0) / sizeof(uint32_t), kLaneSlice / 4, 0, 1);
     }
     __threadfence_system();
   }
@@ -313,21 +337,6 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
     }
   }
   // Consume exactly the active lanes' signals, then check their slices.
-  auto check = [&](int s, int r) {  // this lane's slice of chunk slot (s, u * rounds + r)
-    const int v = u * rounds + r;
-    const size_t w0 = ((static_cast<size_t>(s) * nSlices + v) * chunk + lane * kLaneSlice) / 4;
-    for (size_t i = 0; i < ThreadBytes(lane) / 4; i++) {
-      const uint32_t got =
-          __hip_atomic_load(recvLocal + w0 + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      const uint32_t want = Pattern(salt, s, me, v, lane * kLaneSlice / 4 + i);
-      if (got != want) {
-        printf("[rank %d] early check: src=%d slot=%d lane %d word %zu: got %08x want %08x\n", me,
-               s, v, lane, i, got, want);
-        atomicExch(err, 1);
-        break;
-      }
-    }
-  };
   for (int s = 0; s < n; s++) {
     if (s == me) continue;
     if constexpr (Mode == kThreadPutFlush) {
@@ -338,7 +347,10 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
     }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     if (active) {
-      for (int r = 0; r < rounds; r++) check(s, r);
+      for (int r = 0; r < rounds; r++) {
+        CheckLaneSlice(recvLocal, salt, s, me, u * rounds + r, nSlices, chunk, lane, "early check",
+                       err);
+      }
     }
   }
   // Complete every WR before exit, for the host checks after the barrier.
@@ -435,20 +447,6 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
       if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, ccoCoopWarp{});
     }
   }
-  auto check = [&](int s) {
-    const size_t w0 = ((static_cast<size_t>(s) * nUnits + u) * chunk + lane * kLaneSlice) / 4;
-    for (size_t i = 0; i < ThreadBytes(lane) / 4; i++) {
-      const uint32_t got =
-          __hip_atomic_load(recvLocal + w0 + i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      const uint32_t want = Pattern(salt, s, me, u, lane * kLaneSlice / 4 + i);
-      if (got != want) {
-        printf("[rank %d] thread mode %d: src=%d unit=%d lane %d word %zu: got %08x want %08x\n",
-               me, Mode, s, u, lane, i, got, want);
-        atomicExch(err, 1);
-        break;
-      }
-    }
-  };
   for (int s = 0; s < n; s++) {
     if (s == me) continue;
     if constexpr (Mode == kTmLaneSignal) {
@@ -468,7 +466,7 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
       proxy.waitSignal(Slot(s, u), want, ccoCoopWarp{});
     }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-    if (active) check(s);
+    if (active) CheckLaneSlice(recvLocal, salt, s, me, u, nUnits, chunk, lane, "thread mode", err);
   }
   proxy.flush(ccoCoopWarp{});  // complete every work request before the kernel ends
 }
@@ -726,10 +724,10 @@ __global__ void ProxyStressKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
       proxy.flush(ccoCoopWarp{});
       for (int k = w * kStressRounds + clean; k <= u; k++) {
         for (int p = 0; p < n; p++) {
-          if (p == me) continue;
-          uint32_t* src = sendLocal + off(p, k) / sizeof(uint32_t);
-          for (size_t i = lane; i < kStressChunk / sizeof(uint32_t); i += waveSize)
-            src[i] = kClobber;
+          if (p != me) {
+            ClobberChunk(sendLocal + off(p, k) / sizeof(uint32_t), kStressChunk / sizeof(uint32_t),
+                         lane, waveSize);
+          }
         }
       }
       __threadfence_system();
@@ -785,9 +783,7 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
   const size_t half = chunk / 2;
   uint64_t* flushDone = dc.proxy.flushDone;  // SPSC queue 0
   if (wave == 0) {
-    if (threadIdx.x == 0) {
-      before = __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+    if (threadIdx.x == 0) before = FlushDone(flushDone);
     ccoProxy<> proxy{dc, 0};
     for (int p = 0; p < n; p++) {
       if (p != me) {
@@ -808,14 +804,8 @@ __global__ void ProxyHandoffKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow
       }
     }
     proxy.flush();
-    const uint64_t after =
-        __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     if (__lane_id() == 0) {
-      if (after != before + 2) {
-        printf("[rank %d] spsc_handoff: flushDone %llu -> %llu, want +2\n", me,
-               (unsigned long long)before, (unsigned long long)after);
-        atomicExch(err, 1);
-      }
+      CheckFlushDone(flushDone, before, 2, "spsc_handoff: wave", wave, me, err);
       for (int s = 0; s < n; s++) {
         if (s != me) proxy.waitSignal(Slot(s, 0), 1);
       }
@@ -840,27 +830,20 @@ __global__ void ProxyBlockFlushKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
   auto srcOff = [&](int p, int u) {
     return (static_cast<size_t>(p) * kBlockFlushWaves + u) * chunk;
   };
-  const uint64_t before =
-      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  const uint64_t before = FlushDone(proxy.flushDone);
   for (int p = 0; p < n; p++) {
     if (p == me) continue;
     proxy.put(p, recvWin, srcOff(me, w), sendWin, srcOff(p, w), chunk, ccoGda_NoSignal{},
               ccoCoopWarp{});
   }
   proxy.flush(ccoCoopBlock{});
-  const uint64_t after =
-      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  if (__lane_id() == 0 && after != before + 1) {
-    printf("[rank %d] block_flush: wave %d flushDone %llu -> %llu\n", me, w,
-           (unsigned long long)before, (unsigned long long)after);
-    atomicExch(err, 1);
-  }
+  if (__lane_id() == 0) CheckFlushDone(proxy.flushDone, before, 1, "block_flush: wave", w, me, err);
   // Every wavefront's puts completed: overwrite all of the block's sources.
   for (int p = 0; p < n; p++) {
     if (p == me) continue;
     for (int u = 0; u < kBlockFlushWaves; u++) {
-      uint32_t* src = sendLocal + srcOff(p, u) / sizeof(uint32_t);
-      for (size_t i = threadIdx.x; i < chunk / sizeof(uint32_t); i += blockDim.x) src[i] = kClobber;
+      ClobberChunk(sendLocal + srcOff(p, u) / sizeof(uint32_t), chunk / sizeof(uint32_t),
+                   threadIdx.x, blockDim.x);
     }
   }
   __threadfence_system();
@@ -924,8 +907,7 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
   const int me = dc.rank;
   const int n = dc.worldSize;
   ccoProxy<> proxy{dc, u};
-  const uint64_t before =
-      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  const uint64_t before = FlushDone(proxy.flushDone);
   const size_t off = (static_cast<size_t>(me) * gridDim.x + u) * chunk;
   for (int p = 0; p < n; p++) {
     if (p != me) proxy.put(p, dstWin, off, srcWin, off, chunk, ccoGda_NoSignal{}, ccoCoopBlock{});
@@ -940,13 +922,7 @@ __global__ void ProxyTimeoutKernel(ccoDevComm dc, ccoWindow_t dstWin, ccoWindow_
     }
     atomicExch(err, 1);
   }
-  const uint64_t after =
-      __hip_atomic_load(proxy.flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  if (threadIdx.x == 0 && after != before + 3) {
-    printf("[rank %d] n3: unit %d flushDone %llu -> %llu, want +3\n", me, u,
-           (unsigned long long)before, (unsigned long long)after);
-    atomicExch(err, 1);
-  }
+  if (threadIdx.x == 0) CheckFlushDone(proxy.flushDone, before, 3, "n3: unit", u, me, err);
   for (int p = 0; p < n; p++) {
     if (p != me) proxy.signal(p, ccoGda_SignalSet{Slot(me, u), 1}, ccoCoopBlock{});
   }
@@ -983,17 +959,19 @@ static const char* const kAtomicFreeCases[] = {
     "set_window",          "mpsc_set_put",        "conn_set_put", "tm_branch",
     "tm_branch_contended", "tm_single",           "tm_agg_set",   "tm_value_set"};
 
+// Whether the comma-separated `list` names `name`.
+static bool Listed(const char* list, const char* name) {
+  const std::string padded = std::string(",") + list + ",";
+  return padded.find(std::string(",") + name + ",") != std::string::npos;
+}
+
 // MORI_CCO_PROXY_TEST_CASES: unset/"all", or a comma-separated list of names
 // and/or "atomic_free".
 static bool CaseSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_CASES");
   if (env == nullptr || env[0] == '\0' || !strcmp(env, "all")) return true;
-  const std::string list = std::string(",") + env + ",";
-  auto listed = [&](const char* n) {
-    return list.find(std::string(",") + n + ",") != std::string::npos;
-  };
-  if (listed(name)) return true;
-  if (!listed("atomic_free")) return false;
+  if (Listed(env, name)) return true;
+  if (!Listed(env, "atomic_free")) return false;
   for (const char* n : kAtomicFreeCases) {
     if (!strcmp(n, name)) return true;
   }
@@ -1100,46 +1078,62 @@ static int RunPutCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int
   return c.Verify(name, salt, chunk, nUnits);
 }
 
-template <typename Q, int Mode>
-static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
-                         uint32_t maxPutBytes = 0, bool smallRings = false) {
+// Per-lane cases: `launch(d)` on `nSlots` chunk slots per sender, then exact
+// signal counts and the lane slices.
+template <typename Launch>
+static int RunLaneCase(Ctx& c, const char* name, uint32_t salt, ccoDevComm d, uint32_t maxPutBytes,
+                       int nSlots, Launch launch) {
   if (!CaseSelected(name)) return 0;
-  ccoDevComm d = smallRings ? c.dcThread : c.dc;
   if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
-  const int rounds = smallRings ? kThreadRounds : 1;
-  c.Fresh(d, salt, kChunk, nUnits * rounds);  // a chunk slot per (unit, round)
-  ProxyThreadKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
-      d, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf),
-      static_cast<const uint32_t*>(c.recvBuf), salt, kChunk, nUnits, rounds, c.dErr);
+  c.Fresh(d, salt, kChunk, nSlots);
+  launch(d);
   c.Sync();  // every rank's kernel, and so its final flush, is done
   ProxyCheckSignalsKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots, c.dErr);
   HIP_CHECK(hipStreamSynchronize(c.stream));
-  return c.Verify(name, salt, kChunk, nUnits * rounds, /*laneSlices=*/true);
+  return c.Verify(name, salt, kChunk, nSlots, /*laneSlices=*/true);
+}
+
+template <typename Q, int Mode>
+static int RunThreadCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
+                         uint32_t maxPutBytes = 0, bool smallRings = false) {
+  const int rounds = smallRings ? kThreadRounds : 1;  // a chunk slot per (unit, round)
+  return RunLaneCase(c, name, salt, smallRings ? c.dcThread : c.dc, maxPutBytes, nUnits * rounds,
+                     [&](const ccoDevComm& d) {
+                       ProxyThreadKernel<Q, Mode><<<nUnits, 64, 0, c.stream>>>(
+                           d, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf),
+                           static_cast<const uint32_t*>(c.recvBuf), salt, kChunk, nUnits, rounds,
+                           c.dErr);
+                     });
 }
 
 template <int Mode>
 static int RunThreadModeCase(Ctx& c, const char* name, uint32_t salt, uint32_t maxPutBytes = 0) {
+  return RunLaneCase(c, name, salt, Mode == kTmBranchContended ? c.dcThread : c.dc, maxPutBytes,
+                     kMaxUnits, [&](const ccoDevComm& d) {
+                       ProxyThreadModeKernel<Mode><<<kMaxUnits, 64, 0, c.stream>>>(
+                           d, c.sendWin, c.recvWin, static_cast<const uint32_t*>(c.recvBuf), salt,
+                           kChunk, kMaxUnits, /*zero=*/0, c.dErr);
+                     });
+}
+
+// A case on dc: `launch()` on `nUnits` chunks, then Verify, or only the device
+// checks when !verify.
+template <typename Launch>
+static int RunDcCase(Ctx& c, const char* name, uint32_t salt, size_t chunk, int nUnits, bool verify,
+                     Launch launch) {
   if (!CaseSelected(name)) return 0;
-  ccoDevComm d = Mode == kTmBranchContended ? c.dcThread : c.dc;
-  if (maxPutBytes != 0) d.proxy.maxPutBytes = maxPutBytes;
-  c.Fresh(d, salt, kChunk, kMaxUnits);
-  ProxyThreadModeKernel<Mode><<<kMaxUnits, 64, 0, c.stream>>>(
-      d, c.sendWin, c.recvWin, static_cast<const uint32_t*>(c.recvBuf), salt, kChunk, kMaxUnits,
-      /*zero=*/0, c.dErr);
-  c.Sync();  // every rank's kernel, and so its final flush, is done
-  ProxyCheckSignalsKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots, c.dErr);  // exact counts
-  HIP_CHECK(hipStreamSynchronize(c.stream));
-  return c.Verify(name, salt, kChunk, kMaxUnits, /*laneSlices=*/true);
+  c.Fresh(c.dc, salt, chunk, nUnits);
+  launch();
+  c.Sync();
+  return verify ? c.Verify(name, salt, chunk, nUnits) : c.Harvest(name, 0);
 }
 
 template <typename Q, typename Coop, bool kSet>
 static int RunValueCase(Ctx& c, const char* name, uint32_t salt, int nUnits) {
-  if (!CaseSelected(name)) return 0;
-  c.Fresh(c.dc, salt, kChunk, nUnits);
-  ProxyValueKernel<Q, Coop, kSet><<<nUnits, 64, 0, c.stream>>>(
-      c.dc, c.recvWin, static_cast<const uint64_t*>(c.recvBuf), salt, nUnits, c.dErr);
-  c.Sync();
-  return c.Harvest(name, 0);
+  return RunDcCase(c, name, salt, kChunk, nUnits, /*verify=*/false, [&] {
+    ProxyValueKernel<Q, Coop, kSet><<<nUnits, 64, 0, c.stream>>>(
+        c.dc, c.recvWin, static_cast<const uint64_t*>(c.recvBuf), salt, nUnits, c.dErr);
+  });
 }
 
 template <typename Q, int Mode>
@@ -1156,32 +1150,25 @@ static int RunSetCase(Ctx& c, const char* name, uint32_t salt, int nUnits,
 }
 
 static int RunStressCase(Ctx& c) {
-  if (!CaseSelected("mpsc_stress")) return 0;
-  const int nWaves = kStressBlocks * kStressWarps;
-  const int nUnits = nWaves * kStressRounds;
-  c.Fresh(c.dc, /*salt=*/10, kStressChunk, nUnits);
-  ProxyStressKernel<<<kStressBlocks, kStressWarps * 64, 0, c.stream>>>(
-      c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf),
-      static_cast<ccoGdaSignal_t>(c.nSlots - 1), c.dErr);
-  c.Sync();
-  return c.Verify("mpsc_stress", 10, kStressChunk, nUnits);
+  const int nUnits = kStressBlocks * kStressWarps * kStressRounds;
+  return RunDcCase(c, "mpsc_stress", /*salt=*/10, kStressChunk, nUnits, /*verify=*/true, [&] {
+    ProxyStressKernel<<<kStressBlocks, kStressWarps * 64, 0, c.stream>>>(
+        c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf),
+        static_cast<ccoGdaSignal_t>(c.nSlots - 1), c.dErr);
+  });
 }
 
 static int RunBlockFlushCase(Ctx& c) {
-  if (!CaseSelected("block_flush")) return 0;
-  c.Fresh(c.dc, /*salt=*/40, kChunk, kBlockFlushWaves);
-  ProxyBlockFlushKernel<<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
-      c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
-  c.Sync();
-  return c.Verify("block_flush", 40, kChunk, kBlockFlushWaves);
+  return RunDcCase(c, "block_flush", /*salt=*/40, kChunk, kBlockFlushWaves, /*verify=*/true, [&] {
+    ProxyBlockFlushKernel<<<1, kBlockFlushWaves * 64, 0, c.stream>>>(
+        c.dc, c.sendWin, c.recvWin, static_cast<uint32_t*>(c.sendBuf), kChunk, c.dErr);
+  });
 }
 
 static int RunHandoffCase(Ctx& c) {
-  if (!CaseSelected("spsc_handoff")) return 0;
-  c.Fresh(c.dc, /*salt=*/16, kChunk, /*nUnits=*/1);
-  ProxyHandoffKernel<<<1, 128, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, c.dErr);
-  c.Sync();
-  return c.Verify("spsc_handoff", 16, kChunk, 1);
+  return RunDcCase(c, "spsc_handoff", /*salt=*/16, kChunk, /*nUnits=*/1, /*verify=*/true, [&] {
+    ProxyHandoffKernel<<<1, 128, 0, c.stream>>>(c.dc, c.sendWin, c.recvWin, kChunk, c.dErr);
+  });
 }
 
 static void PrintError(int rank, const char* name, int got, const ccoDevCommError& e) {
@@ -1192,6 +1179,20 @@ static void PrintError(int rank, const char* name, int got, const ccoDevCommErro
       (unsigned long long)e.raddr, e.len, (unsigned long long)e.suppressed, e.message);
 }
 
+// A negative case's own DevComm; reports a failed create.
+static bool CreateOwn(Ctx& c, const char* name, const ccoDevCommRequirements& reqs, ccoDevComm* d) {
+  if (ccoDevCommCreate(c.comm, &reqs, d) == 0) return true;
+  fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
+  return false;
+}
+
+// Destroys it; returns 1 (and reports) on failure.
+static int DestroyOwn(Ctx& c, const char* name, ccoDevComm* d) {
+  if (ccoDevCommDestroy(c.comm, d) == 0) return 0;
+  fprintf(stderr, "[rank %d] %s: DevCommDestroy failed\n", c.rank, name);
+  return 1;
+}
+
 // n1 (selfPut false): rank 0 puts past the end of peer 1's receive window;
 // flush(coop, timeout) returns 2 twice, failed() is true, waitSignal(...,
 // timeout) returns 2, and ccoDevCommGetError reports COMPLETION /
@@ -1200,10 +1201,7 @@ static void PrintError(int rank, const char* name, int got, const ccoDevCommErro
 // but BAD_REQUEST naming the rank itself. ccoDevCommDestroy must return 0.
 static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& reqs, bool selfPut) {
   ccoDevComm d{};
-  if (ccoDevCommCreate(c.comm, &reqs, &d) != 0) {
-    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
-    return c.Harvest(name, 1);
-  }
+  if (!CreateOwn(c, name, reqs, &d)) return c.Harvest(name, 1);
   const bool fails = selfPut || c.rank == 0;  // ranks whose DevComm must fail
   int* dRes = nullptr;
   HIP_CHECK(hipMalloc(&dRes, 4 * sizeof(int)));
@@ -1240,20 +1238,14 @@ static int RunFailCase(Ctx& c, const char* name, const ccoDevCommRequirements& r
     PrintError(c.rank, name, got, e);  // e.g. a responder-side error; not checked
   }
   ccoBarrierAll(c.comm);
-  if (ccoDevCommDestroy(c.comm, &d) != 0) {
-    fprintf(stderr, "[rank %d] %s: DevCommDestroy failed\n", c.rank, name);
-    bad = 1;
-  }
+  bad |= DestroyOwn(c, name, &d);
   return c.Harvest(name, bad);
 }
 
 static int RunTimeoutCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   const char* name = "n3_timeout";
   ccoDevComm d{};
-  if (ccoDevCommCreate(c.comm, &reqs, &d) != 0) {
-    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
-    return c.Harvest(name, 1);
-  }
+  if (!CreateOwn(c, name, reqs, &d)) return c.Harvest(name, 1);
   ProxyResetKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots);
   c.Sync();
   ProxyTimeoutKernel<<<kSpscQueues, 256, 0, c.stream>>>(d, c.recvWin, c.sendWin, kChunk, c.dErr);
@@ -1261,51 +1253,24 @@ static int RunTimeoutCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   ccoDevCommError e{};
   const int got = ccoDevCommGetError(c.comm, &d, &e);
   if (got != 0) PrintError(c.rank, name, got, e);
-  const int destroyed = ccoDevCommDestroy(c.comm, &d);
+  const int destroyed = DestroyOwn(c, name, &d);
   return c.Harvest(name, got != 0 || destroyed != 0);
 }
 
-// n4: MORI_CCO_PROXY_TEST_FAIL_CONNECT=1 (rank 1 fails to connect): creation fails
-// on every rank.
-static int RunFailConnectCase(Ctx& c, const ccoDevCommRequirements& reqs) {
-  setenv("MORI_CCO_PROXY_TEST_FAIL_CONNECT", "1", 1);
-  ccoDevComm d{};
-  const int rc = ccoDevCommCreate(c.comm, &reqs, &d);
-  unsetenv("MORI_CCO_PROXY_TEST_FAIL_CONNECT");
-  if (rc == 0) {
-    fprintf(stderr, "[rank %d] n4_fail_connect: DevCommCreate succeeded\n", c.rank);
-    ccoDevCommDestroy(c.comm, &d);
-  }
-  return c.Harvest("n4_fail_connect", rc == 0);  // its barrier checks the comm still works
-}
-
-// n5: ranks disagree on proxyQpsPerPeer (1 on rank 0, 2 elsewhere):
-// ccoDevCommCreate fails on every rank; Harvest's barrier checks the comm still
-// works.
-static int RunQpsMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
-  ccoDevCommRequirements r = reqs;
-  r.proxyQpsPerPeer = c.rank == 0 ? 1 : 2;
+// n4-n6, n8: ccoDevCommCreate(r) must fail on every rank; Harvest's barrier
+// checks the comm still works. failConnect sets the engine's hook that makes
+// rank 1 fail to connect, for the create call only.
+static int RunCreateFails(Ctx& c, const char* name, const ccoDevCommRequirements& r,
+                          bool failConnect = false) {
+  if (failConnect) setenv("MORI_CCO_PROXY_TEST_FAIL_CONNECT", "1", 1);
   ccoDevComm d{};
   const int rc = ccoDevCommCreate(c.comm, &r, &d);
+  if (failConnect) unsetenv("MORI_CCO_PROXY_TEST_FAIL_CONNECT");
   if (rc == 0) {
-    fprintf(stderr, "[rank %d] n5_qps_mismatch: DevCommCreate succeeded\n", c.rank);
+    fprintf(stderr, "[rank %d] %s: DevCommCreate succeeded\n", c.rank, name);
     ccoDevCommDestroy(c.comm, &d);
   }
-  return c.Harvest("n5_qps_mismatch", rc == 0);  // its barrier checks the comm still works
-}
-
-// n6: ranks disagree on proxyConnectionType (FULL on rank 0, CROSSNODE elsewhere):
-// ccoDevCommCreate fails on every rank.
-static int RunConnMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
-  ccoDevCommRequirements r = reqs;
-  r.proxyConnectionType = c.rank == 0 ? CCO_GDA_CONNECTION_FULL : CCO_GDA_CONNECTION_CROSSNODE;
-  ccoDevComm d{};
-  const int rc = ccoDevCommCreate(c.comm, &r, &d);
-  if (rc == 0) {
-    fprintf(stderr, "[rank %d] n6_conn_mismatch: DevCommCreate succeeded\n", c.rank);
-    ccoDevCommDestroy(c.comm, &d);
-  }
-  return c.Harvest("n6_conn_mismatch", rc == 0);
+  return c.Harvest(name, rc == 0);
 }
 
 // n7: rank 0 signals slot gdaSignalCount on peer 1, one push shape per DevComm:
@@ -1315,10 +1280,7 @@ template <int Shape>
 static int RunBadSlotShape(Ctx& c, const ccoDevCommRequirements& reqs, const char* name,
                            ccoProxyOp wantOp) {
   ccoDevComm d{};
-  if (ccoDevCommCreate(c.comm, &reqs, &d) != 0) {
-    fprintf(stderr, "[rank %d] %s: DevCommCreate failed\n", c.rank, name);
-    return c.Harvest(name, 1);
-  }
+  if (!CreateOwn(c, name, reqs, &d)) return c.Harvest(name, 1);
   ProxyResetKernel<<<1, 256, 0, c.stream>>>(d, c.nSlots);
   c.Sync();
   int* dRes = nullptr;
@@ -1352,10 +1314,7 @@ static int RunBadSlotShape(Ctx& c, const ccoDevCommRequirements& reqs, const cha
     bad = 1;
   }
   ccoBarrierAll(c.comm);
-  if (ccoDevCommDestroy(c.comm, &d) != 0) {
-    fprintf(stderr, "[rank %d] %s: DevCommDestroy failed\n", c.rank, name);
-    bad = 1;
-  }
+  bad |= DestroyOwn(c, name, &d);
   return c.Harvest(name, bad);
 }
 
@@ -1369,36 +1328,18 @@ static int RunBadSlotCase(Ctx& c, const ccoDevCommRequirements& reqs) {
   return fails;
 }
 
-// n8: ranks disagree on gdaSignalCount (one more on rank 0): ccoDevCommCreate
-// fails on every rank.
-static int RunSlotCountMismatchCase(Ctx& c, const ccoDevCommRequirements& reqs) {
-  ccoDevCommRequirements r = reqs;
-  if (c.rank == 0) r.gdaSignalCount += 1;
-  ccoDevComm d{};
-  const int rc = ccoDevCommCreate(c.comm, &r, &d);
-  if (rc == 0) {
-    fprintf(stderr, "[rank %d] n8_slot_count: DevCommCreate succeeded\n", c.rank);
-    ccoDevCommDestroy(c.comm, &d);
-  }
-  return c.Harvest("n8_slot_count", rc == 0);
-}
-
 // MORI_CCO_PROXY_TEST_NEGATIVE: "all" or a comma-separated list of ids (n1..n9).
 static bool NegativeSelected(const char* name) {
   const char* env = getenv("MORI_CCO_PROXY_TEST_NEGATIVE");
   if (env == nullptr || env[0] == '\0') return false;
-  if (!strcmp(env, "all")) return true;
-  const std::string list = std::string(",") + env + ",";
-  return list.find(std::string(",") + name + ",") != std::string::npos;
+  return !strcmp(env, "all") || Listed(env, name);
 }
 
 static int RunSignalCase(Ctx& c) {
-  if (!CaseSelected("signal_only")) return 0;
-  c.Fresh(c.dc, /*salt=*/0, kChunk, kSpscQueues);
-  const ccoGdaSignal_t slot = static_cast<ccoGdaSignal_t>(c.nSlots - 1);
-  ProxySignalKernel<<<kSpscQueues, 64, 0, c.stream>>>(c.dc, slot, c.dErr);
-  c.Sync();
-  return c.Harvest("signal_only", 0);
+  return RunDcCase(c, "signal_only", /*salt=*/0, kChunk, kSpscQueues, /*verify=*/false, [&] {
+    ProxySignalKernel<<<kSpscQueues, 64, 0, c.stream>>>(
+        c.dc, static_cast<ccoGdaSignal_t>(c.nSlots - 1), c.dErr);
+  });
 }
 
 // Proxy QPs without GDA QPs (dcNoGda) and with a different GDA peer set
@@ -1594,38 +1535,28 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunConnCases(c);
 
   // Negative cases, each on a DevComm of its own; then dc must still work.
+  // n5, n6, n8: rank 0 disagrees on QPs per peer, proxy connection type or
+  // gdaSignalCount.
+  ccoDevCommRequirements qpsMismatch = reqs, connMismatch = reqs, slotMismatch = reqs;
+  qpsMismatch.proxyQpsPerPeer = rank == 0 ? 1 : 2;
+  connMismatch.proxyConnectionType =
+      rank == 0 ? CCO_GDA_CONNECTION_FULL : CCO_GDA_CONNECTION_CROSSNODE;
+  if (rank == 0) slotMismatch.gdaSignalCount += 1;
+  const std::pair<const char*, std::function<int()>> negatives[] = {
+      {"n1", [&] { return RunFailCase(c, "n1_bad_raddr", reqs, /*selfPut=*/false); }},
+      {"n2", [&] { return RunFailCase(c, "n2_no_qp", reqs, /*selfPut=*/true); }},
+      {"n3", [&] { return RunTimeoutCase(c, reqs); }},
+      {"n4", [&] { return RunCreateFails(c, "n4_fail_connect", reqs, /*failConnect=*/true); }},
+      {"n5", [&] { return RunCreateFails(c, "n5_qps_mismatch", qpsMismatch); }},
+      {"n6", [&] { return RunCreateFails(c, "n6_conn_mismatch", connMismatch); }},
+      {"n7", [&] { return RunBadSlotCase(c, reqs); }},
+      {"n8", [&] { return RunCreateFails(c, "n8_slot_count", slotMismatch); }},
+  };
   bool anyNegative = false;
-  if (NegativeSelected("n1")) {
+  for (const auto& [id, run] : negatives) {
+    if (!NegativeSelected(id)) continue;
     anyNegative = true;
-    fails += RunFailCase(c, "n1_bad_raddr", reqs, /*selfPut=*/false);
-  }
-  if (NegativeSelected("n2")) {
-    anyNegative = true;
-    fails += RunFailCase(c, "n2_no_qp", reqs, /*selfPut=*/true);
-  }
-  if (NegativeSelected("n3")) {
-    anyNegative = true;
-    fails += RunTimeoutCase(c, reqs);
-  }
-  if (NegativeSelected("n4")) {
-    anyNegative = true;
-    fails += RunFailConnectCase(c, reqs);
-  }
-  if (NegativeSelected("n5")) {
-    anyNegative = true;
-    fails += RunQpsMismatchCase(c, reqs);
-  }
-  if (NegativeSelected("n6")) {
-    anyNegative = true;
-    fails += RunConnMismatchCase(c, reqs);
-  }
-  if (NegativeSelected("n7")) {
-    anyNegative = true;
-    fails += RunBadSlotCase(c, reqs);
-  }
-  if (NegativeSelected("n8")) {
-    anyNegative = true;
-    fails += RunSlotCountMismatchCase(c, reqs);
+    fails += run();
   }
   if (anyNegative) {
     fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_after", 26, kChunk,

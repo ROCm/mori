@@ -579,6 +579,12 @@ void PerfFinalize(PerfContext* ctx) {
   if (!finalized) MPI_Finalize();
 }
 
+int PerfReject(PerfContext* ctx, const char* msg) {
+  if (ctx->my_pe == 0) std::fprintf(stderr, "%s\n", msg);
+  PerfFinalize(ctx);
+  return 1;
+}
+
 void PerfResAlloc(PerfRes* res) {
   HIP_RUNTIME_CHECK(hipEventCreate(&res->start));
   HIP_RUNTIME_CHECK(hipEventCreate(&res->stop));

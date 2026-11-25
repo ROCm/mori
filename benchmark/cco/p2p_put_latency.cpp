@@ -236,35 +236,20 @@ int main(int argc, char** argv) {
 
   PerfArgs& args = ctx.args;
   if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
-    if (ctx.my_pe == 0) std::fprintf(stderr, "-s lane is for cco_p2p_put_bw -t proxy\n");
-    PerfFinalize(&ctx);
-    return 1;
+    return PerfReject(&ctx, "-s lane is for cco_p2p_put_bw -t proxy");
   }
   const int my_pe = ctx.my_pe;
 
-  if (args.transport == Transport::kProxy && args.put_scope != PutScope::kWarp &&
-      args.put_scope != PutScope::kBlock) {
-    if (my_pe == 0) std::fprintf(stderr, "-t proxy needs -s warp|block\n");
-    PerfFinalize(&ctx);
-    return 1;
+  const bool proxy = args.transport == Transport::kProxy;
+  const bool rdma = proxy || args.transport == Transport::kIbgda;
+  const bool warp_or_block =
+      args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
+  if (proxy && !warp_or_block) return PerfReject(&ctx, "-t proxy needs -s warp|block");
+  if (args.proxy_mpsc) return PerfReject(&ctx, "-q mpsc is cco_p2p_put_bw only");
+  if (args.pingpong && (!rdma || !warp_or_block)) {
+    return PerfReject(&ctx, "ping-pong (-P / -S) needs -t ibgda|proxy and -s warp|block");
   }
-  if (args.proxy_mpsc) {
-    if (my_pe == 0) std::fprintf(stderr, "-q mpsc is cco_p2p_put_bw only\n");
-    PerfFinalize(&ctx);
-    return 1;
-  }
-  if (args.pingpong) {
-    const bool rdma = args.transport == Transport::kIbgda || args.transport == Transport::kProxy;
-    const bool scope_ok = args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
-    if (!rdma || !scope_ok) {
-      if (my_pe == 0) {
-        std::fprintf(stderr, "ping-pong (-P / -S) needs -t ibgda|proxy and -s warp|block\n");
-      }
-      PerfFinalize(&ctx);
-      return 1;
-    }
-    if (args.signal_only) args.max_size = args.min_size;  // no payload: one row
-  }
+  if (args.pingpong && args.signal_only) args.max_size = args.min_size;  // no payload: one row
   // Ping-pong needs both PEs in the kernel; otherwise PE 0 issues alone.
   const bool run_kernels = (my_pe == 0) || args.pingpong;
 

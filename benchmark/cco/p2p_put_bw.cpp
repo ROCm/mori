@@ -315,11 +315,7 @@ int main(int argc, char** argv) {
   } else if (proxy && threadScope && !args.proxy_mpsc) {
     scopeError = "-t proxy -s thread|thread_agg needs -q mpsc (or -s lane for SPSC queues)";
   }
-  if (scopeError != nullptr) {
-    if (my_pe == 0) std::fprintf(stderr, "%s\n", scopeError);
-    PerfFinalize(&ctx);
-    return 1;
-  }
+  if (scopeError != nullptr) return PerfReject(&ctx, scopeError);
   const bool run_kernels = (my_pe == 0);  // unidirectional: PE 0 issues
 
   const dim3 grid(args.nblocks, 1, 1);

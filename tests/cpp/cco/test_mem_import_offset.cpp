@@ -219,6 +219,11 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     ok = CheckFloats("LSA peer read", got, want) && ok;
   }
 
+  // What an all-to-all (steps 3 and 4) leaves in this rank's recv window.
+  std::vector<float> recvWant(COUNT * nranks);
+  for (int src = 0; src < nranks; src++)
+    for (size_t i = 0; i < COUNT; i++) recvWant[src * COUNT + i] = SendVal(src, rank, i);
+
   // 3. GDA all-to-all between imported windows (FULL needs intranode cross-rail RDMA)
   const bool skipGda = getenv("MORI_CCO_SKIP_GDA_FULL") != nullptr;
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -253,10 +258,7 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     ccoBarrierAll(comm);
 
     HIP_CHECK(hipMemcpy(got.data(), recvData, bufBytes, hipMemcpyDeviceToHost));
-    std::vector<float> want(COUNT * nranks);
-    for (int src = 0; src < nranks; src++)
-      for (size_t i = 0; i < COUNT; i++) want[src * COUNT + i] = SendVal(src, rank, i);
-    ok = CheckFloats("GDA recv", got, want, /*skipSlot=*/rank) && ok;
+    ok = CheckFloats("GDA recv", got, recvWant, /*skipSlot=*/rank) && ok;
     ok = CheckCanary("GDA recv", recvExt, offset) && ok;
   }
   ok = CheckCanary("send", sendExt, offset) && ok;
@@ -273,11 +275,7 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     HIP_CHECK(hipMemset(recvData, 0xff, bufBytes));
     ccoWindow_t sigWin = nullptr;
     void* sigAlias = nullptr;
-    ccoDevCommRequirements preqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    preqs.gdaConnectionType = CCO_GDA_CONNECTION_FULL;
-    preqs.gdaContextCount = 1;
-    preqs.gdaSignalCount = nranks;
-    preqs.gdaCounterCount = 0;
+    ccoDevCommRequirements preqs = reqs;
     preqs.proxySpscQueueCount = 1;
     ccoDevComm pdc{};
     if (ccoWindowRegister(comm, sigData, sigBytes, &sigWin, &sigAlias) != 0 ||
@@ -294,10 +292,7 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
       HIP_CHECK(hipStreamDestroy(stream));
       ccoBarrierAll(comm);
       HIP_CHECK(hipMemcpy(got.data(), recvData, bufBytes, hipMemcpyDeviceToHost));
-      std::vector<float> want(COUNT * nranks);
-      for (int src = 0; src < nranks; src++)
-        for (size_t i = 0; i < COUNT; i++) want[src * COUNT + i] = SendVal(src, rank, i);
-      ok = CheckFloats("proxy recv", got, want, /*skipSlot=*/rank) && ok;
+      ok = CheckFloats("proxy recv", got, recvWant, /*skipSlot=*/rank) && ok;
       ok = CheckCanary("proxy recv", recvExt, offset) && ok;
       std::vector<uint64_t> slots(2 * nranks);
       HIP_CHECK(hipMemcpy(slots.data(), sigData, sigBytes, hipMemcpyDeviceToHost));

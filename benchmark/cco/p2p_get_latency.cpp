@@ -117,16 +117,10 @@ int main(int argc, char** argv) {
 
   PerfArgs& args = ctx.args;
   if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
-    if (ctx.my_pe == 0) std::fprintf(stderr, "-s lane is for cco_p2p_put_bw -t proxy\n");
-    PerfFinalize(&ctx);
-    return 1;
+    return PerfReject(&ctx, "-s lane is for cco_p2p_put_bw -t proxy");
   }
+  if (args.transport == Transport::kProxy) return PerfReject(&ctx, "-t proxy: ccoProxy has no get");
   const int my_pe = ctx.my_pe;
-  if (args.transport == Transport::kProxy) {
-    if (my_pe == 0) std::fprintf(stderr, "-t proxy: ccoProxy has no get\n");
-    PerfFinalize(&ctx);
-    return 1;
-  }
 
   // SDMA keeps its historical thread-scope default; -s selects warp/block.
   if (args.transport == Transport::kSdma && !args.put_scope_explicit) {

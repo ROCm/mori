@@ -163,6 +163,9 @@ struct PerfContext {
 // (caller should exit 0 without calling PerfFinalize).
 int PerfInit(int argc, char** argv, PerfContext* ctx);
 void PerfFinalize(PerfContext* ctx);
+// Rejects the options after PerfInit: PE 0 prints `msg`, then PerfFinalize.
+// Returns 1, main's exit code.
+int PerfReject(PerfContext* ctx, const char* msg);
 
 using LaunchFn = std::function<void(int /*count*/)>;
 
