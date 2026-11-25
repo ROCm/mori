@@ -22,11 +22,15 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,11 +48,22 @@ class RecordingApi final : public MemoryApi {
   bool Allocate(int device, uint64_t bytes, void** base, ExportedMemory* exported,
                 std::string* error) override {
     if (!host_->Allocate(device, bytes, base, exported, error)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++allocations;
+    allocated_.insert(*base);
     bases[device] = static_cast<uint8_t*>(*base);
     return true;
   }
   void Free(int device, void* base, uint64_t bytes) override {
-    ++frees;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++frees;
+      // Memory this api did not allocate is its owner's to free, not ours.
+      if (allocated_.erase(base) == 0) {
+        ++foreign_frees;
+        return;
+      }
+    }
     host_->Free(device, base, bytes);
   }
   bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
@@ -82,10 +97,14 @@ class RecordingApi final : public MemoryApi {
   int synchronizes = 0;
   int frees = 0;
   int unimports = 0;
+  int allocations = 0;
+  int foreign_frees = 0;  // Free of memory Allocate never returned
   bool fail_copies = false;
   std::function<void(int)> on_synchronize;
 
  private:
+  std::mutex mutex_;
+  std::set<void*> allocated_;
   std::shared_ptr<MemoryApi> host_ = MakeHostMemoryApi();
 };
 
@@ -597,6 +616,137 @@ TEST_F(L1PoolTest, AdoptedMemoryIsSharedButNeverZeroedOrFreed) {
   ASSERT_TRUE(manager->Detach("adopted").ok);
   EXPECT_EQ(api->frees, frees);  // the owner frees it
   EXPECT_EQ(api->unimports, 1);
+}
+
+TEST_F(L1PoolTest, DestroyingTheManagerUnmapsAdoptedMemoryAndNeverFreesIt) {
+  std::vector<uint8_t> owned(64 + kBytes, 0xEE);
+  const uint64_t address = reinterpret_cast<uint64_t>(owned.data());
+  ExternalMemory external{std::string(reinterpret_cast<const char*>(&address), sizeof(address)),
+                          64};
+  ASSERT_TRUE(manager->Attach("adopted", "g", 2, kBytes, external).status.ok);
+  // The server goes away while the engine is still attached.
+  manager.reset();
+  EXPECT_EQ(api->foreign_frees, 0);
+  EXPECT_EQ(api->unimports, 1);
+  EXPECT_EQ(api->frees, 2);  // p0 and p1, which the manager allocated
+}
+
+TEST_F(L1PoolTest, ReattachingAdoptedMemoryAtAnotherOffsetMovesThePool) {
+  std::vector<uint8_t> owned(128 + kBytes, 0xEE);
+  const uint64_t address = reinterpret_cast<uint64_t>(owned.data());
+  const std::string handle(reinterpret_cast<const char*>(&address), sizeof(address));
+  ASSERT_TRUE(manager->Attach("adopted", "g", 2, kBytes, ExternalMemory{handle, 0}).created);
+  EXPECT_EQ(api->bases[2], owned.data());
+  // The engine re-created its KV tensor elsewhere in the same allocation.
+  AttachResult moved = manager->Attach("adopted", "g", 2, kBytes, ExternalMemory{handle, 128});
+  ASSERT_TRUE(moved.status.ok);
+  EXPECT_TRUE(moved.created);
+  EXPECT_EQ(api->bases[2], owned.data() + 128);
+  // The same handle and offset again is the same pool.
+  EXPECT_FALSE(manager->Attach("adopted", "g", 2, kBytes, ExternalMemory{handle, 128}).created);
+  ASSERT_TRUE(manager->Detach("adopted").ok);
+}
+
+TEST_F(L1PoolTest, BindLayoutRejectsARegionWhoseExtentOverflows) {
+  ASSERT_TRUE(manager->Attach("odd", "g2", 2, kBytes).status.ok);
+  Layout wraps;
+  wraps.num_slots = 2;
+  wraps.regions = {Region{0, uint64_t{1} << 63}};  // 2 * 2^63 wraps to 0
+  EXPECT_FALSE(manager->BindLayout("odd", wraps).ok);
+  Layout far;
+  far.num_slots = kSlots;
+  far.regions = {Region{UINT64_MAX - 7, kUnitA}};  // offset + extent wraps past zero
+  EXPECT_FALSE(manager->BindLayout("odd", far).ok);
+  Layout past;
+  past.num_slots = kSlots;
+  past.regions = {Region{kBytes + 1, kUnitA}};
+  EXPECT_FALSE(manager->BindLayout("odd", past).ok);
+}
+
+TEST_F(L1PoolTest, FetchDoesNotEvictAKeyTheSameCallAsksForLater) {
+  Cache(1, {"k2"}, 20);  // the coldest slot of p1
+  Cache(1, {"x1", "x2", "x3", "x4", "x5", "x6", "x7"}, 30);
+  ASSERT_EQ(StatsOf("p1").vacant, 0u);
+  Cache(0, {"k1"}, 10);
+  FetchResult got = manager->Fetch("p1", {"k1", "k2"});
+  // Room for "k1" comes from content this call does not ask for.
+  EXPECT_EQ(got.slots.size(), 2u);
+  EXPECT_EQ(got.evicted_keys, (std::vector<std::string>{"x1"}));
+  ASSERT_FALSE(got.slots.empty());
+  EXPECT_TRUE(Holds(1, got.slots[0], 10));
+  if (got.slots.size() == 2) EXPECT_TRUE(Holds(1, got.slots[1], 20));
+}
+
+TEST_F(L1PoolTest, FetchThatCopiesNothingLeavesNoPinBehindWhenThePoolIsReopened) {
+  // Engines read their own copy of "k" while the pool is re-opened. A fetch
+  // that copies nothing used to leave the lock with a pin taken and nothing
+  // marking the pool busy: Open reset the pin under it, the fetch released it
+  // once more, and the slot stayed pinned -- never to be allocated again.
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back([&] {
+      while (!stop.load()) (void)manager->Fetch("p0", {"k"});
+    });
+  }
+  bool stuck = false;
+  const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+  while (std::chrono::steady_clock::now() < until && !stuck) {
+    if (!manager->Open("p0").status.ok) break;
+    // Looked at before the next Open, which would reset a stuck pin again. The
+    // second pass catches a pin released after the first one took its slots.
+    for (int pass = 0; pass < 2 && !stuck; ++pass) {
+      AllocateResult all = manager->Allocate("p0", kSlots);
+      stuck = all.slots.size() != kSlots;
+      std::vector<Op> ops;
+      if (pass == 1 && !stuck) ops.push_back(Op{OpKind::kPublish, all.slots[0], "k"});
+      for (uint32_t slot : all.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+      (void)manager->Apply("p0", ops);
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  }
+  stop.store(true);
+  for (std::thread& reader : readers) reader.join();
+  EXPECT_FALSE(stuck) << "a slot of p0 stayed pinned after Open";
+}
+
+TEST_F(L1PoolTest, TwoAttachesReplacingABusyPoolAllocateItOnce) {
+  Cache(0, {"a"}, 10);
+  std::mutex gate;
+  std::condition_variable gate_cv;
+  bool copying = false;
+  bool release = false;
+  api->on_synchronize = [&](int device) {
+    if (device != 1) return;
+    std::unique_lock<std::mutex> lock(gate);
+    copying = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release; });
+  };
+  std::thread fetch([&] { (void)manager->Fetch("p1", {"a"}); });
+  {
+    std::unique_lock<std::mutex> lock(gate);
+    gate_cv.wait(lock, [&] { return copying; });
+  }
+  // p1 is busy: both attaches wait for the copy before they replace it.
+  const int allocations = api->allocations;
+  AttachResult first, second;
+  std::thread a([&] { first = manager->Attach("p1", "g", 1, 2 * kBytes); });
+  std::thread b([&] { second = manager->Attach("p1", "g", 1, 2 * kBytes); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  {
+    std::lock_guard<std::mutex> lock(gate);
+    release = true;
+  }
+  gate_cv.notify_all();
+  fetch.join();
+  a.join();
+  b.join();
+  api->on_synchronize = nullptr;
+  // One of them replaced the pool; the other found that done or under way.
+  EXPECT_EQ(api->allocations, allocations + 1);
+  EXPECT_EQ(int{first.created} + int{second.created}, 1);
+  EXPECT_EQ(StatsOf("p1").bytes, 2 * kBytes);
 }
 
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {

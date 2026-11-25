@@ -265,6 +265,8 @@ class PoolManager {
 
   struct Pool {
     std::string id;
+    // Tells this pool from a later one attached under the same id.
+    uint64_t serial = 0;
     std::string group;
     int device = -1;
     void* base = nullptr;
@@ -273,6 +275,7 @@ class PoolManager {
     bool external = false;   // adopted, not allocated: unmap, never free
     void* mapped = nullptr;  // what Import returned, for Unimport
     std::string external_handle;
+    uint64_t external_offset = 0;
     Layout layout;
     bool bound = false;
     std::vector<Slot> slots;
@@ -337,7 +340,11 @@ class PoolManager {
     return slot.released <= pool.committed && slot.written <= pool.committed;
   }
   bool HasPinnedFreeLocked(const Pool* pool) const;
+  // Waits, without the lock, for the pool's copies to finish. Destroys nothing
+  // if the pool was detached or replaced under its id in the meantime.
   void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
+  // Unmap an adopted pool's memory, free an allocated one's.
+  void ReleaseMemoryLocked(Pool* pool);
 
   std::shared_ptr<MemoryApi> api_;
   uint32_t keep_copies_ = 0;
@@ -346,6 +353,7 @@ class PoolManager {
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;
   std::unordered_map<std::string, Group> groups_;
   std::unordered_set<std::string> attaching_;  // pool ids being allocated outside the lock
+  uint64_t next_serial_ = 1;
 };
 
 }  // namespace mori::umbp::l1

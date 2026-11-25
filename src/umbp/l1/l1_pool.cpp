@@ -192,6 +192,9 @@ class HipMemoryApi final : public MemoryApi {
                                             hipMemcpyDeviceToDevice, stream);
       if (err != hipSuccess) {
         *error = HipError("hipMemcpyAsync", err);
+        // The fragments already queued are still copying. The caller gives up
+        // their sources and destinations as soon as this returns.
+        (void)hipStreamSynchronize(stream);
         return false;
       }
     }
@@ -223,12 +226,13 @@ class HipMemoryApi final : public MemoryApi {
   }
 
   // The device is current. Created once and kept: a pool's copies all go here.
+  // A failed creation is not remembered, so the next copy tries again.
   hipStream_t StreamFor(int device) {
     std::lock_guard<std::mutex> lock(table_mutex_);
     auto found = streams_.find(device);
     if (found != streams_.end()) return found->second;
     hipStream_t stream = nullptr;
-    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) return nullptr;
     streams_[device] = stream;
     return stream;
   }
@@ -386,10 +390,16 @@ void PoolManager::HolderUsedLocked(Pool* pool, uint32_t slot) {
 
 PoolManager::~PoolManager() {
   std::lock_guard<std::mutex> lock(mutex_);
-  for (auto& entry : pools_) {
-    api_->Free(entry.second->device, entry.second->base, entry.second->bytes);
-  }
+  for (auto& entry : pools_) ReleaseMemoryLocked(entry.second.get());
   pools_.clear();
+}
+
+void PoolManager::ReleaseMemoryLocked(Pool* pool) {
+  if (pool->external) {
+    api_->Unimport(pool->device, pool->mapped);
+  } else {
+    api_->Free(pool->device, pool->base, pool->bytes);
+  }
 }
 
 PoolManager::Pool* PoolManager::FindLocked(const std::string& pool_id) {
@@ -518,18 +528,17 @@ bool PoolManager::HasPinnedFreeLocked(const Pool* pool) const {
 
 void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) {
   const std::string pool_id = pool->id;
+  const uint64_t serial = pool->serial;
   idle_.wait(lock, [&] {
     Pool* p = FindLocked(pool_id);
-    return p == nullptr || p->busy == 0;
+    return p == nullptr || p->serial != serial || p->busy == 0;
   });
   pool = FindLocked(pool_id);
-  if (pool == nullptr) return;
+  // Someone else destroyed it during the wait, and may have attached a new
+  // pool under the id: that one is not this caller's to destroy.
+  if (pool == nullptr || pool->serial != serial) return;
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
-  if (pool->external) {
-    api_->Unimport(pool->device, pool->mapped);
-  } else {
-    api_->Free(pool->device, pool->base, pool->bytes);
-  }
+  ReleaseMemoryLocked(pool);
   MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}{} evicted={} spare_copy={}",
                  pool_id, pool->device, pool->bytes, pool->external ? " (adopted, unmapped)" : "",
                  pool->evicted, pool->evicted_spare);
@@ -544,14 +553,21 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
     result.status = Status::Error("attach needs a pool id, a device and a non-zero size");
     return result;
   }
+  const uint64_t offset = adopt ? external.offset : 0;
   std::unique_lock<std::mutex> lock(mutex_);
-  if (attaching_.count(pool_id) != 0) {
-    result.status = Status::Error("pool " + pool_id + " is already being attached");
-    return result;
-  }
-  if (Pool* existing = FindLocked(pool_id)) {
+  // DestroyLocked gives up the lock while the pool's copies finish, so another
+  // Attach of this id may have replaced the pool, or be allocating it, by the
+  // time it returns: look again each time round.
+  for (;;) {
+    if (attaching_.count(pool_id) != 0) {
+      result.status = Status::Error("pool " + pool_id + " is already being attached");
+      return result;
+    }
+    Pool* existing = FindLocked(pool_id);
+    if (existing == nullptr) break;
     if (existing->group == group && existing->device == device && existing->bytes == bytes &&
-        existing->external == adopt && existing->external_handle == external.handle) {
+        existing->external == adopt && existing->external_handle == external.handle &&
+        existing->external_offset == offset) {
       result.memory = existing->exported;
       result.bytes = existing->bytes;
       result.created = false;
@@ -580,6 +596,7 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   }
   auto pool = std::make_unique<Pool>();
   pool->id = pool_id;
+  pool->serial = next_serial_++;
   pool->group = group;
   pool->device = device;
   pool->base = base;
@@ -588,6 +605,7 @@ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& 
   pool->external = adopt;
   pool->mapped = mapped;
   pool->external_handle = external.handle;
+  pool->external_offset = offset;
   pools_[pool_id] = std::move(pool);
   MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}{}", pool_id, group, device,
                  bytes, adopt ? " (adopted from its owner)" : "");
@@ -606,8 +624,9 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
   std::vector<uint64_t> units;
   for (const Region& region : layout.regions) {
-    if (region.unit_bytes == 0 ||
-        region.offset + static_cast<uint64_t>(layout.num_slots) * region.unit_bytes > pool->bytes) {
+    // Divided rather than multiplied out: offset + slots * unit can wrap.
+    if (region.unit_bytes == 0 || region.offset > pool->bytes ||
+        region.unit_bytes > (pool->bytes - region.offset) / layout.num_slots) {
       return Status::Error("a region does not fit in pool " + pool_id);
     }
     units.push_back(region.unit_bytes);
@@ -838,6 +857,17 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   // into the caller's slots, check that it holds them.
   std::vector<CopyStep> steps;
   std::vector<uint32_t> local_pins;
+  if (!into) {
+    // Every key of the call this pool already holds is pinned before any
+    // destination is taken: room for an earlier key is never made by evicting
+    // a later one.
+    for (const std::string& key : keys) {
+      auto local = pool->index.find(key);
+      if (local == pool->index.end()) continue;
+      ++pool->slots[local->second].pins;
+      local_pins.push_back(local->second);
+    }
+  }
   for (size_t i = 0; i < keys.size(); ++i) {
     const std::string& key = keys[i];
     if (into) {
@@ -864,9 +894,6 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     }
     auto local = pool->index.find(key);
     if (local != pool->index.end()) {
-      // Pinned so a later destination in this same call cannot evict it.
-      ++pool->slots[local->second].pins;
-      local_pins.push_back(local->second);
       result.slots.push_back(local->second);
       continue;
     }
@@ -892,9 +919,12 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     result.slots.push_back(dst);
   }
 
-  // Copy without the lock. Pool pointers stay valid: Detach, Open and a
-  // re-bind all wait for `busy` to reach zero.
-  lock.unlock();
+  // Copy without the lock. Pool pointers stay valid: each step holds `busy`
+  // on both of its pools, which Detach, Open and a re-bind wait to reach zero.
+  // A call with nothing to copy holds no `busy`, so it keeps the lock: without
+  // it this pool could be detached, or re-opened with this call's pins out.
+  const bool copying = !steps.empty();
+  if (copying) lock.unlock();
   const auto started = std::chrono::steady_clock::now();
   std::vector<bool> copied(steps.size(), false);
   std::string copy_error;
@@ -933,7 +963,7 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   result.copy_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                  std::chrono::steady_clock::now() - started)
                                                  .count());
-  lock.lock();
+  if (copying) lock.lock();
 
   // Commit: a copied slot becomes cached content of this pool.
   size_t valid_keys = result.slots.size();
