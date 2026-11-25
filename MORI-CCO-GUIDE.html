@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI CCO Guide &mdash; MORI development (798ba4a0) documentation</title>
+  <title>MORI CCO Guide &mdash; MORI development (8f048d42) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=c6888252"></script>
+      <script src="_static/documentation_options.js?v=75e2c7e1"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -328,7 +328,7 @@ with the same size.</p></li>
 <td><p># of intra-node (LSA) barriers</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sdma_queue_count</span></code></p></td>
-<td><p># of SDMA queues (0 = default)</p></td>
+<td><p># of SDMA queues per peer. 0 (the default) creates none; SDMA also needs <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code>. The first device communicator on a communicator that asks for queues fixes the count</p></td>
 </tr>
 </tbody>
 </table>
@@ -460,6 +460,7 @@ Immediate <code class="docutils literal notranslate"><span class="pre">ccoGda&lt
     <span class="n">win</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">register_window</span><span class="p">(</span><span class="n">mem</span><span class="o">.</span><span class="n">ptr</span><span class="p">,</span> <span class="n">mem</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
     <span class="n">reqs</span> <span class="o">=</span> <span class="n">CCODevCommRequirements</span><span class="p">()</span>
     <span class="n">reqs</span><span class="o">.</span><span class="n">gda_connection_type</span> <span class="o">=</span> <span class="n">GDA_CONNECTION_NONE</span>   <span class="c1"># LSA / SDMA only</span>
+    <span class="n">reqs</span><span class="o">.</span><span class="n">sdma_queue_count</span> <span class="o">=</span> <span class="mi">2</span>                        <span class="c1"># only for SDMA; 0 = no queues</span>
     <span class="n">dc</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">create_dev_comm</span><span class="p">(</span><span class="n">reqs</span><span class="p">)</span>
     <span class="c1"># kernel(dc.ptr, win.handle, ...)</span>
 </pre></div>
@@ -508,7 +509,7 @@ Immediate <code class="docutils literal notranslate"><span class="pre">ccoGda&lt
 <section id="requirements">
 <h4>Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h4>
 <ul class="simple">
-<li><p><strong>SDMA</strong>: build with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> (the default) and run with <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code>.</p></li>
+<li><p><strong>SDMA</strong>: build with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code> (the default), run with <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code>, and set <code class="docutils literal notranslate"><span class="pre">sdma_queue_count</span> <span class="pre">&gt;</span> <span class="pre">0</span></code> on the <code class="docutils literal notranslate"><span class="pre">CCODevCommRequirements</span></code>. The environment variable only permits SDMA: with a count of 0 the communicator has no queues and every SDMA put moves nothing.</p></li>
 <li><p><strong>GDA on one node</strong>: set <code class="docutils literal notranslate"><span class="pre">gda_connection_type</span> <span class="pre">=</span> <span class="pre">GDA_CONNECTION_FULL</span></code> on the <code class="docutils literal notranslate"><span class="pre">CCODevCommRequirements</span></code> (<a class="reference internal" href="#device-communicator">4. Device Communicator</a>). Example 03 exposes this as <code class="docutils literal notranslate"><span class="pre">MORI_CCO_GDA_CONN=full</span></code>; the library does not read that variable.</p></li>
 <li><p><strong>GDA provider</strong>: fixed at build time, one per NIC, as for the C++ kernels.</p></li>
 <li><p><strong>FlyDSL</strong>: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">flydsl</span></code>. Triton needs a Triton install.</p></li>

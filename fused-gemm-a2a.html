@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GEMM + all-to-all &mdash; MORI development (798ba4a0) documentation</title>
+  <title>GEMM + all-to-all &mdash; MORI development (8f048d42) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=c6888252"></script>
+      <script src="_static/documentation_options.js?v=75e2c7e1"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -370,7 +370,7 @@ can share one instance.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
-<td><p>SDMA queues per peer, at least 1. The communicator’s first dev-comm fixes the count, and the constructor raises if it has fewer. Leave it at 1 (section 8).</p></td>
+<td><p>SDMA queues per peer, at least 1. The first dev-comm on the communicator that asks for SDMA queues fixes the count, and the constructor raises if it has fewer. Leave it at 1 (section 8).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_shapes</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
@@ -930,7 +930,7 @@ on a pure GEMM and changed which chunk count won.</p>
 <td><p>FlyDSL is not installed: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">GemmA2AOp</span> <span class="pre">needs</span> <span class="pre">1</span> <span class="pre">SDMA</span> <span class="pre">queue(s)</span> <span class="pre">per</span> <span class="pre">peer</span> <span class="pre">but</span> <span class="pre">the</span> <span class="pre">communicator</span> <span class="pre">has</span> <span class="pre">0</span></code></p></td>
-<td><p>MORI built without <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>; or <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> not set before the communicator was created; or the communicator’s first dev-comm asked for fewer queues than <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>.</p></td>
+<td><p>MORI built without <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>; or <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> not set before the communicator was created; or the first dev-comm on the communicator that asked for SDMA queues asked for fewer than <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">gemm_a2a</span> <span class="pre">self-test</span> <span class="pre">failed:</span> <span class="pre">recv</span> <span class="pre">block</span> <span class="pre">from</span> <span class="pre">rank</span> <span class="pre">...</span> <span class="pre">holds</span> <span class="pre">...,</span> <span class="pre">expected</span> <span class="pre">...</span></code></p></td>
 <td><p>The puts move nothing; same causes. Without this check the operator would return this rank’s block plus stale data.</p></td>

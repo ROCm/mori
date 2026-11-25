@@ -144,7 +144,7 @@ win = comm.register_window(mem.ptr, mem.size)   # RegisteredWindow: .handle, .lo
 | `gda_signal_count` | # of GDA signal slots (completion signalling) |
 | `gda_counter_count` | # of GDA counter slots |
 | `lsa_barrier_count` | # of intra-node (LSA) barriers |
-| `sdma_queue_count` | # of SDMA queues (0 = default) |
+| `sdma_queue_count` | # of SDMA queues per peer. 0 (the default) creates none; SDMA also needs `MORI_ENABLE_SDMA=1`. The first device communicator on a communicator that asks for queues fixes the count |
 
 ```python
 reqs = CCODevCommRequirements()          # safe defaults
@@ -253,6 +253,7 @@ with Communicator.init(nranks, rank, uid, per_rank_vmm=256 * 1024 * 1024) as com
     win = comm.register_window(mem.ptr, mem.size)
     reqs = CCODevCommRequirements()
     reqs.gda_connection_type = GDA_CONNECTION_NONE   # LSA / SDMA only
+    reqs.sdma_queue_count = 2                        # only for SDMA; 0 = no queues
     dc = comm.create_dev_comm(reqs)
     # kernel(dc.ptr, win.handle, ...)
 ```
@@ -301,7 +302,7 @@ def put_kernel(dev_comm: fx.Int64, send_win: fx.Int64, recv_win: fx.Int64, nbyte
 
 #### Requirements
 
-- **SDMA**: build with `BUILD_CCO_SDMA=ON` (the default) and run with `MORI_ENABLE_SDMA=1`.
+- **SDMA**: build with `BUILD_CCO_SDMA=ON` (the default), run with `MORI_ENABLE_SDMA=1`, and set `sdma_queue_count > 0` on the `CCODevCommRequirements`. The environment variable only permits SDMA: with a count of 0 the communicator has no queues and every SDMA put moves nothing.
 - **GDA on one node**: set `gda_connection_type = GDA_CONNECTION_FULL` on the `CCODevCommRequirements` ([4. Device Communicator](#4-device-communicator)). Example 03 exposes this as `MORI_CCO_GDA_CONN=full`; the library does not read that variable.
 - **GDA provider**: fixed at build time, one per NIC, as for the C++ kernels.
 - **FlyDSL**: `pip install flydsl`. Triton needs a Triton install.

@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>All-gather + GEMM &mdash; MORI development (798ba4a0) documentation</title>
+  <title>All-gather + GEMM &mdash; MORI development (8f048d42) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=c6888252"></script>
+      <script src="_static/documentation_options.js?v=75e2c7e1"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -348,7 +348,7 @@ contract, cleanup, fp8 operands). For this operator:</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code>, set before <code class="docutils literal notranslate"><span class="pre">Communicator.init</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p>SDMA queues</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code> per peer (default 1). The first device communicator created on a communicator fixes its queue count; there are at most 8 per GPU pair.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code> per peer (default 1). The first device communicator on a communicator that asks for SDMA queues fixes its queue count; there are at most 8 per GPU pair.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Ranks</p></td>
 <td><p>P from 2 to 8, every rank in one node (one LSA domain).</p></td>
@@ -1021,7 +1021,7 @@ fails. Before trusting a number of your own, read
 <td><p>Install the extra: <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'amd_mori[flydsl]'</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">AgGemmOp</span> <span class="pre">needs</span> <span class="pre">1</span> <span class="pre">SDMA</span> <span class="pre">queue(s)</span> <span class="pre">per</span> <span class="pre">peer</span> <span class="pre">but</span> <span class="pre">the</span> <span class="pre">communicator</span> <span class="pre">has</span> <span class="pre">0</span></code></p></td>
-<td><p>MORI was built without <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>, <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> was not set before <code class="docutils literal notranslate"><span class="pre">Communicator.init</span></code>, or the first device communicator on this communicator asked for fewer queues than <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>.</p></td>
+<td><p>MORI was built without <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>, <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA=1</span></code> was not set before <code class="docutils literal notranslate"><span class="pre">Communicator.init</span></code>, or the first device communicator on this communicator that asked for SDMA queues asked for fewer than <code class="docutils literal notranslate"><span class="pre">sdma_queues</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RuntimeError:</span> <span class="pre">ag_gemm</span> <span class="pre">self-test</span> <span class="pre">failed:</span> <span class="pre">the</span> <span class="pre">slot</span> <span class="pre">from</span> <span class="pre">rank</span> <span class="pre">S</span> <span class="pre">holds</span> <span class="pre">X,</span> <span class="pre">expected</span> <span class="pre">S+1</span></code></p></td>
 <td><p>The puts move nothing; check the same two settings. Without the test, calls would return wrong rows without an error.</p></td>

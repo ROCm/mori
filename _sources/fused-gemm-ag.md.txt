@@ -130,7 +130,7 @@ For this operator:
   which is when MORI reads it.
 - **SDMA queues**: `mode="auto"` and `"fused"` ask for `max_chunks` per peer
   (default 4), `"split"` for 1. The first device communicator on a communicator
-  fixes its queue count, later ones reuse it, and MORI creates at most 8 per
+  that asks for SDMA queues fixes its queue count, later ones reuse it, and MORI creates at most 8 per
   pair of GPUs. The constructor raises `RuntimeError` if there are too few.
 - **Ranks**: 2 to 8, all in one node (one LSA domain).
 - **VMM**: the window comes out of the communicator's `per_rank_vmm`; size it

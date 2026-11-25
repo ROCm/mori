@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GEMM + all-gather &mdash; MORI development (798ba4a0) documentation</title>
+  <title>GEMM + all-gather &mdash; MORI development (8f048d42) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=c6888252"></script>
+      <script src="_static/documentation_options.js?v=75e2c7e1"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -338,7 +338,7 @@ before constructing it.</p></li>
 which is when MORI reads it.</p></li>
 <li><p><strong>SDMA queues</strong>: <code class="docutils literal notranslate"><span class="pre">mode=&quot;auto&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;fused&quot;</span></code> ask for <code class="docutils literal notranslate"><span class="pre">max_chunks</span></code> per peer
 (default 4), <code class="docutils literal notranslate"><span class="pre">&quot;split&quot;</span></code> for 1. The first device communicator on a communicator
-fixes its queue count, later ones reuse it, and MORI creates at most 8 per
+that asks for SDMA queues fixes its queue count, later ones reuse it, and MORI creates at most 8 per
 pair of GPUs. The constructor raises <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> if there are too few.</p></li>
 <li><p><strong>Ranks</strong>: 2 to 8, all in one node (one LSA domain).</p></li>
 <li><p><strong>VMM</strong>: the window comes out of the communicator’s <code class="docutils literal notranslate"><span class="pre">per_rank_vmm</span></code>; size it
