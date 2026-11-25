@@ -416,7 +416,9 @@ delta ADD/REMOVE with reverse-index + LRU maintenance.
 -- ARGV: prefix, node_id, seq, now_ms, is_full_sync, caps_blob,
 --       n_events, then per-event {kind,key,tier,size}
 local rec = redis.call('HGETALL', KEYS[1])
-if #rec == 0 then return {'UNKNOWN', 0} end
+if #rec == 0 or (is_full_sync == 0 and hget(rec,'status') == '2') then
+  return {'UNKNOWN', 0}                             -- unknown, or EXPIRED and not a full sync
+end
 local last = tonumber(hget(rec,'seq'))
 if is_full_sync == 0 and seq ~= last + 1 then
   redis.call('HSET', KEYS[1], 'last_hb', now_ms, 'status', 1)

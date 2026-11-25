@@ -165,6 +165,12 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.ll128CombineOnly = true;
   differs(c, "ll128CombineOnly");
+  c = base;
+  c.replay = true;
+  differs(c, "replay");
+  c = base;
+  c.combineScatterPlain = true;
+  differs(c, "combineScatterPlain");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
@@ -214,6 +220,36 @@ TEST(Geometry, Dispatch1250xSlabsLeaveRoomForTheStaticLds) {
   }
 }
 
+// ROCm/mori#951: a fixed 16-warp dispatch default asks 458752 B of a 327680 B
+// workgroup at fp32 7168, which the launch accepts and then never schedules. The
+// bound is the slab a row takes, not the dtype: bf16 at 10240 hits it too.
+TEST(Geometry, Dispatch1250xDefaultWarpsFitTheSlabs) {
+  EpRequest req;
+  const struct {
+    int hidden;
+    EpDType dtype;
+    int warps;
+  } want[] = {
+      {7168, EpDType::Bf16, 16}, {7168, EpDType::Fp32, 8},  {10240, EpDType::Bf16, 8},
+      {10240, EpDType::Fp32, 4}, {4096, EpDType::Fp32, 16}, {7168, EpDType::Fp8, 16},
+  };
+  for (const auto& w : want) {
+    req.hiddenDim = w.hidden;
+    req.dtype = w.dtype;
+    const EpCfg c = MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch);
+    EXPECT_EQ(c.warpPerBlock, w.warps) << w.hidden << " dtype " << static_cast<int>(w.dtype);
+    EXPECT_LE(EpDispatch1250xLdsBytes(c) + EpDispatch1250xStaticLdsBytes, Ep1250xLdsBytes);
+  }
+  // Only the arch with the LDS slabs, and only dispatch.
+  req.hiddenDim = 7168;
+  req.dtype = EpDType::Fp32;
+  EXPECT_EQ(MakeEpCfg("gfx950", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Combine).warpPerBlock, 8);
+  // A geometry the caller pinned is its own.
+  req.warpPerBlock = 16;
+  EXPECT_EQ(MakeEpCfg("gfx1250", req, EpKernelKind::Dispatch).warpPerBlock, 16);
+}
+
 TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EpCfg ok;
   EXPECT_TRUE(EpCfgIsValid(ok));
@@ -247,10 +283,10 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   EXPECT_FALSE(EpCfgIsValid(c));
 
   c = ok;
-  // The recv capacity is also the flat-index stride, so an undersized cap does
-  // not merely overrun -- it re-encodes to the next peer.
+  // A cap below the worst case is valid: dispatch drops the slots past it.
   c.maxRecv = ok.worldSize * ok.maxTokPerRank - 1;
-  EXPECT_FALSE(EpCfgIsValid(c));
+  EXPECT_TRUE(EpCfgIsValid(c));
+  EXPECT_TRUE(EpRecvCapped(c));
 
   c = ok;
   c.warpPerBlock = 64;  // 64 * 64 > 1024 threads

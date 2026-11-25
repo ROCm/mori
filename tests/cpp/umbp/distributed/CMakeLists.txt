@@ -141,6 +141,16 @@ add_test(NAME umbp_tags_real_master
 # Unit tests (pure logic; no gRPC / RDMA).  Linked against umbp_common only.
 # --------------------------------------------------------------------------
 
+add_executable(test_umbp_restore_scheduler test_restore_scheduler.cpp)
+target_link_libraries(test_umbp_restore_scheduler PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_restore_scheduler COMMAND test_umbp_restore_scheduler)
+# The scheduler cannot start with every GPU hidden; the restore must be declined.
+add_test(NAME umbp_restore_scheduler_no_gpu
+         COMMAND test_umbp_restore_scheduler
+                 --gtest_filter=RestoreScheduler.DeclinesWhenSchedulerCannotStart)
+set_tests_properties(umbp_restore_scheduler_no_gpu
+                     PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
@@ -465,6 +475,13 @@ add_test(NAME test_in_memory_master_metadata_store COMMAND test_in_memory_master
 
 # test_page_backend — PageBackend (formerly PeerDramAllocator), one instance
 # == one medium (backend-agnostic refactor Phase 2)
+# L1 block pools: slot table, eviction order, cross-pool fetch and the gRPC
+# round trip, all over host memory.
+add_executable(test_l1_pool test_l1_pool.cpp)
+target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
+target_compile_features(test_l1_pool PRIVATE cxx_std_17)
+add_test(NAME umbp_l1_pool COMMAND test_l1_pool)
+
 add_executable(test_page_backend test_page_backend.cpp)
 target_link_libraries(test_page_backend PRIVATE umbp_common
                                                 GTest::gtest_main)
@@ -493,6 +510,14 @@ add_executable(test_transfer_engine test_transfer_engine.cpp)
 target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
 add_test(NAME test_transfer_engine COMMAND test_transfer_engine)
+
+# test_local_rdma_copy — UMBP_LOCAL_RDMA_COPY end to end: a registered host buffer and
+# a registered GPU buffer copied through the NIC loopback, both ways, bytes checked.
+# Needs a GPU and an RDMA NIC; skips without them.
+add_executable(test_local_rdma_copy test_local_rdma_copy.cpp)
+target_link_libraries(test_local_rdma_copy PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_local_rdma_copy PRIVATE cxx_std_17)
+add_test(NAME test_local_rdma_copy COMMAND test_local_rdma_copy)
 
 # test_component_metrics — the observability seam: MetricPublisher's delta /
 # gauge / baseline rules, InstrumentedBackend deriving the generic backend

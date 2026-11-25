@@ -41,6 +41,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
 #include "umbp/distributed/transfer/plan_builder.h"
+#include "umbp/distributed/transfer/restore_scheduler.h"
 
 namespace mori::umbp {
 
@@ -153,6 +154,22 @@ size_t DebugMaxSegments() {
 size_t DebugSummarySeconds() {
   static const size_t n = DebugEnvSize("UMBP_HBM_COPY_DEBUG_SUMMARY_SEC", 10);
   return n;
+}
+
+bool StripedRestoreEnabled() {
+  static const bool enabled = [] {
+    const char* policy = std::getenv("UMBP_HBM_RESTORE_SCHEDULER");
+    if (policy == nullptr || std::string(policy) == "off") return false;
+    if (std::string(policy) == "round_robin") return true;
+    MORI_UMBP_WARN("Unsupported UMBP_HBM_RESTORE_SCHEDULER '{}'; using native restores", policy);
+    return false;
+  }();
+  return enabled;
+}
+
+size_t RestoreChunkBytes() {
+  static const size_t bytes = DebugEnvSize("UMBP_HBM_RESTORE_CHUNK_BYTES", 128ULL << 20);
+  return bytes;
 }
 
 // One counter for the whole engine, so sampling thins the combined stream
@@ -429,6 +446,21 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   // NT-AVX2 path, and overlapping the two engines would make composite
   // selection order load-bearing for performance.
   return IsGpu(src) || IsGpu(dst);
+}
+
+bool HbmCopyEngine::CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                                   uint64_t item_bytes) const {
+  if (!CanHandle(src, dst)) return false;
+  // Opt-in: a large item between a registered host buffer and a registered GPU
+  // buffer belongs to MoriIoEngine's local loopback, which sits behind this
+  // engine in the composite.  An empty item is never yielded: the RDMA planner
+  // drops a zero-size item instead of carrying it, and with a floor of 0 that
+  // would turn today's no-op copy into a tag that never completes.
+  if (yield_registered_host_gpu_pairs_ && item_bytes > 0 && item_bytes >= yield_min_item_bytes_ &&
+      IsGpu(src) != IsGpu(dst) && src.HasMemoryDesc() && dst.HasMemoryDesc()) {
+    return false;
+  }
+  return true;
 }
 
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
@@ -779,6 +811,14 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
   } else {
     device_touched = true;
   }
+  auto map_host = [this](const void* ptr, size_t bytes, int device) {
+    return HostRegionDeviceAddress(ptr, bytes, device);
+  };
+  if (StripedRestoreEnabled() && TryStripedRestore(plans, map_host, RestoreChunkBytes())) {
+    if (device_touched && entry_device >= 0) (void)hipSetDevice(entry_device);
+    return std::make_unique<SettledHandle>(std::move(failures));
+  }
+
   const bool debug = DebugEnabled();
   std::vector<GatherSkip> skips;
   const std::vector<char> gathered = GatherEligiblePlans(plans, debug ? &skips : nullptr);
@@ -826,14 +866,12 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
+    const size_t piece = HostRegistrationChunkBytes();
     for (size_t i = 0; i < plan.sizes.size();) {
-      size_t coalesced = plan.sizes[i];
-      size_t j = i + 1;
-      while (j < plan.sizes.size() && plan.src_offsets[j] == plan.src_offsets[i] + coalesced &&
-             plan.dst_offsets[j] == plan.dst_offsets[i] + coalesced) {
-        coalesced += plan.sizes[j];
-        ++j;
-      }
+      // Never across a host registration piece: the builder split there, and a
+      // merged call fails with "invalid argument" (CoalescedRunEnd).
+      size_t coalesced = 0;
+      const size_t j = CoalescedRunEnd(plan, i, piece, &coalesced);
       err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
       plan_bytes += coalesced;
