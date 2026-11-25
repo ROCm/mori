@@ -177,15 +177,18 @@ extern "C" __global__ void OneShotAll2allSdmaAsyncWaitKernel_u32(
                                          args.outputTransitMemObj, args.flagsMemObj);
 }
 
-// TDM transport (gfx125x only). Its completion is inside the one kernel, so it
-// has no async put/wait pair. It takes the SDMA kernel's arguments plus the
-// sync array the Python side allocates (CclTdmAll2allArgs).
+// TDM transport (gfx125x only). Its completion, and the copy into the caller's
+// output, are inside the one kernel, so it has no async put/wait pair. It takes
+// the SDMA kernel's arguments plus the sync array the Python side allocates, the
+// caller's output, the size of a transit half and where the kernel's words sit
+// in the transit buffer (CclTdmAll2allArgs).
 #if defined(MORI_CCL_HAS_TDM)
 extern "C" __global__ void TdmAll2allKernel_u32(CclTdmAll2allArgs args) {
   const CclAll2allArgs<uint32_t>& a = args.base;
   TdmAll2allKernel_body<uint32_t>(a.myPe, a.npes, a.input, a.inputTransitMemObj,
                                   a.outputTransitMemObj, a.flagsMemObj, a.elementCount,
-                                  args.sync);
+                                  args.sync, static_cast<uint32_t*>(args.output),
+                                  args.halfElems, args.wordsElems);
 }
 #endif
 

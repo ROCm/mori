@@ -20,7 +20,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""All2allSdma on the TDM transport (MORI_CCL_ALL2ALL_BACKEND=tdm, gfx125x only).
+"""All2allSdma on gfx125x, where it runs on the TDM transport only.
+
+The test runs with SDMA off in mori (MORI_ENABLE_SDMA=0) and in the ROCm
+runtime (HSA_ENABLE_SDMA=0), and checks that asking for the SDMA transport is
+refused. Both ways of delivering the result are checked: into the caller's
+output (copy_output_to_user=True) and left in the output transit buffer.
 
 Every call sends data that depends on the call number, so a chunk left in a
 transit buffer by an earlier call cannot pass for the current one. The sizes
@@ -28,10 +33,9 @@ cover whole TDM tiles, a TDM tail of a few rows, tails short enough to be left
 to the lanes, and chunk sizes whose offsets are not 128 B aligned, which the
 kernel copies with the lanes alone.
 
---bench also times the kernel alone (no host synchronization, no copy into the
-user tensor) at power-of-two sizes per GPU. Back-to-back launches are captured
-into one HIP graph and replayed, so the host's launch cost does not cap the
-small sizes; the kernel keeps its call count in device memory, which is what
+--bench times both ways at power-of-two sizes per GPU. Back-to-back calls are
+captured into one HIP graph and replayed, so the host's launch cost does not cap
+the small sizes; the kernel keeps its call count in device memory, which is what
 makes it replayable. Bandwidth is reported the way rccl-tests does for
 alltoall: algBw = bytes per GPU / time, busBw = algBw * (npes - 1) / npes.
 """
@@ -87,34 +91,53 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     assert (my_pe, npes) == (rank, world_size)
     dev = torch.device("cuda", rank)
 
+    # Refused before the constructor allocates anything, so no rank is left in a collective.
+    os.environ["MORI_CCL_ALL2ALL_BACKEND"] = "sdma"
+    try:
+        All2allSdma(my_pe, npes, transit_buffer_size=1 << 20)
+        refused = False
+    except RuntimeError:
+        refused = True
+    del os.environ["MORI_CCL_ALL2ALL_BACKEND"]
+    assert refused, "MORI_CCL_ALL2ALL_BACKEND=sdma was accepted on gfx125x"
+
     bench_counts = [b // 4 // npes for b in _BENCH_BYTES_PER_GPU] if bench else []
     max_count = max(list(_CHECK_COUNTS) + bench_counts)
     nbytes = max_count * npes * 4
-    a2a = All2allSdma(
-        my_pe,
-        npes,
-        input_buffer_size=nbytes,
-        output_buffer_size=nbytes,
-        copy_output_to_user=True,
-    )
-    assert a2a._backend == "tdm", a2a._backend
+    handles = {
+        # Calls alternate between the halves of the output transit buffer.
+        "into output": All2allSdma(
+            my_pe, npes, input_buffer_size=nbytes, output_buffer_size=2 * nbytes,
+            copy_output_to_user=True,
+        ),
+        "in transit": All2allSdma(
+            my_pe, npes, input_buffer_size=nbytes, output_buffer_size=nbytes,
+            copy_output_to_user=False,
+        ),
+    }
+    backends = {m: h._backend for m, h in handles.items()}
+    assert set(backends.values()) == {"tdm"}, backends
     stream = torch.cuda.Stream(device=dev)
-    call = 0
+    calls = {m: 0 for m in handles}
     failed = 0
 
-    def check(count, use_async=False):
-        nonlocal call, failed
-        call += 1
+    def check(mode, count, use_async=False):
+        nonlocal failed
+        h = handles[mode]
+        calls[mode] += 1
+        call = calls[mode]
         inp = torch.cat([_chunk(my_pe, d, npes, call, count, dev) for d in range(npes)])
         out = torch.full((npes * count,), -1, dtype=torch.int32, device=dev)
         torch.cuda.synchronize()
         with torch.cuda.stream(stream):
             if use_async:
-                a2a.start_async(inp, out, count, stream)
-                a2a.wait_async(stream)
+                h.start_async(inp, out, count, stream)
+                h.wait_async(stream)
             else:
-                a2a(inp, out, count, stream)
+                h(inp, out, count, stream)
         torch.cuda.synchronize()
+        if mode == "in transit":
+            out = h.get_output_transit_buffer(dtype=torch.int32)[: npes * count]
         bad = 0
         for s in range(npes):
             want = _chunk(s, my_pe, npes, call, count, dev)
@@ -124,83 +147,83 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
             if n:
                 k = int(wrong.nonzero()[0].item())
                 print(
-                    f"[check] PE {my_pe} count {count} call {call} from PE {s}: {n} of "
+                    f"[check] PE {my_pe} {mode} count {count} call {call} from PE {s}: {n} of "
                     f"{count} wrong, first at {k}: got {int(got[k])} want {int(want[k])}",
                     flush=True,
                 )
             bad += n
         failed += int(bad != 0)
 
-    for count in list(_CHECK_COUNTS) + bench_counts:
-        for _ in range(_CHECK_CALLS):
-            check(count)
-    check(8 * 4096, use_async=True)
-    checks = call
+    for mode in handles:
+        for count in list(_CHECK_COUNTS) + bench_counts:
+            for _ in range(_CHECK_CALLS):
+                check(mode, count)
+        check(mode, 8 * 4096, use_async=True)
 
     if bench:
-        s = stream.cuda_stream
-
-        def launch(inp, out, count):
-            args = a2a._handle.prepare_sync(inp.data_ptr(), out.data_ptr(), count, s)
-            a2a._launch_tdm(args, s)
-
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        times = {b: [] for b in _BENCH_BYTES_PER_GPU}
+        times = {m: {b: [] for b in _BENCH_BYTES_PER_GPU} for m in handles}
         for b, count in zip(_BENCH_BYTES_PER_GPU, bench_counts):
             inp = torch.ones(npes * count, dtype=torch.int32, device=dev)
             out = torch.empty_like(inp)
-            graph = torch.cuda.CUDAGraph()
-            torch.cuda.synchronize()
-            with torch.cuda.graph(graph, stream=stream):
-                for _ in range(iters):
-                    launch(inp, out, count)
-            torch.cuda.synchronize()
-            for r in range(warmup + rounds):
-                dist.barrier()
-                with torch.cuda.stream(stream):
-                    start.record(stream)
-                    graph.replay()
-                    end.record(stream)
-                end.synchronize()
-                if r < warmup:
-                    continue
-                t = torch.tensor([start.elapsed_time(end) * 1000.0 / iters], dtype=torch.float64)
-                dist.all_reduce(t, op=dist.ReduceOp.MAX)
-                times[b].append(t.item())
-            del graph
+            # No loop variable holds a handle: every handle must be gone by shmem_finalize.
+            for mode in handles:
+                graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph, stream=stream):
+                    for _ in range(iters):
+                        handles[mode](inp, out, count, stream)
+                torch.cuda.synchronize()
+                for r in range(warmup + rounds):
+                    dist.barrier()
+                    with torch.cuda.stream(stream):
+                        start.record(stream)
+                        graph.replay()
+                        end.record(stream)
+                    end.synchronize()
+                    if r < warmup:
+                        continue
+                    t = torch.tensor(
+                        [start.elapsed_time(end) * 1000.0 / iters], dtype=torch.float64
+                    )
+                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                    times[mode][b].append(t.item())
+                del graph
         # The flags must still agree after thousands of back-to-back calls.
-        check(bench_counts[-1])
-        checks = call
+        for mode in handles:
+            check(mode, bench_counts[-1])
         if rank == 0:
             print(
-                f"[bench] npes {npes}, one graph of {iters} calls per size, {warmup} warmup "
-                f"replays, {rounds} timed; us per call = slowest rank, median over the timed "
-                "replays",
+                f"[bench] npes {npes}, one graph of {iters} calls per size and mode, {warmup} "
+                f"warmup replays, {rounds} timed; us per call = slowest rank, median over the "
+                "timed replays",
                 flush=True,
             )
-            for b in _BENCH_BYTES_PER_GPU:
-                us = statistics.median(times[b])
-                alg = b / us / 1000.0
-                print(
-                    f"[a2a-tdm] {_fmt_bytes(b):>7} per GPU  {us:8.2f} us "
-                    f"({'/'.join(f'{x:.2f}' for x in times[b])})  "
-                    f"algBw {alg:7.1f} GB/s  busBw {alg * (npes - 1) / npes:7.1f} GB/s",
-                    flush=True,
-                )
+            for mode in handles:
+                for b in _BENCH_BYTES_PER_GPU:
+                    us = statistics.median(times[mode][b])
+                    alg = b / us / 1000.0
+                    print(
+                        f"[a2a-tdm] {mode:<11} {_fmt_bytes(b):>7} per GPU  {us:8.2f} us "
+                        f"({'/'.join(f'{x:.2f}' for x in times[mode][b])})  "
+                        f"algBw {alg:7.1f} GB/s  busBw {alg * (npes - 1) / npes:7.1f} GB/s",
+                        flush=True,
+                    )
 
     f = torch.tensor([failed], dtype=torch.int64)
     dist.all_reduce(f, op=dist.ReduceOp.SUM)
     if rank == 0:
         print(
-            f"[check] {'PASS' if f.item() == 0 else 'FAIL'}: {checks} calls on {npes} ranks, "
-            f"{f.item()} rank-calls wrong",
+            f"[check] {'PASS' if f.item() == 0 else 'FAIL'}: "
+            + ", ".join(f"{calls[m]} calls {m}" for m in handles)
+            + f" on {npes} ranks, {f.item()} rank-calls wrong",
             flush=True,
         )
 
     torch.cuda.synchronize()
     dist.barrier()
-    del a2a
+    del handles
     dist.barrier()
     shmem.shmem_finalize()
     dist.destroy_process_group()
@@ -218,9 +241,11 @@ def _gfx125x():
 
 
 def _run(world_size, bench=False, rounds=5, iters=100, warmup=2):
-    # The TDM transport never uses an SDMA queue, so the copy engines stay off.
+    # Nothing on this path may use SDMA: no SDMA queues in mori, and no copy
+    # engine behind the ROCm runtime's own copies either.
     os.environ["MORI_ENABLE_SDMA"] = "0"
-    os.environ["MORI_CCL_ALL2ALL_BACKEND"] = "tdm"
+    os.environ["HSA_ENABLE_SDMA"] = "0"
+    os.environ.pop("MORI_CCL_ALL2ALL_BACKEND", None)
     torch.multiprocessing.spawn(
         _worker,
         args=(world_size, get_free_port(), bench, rounds, iters, warmup),

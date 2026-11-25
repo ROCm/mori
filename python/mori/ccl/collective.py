@@ -75,10 +75,11 @@ def _require_sdma_env(class_name: str) -> None:
 # ---------------------------------------------------------------------------
 # MORI_CCL_ALLREDUCE_BACKEND and MORI_CCL_ALL2ALL_BACKEND pick which engine
 # carries the cross-GPU bytes. Default is sdma on every architecture, including
-# gfx125x. tdm requires gfx125x because the TDM engine does not exist elsewhere,
-# and because ccl_kernels.hip only emits the Tdm* symbols under that arch guard
-# -- asking for them on another target would fail at kernel lookup rather than
-# here.
+# gfx125x, except for All2all on gfx125x, which runs on tdm only
+# (_resolve_all2all_backend). tdm requires gfx125x because the TDM engine does
+# not exist elsewhere, and because ccl_kernels.hip only emits the Tdm* symbols
+# under that arch guard -- asking for them on another target would fail at
+# kernel lookup rather than here.
 _CCL_BACKENDS = ("sdma", "tdm")
 
 
@@ -105,6 +106,18 @@ def _resolve_backend(env_name: str) -> str:
         raise RuntimeError(
             f"{env_name}=tdm requires a gfx125x GPU (detected "
             f"arch {arch!r}); the TDM engine does not exist on this target."
+        )
+    return "tdm"
+
+
+def _resolve_all2all_backend() -> str:
+    if not _detect_arch_str().startswith("gfx125"):
+        return _resolve_backend("MORI_CCL_ALL2ALL_BACKEND")
+    raw = os.environ.get("MORI_CCL_ALL2ALL_BACKEND", "").strip().lower()
+    if raw not in ("", "tdm"):
+        raise RuntimeError(
+            f"MORI_CCL_ALL2ALL_BACKEND={raw!r}: All2all on gfx125x runs on the "
+            f"TDM engine only and does not use SDMA."
         )
     return "tdm"
 
@@ -139,17 +152,20 @@ def _tdm_shared_mem(threads: int) -> int:
 _TDM_A2A_TILE_BYTES = 256 * 16 * 4
 # 64 blocks x 16 wave32 is the 1024 warps in flight the AllReduce launch uses.
 # Must not exceed MORI_CCL_TDM_A2A_MAX_BLOCKS: every block owns a slot in the
-# sync array.
+# sync array, and a word per rank in the output transit buffer.
 _TDM_A2A_BLOCKS = 64
 _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
-# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block, the go word and the
-# number of the last finished call.
-_TDM_A2A_SYNC_WORDS = 64 + 2
+# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block and the go word.
+_TDM_A2A_SYNC_WORDS = 64 + 1
 # sizeof(CclAll2allArgs<uint32_t>), the struct prepare_sync fills. The TDM
-# kernel takes those bytes followed by the sync pointer (CclTdmAll2allArgs,
-# which static_asserts both numbers).
+# kernel takes those bytes followed by the sync pointer, the caller's output,
+# the 4-byte elements in a transit half and the 4-byte elements before the
+# words (CclTdmAll2allArgs, which static_asserts every offset).
 _TDM_A2A_BASE_ARGS_BYTES = 72
-_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 8
+_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 32
+# Each half of the output transit buffer starts on a 128 B boundary, the
+# alignment TDM needs.
+_TDM_A2A_HALF_ALIGN = 128
 
 
 _TORCH_DTYPE_TO_NUMPY = {
@@ -236,7 +252,7 @@ class All2allSdma:
     ):
         # Resolved once, like AllreduceSdma's: the two transports read the same
         # flags differently, so ranks must agree on it for the life of the handle.
-        self._backend = _resolve_backend("MORI_CCL_ALL2ALL_BACKEND")
+        self._backend = _resolve_all2all_backend()
         # The TDM kernel carries every size itself and never touches an SDMA
         # queue, unlike AllreduceSdma's TDM backend, which keeps small messages
         # on SDMA.
@@ -245,21 +261,33 @@ class All2allSdma:
         _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
+        self._copy_out = copy_output_to_user
+        # The TDM kernel copies into the caller's output itself, so the C++
+        # handle never copies: its copy is a hipMemcpyAsync between two host
+        # synchronizations.
+        handle_copy = copy_output_to_user and self._backend != "tdm"
         handle_class = getattr(mori_cpp, "All2allSdmaHandle")
+        # The TDM kernel keeps a u64 per rank and block in the output transit
+        # buffer, after the room the caller asked for and on a u64 boundary.
+        extra = npes * _TDM_A2A_BLOCKS * 8 + 8 if self._backend == "tdm" else 0
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(
-                my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user
+                my_pe, npes, input_buffer_size, output_buffer_size + extra, handle_copy
+            )
+        elif extra:
+            # How the C++ handle splits a single size.
+            total = transit_buffer_size
+            if total is None:
+                total = 512 * 1024 * 1024
+            self._handle = handle_class(
+                my_pe, npes, total // 2, total // 2 + extra, handle_copy
             )
         elif transit_buffer_size is not None:
-            self._handle = handle_class(
-                my_pe, npes, transit_buffer_size, copy_output_to_user
-            )
+            self._handle = handle_class(my_pe, npes, transit_buffer_size, handle_copy)
         else:
-            self._handle = handle_class(
-                my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
-            )
-        self._output_transit_bytes = self._handle.get_output_transit_buffer()[1]
+            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, handle_copy)
+        self._output_transit_bytes = self._handle.get_output_transit_buffer()[1] - extra
         if self._backend == "tdm":
             if npes > _TDM_WAVE_SIZE:
                 raise ValueError(
@@ -273,27 +301,53 @@ class All2allSdma:
                 dtype=torch.int64,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
-            # The first launch may be on another stream than the fill.
+            # With copy_output_to_user, consecutive calls alternate between the
+            # two halves of the output transit buffer.
+            half = self._output_transit_bytes // 2
+            self._tdm_half_bytes = half // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
+            # Peers raise the words on every call, from the first one on.
+            words_at = (self._output_transit_bytes + 7) // 8 * 8
+            _ptr_to_tensor(
+                self._handle.get_output_transit_buffer()[0] + words_at,
+                extra - 8,
+                torch.int32,
+                self._tdm_sync.device,
+            ).zero_()
+            # The first launch may be on another stream than the fills, and no
+            # peer may raise a word before its owner has zeroed it.
             torch.cuda.synchronize()
+            mori_cpp.shmem_barrier_all()
             self._tdm_args = ctypes.create_string_buffer(_TDM_A2A_ARGS_BYTES)
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES
             ).value = self._tdm_sync.data_ptr()
+            ctypes.c_uint64.from_buffer(
+                self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 16
+            ).value = self._tdm_half_bytes // 4
+            ctypes.c_uint64.from_buffer(
+                self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 24
+            ).value = words_at // 4
 
     def _check_tdm_count(self, count: int) -> None:
         # The TDM kernel writes count * npes uint32 into every rank's output
-        # transit buffer and nothing on the device checks the bound.
+        # transit buffer, into one half of it with copy_output_to_user, and
+        # nothing on the device checks the bound.
         need = count * self.npes * 4
-        if need > self._output_transit_bytes:
+        room = self._tdm_half_bytes if self._copy_out else self._output_transit_bytes
+        if need > room:
             raise ValueError(
                 f"count={count} needs {need} bytes of output transit buffer per "
-                f"rank, but it has {self._output_transit_bytes}"
+                f"rank, but it has {room}"
+                + (" (half of it, with copy_output_to_user)" if self._copy_out else "")
             )
 
-    def _launch_tdm(self, args, s: int) -> None:
+    def _launch_tdm(self, args, output_ptr: int, s: int) -> None:
         # hipModuleLaunchKernel copies the argument bytes at launch, and a graph
         # capture keeps that copy, so the buffer is reused for every call.
         ctypes.memmove(self._tdm_args, args, _TDM_A2A_BASE_ARGS_BYTES)
+        ctypes.c_uint64.from_buffer(
+            self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 8
+        ).value = output_ptr if self._copy_out else 0
         _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
             (_TDM_A2A_BLOCKS,),
             (_TDM_THREADS,),
@@ -311,11 +365,13 @@ class All2allSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         if self._backend == "tdm":
-            self._launch_tdm(args, s)
-        else:
-            _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
-                (1,), (64,), 0, s, args
-            )
+            # Ordered on the stream like any kernel: no host synchronization,
+            # so it can be captured into a graph.
+            self._launch_tdm(args, output_data.data_ptr(), s)
+            return time.perf_counter() - t0
+        _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
+            (1,), (64,), 0, s, args
+        )
         self._handle.finish_sync(output_data.data_ptr(), count, s)
         return time.perf_counter() - t0
 
@@ -327,7 +383,7 @@ class All2allSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         if self._backend == "tdm":
-            self._launch_tdm(args, s)
+            self._launch_tdm(args, output_data.data_ptr(), s)
         else:
             _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
                 (1,), (64,), 0, s, args
@@ -338,7 +394,8 @@ class All2allSdma:
     def wait_async(self, stream=None) -> float:
         s = _stream_to_int(stream)
         if self._backend == "tdm":
-            # The TDM kernel waits for every peer itself; only the host side is left.
+            # The TDM kernel waits for every peer and fills the caller's output
+            # itself; only the host side is left.
             return self._handle.finish_async_wait(s)
         args = self._handle.prepare_async_wait(s)
         _get_ccl_func("OneShotAll2allSdmaAsyncWaitKernel_u32").launch_struct(
@@ -356,9 +413,12 @@ class All2allSdma:
         self._handle.reset_flags()
 
     def get_output_transit_buffer(self, dtype=None, device=None):
+        # On the TDM transport with copy_output_to_user, the result is in the
+        # caller's output and this buffer is the kernel's scratch. The TDM
+        # kernel's words after the caller's room are left out.
         dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
-        ptr, size_bytes = self._handle.get_output_transit_buffer()
-        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
+        ptr = self._handle.get_output_transit_buffer()[0]
+        return _ptr_to_tensor(ptr, self._output_transit_bytes, dtype, device)
 
 
 # ---------------------------------------------------------------------------
