@@ -117,7 +117,7 @@ TEST(RasLinks, TwoRuntimesThatRegisterEachOtherShareOneLinkAndExchangeHeartbeats
   Register(*b, "engine-b", "engine-a", ea);
 
   auto flowing = [](const LinkInfo& l) {
-    return Connected(l) && l.heartbeatsReceived >= 3 && l.acksReceived >= 3;
+    return Connected(l) && l.heartbeatsReceived >= 3 && l.acksReceived >= 3 && l.hasTiming;
   };
   ASSERT_TRUE(WaitLink(*a, eb.uuid, flowing));
   ASSERT_TRUE(WaitLink(*b, ea.uuid, flowing));
@@ -131,6 +131,11 @@ TEST(RasLinks, TwoRuntimesThatRegisterEachOtherShareOneLinkAndExchangeHeartbeats
   EXPECT_EQ(la.peerHostname, "host-b");
   EXPECT_EQ(lb.peerHostname, "host-a");
   EXPECT_FALSE(la.peerDegraded);
+  // Same host, same clock: the estimate must contain an offset of zero.
+  EXPECT_GT(la.rttNs, 0);
+  EXPECT_LT(la.rttNs, 100000000);
+  EXPECT_LE(std::llabs(la.offsetNs), la.offsetBoundNs);
+  EXPECT_LE(std::llabs(lb.offsetNs), lb.offsetBoundNs);
   EXPECT_GE(la.lastRxAgeMs, 0);
   EXPECT_LT(la.lastRxAgeMs, 1000);
 }
@@ -518,7 +523,7 @@ TEST(RasLinks, HeartbeatsAreAnsweredAtOnceAndSentOnSchedule) {
       ASSERT_TRUE(f.has_value());
       if (std::holds_alternative<proto::Heartbeat>(f->message)) {
         ++heartbeatsFromCore;
-        // Answer the core's own heartbeats.
+        // Answer the core's own heartbeats, so it can measure the link too.
         ASSERT_TRUE(fake.Send(fd, seq++,
                               MakeAck(std::get<proto::Heartbeat>(f->message), MonoNowNs(),
                                       MonoNowNs(), WallNowNs())));
@@ -535,7 +540,72 @@ TEST(RasLinks, HeartbeatsAreAnsweredAtOnceAndSentOnSchedule) {
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
   }
   EXPECT_GE(heartbeatsFromCore, 3);  // every 50 ms
-  EXPECT_TRUE(WaitLink(*core, fake.identity.uuid, [](const LinkInfo& l) {
-    return l.acksReceived >= 3 && l.heartbeatsReceived >= 5;
-  }));
+  EXPECT_TRUE(WaitLink(*core, fake.identity.uuid,
+                       [](const LinkInfo& l) { return l.hasTiming && l.heartbeatsReceived >= 5; }));
+}
+
+// The peer's clock can move while the link is down, so a reconnect starts its timing over, and
+// a link that is down reports no timing.
+TEST(RasLinks, AReconnectStartsItsTimingOver) {
+  constexpr int64_t kSkewNs = 50000000;  // the fake's wall clock moves 50 ms while it's down
+  auto core = StartCore("t");
+  FakePeer fake(UuidBeside(core->Endpoint().uuid, false), "fake-token");
+  const RuntimeUuid peer = fake.identity.uuid;
+  Register(*core, "engine-t", "engine-fake", fake.Endpoint());
+
+  // Accepts the core's connection and answers its heartbeats `delay` late, with the fake's wall
+  // clock `skewNs` ahead, until `done` holds for the core's view of the link. A connection that
+  // goes quiet, one the core already gave up on, is dropped for the next.
+  auto serve = [&](int64_t skewNs, std::chrono::milliseconds delay,
+                   const std::function<bool(const LinkInfo&)>& done) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+      int fd = fake.Accept(1000);
+      if (fd < 0 || !fake.Recv(fd, 1000) ||
+          !fake.Send(fd, 1, fake.Reply(proto::HelloStatus::kOk))) {
+        continue;
+      }
+      uint64_t seq = 2;
+      auto quietUntil = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (std::chrono::steady_clock::now() < std::min(deadline, quietUntil)) {
+        std::optional<proto::Frame> f = fake.Recv(fd, 20);
+        if (f && std::holds_alternative<proto::Heartbeat>(f->message)) {
+          std::this_thread::sleep_for(delay);
+          fake.Send(fd, seq++,
+                    MakeAck(std::get<proto::Heartbeat>(f->message), MonoNowNs(), MonoNowNs(),
+                            WallNowNs() + skewNs));
+          quietUntil = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+        std::optional<LinkInfo> l = Link(*core, peer);
+        if (l && done(*l)) return fd;
+      }
+    }
+    return -1;
+  };
+
+  // Prompt ACKs that fill the timing window with tight bounds.
+  int first = serve(0, std::chrono::milliseconds(0), [](const LinkInfo& l) {
+    return Connected(l) && l.hasTiming && l.acksReceived >= 2 * HeartbeatTracker::kWindow;
+  });
+  ASSERT_GE(first, 0);
+  LinkInfo before = *Link(*core, peer);
+  EXPECT_LE(std::llabs(before.offsetNs), before.offsetBoundNs);
+  shutdown(first, SHUT_RDWR);  // the link goes down, and the core reconnects at once
+  ASSERT_TRUE(WaitLink(*core, peer, [](const LinkInfo& l) { return !Connected(l); }));
+  EXPECT_FALSE(Link(*core, peer)->hasTiming);
+
+  // Every offset the reconnected link reports comes from the new connection, 50 ms ahead. Its
+  // ACKs come 2 ms late, so any sample left from before, with its tighter bound, would win.
+  int fresh = 0, stale = 0;
+  int second = serve(kSkewNs, std::chrono::milliseconds(2), [&](const LinkInfo& l) {
+    if (!Connected(l) || !l.hasTiming) return false;
+    if (std::llabs(l.offsetNs - kSkewNs) <= l.offsetBoundNs) {
+      ++fresh;
+    } else {
+      ++stale;
+    }
+    return fresh >= 5;
+  });
+  ASSERT_GE(second, 0);
+  EXPECT_EQ(stale, 0);
 }
