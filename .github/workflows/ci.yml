@@ -446,6 +446,12 @@ jobs:
             cmake -B build -DBUILD_TESTS=ON
             cmake --build build --target test_block_copy_alignment -j
             MORI_SHMEM_HEAP_SIZE=6G timeout 180 mpirun --allow-run-as-root -np 2 ./build/tests/cpp/test_block_copy_alignment
+            # WarpAccum / WarpAccumLF correctness sweep: single-GPU, no MPI/shmem.
+            cmake --build build --target test_warp_accum -j
+            timeout 180 ./build/tests/cpp/test_warp_accum
+            # A couple of WarpAccum micro-benchmarks, mirroring the vec-16 lf2 combine gathers.
+            timeout 120 ./build/tests/cpp/test_warp_accum --bench --type bf16 --vec 16 --mode lf2 --accum 8 --nelems 7168 --check
+            timeout 120 ./build/tests/cpp/test_warp_accum --bench --type fp8 --vec 16 --mode lf2 --accum 8 --nelems 7168 --check --peer
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
