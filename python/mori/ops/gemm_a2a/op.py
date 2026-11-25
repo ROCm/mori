@@ -165,7 +165,7 @@ class GemmA2AOp:
             reqs.sdma_queue_count = sdma_queues
             self.dev_comm = comm.create_dev_comm(reqs)
             # Both modes push over SDMA. cco fixes the queue count at the comm's
-            # first dev-comm and only logs when a later one asks for more, or
+            # first dev-comm that asks for queues and only logs when a later one asks for more, or
             # when SDMA is off altogether; a put on a queue that does not exist
             # moves nothing, so the op would return stale bytes without a word.
             if self.dev_comm.sdma_num_queue < sdma_queues:
@@ -173,8 +173,8 @@ class GemmA2AOp:
                     f"GemmA2AOp needs {sdma_queues} SDMA queue(s) per peer but the "
                     f"communicator has {self.dev_comm.sdma_num_queue}: build mori "
                     f"with BUILD_CCO_SDMA=ON, set MORI_ENABLE_SDMA=1, and make sure "
-                    f"the first dev-comm created on this communicator asked for at "
-                    f"least that many"
+                    f"the first dev-comm on this communicator that asked for SDMA "
+                    f"queues asked for at least that many"
                 )
             # World ranks are used as LSA ranks throughout.
             if self.dev_comm.lsa_size != self.world_size:

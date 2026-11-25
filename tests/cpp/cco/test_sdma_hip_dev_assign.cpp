@@ -176,6 +176,7 @@ static int SdmaAllGatherSetup(int rank, int nranks, const mori::cco::ccoUniqueId
   // SDMA needs no GDA connectivity; the signal pool is materialized whenever the
   // comm has SDMA queues (set up in ccoCommCreate for canSDMA peers).
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  reqs.sdmaQueueCount = 2;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.gdaContextCount = 0;
   reqs.gdaSignalCount = 0;

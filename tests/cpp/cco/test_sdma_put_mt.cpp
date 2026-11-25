@@ -141,6 +141,7 @@ static void worker(int rank, int nranks, int dev, const mori::cco::ccoUniqueId& 
   }
 
   mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  reqs.sdmaQueueCount = 2;
   reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_NONE;
   reqs.gdaContextCount = 0;
   reqs.gdaSignalCount = 0;

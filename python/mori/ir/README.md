@@ -105,8 +105,9 @@ The flat CCO functions mirror the monomorphized C symbols. Examples:
 GDA put / put_value / get / signal / flush_peer / flush_async take a trailing
 `GdaFlags` word (`TEAM_GDA` only).
 
-SDMA requires a MORI build with `BUILD_CCO_SDMA=ON` and runtime
-`MORI_ENABLE_SDMA=1`. GDA peers are world ranks, or GDA-team indices with
+SDMA requires a MORI build with `BUILD_CCO_SDMA=ON`, runtime
+`MORI_ENABLE_SDMA=1`, and a device communicator created with
+`sdma_queue_count > 0` (0 creates no queues). GDA peers are world ranks, or GDA-team indices with
 `team=Team.GDA`; LSA/SDMA peers are LSA ranks.
 
 ## Quick Start (Bitcode only, no Triton)

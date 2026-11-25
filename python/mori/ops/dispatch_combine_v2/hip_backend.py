@@ -215,17 +215,22 @@ def _hsa_cu_mask_cus(device_index: int, mp_count: int):
 
 
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
-    """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
+    """How many SDMA queues per pair to ask cco for (at least 1).
 
     `model` is detect_model()'s answer, None when the part is not one it knows.
 
     An explicit MORI_SDMA_NUM_CHANNELS is the operator saying what this machine
-    can take, so it wins: returning 0 lets cco fall through to it. Without that
-    deference this request silently beat the env knob, and the only way out of
-    the MI308X abort was to edit the source.
+    can take, so it wins. It is read here, clamped to 1..8 as anvil does: cco
+    creates queues only for an explicit count, so a 0 here would mean none.
+    Without that deference this request silently beat the env knob, and the
+    only way out of the MI308X abort was to edit the source.
     """
-    if os.environ.get("MORI_SDMA_NUM_CHANNELS"):
-        return 0
+    try:
+        env = int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "0"))
+    except ValueError:
+        env = 0
+    if env >= 1:
+        return min(env, 8)
     want = min(8, max(1, gpu_per_node))
     cap = _ASYNCLL_SDMA_QUEUE_CAP.get(model)
     return min(want, cap) if cap else want
