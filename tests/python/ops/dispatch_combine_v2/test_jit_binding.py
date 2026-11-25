@@ -311,12 +311,11 @@ def test_dispatch_serves_replay_and_the_receive_cap(extra):
 
 
 def test_dispatch_refuses_a_world_past_the_wavefront():
-    # Lane p of the routing warp owns destination p.
-    big = {k: v for k, v in _BIG.items() if k != "world_size"}
-    with pytest.raises(RuntimeError, match="inconsistent config"):
-        cb.EpDispatchPlan.describe(
-            arch="gfx950", world_size=128, max_recv=128 * 64, **big
-        )
+    # Lane p of the routing warp owns destination p. max_recv follows the world so
+    # this trips the wavefront check rather than looking like a receive cap.
+    req = dict(_BIG, world_size=128, max_recv=128 * 64)
+    with pytest.raises(RuntimeError, match="must fit in a wavefront"):
+        cb.EpDispatchPlan.describe(arch="gfx950", **req)
 
 
 def _device_arch():
