@@ -41,12 +41,19 @@ class BootstrapNetwork;
 
 namespace cco {
 
+constexpr int kDefaultProxyThreads = 4;
+constexpr int kDefaultProxyQpsPerPeer = 4;
+constexpr size_t kDefaultProxyQueueCapacity = 4096;  // lines (256 KiB ring per queue)
+
 struct ccoProxyEngineConfig {
-  int numSpscQueues{0};        // KIWI SPSC device-to-host queues
-  int numMpscQueues{0};        // KIWI MPSC device-to-host queues
-  int numThreads{0};           // host proxy threads; 0 = 4. Capped at the queue count.
-  size_t queueCapacity{0};     // ring lines (power of two); 0 = default
-  int qpsPerPeer{1};           // RC QPs per (thread, peer); capped at a thread's queue count
+  int numSpscQueues{0};  // KIWI SPSC device-to-host queues
+  int numMpscQueues{0};  // KIWI MPSC device-to-host queues
+  // Host proxy threads; 0 = kDefaultProxyThreads. Capped at the queue count.
+  int numThreads{0};
+  // Ring lines (power of two); 0 = kDefaultProxyQueueCapacity.
+  size_t queueCapacity{0};
+  // RC QPs per (thread, peer); capped at a thread's queue count.
+  int qpsPerPeer{kDefaultProxyQpsPerPeer};
   int signalCount{0};          // user signal slots (gdaSignalCount); slot signals must be below it
   std::vector<bool> peerMask;  // [worldSize] peers that get a QP per proxy thread
 };

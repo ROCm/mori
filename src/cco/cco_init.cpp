@@ -53,9 +53,8 @@
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
-#ifdef MORI_CCO_PROXY
+// Declarations and defaults only; the engine is linked in when MORI_CCO_PROXY is set.
 #include "cco_proxy_engine.hpp"
-#endif
 
 namespace mori {
 namespace cco {
@@ -1793,8 +1792,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
   const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
   const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  const int proxyQpsPerPeer =
-      (reqsHaveProxy && reqs->proxyQpsPerPeer > 0) ? reqs->proxyQpsPerPeer : 4;
+  const int proxyQpsPerPeer = (reqsHaveProxy && reqs->proxyQpsPerPeer > 0)
+                                  ? reqs->proxyQpsPerPeer
+                                  : kDefaultProxyQpsPerPeer;
   const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
   // Requested proxy connection type: -1 follows gdaConnectionType; NONE without queues.
   int proxyConnReq = CCO_GDA_CONNECTION_NONE;
@@ -2329,16 +2329,22 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 /*                           ccoDevCommGetError                            */
 /* ========================================================================== */
 
+#ifdef MORI_CCO_PROXY
+// Only an engine still listed on comm is alive (a destroyed DevComm's copy
+// points at a freed one). Caller holds comm->allocMutex.
+static std::vector<void*>::iterator FindProxyEngine(ccoComm* comm, const void* engine) {
+  return std::find(comm->proxyEngines.begin(), comm->proxyEngines.end(), engine);
+}
+#endif
+
 int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError* err) {
   if (comm == nullptr || devComm == nullptr || err == nullptr) return -1;
   *err = ccoDevCommError{};
 #ifdef MORI_CCO_PROXY
   if (devComm->proxy.engine != nullptr) {
-    // Only an engine still listed on comm is alive (a destroyed DevComm's copy
-    // points at a freed one); the lock keeps a concurrent destroy from freeing it.
+    // The lock keeps a concurrent destroy from freeing the engine.
     std::lock_guard<std::mutex> lock(comm->allocMutex);
-    const auto& engines = comm->proxyEngines;
-    if (std::find(engines.begin(), engines.end(), devComm->proxy.engine) == engines.end()) return 0;
+    if (FindProxyEngine(comm, devComm->proxy.engine) == comm->proxyEngines.end()) return 0;
     return ccoProxyEngineGetError(static_cast<const ccoProxyEngine*>(devComm->proxy.engine), err);
   }
 #endif
@@ -2363,10 +2369,9 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
     bool owned = false;
     {
       std::lock_guard<std::mutex> lock(comm->allocMutex);
-      auto& engines = comm->proxyEngines;
-      auto it = std::find(engines.begin(), engines.end(), hostShadow.proxy.engine);
-      if (it != engines.end()) {
-        engines.erase(it);
+      auto it = FindProxyEngine(comm, hostShadow.proxy.engine);
+      if (it != comm->proxyEngines.end()) {
+        comm->proxyEngines.erase(it);
         owned = true;
       }
     }

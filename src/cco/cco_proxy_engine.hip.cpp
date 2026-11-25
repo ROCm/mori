@@ -66,6 +66,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <new>
@@ -80,8 +81,6 @@ namespace cco {
 
 namespace {
 
-constexpr size_t kDefaultQueueCapacity = 4096;  // lines (256 KiB ring per queue)
-constexpr int kDefaultMaxThreads = 4;
 constexpr uint32_t kSqDepth = 512;  // WRs per QP
 constexpr int kPopBatch = 64;       // callbacks run per queue per pass
 constexpr int kCqPollBatch = 32;
@@ -374,11 +373,11 @@ class ProxyWorker {
         qp.shadow.resize(kSqDepth);
       }
     }
-    thread_ = std::thread([this, cpu, stop] {
+    thread_ = std::thread([this, cpu] {
       PinCallingThread(id_, cpu);
       current_ = this;
       try {
-        Run(stop);
+        Run();
       } catch (const std::exception& e) {
         Raise(MakeError(CCO_PROXY_ERR_INTERNAL, -1, -1, -1),
               std::string("proxy thread failed: ") + e.what());
@@ -401,9 +400,7 @@ class ProxyWorker {
     Register(ctx, ccoProxyOpPut, &ProxyWorker::OnPut);
     Register(ctx, ccoProxyOpPutSignal, &ProxyWorker::OnPutSignal);
     Register(ctx, ccoProxyOpSignal, &ProxyWorker::OnSignal);
-    const uint8_t flushId =
-        ctx.register_callback(std::function<void()>([] { current_->OnFlush(); }));
-    if (flushId != ccoProxyOpFlush) throw std::runtime_error("ccoProxy callback id mismatch");
+    Register(ctx, ccoProxyOpFlush, &ProxyWorker::OnFlush);
     Register(ctx, ccoProxyOpPutValue, &ProxyWorker::OnPutValue);
     Register(ctx, ccoProxyOpPutValueSignal, &ProxyWorker::OnPutValueSignal);
     static_assert(ccoProxyOpCount == 6, "register every ccoProxyOp");
@@ -425,7 +422,14 @@ class ProxyWorker {
     if (id != op) throw std::runtime_error("ccoProxy callback id mismatch");
   }
 
-  void Run(const std::atomic<bool>* stop) {
+  template <typename Q>
+  static void Register(mori::cco::proxy::invoke::Context<Q>& ctx, ccoProxyOp op,
+                       void (ProxyWorker::*fn)()) {
+    const uint8_t id = ctx.register_callback(std::function<void()>([fn] { (current_->*fn)(); }));
+    if (id != op) throw std::runtime_error("ccoProxy callback id mismatch");
+  }
+
+  void Run() {
     for (;;) {
       if (!failed_ && ErrorPublished()) EnterFailed();
       size_t popped = 0;
@@ -437,24 +441,13 @@ class ProxyWorker {
       bool inFlight = false;
       bool flushPending = false;
       if (!failed_) {
-        bool completed = false;
-        for (int i : activeQps_) {
-          ProxyQp& qp = qps[i];
-          PostChain(qp);
-          if (!failed_ && qp.completedSeq < qp.postedSeq) {
-            completed = PollCq(qp) || completed;
-            inFlight = inFlight || qp.completedSeq < qp.postedSeq;
-          }
-        }
-        for (OwnedQueue* oq : queues) {
-          if (completed) RetireFlushes(*oq);
-          flushPending = flushPending || !oq->pending.empty();
-        }
+        PostAndPollAll(&inFlight);
+        for (OwnedQueue* oq : queues) flushPending = flushPending || !oq->pending.empty();
       }
       if (popped == 0) {
         // Stop only once drained: nothing waiting and, unless failed, every WR
         // completed and every FLUSH answered (a failed QP may never complete).
-        if (stop->load(std::memory_order_acquire) && !AnyReady() &&
+        if (stop_->load(std::memory_order_acquire) && !AnyReady() &&
             (failed_ || (!inFlight && !flushPending))) {
           break;
         }
@@ -532,11 +525,15 @@ class ProxyWorker {
     Poison();
   }
 
-  // Sets ccoProxyFailedBit in every owned queue's flushDone (this worker is its
-  // only writer).
-  void Poison() {
-    for (OwnedQueue* oq : queues) {
-      __atomic_store_n(oq->flushDone, oq->flushed | ccoProxyFailedBit, __ATOMIC_RELEASE);
+  // Sets ccoProxyFailedBit in every owned queue's flushDone.
+  void Poison() { PublishFlushDone(queues, ccoProxyFailedBit); }
+
+  // Release-stores flushed | bits into each queue's flushDone (this worker is its
+  // only writer), then one sfence for the batch.
+  template <typename Queues>
+  static void PublishFlushDone(const Queues& qs, uint64_t bits) {
+    for (OwnedQueue* oq : qs) {
+      __atomic_store_n(oq->flushDone, oq->flushed | bits, __ATOMIC_RELEASE);
     }
     _mm_sfence();  // drain the write-combining buffer toward the device
   }
@@ -647,8 +644,7 @@ class ProxyWorker {
     }
     if (retired != 0) {
       oq.flushed += retired;
-      __atomic_store_n(oq.flushDone, oq.flushed, __ATOMIC_RELEASE);
-      _mm_sfence();  // drain the write-combining buffer toward the device
+      PublishFlushDone(std::initializer_list<OwnedQueue*>{&oq}, 0);
     }
   }
 
@@ -658,28 +654,42 @@ class ProxyWorker {
   bool Reserve(ProxyQp& qp, size_t n) {
     while (qp.postedSeq + qp.wrs.size() + n - qp.completedSeq > kSqDepth) {
       if (ErrorPublished()) EnterFailed();
-      bool completed = false;
-      for (int i : activeQps_) {
-        if (failed_) return false;
-        ProxyQp& q = qps[i];
-        PostChain(q);
-        if (!failed_ && q.completedSeq < q.postedSeq) completed = PollCq(q) || completed;
-      }
       if (failed_) return false;
-      if (completed) {
-        for (OwnedQueue* oq : queues) RetireFlushes(*oq);
-      }
+      PostAndPollAll();
+      if (failed_) return false;
     }
     return true;
   }
 
-  // Append a WR to qp's pending chain; returns its sequence number. `inl` is
-  // the payload of an IBV_SEND_INLINE WR.
-  uint64_t Append(ProxyQp& qp, const ibv_send_wr& wr, const ibv_sge& sge, uint64_t inl = 0) {
+  // Posts every QP's chain, polls the CQs with WRs outstanding and, if any
+  // completed, retires flushes. Sets *inFlight if a polled QP still has WRs
+  // outstanding. Once failed, chains are empty and nothing is polled.
+  void PostAndPollAll(bool* inFlight = nullptr) {
+    bool completed = false;
+    for (int i : activeQps_) {
+      ProxyQp& qp = qps[i];
+      PostChain(qp);
+      if (!failed_ && qp.completedSeq < qp.postedSeq) {
+        completed = PollCq(qp) || completed;
+        if (inFlight != nullptr) *inFlight = *inFlight || qp.completedSeq < qp.postedSeq;
+      }
+    }
+    if (completed) {
+      for (OwnedQueue* oq : queues) RetireFlushes(*oq);
+    }
+  }
+
+  // Appends a WR to qp's pending chain and records its target; returns its
+  // sequence number. `inl` is the payload of an IBV_SEND_INLINE WR.
+  uint64_t Append(ProxyQp& qp, const ibv_send_wr& wr, const ibv_sge& sge, uint64_t raddr,
+                  uint32_t rkey, uint32_t len, uint64_t inl = 0) {
     qp.wrs.push_back(wr);
     qp.sges.push_back(sge);
     qp.inl.push_back(inl);
-    return qp.postedSeq + qp.wrs.size();
+    const uint64_t seq = qp.postedSeq + qp.wrs.size();
+    qp.shadow[seq % kSqDepth] =
+        WrShadow{raddr, rkey, len, cur_->index, static_cast<int>(wr.opcode)};
+    return seq;
   }
 
   // Error for WR `seq` of qp, with its target if the seq is still tracked.
@@ -707,9 +717,7 @@ class ProxyWorker {
     wr.num_sge = d.bytes ? 1 : 0;
     wr.wr.rdma.remote_addr = d.raddr;
     wr.wr.rdma.rkey = d.rkey;
-    const uint64_t seq = Append(qp, wr, sge);
-    qp.shadow[seq % kSqDepth] = WrShadow{d.raddr, d.rkey, d.bytes, cur_->index, IBV_WR_RDMA_WRITE};
-    return seq;
+    return Append(qp, wr, sge, d.raddr, d.rkey, d.bytes);
   }
 
   // RDMA write of the low `bytes` bytes of `value`, inline (no local MR).
@@ -722,9 +730,7 @@ class ProxyWorker {
     wr.send_flags = IBV_SEND_INLINE;
     wr.wr.rdma.remote_addr = raddr;
     wr.wr.rdma.rkey = rkey;
-    const uint64_t seq = Append(qp, wr, sge, value);
-    qp.shadow[seq % kSqDepth] = WrShadow{raddr, rkey, bytes, cur_->index, IBV_WR_RDMA_WRITE};
-    return seq;
+    return Append(qp, wr, sge, raddr, rkey, bytes, value);
   }
 
   // A signal: an 8-byte inline write (set) or an atomic fetch-add.
@@ -744,10 +750,7 @@ class ProxyWorker {
     wr.wr.atomic.remote_addr = d.raddr;
     wr.wr.atomic.rkey = d.rkey;
     wr.wr.atomic.compare_add = d.value;
-    const uint64_t seq = Append(qp, wr, sge);
-    qp.shadow[seq % kSqDepth] =
-        WrShadow{d.raddr, d.rkey, sizeof(uint64_t), cur_->index, IBV_WR_ATOMIC_FETCH_AND_ADD};
-    return seq;
+    return Append(qp, wr, sge, d.raddr, d.rkey, sizeof(uint64_t));
   }
 
   // Posts the pending chain with one ibv_post_send.
@@ -819,6 +822,26 @@ class ProxyWorker {
   std::thread thread_;
 };
 
+// Per-rank setup result, Allgather'd at each agreement point.
+struct ProxyCreateInfo {
+  int32_t ok;  // this rank's step succeeded
+  int32_t pad;
+  uint64_t maxMsgBytes;  // the port's max_msg_sz
+};
+
+// Allgathers every rank's result. If *error is still empty, sets it to the first
+// rank that failed, so all ranks fail or go on together.
+std::vector<ProxyCreateInfo> AgreeOk(application::BootstrapNetwork* bootNet, ProxyCreateInfo mine,
+                                     const char* what, std::string* error) {
+  const int worldSize = bootNet->GetWorldSize();
+  std::vector<ProxyCreateInfo> all(worldSize);
+  bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
+  for (int r = 0; r < worldSize && error->empty(); r++) {
+    if (!all[r].ok) *error = "rank " + std::to_string(r) + " " + what;
+  }
+  return all;
+}
+
 }  // namespace
 
 class ccoProxyEngine {
@@ -862,17 +885,6 @@ class ccoProxyEngine {
   std::atomic<bool> stop{false};
 };
 
-namespace {
-
-// Per-rank setup result, Allgather'd before the QP exchange.
-struct ProxyCreateInfo {
-  int32_t ok;  // this rank's local setup succeeded
-  int32_t pad;
-  uint64_t maxMsgBytes;  // the port's max_msg_sz
-};
-
-}  // namespace
-
 ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
                                      application::BootstrapNetwork* bootNet,
                                      const ccoProxyEngineConfig& config, ccoProxyContext* out) {
@@ -880,6 +892,13 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   const int worldSize = bootNet->GetWorldSize();
   const int rank = bootNet->GetLocalRank();
   engine->rank = rank;
+  // Logs and stops any started threads (they have posted nothing); the engine
+  // destructor releases the rest.
+  auto fail = [&](const std::string& why) -> ccoProxyEngine* {
+    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, why);
+    engine->StopAndJoin();
+    return nullptr;
+  };
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
   // Summed in 64 bits and validated below before any use as an int.
@@ -888,7 +907,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       static_cast<int>(std::clamp<int64_t>(numQueues64, 0, std::numeric_limits<int>::max()));
   // Never more threads than queues: a thread without a queue would only spin.
   const int numThreads =
-      std::min(config.numThreads > 0 ? config.numThreads : kDefaultMaxThreads, numQueues);
+      std::min(config.numThreads > 0 ? config.numThreads : kDefaultProxyThreads, numQueues);
   // QPs per peer of thread t: threadQps[t] = min(config.qpsPerPeer, t's queue
   // count), so no QP lacks a queue. Handle (peer, t, slot) sits at
   // local[peer * qpsPerRank + qpBase[t] + slot]; every rank computes the same
@@ -922,7 +941,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       qpsPerRank += threadQps.back();
     }
     local.resize(static_cast<size_t>(worldSize) * qpsPerRank);
-    const size_t capacity = config.queueCapacity ? config.queueCapacity : kDefaultQueueCapacity;
+    const size_t capacity =
+        config.queueCapacity ? config.queueCapacity : kDefaultProxyQueueCapacity;
     if ((capacity & (capacity - 1)) != 0 ||
         capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
       throw std::runtime_error("queue capacity must be a power of two >= the largest descriptor");
@@ -1028,23 +1048,13 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     error = e.what();
   }
 
-  // All ranks see the same table, so all fail or all go on. One RDMA write must
-  // fit every port.
   mine.ok = error.empty() ? 1 : 0;
-  std::vector<ProxyCreateInfo> all(worldSize);
-  bootNet->Allgather(&mine, all.data(), sizeof(ProxyCreateInfo));
+  const std::vector<ProxyCreateInfo> all =
+      AgreeOk(bootNet, mine, "failed to set up its proxy engine", &error);
+  if (!error.empty()) return fail(error);
+  // One RDMA write must fit every port.
   uint64_t maxMsgBytes = ccoProxyMaxPutBytes;
-  for (int r = 0; r < worldSize && error.empty(); r++) {
-    if (!all[r].ok) {
-      error = "rank " + std::to_string(r) + " failed to set up its proxy engine";
-    } else {
-      maxMsgBytes = std::min(maxMsgBytes, all[r].maxMsgBytes);
-    }
-  }
-  if (!error.empty()) {
-    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, error);
-    return nullptr;  // engine destructor releases what was built
-  }
+  for (const ProxyCreateInfo& info : all) maxMsgBytes = std::min(maxMsgBytes, info.maxMsgBytes);
 
   // Exchange QP handles the way Context does. A broken bootstrap leaves nothing
   // to agree on.
@@ -1053,8 +1063,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     bootNet->AllToAll(local.data(), remote.data(),
                       sizeof(application::RdmaEndpointHandle) * qpsPerRank);
   } catch (const std::exception& e) {
-    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, e.what());
-    return nullptr;  // engine destructor releases what was built
+    return fail(e.what());
   }
 
   // Connect and start, then agree: a rank going on with QPs whose peer failed
@@ -1097,17 +1106,10 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   } catch (const std::exception& e) {
     error = e.what();
   }
-  int32_t connected = error.empty() ? 1 : 0;
-  std::vector<int32_t> allConnected(worldSize);
-  bootNet->Allgather(&connected, allConnected.data(), sizeof(int32_t));
-  for (int r = 0; r < worldSize && error.empty(); r++) {
-    if (!allConnected[r]) error = "rank " + std::to_string(r) + " failed to connect or start";
-  }
-  if (!error.empty()) {
-    MORI_SHMEM_ERROR("ccoProxyEngineCreate: rank={} failed: {}", rank, error);
-    engine->StopAndJoin();  // the threads have posted nothing
-    return nullptr;         // engine destructor releases what was built
-  }
+  ProxyCreateInfo connected{};
+  connected.ok = error.empty() ? 1 : 0;
+  AgreeOk(bootNet, connected, "failed to connect or start", &error);
+  if (!error.empty()) return fail(error);
 
   const int numPeers =
       static_cast<int>(std::count(config.peerMask.begin(), config.peerMask.end(), true)) -

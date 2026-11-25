@@ -50,12 +50,11 @@ if(BUILD_CCO_PROXY)
     add_library(mori_cco_proxy OBJECT ${MORI_CCO_PROXY_SOURCES})
     target_include_directories(mori_cco_proxy PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
                                                       ${CMAKE_CURRENT_SOURCE_DIR}/proxy)
-    target_compile_definitions(mori_cco_proxy PRIVATE MORI_CCO_PROXY=1)
     target_link_libraries(mori_cco_proxy PRIVATE mori_logging hip::host
                                                  hsa-runtime64::hsa-runtime64 mori_application_static)
     set_target_properties(
       mori_cco_proxy PROPERTIES HIP_ARCHITECTURES "${MORI_CCO_PROXY_HIP_ARCHITECTURES}"
-                                POSITION_INDEPENDENT_CODE ON HIP_STANDARD 17 CXX_STANDARD 17)
+                                POSITION_INDEPENDENT_CODE ON HIP_STANDARD 17)
     target_sources(mori_cco PRIVATE $<TARGET_OBJECTS:mori_cco_proxy>)
     target_compile_definitions(mori_cco PUBLIC MORI_CCO_PROXY=1)
     target_link_libraries(mori_cco PRIVATE hsa-runtime64::hsa-runtime64)
