@@ -37,13 +37,14 @@
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/collective/inter_node/kernels/all_gather.hpp"
 
-// The TDM AllReduce transport exists only where the engine does. Guarding the include rather than
-// the header's contents follows src/ops/dispatch_combine/intranode_entry.hpp: the arch test lives at
-// the one place that chooses, so the implementation never interleaves arch tests with the code they
-// guard. On any other target the TdmAllreduce* symbols are simply absent from the .hsaco, and
+// The TDM transports (AllReduce, All2all) exist only where the engine does. Guarding the include
+// rather than the header's contents follows src/ops/dispatch_combine/intranode_entry.hpp: the arch
+// test lives at the one place that chooses, so the implementation never interleaves arch tests with
+// the code they guard. On any other target the Tdm* symbols are simply absent from the .hsaco, and
 // python/mori/ccl/collective.py refuses the TDM backend before it can ask for them.
 #if defined(__gfx1250__) || defined(__gfx1251__)
-#define MORI_CCL_HAS_TDM_ALLREDUCE 1
+#define MORI_CCL_HAS_TDM 1
+#include "mori/collective/all2all/oneshot_all2all_tdm_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_tdm_kernel.hpp"
 #endif
 
@@ -176,6 +177,18 @@ extern "C" __global__ void OneShotAll2allSdmaAsyncWaitKernel_u32(
                                          args.outputTransitMemObj, args.flagsMemObj);
 }
 
+// TDM transport (gfx125x only). Its completion is inside the one kernel, so it
+// has no async put/wait pair. It takes the SDMA kernel's arguments plus the
+// sync array the Python side allocates (CclTdmAll2allArgs).
+#if defined(MORI_CCL_HAS_TDM)
+extern "C" __global__ void TdmAll2allKernel_u32(CclTdmAll2allArgs args) {
+  const CclAll2allArgs<uint32_t>& a = args.base;
+  TdmAll2allKernel_body<uint32_t>(a.myPe, a.npes, a.input, a.inputTransitMemObj,
+                                  a.outputTransitMemObj, a.flagsMemObj, a.elementCount,
+                                  args.sync);
+}
+#endif
+
 // ============================================================================
 // AllGather instantiations (uint32_t)
 // ============================================================================
@@ -255,7 +268,7 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_PROTECTED_AG,
 // allgather reads the reduced slot unconditionally, which is why it wraps with
 // CCL_WRAP_ALLREDUCE_AG rather than needing the PROTECTED variant's extra
 // source-offset argument.
-#if defined(MORI_CCL_HAS_TDM_ALLREDUCE)
+#if defined(MORI_CCL_HAS_TDM)
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, TdmReduceScatterKernel)
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, TdmAllGatherKernel)
 #endif

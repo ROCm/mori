@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ctypes
 import os
 import time
 
@@ -70,14 +71,15 @@ def _require_sdma_env(class_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AllReduce transport selection
+# AllReduce / All2all transport selection
 # ---------------------------------------------------------------------------
-# MORI_CCL_ALLREDUCE_BACKEND picks which engine carries the cross-GPU bytes.
-# Default is sdma on every architecture, including gfx125x. tdm requires gfx125x
-# because the TDM engine does not exist elsewhere, and because ccl_kernels.hip
-# only emits the TdmAllreduce* symbols under that arch guard -- asking for them
-# on another target would fail at kernel lookup rather than here.
-_ALLREDUCE_BACKENDS = ("sdma", "tdm")
+# MORI_CCL_ALLREDUCE_BACKEND and MORI_CCL_ALL2ALL_BACKEND pick which engine
+# carries the cross-GPU bytes. Default is sdma on every architecture, including
+# gfx125x. tdm requires gfx125x because the TDM engine does not exist elsewhere,
+# and because ccl_kernels.hip only emits the Tdm* symbols under that arch guard
+# -- asking for them on another target would fail at kernel lookup rather than
+# here.
+_CCL_BACKENDS = ("sdma", "tdm")
 
 
 def _detect_arch_str() -> str:
@@ -92,18 +94,16 @@ def _detect_arch_str() -> str:
         return ""
 
 
-def _resolve_allreduce_backend() -> str:
-    raw = os.environ.get("MORI_CCL_ALLREDUCE_BACKEND", "").strip().lower()
+def _resolve_backend(env_name: str) -> str:
+    raw = os.environ.get(env_name, "").strip().lower()
     if raw in ("", "sdma"):
         return "sdma"
-    if raw not in _ALLREDUCE_BACKENDS:
-        raise ValueError(
-            f"MORI_CCL_ALLREDUCE_BACKEND={raw!r} is not one of {_ALLREDUCE_BACKENDS}"
-        )
+    if raw not in _CCL_BACKENDS:
+        raise ValueError(f"{env_name}={raw!r} is not one of {_CCL_BACKENDS}")
     arch = _detect_arch_str()
     if not arch.startswith("gfx125"):
         raise RuntimeError(
-            f"MORI_CCL_ALLREDUCE_BACKEND=tdm requires a gfx125x GPU (detected "
+            f"{env_name}=tdm requires a gfx125x GPU (detected "
             f"arch {arch!r}); the TDM engine does not exist on this target."
         )
     return "tdm"
@@ -131,6 +131,25 @@ _TDM_THREADS = 512
 def _tdm_shared_mem(threads: int) -> int:
     warps = (threads + _TDM_WAVE_SIZE - 1) // _TDM_WAVE_SIZE
     return warps * _TDM_TILE_BYTES
+
+
+# Must equal MORI_CCL_TDM_A2A_TILE_BYTES in
+# include/mori/collective/all2all/oneshot_all2all_tdm_kernel.hpp, for the same
+# reason as _TDM_TILE_BYTES. 16 warps x 16 KiB is 256 KiB of LDS a block.
+_TDM_A2A_TILE_BYTES = 256 * 16 * 4
+# 64 blocks x 16 wave32 is the 1024 warps in flight the AllReduce launch uses.
+# Must not exceed MORI_CCL_TDM_A2A_MAX_BLOCKS: every block owns a slot in the
+# sync array.
+_TDM_A2A_BLOCKS = 64
+_TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
+# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block, the go word and the
+# number of the last finished call.
+_TDM_A2A_SYNC_WORDS = 64 + 2
+# sizeof(CclAll2allArgs<uint32_t>), the struct prepare_sync fills. The TDM
+# kernel takes those bytes followed by the sync pointer (CclTdmAll2allArgs,
+# which static_asserts both numbers).
+_TDM_A2A_BASE_ARGS_BYTES = 72
+_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 8
 
 
 _TORCH_DTYPE_TO_NUMPY = {
@@ -215,7 +234,14 @@ class All2allSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
-        _require_sdma_env("All2allSdma")
+        # Resolved once, like AllreduceSdma's: the two transports read the same
+        # flags differently, so ranks must agree on it for the life of the handle.
+        self._backend = _resolve_backend("MORI_CCL_ALL2ALL_BACKEND")
+        # The TDM kernel carries every size itself and never touches an SDMA
+        # queue, unlike AllreduceSdma's TDM backend, which keeps small messages
+        # on SDMA.
+        if self._backend != "tdm":
+            _require_sdma_env("All2allSdma")
         _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
@@ -233,32 +259,87 @@ class All2allSdma:
             self._handle = handle_class(
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
+        self._output_transit_bytes = self._handle.get_output_transit_buffer()[1]
+        if self._backend == "tdm":
+            if npes > _TDM_WAVE_SIZE:
+                raise ValueError(
+                    f"the TDM all2all signals its peers from one wave32 and takes at "
+                    f"most {_TDM_WAVE_SIZE} ranks, got npes={npes}"
+                )
+            # One per handle, so two handles never share block slots or call
+            # numbers. Ordinary device memory: only this rank's blocks use it.
+            self._tdm_sync = torch.zeros(
+                _TDM_A2A_SYNC_WORDS,
+                dtype=torch.int64,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            # The first launch may be on another stream than the fill.
+            torch.cuda.synchronize()
+            self._tdm_args = ctypes.create_string_buffer(_TDM_A2A_ARGS_BYTES)
+            ctypes.c_uint64.from_buffer(
+                self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES
+            ).value = self._tdm_sync.data_ptr()
+
+    def _check_tdm_count(self, count: int) -> None:
+        # The TDM kernel writes count * npes uint32 into every rank's output
+        # transit buffer and nothing on the device checks the bound.
+        need = count * self.npes * 4
+        if need > self._output_transit_bytes:
+            raise ValueError(
+                f"count={count} needs {need} bytes of output transit buffer per "
+                f"rank, but it has {self._output_transit_bytes}"
+            )
+
+    def _launch_tdm(self, args, s: int) -> None:
+        # hipModuleLaunchKernel copies the argument bytes at launch, and a graph
+        # capture keeps that copy, so the buffer is reused for every call.
+        ctypes.memmove(self._tdm_args, args, _TDM_A2A_BASE_ARGS_BYTES)
+        _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
+            (_TDM_A2A_BLOCKS,),
+            (_TDM_THREADS,),
+            _TDM_A2A_SHARED_MEM,
+            s,
+            ctypes.addressof(self._tdm_args),
+        )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> float:
         s = _stream_to_int(stream)
         t0 = time.perf_counter()
+        if self._backend == "tdm":
+            self._check_tdm_count(count)
         args = self._handle.prepare_sync(
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
-        _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
-            (1,), (64,), 0, s, args
-        )
+        if self._backend == "tdm":
+            self._launch_tdm(args, s)
+        else:
+            _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
+                (1,), (64,), 0, s, args
+            )
         self._handle.finish_sync(output_data.data_ptr(), count, s)
         return time.perf_counter() - t0
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         s = _stream_to_int(stream)
+        if self._backend == "tdm":
+            self._check_tdm_count(count)
         args = self._handle.prepare_async_start(
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
-        _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
-            (1,), (64,), 0, s, args
-        )
+        if self._backend == "tdm":
+            self._launch_tdm(args, s)
+        else:
+            _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
+                (1,), (64,), 0, s, args
+            )
         self._handle.after_async_start()
         return True
 
     def wait_async(self, stream=None) -> float:
         s = _stream_to_int(stream)
+        if self._backend == "tdm":
+            # The TDM kernel waits for every peer itself; only the host side is left.
+            return self._handle.finish_async_wait(s)
         args = self._handle.prepare_async_wait(s)
         _get_ccl_func("OneShotAll2allSdmaAsyncWaitKernel_u32").launch_struct(
             (1,), (512,), 0, s, args
@@ -1139,7 +1220,7 @@ class AllreduceSdma:
         # Resolved once, in the constructor, so every call in a process uses the
         # same transport: the flag protocol is shared state, and two ranks
         # disagreeing about which kernel is running would hang rather than fail.
-        self._backend = _resolve_allreduce_backend()
+        self._backend = _resolve_backend("MORI_CCL_ALLREDUCE_BACKEND")
         self._type_suffix = _DTYPE_TO_SUFFIX.get(dtype)
         if self._type_suffix is None:
             raise ValueError(
