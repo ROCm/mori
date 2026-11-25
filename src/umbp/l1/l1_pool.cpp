@@ -29,7 +29,10 @@
 #include <cstring>
 #include <map>
 #include <shared_mutex>
+#include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -394,12 +397,23 @@ PoolManager::~PoolManager() {
   pools_.clear();
 }
 
-void PoolManager::ReleaseMemoryLocked(Pool* pool) {
-  if (pool->external) {
-    api_->Unimport(pool->device, pool->mapped);
+void PoolManager::ReleasePart(const Part& part) {
+  if (!part.attached) return;
+  if (part.external) {
+    api_->Unimport(part.device, part.mapped);
   } else {
-    api_->Free(pool->device, pool->base, pool->bytes);
+    api_->Free(part.device, part.base, part.bytes);
   }
+}
+
+void PoolManager::ReleaseMemoryLocked(Pool* pool) {
+  for (const Part& part : pool->parts) ReleasePart(part);
+}
+
+// Pools of one group declare the same slot sizes part by part (`BindLayout`),
+// so two of them differ in shape only by how many parts they have.
+bool PoolManager::SameShape(const Pool& src, const Pool& dst) {
+  return src.parts.size() == dst.parts.size();
 }
 
 PoolManager::Pool* PoolManager::FindLocked(const std::string& pool_id) {
@@ -438,6 +452,7 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
   }
   pool->held = 0;
   pool->committed = 0;
+  for (Part& part : pool->parts) part.committed = 0;
 }
 
 bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
@@ -539,105 +554,152 @@ void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool) 
   if (pool == nullptr || pool->serial != serial) return;
   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
   ReleaseMemoryLocked(pool);
-  MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}{} evicted={} spare_copy={}",
-                 pool_id, pool->device, pool->bytes, pool->external ? " (adopted, unmapped)" : "",
-                 pool->evicted, pool->evicted_spare);
+  uint64_t bytes = 0;
+  for (const Part& part : pool->parts) bytes += part.attached ? part.bytes : 0;
+  MORI_UMBP_INFO("[L1Pool] destroyed pool={} parts={} bytes={} evicted={} spare_copy={}", pool_id,
+                 pool->parts.size(), bytes, pool->evicted, pool->evicted_spare);
   pools_.erase(pool_id);
 }
 
 AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& group, int device,
-                                 uint64_t bytes, const ExternalMemory& external) {
+                                 uint64_t bytes, const ExternalMemory& external,
+                                 const PartSpec& spec) {
   const bool adopt = !external.handle.empty();
   AttachResult result;
   if (pool_id.empty() || bytes == 0 || device < 0) {
     result.status = Status::Error("attach needs a pool id, a device and a non-zero size");
     return result;
   }
+  if (spec.count == 0 || spec.count > kMaxParts || spec.index >= spec.count) {
+    result.status = Status::Error("attach of pool " + pool_id + " names part " +
+                                  std::to_string(spec.index) + " of " + std::to_string(spec.count));
+    return result;
+  }
   const uint64_t offset = adopt ? external.offset : 0;
+  const std::string attach_key = pool_id + "#" + std::to_string(spec.index);
   std::unique_lock<std::mutex> lock(mutex_);
   // DestroyLocked gives up the lock while the pool's copies finish, so another
   // Attach of this id may have replaced the pool, or be allocating it, by the
   // time it returns: look again each time round.
   for (;;) {
-    if (attaching_.count(pool_id) != 0) {
+    if (attaching_.count(attach_key) != 0) {
       result.status = Status::Error("pool " + pool_id + " is already being attached");
       return result;
     }
     Pool* existing = FindLocked(pool_id);
     if (existing == nullptr) break;
-    if (existing->group == group && existing->device == device && existing->bytes == bytes &&
-        existing->external == adopt && existing->external_handle == external.handle &&
-        existing->external_offset == offset) {
-      result.memory = existing->exported;
-      result.bytes = existing->bytes;
-      result.created = false;
-      return result;
+    if (existing->group == group && existing->parts.size() == spec.count) {
+      const Part& have = existing->parts[spec.index];
+      // The pool's other parts came first and it is waiting for this one.
+      if (!have.attached) break;
+      if (have.device == device && have.bytes == bytes && have.external == adopt &&
+          have.external_handle == external.handle && have.external_offset == offset) {
+        result.memory = have.exported;
+        result.bytes = have.bytes;
+        result.created = false;
+        return result;
+      }
     }
+    // Another shape under this id: the pool goes, every part of it. Its owner
+    // restarted, and the other parts' memory went with the old process too.
     DestroyLocked(lock, existing);
   }
   // The allocation zero-fills hundreds of GB; do it without the lock so pools
   // already serving are not stalled behind it.
-  attaching_.insert(pool_id);
+  attaching_.insert(attach_key);
   lock.unlock();
-  void* base = nullptr;
-  void* mapped = nullptr;
-  ExportedMemory exported;
+  Part part;
   std::string error;
-  const bool ok =
-      adopt ? api_->Import(device, external.handle, external.offset, &base, &mapped, &error)
-            : api_->Allocate(device, bytes, &base, &exported, &error);
+  const bool ok = adopt ? api_->Import(device, external.handle, external.offset, &part.base,
+                                       &part.mapped, &error)
+                        : api_->Allocate(device, bytes, &part.base, &part.exported, &error);
   lock.lock();
-  attaching_.erase(pool_id);
+  attaching_.erase(attach_key);
   if (!ok) {
-    MORI_UMBP_ERROR("[L1Pool] attach pool={} device={} bytes={} failed: {}", pool_id, device, bytes,
-                    error);
+    MORI_UMBP_ERROR("[L1Pool] attach pool={} part={} device={} bytes={} failed: {}", pool_id,
+                    spec.index, device, bytes, error);
     result.status = Status::Error(error);
     return result;
   }
-  auto pool = std::make_unique<Pool>();
-  pool->id = pool_id;
-  pool->serial = next_serial_++;
-  pool->group = group;
-  pool->device = device;
-  pool->base = base;
-  pool->bytes = bytes;
-  pool->exported = exported;
-  pool->external = adopt;
-  pool->mapped = mapped;
-  pool->external_handle = external.handle;
-  pool->external_offset = offset;
-  pools_[pool_id] = std::move(pool);
-  MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}{}", pool_id, group, device,
-                 bytes, adopt ? " (adopted from its owner)" : "");
-  result.memory = std::move(exported);
+  part.attached = true;
+  part.device = device;
+  part.bytes = bytes;
+  part.external = adopt;
+  part.external_handle = external.handle;
+  part.external_offset = offset;
+  // The pool's other parts attach on their own threads: by now one of them may
+  // have created the pool this part belongs to.
+  Pool* pool = FindLocked(pool_id);
+  if (pool != nullptr && (pool->group != group || pool->parts.size() != spec.count ||
+                          pool->parts[spec.index].attached)) {
+    ReleasePart(part);
+    result.status = Status::Error("pool " + pool_id + " was replaced while part " +
+                                  std::to_string(spec.index) + " was attaching");
+    return result;
+  }
+  if (pool == nullptr) {
+    auto created = std::make_unique<Pool>();
+    created->id = pool_id;
+    created->serial = next_serial_++;
+    created->group = group;
+    created->parts.resize(spec.count);
+    pool = created.get();
+    pools_[pool_id] = std::move(created);
+  }
+  result.memory = part.exported;
+  pool->parts[spec.index] = std::move(part);
+  MORI_UMBP_INFO("[L1Pool] attached pool={} part={}/{} group={} device={} bytes={}{}", pool_id,
+                 spec.index, spec.count, group, device, bytes,
+                 adopt ? " (adopted from its owner)" : "");
   result.bytes = bytes;
   result.created = true;
   return result;
 }
 
-Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout) {
+Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout,
+                               uint32_t part_index) {
   if (layout.num_slots == 0 || layout.regions.empty()) {
     return Status::Error("a layout needs slots and at least one region");
   }
   std::unique_lock<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
+  const auto part_of = [&](Pool* p) -> Part* {
+    return part_index < p->parts.size() && p->parts[part_index].attached ? &p->parts[part_index]
+                                                                         : nullptr;
+  };
+  Part* part = part_of(pool);
+  if (part == nullptr) {
+    return Status::Error("pool " + pool_id + " has no part " + std::to_string(part_index) +
+                         " attached");
+  }
   std::vector<uint64_t> units;
   for (const Region& region : layout.regions) {
     // Divided rather than multiplied out: offset + slots * unit can wrap.
-    if (region.unit_bytes == 0 || region.offset > pool->bytes ||
-        region.unit_bytes > (pool->bytes - region.offset) / layout.num_slots) {
+    if (region.unit_bytes == 0 || region.offset > part->bytes ||
+        region.unit_bytes > (part->bytes - region.offset) / layout.num_slots) {
       return Status::Error("a region does not fit in pool " + pool_id);
     }
     units.push_back(region.unit_bytes);
   }
-  if (pool->bound && SameLayout(pool->layout, layout)) return Status{};
+  if (part->bound && SameLayout(part->layout, layout)) return Status{};
+  // One slot table for every part: slot i is the same slot on each of them.
+  for (size_t i = 0; i < pool->parts.size(); ++i) {
+    const Part& other = pool->parts[i];
+    if (i != part_index && other.bound && other.layout.num_slots != layout.num_slots) {
+      return Status::Error("part " + std::to_string(part_index) + " of pool " + pool_id +
+                           " declares " + std::to_string(layout.num_slots) + " slots, part " +
+                           std::to_string(i) + " " + std::to_string(other.layout.num_slots));
+    }
+  }
 
   Group& group = groups_[pool->group];
-  if (group.has_layout && group.unit_bytes != units) {
+  if (part_index < group.unit_bytes.size() && !group.unit_bytes[part_index].empty() &&
+      group.unit_bytes[part_index] != units) {
     for (const auto& entry : pools_) {
       const Pool* other = entry.second.get();
-      if (other != pool && other->bound && other->group == pool->group) {
+      if (other != pool && other->group == pool->group && part_index < other->parts.size() &&
+          other->parts[part_index].bound) {
         return Status::Error("pool " + pool_id + " declares slot sizes that differ from group " +
                              pool->group);
       }
@@ -649,18 +711,24 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
       return p == nullptr || p->busy == 0;
     });
     pool = FindLocked(pool_id);
-    if (pool == nullptr) return Status::Error("pool " + pool_id + " was detached");
+    part = pool == nullptr ? nullptr : part_of(pool);
+    if (part == nullptr) return Status::Error("pool " + pool_id + " was detached");
     ResetSlotsLocked(pool);
   }
   Group& current = groups_[pool->group];
-  current.has_layout = true;
-  current.unit_bytes = std::move(units);
-  pool->layout = layout;
+  if (current.unit_bytes.size() <= part_index) current.unit_bytes.resize(part_index + 1);
+  current.unit_bytes[part_index] = std::move(units);
+  part->layout = layout;
+  part->bound = true;
+  pool->bound = std::all_of(pool->parts.begin(), pool->parts.end(),
+                            [](const Part& p) { return p.attached && p.bound; });
+  MORI_UMBP_INFO("[L1Pool] bound pool={} part={}/{} slots={} regions={}{}", pool_id, part_index,
+                 pool->parts.size(), layout.num_slots, layout.regions.size(),
+                 pool->bound ? "" : " (waiting for the other parts)");
+  if (!pool->bound) return Status{};
+  pool->num_slots = layout.num_slots;
   pool->slots.assign(layout.num_slots, Slot{});
-  pool->bound = true;
   ResetSlotsLocked(pool);
-  MORI_UMBP_INFO("[L1Pool] bound pool={} slots={} regions={}", pool_id, layout.num_slots,
-                 layout.regions.size());
   return Status{};
 }
 
@@ -677,7 +745,7 @@ OpenResult PoolManager::Open(const std::string& pool_id) {
     return result;
   }
   ResetSlotsLocked(pool);
-  result.num_slots = pool->layout.num_slots;
+  result.num_slots = pool->num_slots;
   MORI_UMBP_INFO("[L1Pool] opened pool={} slots={}", pool_id, result.num_slots);
   return result;
 }
@@ -714,11 +782,18 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
   return result;
 }
 
-Status PoolManager::Commit(const std::string& pool_id, uint64_t committed) {
+Status PoolManager::Commit(const std::string& pool_id, uint64_t committed, uint32_t part) {
   std::lock_guard<std::mutex> lock(mutex_);
   Pool* pool = FindLocked(pool_id);
   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
-  pool->committed = std::max(pool->committed, committed);
+  if (part >= pool->parts.size()) {
+    return Status::Error("pool " + pool_id + " has no part " + std::to_string(part));
+  }
+  pool->parts[part].committed = std::max(pool->parts[part].committed, committed);
+  // A slot is one slot on every part: it has landed when the slowest has.
+  uint64_t slowest = pool->parts[0].committed;
+  for (const Part& p : pool->parts) slowest = std::min(slowest, p.committed);
+  pool->committed = slowest;
   // A fetch into this pool's held slots may be waiting for them to settle.
   idle_.notify_all();
   return Status{};
@@ -814,7 +889,9 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     if (holders == group.holders.end()) return nullptr;
     for (const Holder& h : holders->second) {
       // Not this pool, and not a slot its owner may still be writing.
-      if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) return &h;
+      if (h.pool != pool && SameShape(*h.pool, *pool) && Readable(*h.pool, h.pool->slots[h.slot])) {
+        return &h;
+      }
     }
     return nullptr;
   };
@@ -902,7 +979,8 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     if (holders != group.holders.end()) {
       for (const Holder& h : holders->second) {
         // Not this pool, and not a slot its owner may still be writing.
-        if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) {
+        if (h.pool != pool && SameShape(*h.pool, *pool) &&
+            Readable(*h.pool, h.pool->slots[h.slot])) {
           source = &h;
           break;
         }
@@ -928,7 +1006,9 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
   const auto started = std::chrono::steady_clock::now();
   std::vector<bool> copied(steps.size(), false);
   std::string copy_error;
-  std::vector<MemoryApi::Fragment> fragments;
+  // Part p of the source slots to part p of the destination slots.
+  const size_t num_parts = pool->parts.size();
+  std::vector<std::vector<MemoryApi::Fragment>> fragments(num_parts);
   size_t run_start = 0;
   bool failed = false;
   while (run_start < steps.size()) {
@@ -940,23 +1020,42 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
     }
     const CopyStep& first = steps[run_start];
     const uint64_t run_slots = run_end - run_start;
-    for (size_t r = 0; r < pool->layout.regions.size(); ++r) {
-      const Region& dst_region = pool->layout.regions[r];
-      const Region& src_region = first.src->layout.regions[r];
-      const uint64_t unit = dst_region.unit_bytes;
-      void* dst =
-          static_cast<char*>(pool->base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
-      const void* src = static_cast<const char*>(first.src->base) + src_region.offset +
-                        uint64_t{first.src_slot} * unit;
-      fragments.push_back(MemoryApi::Fragment{dst, src, run_slots * unit, first.src->device});
-      result.copied_bytes += run_slots * unit;
+    for (size_t p = 0; p < num_parts; ++p) {
+      const Part& dst_part = pool->parts[p];
+      const Part& src_part = first.src->parts[p];
+      for (size_t r = 0; r < dst_part.layout.regions.size(); ++r) {
+        const Region& dst_region = dst_part.layout.regions[r];
+        const Region& src_region = src_part.layout.regions[r];
+        const uint64_t unit = dst_region.unit_bytes;
+        void* dst =
+            static_cast<char*>(dst_part.base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
+        const void* src = static_cast<const char*>(src_part.base) + src_region.offset +
+                          uint64_t{first.src_slot} * unit;
+        fragments[p].push_back(MemoryApi::Fragment{dst, src, run_slots * unit, src_part.device});
+        result.copied_bytes += run_slots * unit;
+      }
     }
     run_start = run_end;
   }
-  // One batch for the whole call, landed before it returns: nothing is
-  // handed to the requester before then.
-  if (!fragments.empty()) {
-    failed = !api_->CopyBatch(pool->device, fragments, &copy_error);
+  // One batch a part for the whole call, landed before it returns: nothing is
+  // handed to the requester before then. The parts are on different devices,
+  // so their batches run side by side; a slot counts only if every part of it
+  // landed.
+  if (!steps.empty()) {
+    std::vector<std::string> errors(num_parts);
+    std::vector<char> landed(num_parts, 0);
+    const auto copy_part = [&](size_t p) {
+      landed[p] = api_->CopyBatch(pool->parts[p].device, fragments[p], &errors[p]) ? 1 : 0;
+    };
+    std::vector<std::thread> workers;
+    for (size_t p = 1; p < num_parts; ++p) workers.emplace_back(copy_part, p);
+    copy_part(0);
+    for (std::thread& worker : workers) worker.join();
+    for (size_t p = 0; p < num_parts; ++p) {
+      if (landed[p] != 0) continue;
+      if (!failed) copy_error = "part " + std::to_string(p) + ": " + errors[p];
+      failed = true;
+    }
     if (failed) result.copied_bytes = 0;
     std::fill(copied.begin(), copied.end(), !failed);
   }
@@ -1082,8 +1181,9 @@ std::vector<PoolStats> PoolManager::Stats() const {
     PoolStats stats;
     stats.pool_id = pool.id;
     stats.group = pool.group;
-    stats.device = pool.device;
-    stats.bytes = pool.bytes;
+    stats.device = pool.parts[0].device;
+    for (const Part& part : pool.parts) stats.bytes += part.attached ? part.bytes : 0;
+    stats.parts = static_cast<uint32_t>(pool.parts.size());
     stats.num_slots = static_cast<uint32_t>(pool.slots.size());
     stats.held = pool.held;
     stats.cached = static_cast<uint32_t>(pool.lru.size() + pool.kept.size());

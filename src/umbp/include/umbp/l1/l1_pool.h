@@ -42,6 +42,13 @@ namespace mori::umbp::l1 {
 // the content index. Pools in the same group share that index, so content one
 // engine published can be copied into another engine's pool on request.
 //
+// A pool may also be several such allocations, its parts: an engine rank that
+// runs tensor-parallel attention keeps slot i of its KV on every one of its
+// devices, a different shard on each. The parts share one slot table -- one
+// free list, one index, one eviction order -- so slot i is the same slot on
+// every device; each part has its own memory and layout and reports its own
+// device's progress. A copy between two pools copies part p to part p.
+//
 // Nothing here knows what a slot holds. A slot is `sum(region.unit_bytes)`
 // bytes, spread over the pool's regions; a key is opaque bytes.
 //
@@ -129,6 +136,13 @@ struct ExternalMemory {
   uint64_t offset = 0;
 };
 
+// Which part of a pool an Attach brings, and how many the pool has. Every
+// part of a pool names the same count.
+struct PartSpec {
+  uint32_t index = 0;
+  uint32_t count = 1;
+};
+
 struct AttachResult {
   Status status;
   ExportedMemory memory;
@@ -173,8 +187,9 @@ struct FetchResult {
 struct PoolStats {
   std::string pool_id;
   std::string group;
-  int device = -1;
-  uint64_t bytes = 0;
+  int device = -1;     // of part 0
+  uint64_t bytes = 0;  // over every part
+  uint32_t parts = 1;
   uint32_t num_slots = 0;
   uint32_t held = 0;
   uint32_t cached = 0;
@@ -198,10 +213,15 @@ class PoolManager {
   // match. A pool with the same id and a different shape is replaced.
   // With `external.handle` the pool adopts that memory instead: the owner keeps
   // allocating and freeing it, the server only maps it and manages its slots.
+  // With `part.count` > 1 this is one part of the pool: the others arrive in
+  // their own calls, in any order, and the pool serves once all are bound. A
+  // part attached again with another shape replaces the whole pool.
   AttachResult Attach(const std::string& pool_id, const std::string& group, int device,
-                      uint64_t bytes, const ExternalMemory& external = {});
-  // Every pool of a group must declare the same per-region slot sizes.
-  Status BindLayout(const std::string& pool_id, const Layout& layout);
+                      uint64_t bytes, const ExternalMemory& external = {},
+                      const PartSpec& part = {});
+  // Every pool of a group must declare the same per-region slot sizes, part by
+  // part, and every part of a pool the same number of slots.
+  Status BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part = 0);
   // Reset every slot to vacant and drop the pool's keys.
   OpenResult Open(const std::string& pool_id);
   // Up to `count` slots: vacant ones first (lowest id), then — only until
@@ -210,11 +230,14 @@ class PoolManager {
   AllocateResult Allocate(const std::string& pool_id, uint32_t count,
                           uint32_t min_count = kAllRequired);
   static constexpr uint32_t kAllRequired = UINT32_MAX;
+  // More parts than a pool has devices to put them on is a caller's mistake.
+  static constexpr uint32_t kMaxParts = 64;
   // `stamp` marks the slots these ops publish or release as unsettled until a
   // Commit at or past it; 0 means they are settled already.
   Status Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp = 0);
   // Every write the owner's device was issued before `committed` has landed.
-  Status Commit(const std::string& pool_id, uint64_t committed);
+  // A pool of several parts has got as far as its slowest part.
+  Status Commit(const std::string& pool_id, uint64_t committed, uint32_t part = 0);
   // For each key in order: already in this pool -> its slot; held, settled,
   // by another pool of the group -> copied into a settled free slot here,
   // which becomes cached under that key. Stops at the first key no settled
@@ -263,11 +286,9 @@ class PoolManager {
     bool kept = false;
   };
 
-  struct Pool {
-    std::string id;
-    // Tells this pool from a later one attached under the same id.
-    uint64_t serial = 0;
-    std::string group;
+  // One allocation of a pool, on one device.
+  struct Part {
+    bool attached = false;
     int device = -1;
     void* base = nullptr;
     uint64_t bytes = 0;
@@ -278,6 +299,18 @@ class PoolManager {
     uint64_t external_offset = 0;
     Layout layout;
     bool bound = false;
+    uint64_t committed = 0;  // how far this part's device has got
+  };
+
+  struct Pool {
+    std::string id;
+    // Tells this pool from a later one attached under the same id.
+    uint64_t serial = 0;
+    std::string group;
+    std::vector<Part> parts;
+    // Every part attached and bound: the pool has slots and can be opened.
+    bool bound = false;
+    uint32_t num_slots = 0;
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
     std::list<uint32_t> lru;  // cached slots, coldest first
@@ -287,7 +320,7 @@ class PoolManager {
     std::unordered_map<std::string, uint32_t> index;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
-    uint64_t committed = 0;  // how far the owner's device has got
+    uint64_t committed = 0;  // how far the owner's devices have got: the slowest part
     uint64_t evicted = 0;
     uint64_t evicted_spare = 0;  // of those, evictions that left another pool holding the key
     uint64_t fetched_in_slots = 0;
@@ -302,8 +335,9 @@ class PoolManager {
   };
 
   struct Group {
-    bool has_layout = false;
-    std::vector<uint64_t> unit_bytes;
+    // Per part index, the slot size of each region; empty until a pool of the
+    // group binds that part.
+    std::vector<std::vector<uint64_t>> unit_bytes;
     std::unordered_map<std::string, std::vector<Holder>> holders;
   };
 
@@ -345,6 +379,10 @@ class PoolManager {
   void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
   // Unmap an adopted pool's memory, free an allocated one's.
   void ReleaseMemoryLocked(Pool* pool);
+  void ReleasePart(const Part& part);
+  // Whether a slot of `src` can be copied into `dst`: the same parts, each
+  // with the same regions.
+  static bool SameShape(const Pool& src, const Pool& dst);
 
   std::shared_ptr<MemoryApi> api_;
   uint32_t keep_copies_ = 0;
@@ -352,7 +390,8 @@ class PoolManager {
   std::condition_variable idle_;
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;
   std::unordered_map<std::string, Group> groups_;
-  std::unordered_set<std::string> attaching_;  // pool ids being allocated outside the lock
+  // "pool id#part" of each part being allocated or mapped outside the lock
+  std::unordered_set<std::string> attaching_;
   uint64_t next_serial_ = 1;
 };
 

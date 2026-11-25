@@ -60,6 +60,11 @@ message AttachRequest {
   // neither zeroed nor freed by the server; detaching only unmaps it.
   bytes external_handle = 5;
   uint64 external_offset = 6;
+  // A pool over several allocations (an engine rank whose KV is sharded over
+  // its devices): this call brings part `part` of `num_parts`. The parts share
+  // one slot table; each has its own memory, layout and commit. 0 parts = 1.
+  uint32 part = 7;
+  uint32 num_parts = 8;
 }
 
 message AttachResponse {
@@ -83,6 +88,8 @@ message BindLayoutRequest {
   string pool_id = 1;
   uint32 num_slots = 2;
   repeated Region regions = 3;
+  // The part this layout is of. Every part declares the same `num_slots`.
+  uint32 part = 4;
 }
 
 message OpenRequest {
@@ -137,6 +144,8 @@ message CommitRequest {
   string pool_id = 1;
   // Every device write issued before this instant has landed.
   uint64 committed = 2;
+  // The part whose device that is. A slot has settled once every part's has.
+  uint32 part = 3;
 }
 
 message FetchRequest {
@@ -182,6 +191,7 @@ message PoolStats {
   uint64 fetched_in_bytes = 11;
   uint64 served_out_slots = 12;
   uint64 copy_micros = 13;
+  uint32 parts = 14;
 }
 
 message StatsResponse {

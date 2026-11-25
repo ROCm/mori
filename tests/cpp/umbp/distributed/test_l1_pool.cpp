@@ -69,6 +69,7 @@ class RecordingApi final : public MemoryApi {
   bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
               std::string* error) override {
     if (!host_->Import(device, handle, offset, base, mapped, error)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
     bases[device] = static_cast<uint8_t*>(*base);
     return true;
   }
@@ -93,8 +94,9 @@ class RecordingApi final : public MemoryApi {
   }
 
   std::map<int, uint8_t*> bases;
-  int copies = 0;
-  int synchronizes = 0;
+  // Counted from several threads: a pool's parts copy side by side.
+  std::atomic<int> copies{0};
+  std::atomic<int> synchronizes{0};
   int frees = 0;
   int unimports = 0;
   int allocations = 0;
@@ -749,6 +751,221 @@ TEST_F(L1PoolTest, TwoAttachesReplacingABusyPoolAllocateItOnce) {
   EXPECT_EQ(StatsOf("p1").bytes, 2 * kBytes);
 }
 
+// A pool of two parts, as an engine rank with tensor-parallel attention has:
+// slot i is on both devices, a different shard on each, in a different layout.
+constexpr uint64_t kUnitC = 8;
+constexpr uint64_t kBytesC = kSlots * kUnitC;
+
+Layout ShardLayout() {
+  Layout layout;
+  layout.num_slots = kSlots;
+  layout.regions = {Region{0, kUnitC}};
+  return layout;
+}
+
+class L1PartsTest : public L1PoolTest {
+ protected:
+  // Pool r<rank>: part 0 on device 10 * rank + 10, part 1 on the next device.
+  static int Device(int rank, uint32_t part) { return 10 * rank + 10 + static_cast<int>(part); }
+  static std::string Id(int rank) { return "r" + std::to_string(rank); }
+
+  Status AttachPart(int rank, uint32_t part) {
+    return manager
+        ->Attach(Id(rank), "tp", Device(rank, part), part == 0 ? kBytes : kBytesC, {},
+                 PartSpec{part, 2})
+        .status;
+  }
+  void Bring(int rank) {
+    for (uint32_t part : {0u, 1u}) {
+      ASSERT_TRUE(AttachPart(rank, part).ok);
+      ASSERT_TRUE(manager->BindLayout(Id(rank), part == 0 ? TestLayout() : ShardLayout(), part).ok);
+    }
+    ASSERT_EQ(manager->Open(Id(rank)).num_slots, kSlots);
+  }
+  void FillShard(int rank, uint32_t slot, uint8_t value) {
+    std::memset(api->bases[Device(rank, 1)] + slot * kUnitC, value, kUnitC);
+  }
+  bool ShardHolds(int rank, uint32_t slot, uint8_t value) {
+    const uint8_t* c = api->bases[Device(rank, 1)] + slot * kUnitC;
+    for (uint64_t i = 0; i < kUnitC; ++i) {
+      if (c[i] != value) return false;
+    }
+    return true;
+  }
+  // Allocate one slot of r<rank>, write both parts of it, publish and release.
+  uint32_t CacheOne(int rank, const std::string& key, uint8_t value, uint64_t stamp = 0) {
+    AllocateResult got = manager->Allocate(Id(rank), 1);
+    EXPECT_EQ(got.slots.size(), 1u);
+    Fill(Device(rank, 0), got.slots[0], value);
+    FillShard(rank, got.slots[0], static_cast<uint8_t>(value + 50));
+    EXPECT_TRUE(manager
+                    ->Apply(Id(rank),
+                            {Op{OpKind::kPublish, got.slots[0], key},
+                             Op{OpKind::kRelease, got.slots[0], ""}},
+                            stamp)
+                    .ok);
+    return got.slots[0];
+  }
+};
+
+TEST_F(L1PartsTest, APoolServesOnlyOnceEveryPartIsBound) {
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  EXPECT_FALSE(manager->Allocate("r0", 1).status.ok);
+  // A layout for a part that has not arrived is refused, not remembered.
+  EXPECT_FALSE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+  const PoolStats stats = StatsOf("r0");
+  EXPECT_EQ(stats.parts, 2u);
+  EXPECT_EQ(stats.bytes, kBytes + kBytesC);
+  EXPECT_EQ(stats.device, Device(0, 0));
+}
+
+TEST_F(L1PartsTest, PartsMayArriveInAnyOrder) {
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+}
+
+TEST_F(L1PartsTest, AttachRejectsAPartOutsideItsCount) {
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{2, 2}).status.ok);
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, 0}).status.ok);
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, PoolManager::kMaxParts + 1})
+                   .status.ok);
+}
+
+TEST_F(L1PartsTest, EveryPartDeclaresTheSameSlotCount) {
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  Layout fewer = ShardLayout();
+  fewer.num_slots = kSlots - 1;
+  EXPECT_FALSE(manager->BindLayout("r0", fewer, 1).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+}
+
+TEST_F(L1PartsTest, FetchCopiesEveryPartOfASlotToTheSamePart) {
+  Bring(0);
+  Bring(1);
+  CacheOne(1, "filler", 90);  // so the slot numbers of the two pools differ
+  const uint32_t src = CacheOne(0, "k", 7);
+  FetchResult fetched = manager->Fetch("r1", {"k"});
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  const uint32_t dst = fetched.slots[0];
+  EXPECT_NE(dst, src);
+  EXPECT_TRUE(Holds(Device(1, 0), dst, 7));
+  EXPECT_TRUE(ShardHolds(1, dst, 57));
+  EXPECT_EQ(fetched.copied_slots, 1u);
+  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
+  EXPECT_EQ(StatsOf("r1").fetched_in_bytes, kUnitA + kUnitB + kUnitC);
+}
+
+TEST_F(L1PartsTest, FetchIntoHeldSlotsFillsEveryPart) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "a", 3);
+  CacheOne(0, "b", 4);
+  AllocateResult held = manager->Allocate("r1", 2);
+  ASSERT_EQ(held.slots.size(), 2u);
+  FetchOptions into;
+  into.dst_slots = held.slots;
+  FetchResult fetched = manager->Fetch("r1", {"a", "b"}, into);
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_TRUE(Holds(Device(1, 0), held.slots[0], 3));
+  EXPECT_TRUE(ShardHolds(1, held.slots[0], 53));
+  EXPECT_TRUE(Holds(Device(1, 0), held.slots[1], 4));
+  EXPECT_TRUE(ShardHolds(1, held.slots[1], 54));
+}
+
+TEST_F(L1PartsTest, ASlotSettlesOnlyWhenEveryPartHasCommitted) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7, /*stamp=*/500);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 500, 0).ok);
+  // Part 1's device may still be writing its shard of the slot.
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 499, 1).ok);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 500, 1).ok);
+  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
+  EXPECT_FALSE(manager->Commit("r0", 600, 2).ok);
+}
+
+TEST_F(L1PartsTest, APartThatFailsToCopyLeavesNothingBehind) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7);
+  api->fail_copies = true;
+  FetchResult failed = manager->Fetch("r1", {"k"});
+  EXPECT_TRUE(failed.slots.empty());
+  EXPECT_EQ(failed.copied_bytes, 0u);
+  EXPECT_EQ(StatsOf("r1").vacant, kSlots);
+  api->fail_copies = false;
+  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
+}
+
+TEST_F(L1PartsTest, PoolsWithADifferentNumberOfPartsDoNotExchangeSlots) {
+  Bring(0);
+  // One part, in the same group and with part 0's layout.
+  ASSERT_TRUE(manager->Attach("single", "tp", 30, kBytes).status.ok);
+  ASSERT_TRUE(manager->BindLayout("single", TestLayout()).ok);
+  ASSERT_EQ(manager->Open("single").num_slots, kSlots);
+  CacheOne(0, "k", 7);
+  EXPECT_TRUE(manager->Fetch("single", {"k"}).slots.empty());
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("single", {"k"}, probe).available, 0u);
+}
+
+TEST_F(L1PartsTest, GroupChecksSlotSizesPartByPart) {
+  Bring(0);
+  ASSERT_TRUE(AttachPart(1, 0).ok);
+  ASSERT_TRUE(AttachPart(1, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r1", TestLayout(), 0).ok);
+  // Part 0's layout is not part 1's.
+  ASSERT_TRUE(manager->Attach("r2", "tp", 41, kBytes, {}, PartSpec{1, 2}).status.ok);
+  EXPECT_FALSE(manager->BindLayout("r2", TestLayout(), 1).ok);
+  EXPECT_TRUE(manager->BindLayout("r1", ShardLayout(), 1).ok);
+}
+
+TEST_F(L1PartsTest, APartAttachedWithAnotherShapeReplacesTheWholePool) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7);
+  const int frees = api->frees;
+  // The rank restarted: its first part comes back larger.
+  ASSERT_TRUE(manager->Attach("r0", "tp", Device(0, 1), 2 * kBytesC, {}, PartSpec{1, 2}).status.ok);
+  EXPECT_EQ(api->frees, frees + 2);  // both parts of the old pool
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());  // its content went with it
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+  // The same part again, unchanged: the pool stays.
+  AttachResult again = manager->Attach("r0", "tp", Device(0, 0), kBytes, {}, PartSpec{0, 2});
+  EXPECT_TRUE(again.status.ok);
+  EXPECT_FALSE(again.created);
+}
+
+TEST_F(L1PartsTest, DetachReleasesEveryPart) {
+  Bring(0);
+  const int frees = api->frees;
+  ASSERT_TRUE(manager->Detach("r0").ok);
+  EXPECT_EQ(api->frees, frees + 2);
+  EXPECT_TRUE(manager->Detach("r0").ok);  // the rank's other runner detaching the same pool
+  EXPECT_EQ(api->frees, frees + 2);
+}
+
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
   const std::string path = "/tmp/umbp_l1_test_" + std::to_string(getpid()) + ".sock";
   unlink(path.c_str());
@@ -790,6 +1007,28 @@ TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
     EXPECT_EQ(stats[1].fetched_in_slots, 3u);
     EXPECT_TRUE(client.Detach("p0").ok);
     EXPECT_FALSE(client.Open("p0").status.ok);
+    // A pool of two parts: each part attaches, binds and commits by its index.
+    for (const std::string id : {"r0", "r1"}) {
+      for (uint32_t part : {0u, 1u}) {
+        AttachResult attached =
+            client.Attach(id, "tp", 2 + static_cast<int>(part), kBytes, {}, PartSpec{part, 2});
+        ASSERT_TRUE(attached.status.ok) << attached.status.error;
+        EXPECT_EQ(client.Open(id).status.ok, false);
+        ASSERT_TRUE(client.BindLayout(id, TestLayout(), part).ok);
+      }
+      EXPECT_EQ(client.Open(id).num_slots, kSlots);
+    }
+    AllocateResult shard = client.Allocate("r0", 1, 1);
+    ASSERT_TRUE(client.Apply("r0", {Op{OpKind::kPublish, shard.slots[0], "s"}}, 700).ok);
+    ASSERT_TRUE(client.Commit("r0", 700, 0).ok);
+    EXPECT_TRUE(client.Fetch("r1", {"s"}).slots.empty());
+    ASSERT_TRUE(client.Commit("r0", 700, 1).ok);
+    FetchResult both = client.Fetch("r1", {"s"});
+    EXPECT_EQ(both.slots.size(), 1u);
+    EXPECT_EQ(both.copied_bytes, 2 * (kUnitA + kUnitB));
+    ASSERT_TRUE(client.Stats(&stats).ok);
+    ASSERT_EQ(stats.size(), 3u);
+    EXPECT_EQ(stats[1].parts, 2u);
   }
   unlink(path.c_str());
 }
