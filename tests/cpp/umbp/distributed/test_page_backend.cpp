@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -644,6 +645,195 @@ TEST(PageBackend, StillHoldsAfterClearLocalAndForUnstampedReads) {
   a->ClearLocal();
   EXPECT_EQ(a->BatchStillHolds({"a", "b"}, {r[0].generation, r[1].generation}),
             (std::vector<bool>{false, false}));
+}
+
+// ---- A remote reader's report ends its read lease (#749) --------------------
+//
+// The lease is a timer only because a one-sided read never says when it is
+// done.  BatchFinishReads is the reader saying so.  Every lease below is 60 s,
+// so nothing here is freed by the timer.
+
+namespace {
+
+std::unique_ptr<PageBackend> MakeLongLeased() {
+  return MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{60000});
+}
+
+void CommitKey(PageBackend& a, const std::string& key) {
+  auto p = AllocateOk(a, key, kPageSize);
+  ASSERT_TRUE(p.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a.Commit(p->slot_id, key, committed_bytes));
+}
+
+uint64_t RemoteResolve(PageBackend& a, const std::string& key) {
+  return a.BatchResolve({key}, /*include_descs=*/false)[0].generation;
+}
+
+// Evict refuses a leased key and changes nothing, so it doubles as the probe.
+bool Leased(PageBackend& a, const std::string& key) { return a.Evict({key})[0].bytes_freed == 0; }
+
+}  // namespace
+
+TEST(PageBackendFinishReads, AReportMakesTheKeyEvictableAtOnce) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  ASSERT_TRUE(Leased(*a, "k")) << "protected while the reader copies";
+
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize)
+      << "the reader reported; nothing is left for the lease to cover";
+}
+
+TEST(PageBackendFinishReads, TheLeaseWaitsForItsLastReader) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  // One per answer: a key asked twice in a batch is reported twice.
+  const auto twice = a->BatchResolve({"k", "k"}, false);
+  ASSERT_EQ(twice[0].generation, gen);
+  ASSERT_EQ(twice[1].generation, gen);
+
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(Leased(*a, "k")) << "two readers are still copying";
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(Leased(*a, "k")) << "one reader is still copying";
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+}
+
+TEST(PageBackendFinishReads, AReportForAnotherCopyEndsNothing) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  CommitKey(*a, "other");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  const uint64_t other_gen = RemoteResolve(*a, "other");
+
+  // Another copy's stamp, a key that is not here, and an unstamped read.
+  EXPECT_EQ(a->BatchFinishReads({"k", "ghost", "k"}, {other_gen, gen, 0}),
+            (std::vector<bool>{false, false, true}));
+  EXPECT_TRUE(Leased(*a, "k"));
+  EXPECT_TRUE(Leased(*a, "other"));
+}
+
+// A reader that died, or an older build: its count is never taken back, so the
+// timer stays in charge of that key, exactly as before.
+TEST(PageBackendFinishReads, AReaderThatNeverReportsLeavesTheTimerInCharge) {
+  auto a = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{200});
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  RemoteResolve(*a, "k");  // the silent reader
+
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(Leased(*a, "k")) << "the silent reader may still be copying";
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+}
+
+// A report beyond the readers counted (a duplicate) must not go below zero and
+// release the next reader's lease on its own arrival.
+TEST(PageBackendFinishReads, ASpareReportDoesNotReleaseTheNextReader) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  EXPECT_EQ(a->BatchFinishReads({"k", "k"}, {gen, gen}), (std::vector<bool>{true, true}));
+
+  ASSERT_EQ(RemoteResolve(*a, "k"), gen);
+  EXPECT_TRUE(Leased(*a, "k")) << "a new reader starts from a count of zero";
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+}
+
+TEST(PageBackendFinishReads, ALocalHoldOutlivesTheRemoteReport) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  auto local = a->BatchResolve({"k"}, false, false, ResolveReader::kLocal);
+  ASSERT_NE(local[0].hold, nullptr);
+  const uint64_t gen = RemoteResolve(*a, "k");
+
+  EXPECT_EQ(a->BatchFinishReads({"k"}, {gen}), std::vector<bool>{true});
+  EXPECT_TRUE(Leased(*a, "k")) << "the in-process reader still holds the pages";
+  local.clear();
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+}
+
+// The count an operator reads to see that readers are reporting.
+TEST(PageBackendFinishReads, CountsTheLeasesItsReadersEnded) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  const auto releases = [&]() -> uint64_t {
+    for (const MetricSample& sample : a->SampleMetrics()) {
+      for (const auto& label : sample.labels) {
+        if (label.second == "read_lease_reader_release") return sample.value;
+      }
+    }
+    return 0;
+  };
+  const uint64_t gen = RemoteResolve(*a, "k");
+  RemoteResolve(*a, "k");
+  EXPECT_EQ(releases(), 0u);
+  a->BatchFinishReads({"k"}, {gen});
+  EXPECT_EQ(releases(), 0u) << "one reader is still copying";
+  a->BatchFinishReads({"k"}, {gen});
+  EXPECT_EQ(releases(), 1u);
+  a->BatchFinishReads({"k"}, {gen});
+  EXPECT_EQ(releases(), 1u) << "a spare report ends nothing";
+}
+
+// What the node's own eviction sees: a leased key is not even offered.
+TEST(PageBackendFinishReads, AReportedKeyIsOfferedToEviction) {
+  auto a = MakeLongLeased();
+  a->TrackEvictionOrder();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  ASSERT_TRUE(a->EvictionCandidates(8).empty());
+
+  a->BatchFinishReads({"k"}, {gen});
+  const auto offers = a->EvictionCandidates(8);
+  ASSERT_EQ(offers.size(), 1u);
+  EXPECT_EQ(offers[0].key, "k");
+}
+
+// ClearLocal parks leased pages until their lease runs out.
+TEST(PageBackendFinishReads, ClearLocalFreesReportedPagesAtOnce) {
+  auto a = MakeLongLeased();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  a->BatchFinishReads({"k"}, {gen});
+
+  a->ClearLocal();
+  const TierCapacity cap = a->Capacity();
+  EXPECT_EQ(cap.available_bytes, cap.total_bytes) << "no page left waiting for a lease";
+}
+
+// Resolves and reports run under a shared lock, many at once.  A reader between
+// its resolve and its report must never see its key offered for eviction, and
+// once every reader has reported the key must be free to go.
+TEST(PageBackendFinishReads, ConcurrentReadersKeepTheLeaseUntilTheLastReport) {
+  auto a = MakeLongLeased();
+  a->TrackEvictionOrder();
+  CommitKey(*a, "k");
+  const uint64_t gen = RemoteResolve(*a, "k");
+  a->BatchFinishReads({"k"}, {gen});
+
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 20000;
+  std::atomic<uint64_t> offered_mid_read{0};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < kThreads; ++t) {
+    readers.emplace_back([&] {
+      for (int i = 0; i < kRounds; ++i) {
+        a->BatchResolve({"k"}, false);
+        if (!a->EvictionCandidates(1).empty()) offered_mid_read.fetch_add(1);
+        a->BatchFinishReads({"k"}, {gen});
+      }
+    });
+  }
+  for (auto& reader : readers) reader.join();
+
+  EXPECT_EQ(offered_mid_read.load(), 0u) << "a report released a lease another reader held";
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize) << "every reader reported";
 }
 
 // ---- Full-sync snapshot -----------------------------------------------------

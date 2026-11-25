@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -205,7 +206,8 @@ class PageBackend : public MediumBackend {
   // `pending_ttl` is the only TTL in the system.  After this elapses
   // without a matching Commit / Abort, the reaper frees the slot's
   // pages.  `read_lease_ttl` is how long a single Resolve protects its
-  // key from concurrent Evict.  `reaper_interval` is the wakeup cadence
+  // key from concurrent Evict, at most: a remote reader that reports back
+  // (BatchFinishReads) ends it sooner.  `reaper_interval` is the wakeup cadence
   // for sweeping expired pendings and read leases.
   PageBackend(TierType tier, uint64_t page_size, TierConfig cfg,
               std::chrono::milliseconds pending_ttl,
@@ -277,7 +279,12 @@ class PageBackend : public MediumBackend {
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
   std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& generations) const override;
+  // Ends the read lease as soon as the last remote reader counted on it has
+  // reported, so the key is evictable then and not a full read_lease_ttl later.
+  std::vector<bool> BatchFinishReads(const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
+  std::vector<MetricSample> SampleMetrics() const override;
 
   uint64_t PageSize() const override { return page_size_; }
   std::vector<BufferMemoryDescBytes> AllBufferDescs() const override;
@@ -358,9 +365,16 @@ class PageBackend : public MediumBackend {
     // Atomic, and stored as a steady_clock nanosecond count rather than a
     // time_point, because the resolve paths renew it under a SHARED lock:
     // many readers may renew the same key at once.  Renewal is a CAS-max
-    // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
-    // thread already extended.
+    // (AddRemoteReader) so a slower thread can never shorten a lease another
+    // thread already extended.  Only the last reader's report pulls it back
+    // (EndLeaseIfUnread).
     std::atomic<int64_t> read_lease_ns{0};
+    // Remote readers the lease is held for: one per remote resolve answer that
+    // named this slot, taken back by that reader's report (BatchFinishReads).
+    // Reaching 0 ends the lease early.  A reader that never reports (an older
+    // build, one that died) leaves its count here, and the lease to the timer.
+    // It never decides whether the pages may be freed; read_lease_ns does.
+    std::atomic<uint64_t> remote_readers{0};
     // Copied into every kLocal hit; a reader still has it while use_count() > 1.
     // Made at commit, so the shared-lock resolve path only copies it.
     std::shared_ptr<const void> hold;
@@ -385,6 +399,7 @@ class PageBackend : public MediumBackend {
         : pages(std::move(other.pages)),
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
+          remote_readers(other.remote_readers.load(std::memory_order_relaxed)),
           hold(std::move(other.hold)),
           generation(other.generation),
           lru_it(other.lru_it),
@@ -395,6 +410,8 @@ class PageBackend : public MediumBackend {
       size = other.size;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
+      remote_readers.store(other.remote_readers.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
       hold = std::move(other.hold);
       generation = other.generation;
       lru_it = other.lru_it;
@@ -409,14 +426,35 @@ class PageBackend : public MediumBackend {
   static int64_t SteadyNs(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
   }
-  // Extend `slot`'s lease to `deadline_ns` without ever shortening it.  Safe
-  // under a shared lock; concurrent renewals settle on the latest deadline.
-  static void RenewLeaseAtomic(OwnedSlot& slot, int64_t deadline_ns) {
-    int64_t current = slot.read_lease_ns.load(std::memory_order_relaxed);
-    while (current < deadline_ns &&
-           !slot.read_lease_ns.compare_exchange_weak(
-               current, deadline_ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
+  // A remote reader arrives: count it, then extend the lease to `deadline_ns`
+  // without ever shortening it.  Safe under a shared lock, against other
+  // arrivals (they settle on the latest deadline) and against reports.
+  //
+  // The two steps are ordered against EndLeaseIfUnread, which reads the lease
+  // and then the count: counted first, this reader is either seen by a report
+  // that already read the lease, or its renewal is seen by one that has not.
+  // And the renewal always stores a NEW value, so a report holding the old one
+  // fails its compare-exchange instead of ending this reader's lease.
+  static void AddRemoteReader(OwnedSlot& slot, int64_t deadline_ns) {
+    slot.remote_readers.fetch_add(1);
+    int64_t current = slot.read_lease_ns.load();
+    while (!slot.read_lease_ns.compare_exchange_weak(current, std::max(deadline_ns, current + 1))) {
     }
+  }
+  // A remote reader reports.  Takes its count back; true when it was the last
+  // one counted.  A report with nobody counted takes nothing.
+  static bool RemoveRemoteReader(OwnedSlot& slot) {
+    uint64_t readers = slot.remote_readers.load();
+    while (readers != 0 && !slot.remote_readers.compare_exchange_weak(readers, readers - 1)) {
+    }
+    return readers == 1;
+  }
+  // After the last report: pull the lease back to `now_ns` unless a reader
+  // arrived meanwhile.  True when a lease that was still running was ended.
+  static bool EndLeaseIfUnread(OwnedSlot& slot, int64_t now_ns) {
+    int64_t lease_ns = slot.read_lease_ns.load();
+    if (lease_ns <= now_ns || slot.remote_readers.load() != 0) return false;
+    return slot.read_lease_ns.compare_exchange_strong(lease_ns, now_ns);
   }
 
   AllocateResult AllocateLocked(const std::string& key, uint64_t size,
@@ -553,6 +591,9 @@ class PageBackend : public MediumBackend {
   uint64_t alloc_failures_ = 0;  // guarded by mutex_; samples the Allocate WARN
 
   std::atomic<uint64_t> next_slot_id_{1};
+
+  // Read leases ended by their readers' reports ahead of the timer.
+  std::atomic<uint64_t> lease_reader_releases_{0};
 
   // Set by ClearLocal(), cleared by ClearFullSyncAcked().  Gates Allocate()
   // so no new owned key appears between local clear and the first acked
