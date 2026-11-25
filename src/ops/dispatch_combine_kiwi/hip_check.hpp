@@ -50,9 +50,6 @@ inline void hip_check_throw(hipError_t error, const char* file, int line) {
 }  // namespace internal
 }  // namespace mori::kiwi::ep
 
-#ifdef HIP_CHECK
-#undef HIP_CHECK
-#endif
 #define HIP_CHECK(call) ::mori::kiwi::ep::internal::hip_check_abort((call), __FILE__, __LINE__)
 
 #define HIP_CHECK_THROW(call) \

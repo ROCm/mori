@@ -145,6 +145,17 @@ class PeerPool {
   // Returns the number of (medium, key) copies touched.
   size_t BatchTouch(const std::vector<std::string>& keys);
 
+  // After a remote reader's copy: is each (backend, key, generation) it was
+  // resolved against still the copy here?  False when the backend is gone or
+  // the copy was freed or replaced since, so the reader drops what it read.
+  // The three vectors are parallel; one answer per key, in order.
+  // `release`: the reader is also done with every copy named, so each backend
+  // may stop holding it for that reader (MediumBackend::BatchFinishReads).
+  std::vector<bool> ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                     const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations,
+                                     bool release = false);
+
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
@@ -185,6 +196,8 @@ class PeerPool {
   void SetEvictionCandidateSource(EvictionCandidateSource source);
 
  private:
+  // See the definition: the source GPU's HBM backend first, among equals.
+  void PreferSourceDevice(int device, std::vector<uint32_t>* order) const;
   struct PendingPlacement {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
     uint64_t local_slot_id = 0;

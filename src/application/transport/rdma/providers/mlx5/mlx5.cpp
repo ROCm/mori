@@ -37,6 +37,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
@@ -297,21 +298,25 @@ std::string MacToString(const uint8_t mac[ETHERNET_LL_SIZE]) {
 //
 // Costs about 25 us when the neighbour is reachable, but about 1 s when it is not: the kernel sends
 // an ARP request and waits for it to time out. Every QP to the same peer carries the same GID, so
-// the result is cached per (sgid index, remote GID), failures included -- otherwise a peer that
-// cannot be resolved would cost ~1 s per QP during setup. The cache lives as long as the process,
-// so a peer whose MAC changes underneath us (a migrated VM, say) keeps the old value;
-// MORI_MLX5_RESOLVE_DMAC=0 turns the whole path off.
+// the result is cached per (local device, port, sgid index, remote GID), failures included --
+// otherwise a peer that cannot be resolved would cost ~1 s per QP during setup. The local side is
+// part of the key because each local NIC can have its own next hop on a routed fabric. The cache
+// lives as long as the process, so a peer whose MAC changes underneath us (a migrated VM, say)
+// keeps the old value; MORI_MLX5_RESOLVE_DMAC=0 turns the whole path off.
 int ResolveRoceDmac(ibv_pd* pd, uint32_t portId, int gidIdx, const uint8_t remoteGid[16],
                     uint8_t dmac[ETHERNET_LL_SIZE]) {
   struct Entry {
     int err;
     uint8_t mac[ETHERNET_LL_SIZE];
   };
-  // Sorted map keyed by the raw GID: small, and lookups happen once per QP.
+  // Sorted map: small, and lookups happen once per QP. The device name, unlike the context
+  // pointer, is not recycled when a context is closed and reopened.
+  using Key = std::tuple<std::string, uint32_t, int, std::array<uint8_t, 16>>;
   static std::mutex cacheMutex;
-  static std::map<std::array<uint8_t, 16>, Entry> cache;
-  std::array<uint8_t, 16> key;
-  memcpy(key.data(), remoteGid, key.size());
+  static std::map<Key, Entry> cache;
+  std::array<uint8_t, 16> gid;
+  memcpy(gid.data(), remoteGid, gid.size());
+  const Key key{pd->context->device->name, portId, gidIdx, gid};
   {
     std::lock_guard<std::mutex> lock(cacheMutex);
     auto it = cache.find(key);
@@ -724,7 +729,8 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
            sizeof(remote_handle.eth.gid));
 
     // remote_handle.eth.mac is the peer NIC's own MAC, which only works on the same L2 segment.
-    // A DEVX QP bypasses the kernel's resolution, so resolve the next hop here (cached per peer).
+    // A DEVX QP bypasses the kernel's resolution, so resolve the next hop here (cached per local
+    // NIC and peer).
     // A resolution failure, or MORI_MLX5_RESOLVE_DMAC=0, keeps the old behaviour.
     uint8_t dmac[ETHERNET_LL_SIZE];
     memcpy(dmac, remote_handle.eth.mac, sizeof(dmac));

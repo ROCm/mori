@@ -279,6 +279,34 @@ def test_describe_rejects_what_the_constructor_rejects():
         cb.EpDispatchPlan.describe(hidden_dim=7)
 
 
+def _device_arch():
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
+def _built_for(plan):
+    """The arch a plan compiled for: its cache directory is <root>/<arch>_<nic>[_ccqe]/<entry>."""
+    return plan.info["cacheDir"].split("/")[-2].split("_", 1)[0]
+
+
+def test_describe_arch_applies_to_that_call_only():
+    # Every arch, one after another, then a plan with none: each arch= is gone
+    # when its call returns, so the plan is built for the device.
+    for arch in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
+        cb.EpDispatchPlan.describe(arch=arch, **_SMALL)
+    p = cb.EpDispatchPlan(**_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
+def test_create_for_another_arch_fails_before_compiling():
+    other = "gfx950" if _device_arch() == "gfx942" else "gfx942"
+    with pytest.raises(RuntimeError, match=f"building for {other} \\(set by arch=\\)"):
+        cb.EpDispatchPlan(arch=other, **_SMALL)
+    p = cb.EpDispatchPlan(arch=_device_arch(), **_SMALL)
+    assert _built_for(p) == _device_arch()
+    p.close()
+
+
 def test_every_arena_region_is_reported_in_args_order():
     stems = [
         n[3].lower() + n[4:]
@@ -288,6 +316,176 @@ def test_every_arena_region_is_reported_in_args_order():
     for cls in (cb.EpDispatchPlan, cb.EpCombinePlan):
         info = cls.describe()
         assert [k[len("region.") :] for k in info if k.startswith("region.")] == stems
+
+
+_CARD_KW = dict(world_size=8, max_tok_per_rank=512, max_recv=4096, warp_per_block=16)
+
+
+def _without_card_dedup(info):
+    return {
+        k: v
+        for k, v in info.items()
+        if k not in ("cardDedup", "region.fwdMap", "cfgText")
+    }
+
+
+def test_card_dedup_adds_a_forward_map_and_nothing_else():
+    off = cb.EpDispatchPlan.describe(**_CARD_KW)
+    if not off["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="cardDedup needs gfx125x"):
+            cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+        return
+    on = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True)
+    assert (off["cardDedup"], off["region.fwdMap"]) == (False, 0)
+    assert (on["cardDedup"], on["region.fwdMap"]) == (True, 4096 * 4)
+    assert _without_card_dedup(on) == _without_card_dedup(off)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .cardDedup=true}"
+    comb = cb.EpCombinePlan.describe(**_CARD_KW, card_dedup=True)
+    assert (comb["cardDedup"], comb["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(world_size=7),
+        dict(warp_per_block=8),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=16),
+        dict(hidden_dim=3584, dtype="fp4x2", world_size=4, max_recv=2048),
+        dict(card_pull_blocks=65),
+    ],
+)
+def test_card_dedup_rejects_a_cfg_whose_payload_takes_another_path(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardDedup needs"):
+        cb.EpDispatchPlan.describe(**dict(_CARD_KW, card_dedup=True, **kw))
+
+
+def test_card_pull_blocks_run_past_the_senders_and_add_two_words():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    serial = cb.EpDispatchPlan.describe(**kw)
+    ovl = cb.EpDispatchPlan.describe(**kw, card_pull_blocks=16)
+    assert (serial["blockNum"], serial["gridX"]) == (64, 64)
+    assert (ovl["blockNum"], ovl["gridX"]) == (64, 80)
+    assert ovl["region.fwdMap"] == serial["region.fwdMap"] + 64
+
+
+def test_card_fwd_mark_changes_the_cfg_only_without_pull_blocks():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, card_dedup=True, block_num=64)
+    plain = cb.EpDispatchPlan.describe(**kw)
+    mark = cb.EpDispatchPlan.describe(**kw, card_fwd_mark=True)
+    assert (plain["cardFwdMark"], mark["cardFwdMark"]) == (False, True)
+    assert mark["cfgText"] == plain["cfgText"][:-1] + ", .cardFwdMark=true}"
+    for k in ("cardFwdMark", "cfgText"):
+        plain.pop(k), mark.pop(k)
+    assert mark == plain
+    ovl = dict(kw, card_pull_blocks=16)
+    assert cb.EpDispatchPlan.describe(
+        **ovl, card_fwd_mark=True
+    ) == cb.EpDispatchPlan.describe(**ovl)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(card_pull_blocks=16),
+        dict(card_fwd_mark=True),
+        dict(card_combine=True),
+    ],
+)
+def test_card_dedup_knobs_need_card_dedup(kw):
+    with pytest.raises(RuntimeError, match="need cardDedup"):
+        cb.EpDispatchPlan.describe(**_CARD_KW, **kw)
+
+
+_LL128_KW = dict(world_size=8, max_tok_per_rank=128, max_recv=1024, ll128=True)
+
+
+def test_ll128_card_dedup_changes_the_ll128_dispatch_cfg_and_nothing_else():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("ll128 is gfx125x only")
+    off = cb.EpDispatchPlan.describe(**_LL128_KW)
+    on = cb.EpDispatchPlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert (off["ll128Dedup"], on["ll128Dedup"]) == (False, True)
+    assert on["cfgText"] == off["cfgText"][:-1] + ", .ll128Dedup=true}"
+    for k in ("ll128Dedup", "cfgText"):
+        off.pop(k), on.pop(k)
+    assert on == off
+    comb = cb.EpCombinePlan.describe(**_LL128_KW, ll128_dedup=True)
+    assert comb == cb.EpCombinePlan.describe(**_LL128_KW)
+    for kw in (dict(ll128=False), dict(world_size=7)):
+        with pytest.raises(
+            RuntimeError, match="ll128Dedup is the ll128 dispatch's cardDedup"
+        ):
+            cb.EpDispatchPlan.describe(**dict(_LL128_KW, **kw), ll128_dedup=True)
+
+
+_CARD_COMB_KW = dict(_CARD_KW, combine_bf16_push=True)
+
+
+def _up128(n):
+    return (n + 127) // 128 * 128
+
+
+def test_card_combine_lays_out_the_reverse_map_and_flags():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    rev = _up128(4096 * 4 + 64)
+    size = _up128(_up128(rev + 4096 * 4) + 4096 * 8)
+    disp = cb.EpDispatchPlan.describe(**_CARD_KW, card_dedup=True, card_combine=True)
+    assert (disp["cardCombine"], disp["region.fwdMap"]) == (True, size)
+    fold = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert (fold["cardDedup"], fold["cardCombine"], fold["region.fwdMap"]) == (
+        False,
+        True,
+        size,
+    )
+    plain = cb.EpCombinePlan.describe(**_CARD_COMB_KW)
+    assert (plain["cardCombine"], plain["region.fwdMap"]) == (False, 0)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(combine_bf16_push=False),
+        dict(combine_bf16_push=False, combine_fp4=True, combine_fp4_f32_scale=True),
+        dict(combine_bf16_push=False, combine_fp8=True, warp_per_block=8),
+        dict(world_size=4),
+        dict(warp_per_block=8),
+        dict(warp_per_block=24),
+        dict(block_num=1),
+    ],
+)
+def test_card_combine_takes_a_push_combine_on_16_warps(kw):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    with pytest.raises(RuntimeError, match="cardCombine needs"):
+        cb.EpCombinePlan.describe(**{**_CARD_COMB_KW, "card_combine": True, **kw})
+
+
+@pytest.mark.parametrize("quant", ["combine_fp8", "combine_fp4"])
+def test_card_combine_folds_the_quantized_push_too(quant):
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_combine is gfx125x only")
+    kw = {**_CARD_KW, quant: True}
+    fold = cb.EpCombinePlan.describe(**kw, card_combine=True)
+    plain = cb.EpCombinePlan.describe(**kw)
+    assert (plain["cardCombine"], fold["cardCombine"]) == (False, True)
+    bf16 = cb.EpCombinePlan.describe(**_CARD_COMB_KW, card_combine=True)
+    assert fold["region.fwdMap"] == bf16["region.fwdMap"]
+    assert fold["cfgText"] == plain["cfgText"][:-1] + ", .cardCombine=true}"
+
+
+def test_card_dedup_takes_an_fp4_dispatch_past_its_packed_paths():
+    if not cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        pytest.skip("card_dedup is gfx125x only")
+    kw = dict(_CARD_KW, hidden_dim=3584, dtype="fp4x2")
+    on = cb.EpDispatchPlan.describe(**kw, card_dedup=True, card_pull_blocks=8)
+    assert (on["cardDedup"], on["gridX"]) == (True, on["blockNum"] + 8)
 
 
 def _reference_regions(
@@ -807,3 +1005,356 @@ def test_a_group_compares_defaults_by_the_address_launch_writes(launched, stages
     cb.plan_api.make_launch_group([a, b])
     for p in (a, b, other):
         p.close()
+
+
+_SCATTER_KW = dict(
+    world_size=8,
+    hidden_dim=7168,
+    max_tok_per_rank=128,
+    max_recv=1024,
+    num_expert_per_token=8,
+)
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+def test_scatter_combine_lands_one_quantized_row_per_source_token(group, fp4):
+    from mori.jit.core import _target_arch
+
+    arch = _target_arch()
+    kw = dict(_SCATTER_KW, combine_scatter_q_group=group, combine_scatter_fp4=fp4)
+    if arch.startswith("gfx125") or (fp4 and not arch.startswith("gfx950")):
+        with pytest.raises(RuntimeError, match="combineScatter"):
+            cb.EpCombinePlan.describe(**kw)
+        return
+    info = cb.EpCombinePlan.describe(**kw)
+    payload = 7168 // 2 if fp4 else 7168
+    scales = 7168 // 32 if group == 32 else 7168 // 128 * 4
+    assert info["scatterRowBytes"] == _up128(payload + scales + 4 * 8)
+    # every (source rank, source token) pair has its own landing row
+    assert info["region.outTok"] == info["scatterLandOff"] + 8 * 128 * (
+        info["scatterRowBytes"]
+    )
+    assert (info["combineScatterQGroup"], info["combineScatterFp4"]) == (group, fp4)
+
+
+def test_scatter_combine_refuses_a_push_beside_it():
+    with pytest.raises(RuntimeError, match="combineScatter"):
+        cb.EpCombinePlan.describe(
+            **_SCATTER_KW, combine_scatter_q_group=128, combine_bf16_push=True
+        )
+    with pytest.raises(RuntimeError, match="needs combineScatterQGroup"):
+        cb.EpCombinePlan.describe(**_SCATTER_KW, combine_scatter_fp4=True)
+
+
+def test_a_recv_cap_below_the_worst_case_drops_on_the_portable_body():
+    capped = dict(world_size=8, max_tok_per_rank=128, max_recv=512)
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="token dropping"):
+            cb.EpDispatchPlan.describe(**capped)
+        return
+    info = cb.EpDispatchPlan.describe(**capped)
+    full = cb.EpDispatchPlan.describe(**{**capped, "max_recv": 1024})
+    for region in ("recvToSrc", "outIdx", "outWts", "dispOut"):
+        assert info[f"region.{region}"] < full[f"region.{region}"], region
+
+
+def test_replay_is_its_own_dispatch_binary():
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="replay"):
+            cb.EpDispatchPlan.describe(**_SMALL, replay=True)
+        return
+    info = cb.EpDispatchPlan.describe(**_SMALL, replay=True)
+    plain = cb.EpDispatchPlan.describe(**_SMALL)
+    assert (info["replay"], plain["replay"]) == (True, False)
+    # same arena: replay writes the regions the routing pass wrote
+    assert {k: v for k, v in info.items() if k.startswith("region.")} == {
+        k: v for k, v in plain.items() if k.startswith("region.")
+    }
+    with pytest.raises(RuntimeError, match="replay"):
+        cb.EpCombinePlan.describe(**_SMALL, replay=True)
+
+
+@pytest.mark.parametrize("dtype, elem", [(torch.bfloat16, 2), (torch.float32, 4)])
+def test_plain_scatter_lands_one_unquantized_row_per_source_token(dtype, elem):
+    kw = dict(_SCATTER_KW, combine_scatter_plain=True, dtype=dtype)
+    if cb.EpDispatchPlan.describe(**_CARD_KW)["sharedBytes"]:
+        with pytest.raises(RuntimeError, match="combineScatterPlain"):
+            cb.EpCombinePlan.describe(**kw)
+        return
+    info = cb.EpCombinePlan.describe(**kw)
+    assert info["scatterRowBytes"] == _up128(7168 * elem + 4 * 8)
+    assert info["region.outTok"] == info["scatterLandOff"] + 8 * 128 * (
+        info["scatterRowBytes"]
+    )
+    with pytest.raises(RuntimeError, match="combineScatter"):
+        cb.EpCombinePlan.describe(**kw, combine_scatter_q_group=128)
+
+
+# --------------------------------------------------------------------------
+# The local kernels: local_expert_count and the StdMoE converts
+# --------------------------------------------------------------------------
+
+_LOCAL_KW = dict(
+    world_size=2,
+    hidden_dim=1024,
+    max_tok_per_rank=64,
+    num_expert_per_rank=4,
+    num_expert_per_token=4,
+    block_num=8,
+    warp_per_block=4,
+)
+
+
+def _local(name):
+    cls = cb.local_plan(name)
+    assert cls is not None, f"{name} is not registered"
+    return cls
+
+
+def _stream():
+    return torch.cuda.current_stream().cuda_stream
+
+
+def test_registry_lists_the_local_kernels():
+    plans = cb.registered_plans()
+    for name in cb.LOCAL_PLANS:
+        assert name in plans
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+def test_local_plans_bind_no_arena_region(name):
+    # Every pointer is local: a `window` or off<Region> field would be bound from
+    # an arena the op never passes.
+    names = _local(name)._arg_names
+    assert "window" not in names
+    assert not [n for n in names if n.startswith("off") and n[3:4].isupper()]
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+def test_local_describe_matches_the_built_plan(name):
+    cls = _local(name)
+    described = cls.describe(**_LOCAL_KW)
+    assert described["sharedBytes"] == 0 and described["gridX"] == 8
+    assert described["recvRows"] == 128 and described["bucketRows"] == 128
+    assert not [k for k in described if k.startswith("region.")]
+    p = cls(**_LOCAL_KW)
+    built = p.info
+    p.close()
+    assert described.pop("cacheDir") == ""
+    built.pop("cacheDir")
+    assert described == built
+
+
+@pytest.mark.parametrize("name", ["ep_convert_dispatch", "ep_convert_combine"])
+@pytest.mark.parametrize("dtype", ["fp32", "fp8", "fp4x2"])
+def test_convert_plans_refuse_a_non_bf16_token(name, dtype):
+    with pytest.raises(RuntimeError, match="bf16 only"):
+        _local(name).describe(**dict(_LOCAL_KW, dtype=dtype))
+
+
+def test_local_count_ignores_the_token_dtype():
+    _local("ep_local_expert_count").describe(**dict(_LOCAL_KW, dtype="fp8"))
+
+
+@pytest.mark.parametrize("name", cb.LOCAL_PLANS)
+@pytest.mark.parametrize(
+    "kw", [dict(num_expert_per_token=65), dict(num_expert_per_rank=8193)]
+)
+def test_local_plans_refuse_what_they_cannot_hold(name, kw):
+    # top-k past the wave; experts past the LDS histogram
+    with pytest.raises(RuntimeError, match="inconsistent config"):
+        _local(name).describe(**dict(_LOCAL_KW, **kw))
+
+
+def test_the_hip_gate_takes_the_local_limits_from_the_plans():
+    # The gate keeps no copy of EpLocalCfgIsValid: it asks the plans, and
+    # reports their reason.
+    from types import SimpleNamespace
+
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    refusal = EpDispatchCombineOpHip._local_refusal
+    ok = dict(
+        world_size=2,
+        max_num_inp_token_per_rank=64,
+        num_experts_per_rank=4,
+        num_experts_per_token=4,
+        hidden_dim=1024,
+        dispatch_dtype=torch.bfloat16,
+    )
+    assert refusal(SimpleNamespace(**ok), *cb.LOCAL_PLANS) is None
+    for kw in (
+        dict(num_experts_per_token=65),
+        dict(num_experts_per_rank=8193),
+        dict(hidden_dim=1023),
+    ):
+        why = refusal(SimpleNamespace(**dict(ok, **kw)), *cb.LOCAL_PLANS)
+        assert why and "inconsistent config" in why, (kw, why)
+
+
+def _count(idx, rank, epr, rows):
+    ids = idx[:rows].flatten().long() - rank * epr
+    ids = ids[(ids >= 0) & (ids < epr)]
+    return torch.bincount(ids, minlength=epr).to(torch.int32)
+
+
+@pytest.mark.parametrize(
+    "epr,topk,total,rank",
+    [(4, 4, 100, 1), (1, 1, 128, 0), (4, 8, 1000, 1), (16, 8, 0, 0), (300, 2, 128, 1)],
+)
+def test_local_expert_count_counts_this_ranks_ids(epr, topk, total, rank):
+    kw = dict(_LOCAL_KW, num_expert_per_rank=epr, num_expert_per_token=topk)
+    p = _local("ep_local_expert_count")(**kw)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    rows = p.info["recvRows"]
+    g = torch.Generator().manual_seed(epr * 100 + topk)
+    # Negative and past-the-end ids are skipped; a total past the rows is clamped.
+    idx = torch.randint(-3, 2 * epr + 3, (rows, topk), generator=g, dtype=torch.int32)
+    out = torch.full((epr,), -1, dtype=torch.int32, device=dev)
+    out.zero_()
+    p.launch(
+        stream=_stream(),
+        out_idx=idx.to(dev),
+        total_recv=torch.tensor([total], dtype=torch.int32, device=dev),
+        expert_count=out,
+        rank=rank,
+    )
+    torch.cuda.synchronize()
+    p.close()
+    assert torch.equal(out.cpu(), _count(idx, rank, epr, min(total, rows)))
+
+
+def _bare_op(backend_cls, **kernels):
+    from mori.ops.dispatch_combine_v2.dispatch_combine_op import KernelSet
+
+    op = object.__new__(backend_cls)
+    op._kernels = KernelSet(dispatch={}, combine={}, **kernels)
+    return op
+
+
+def test_local_expert_count_without_a_kernel_raises_and_is_not_advertised():
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = _bare_op(EpDispatchCombineOpHip)
+    assert "local_expert_count" not in op.capabilities
+    with pytest.raises(NotImplementedError, match="local_expert_count"):
+        op.local_expert_count()
+
+
+def test_local_expert_count_capability_follows_the_kernel():
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = _bare_op(EpDispatchCombineOpHip, local_expert_count=lambda **_: None)
+    assert "local_expert_count" in op.capabilities
+
+
+def test_convert_round_trip_matches_a_reference():
+    kw = dict(_LOCAL_KW, hidden_dim=1024)
+    disp = _local("ep_convert_dispatch")(**kw)
+    comb = _local("ep_convert_combine")(**kw)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    rows, bucket = disp.info["recvRows"], disp.info["bucketRows"]
+    epr, topk, hidden, rank, total = 4, 4, 1024, 1, 100
+    g = torch.Generator().manual_seed(7)
+    idx = torch.randint(0, 2 * epr, (rows, topk), generator=g, dtype=torch.int32)
+    idx[0, 0] = -1
+    x = torch.randn(rows, hidden, generator=g).to(torch.bfloat16)
+    wts = torch.rand(rows, topk, generator=g)
+    src = torch.randperm(rows, generator=g).to(torch.int32)
+    count = torch.zeros(epr, dtype=torch.int32, device=dev)
+    packed_x = torch.zeros(epr, bucket, hidden, dtype=torch.bfloat16, device=dev)
+    packed_src = torch.zeros(epr * bucket, dtype=torch.int32, device=dev)
+    slot_map = torch.full((rows * topk,), -1, dtype=torch.int64, device=dev)
+    out_tok = torch.zeros(rows, hidden, dtype=torch.bfloat16, device=dev)
+    tr = torch.tensor([total], dtype=torch.int32, device=dev)
+    common = dict(packed_x=packed_x, slot_map=slot_map, total_recv=tr, rank=rank)
+    xs, idxs = x.to(dev), idx.to(dev)
+    disp.launch(
+        stream=_stream(),
+        out_idx=idxs,
+        expert_count=count,
+        disp_out=xs,
+        recv_to_src=src.to(dev),
+        packed_src=packed_src,
+        **common,
+    )
+    comb.launch(
+        stream=_stream(), out_idx=idxs, out_wts=wts.to(dev), out_tok=out_tok, **common
+    )
+    torch.cuda.synchronize()
+    disp.close()
+    comb.close()
+
+    assert torch.equal(count.cpu(), _count(idx, rank, epr, total))
+    sm = slot_map.cpu()
+    local = idx[:total] - rank * epr
+    is_local = (local >= 0) & (local < epr)
+    assert torch.equal(sm[: total * topk].view(total, topk) >= 0, is_local)
+    for r, k in is_local.nonzero().tolist():
+        row = int(sm[r * topk + k])
+        e = int(local[r, k])
+        assert row // bucket == e and row % bucket < int(count[e])
+        assert int(packed_src[row]) == int(src[r])
+        assert torch.equal(packed_x.view(-1, hidden)[row].cpu(), x[r])
+    exp = (x[:total].float() * (wts[:total] * is_local).sum(1, keepdim=True)).to(
+        torch.bfloat16
+    )
+    assert torch.allclose(
+        out_tok[:total].float().cpu(), exp.float(), atol=2e-2, rtol=2e-2
+    )
+    assert not out_tok[total:].any()
+
+
+def _std_moe_cfg(dtype, combine_mode="gather"):
+    from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+
+    # Pinned geometry: no tuning-table lookup, so no GPU query.
+    return EpDispatchCombineConfig(
+        rank=0,
+        world_size=8,
+        hidden_dim=7168,
+        max_num_inp_token_per_rank=128,
+        num_experts_per_rank=32,
+        num_experts_per_token=8,
+        data_type=dtype,
+        enable_std_moe=True,
+        combine_mode=combine_mode,
+        dispatch_block_num=64,
+        warp_num_per_block=16,
+        combine_block_num=64,
+        combine_warp_num_per_block=8,
+    )
+
+
+@pytest.mark.parametrize(
+    "is1250,dtype,mode,reason",
+    [
+        (False, torch.bfloat16, "gather", None),
+        (False, torch.float32, "gather", "bf16 only"),
+        (False, torch.bfloat16, "scatter", "gather only"),
+        (True, torch.bfloat16, "gather", "gfx942/gfx950 only"),
+    ],
+)
+def test_hip_std_moe_gate(is1250, dtype, mode, reason):
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = object.__new__(EpDispatchCombineOpHip)
+    op._is1250 = is1250
+    op._arch = "gfx1250" if is1250 else "gfx942"
+    bad = [r for r in op._unsupported(_std_moe_cfg(dtype, mode)) if "std_moe" in r]
+    assert len(bad) == (reason is not None)
+    assert reason is None or reason in bad[0]
+
+
+def test_std_moe_without_its_kernels_raises_and_is_not_advertised():
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    op = _bare_op(EpDispatchCombineOpHip)
+    op.cfg = _std_moe_cfg(torch.bfloat16)
+    assert "std_moe" not in op.capabilities
+    with pytest.raises(NotImplementedError, match="StdMoE"):
+        op.convert_dispatch_output()
+    op.cfg.enable_std_moe = False
+    with pytest.raises(ValueError, match="without enable_std_moe"):
+        op.convert_combine_input(None)

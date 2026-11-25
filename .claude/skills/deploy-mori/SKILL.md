@@ -52,7 +52,7 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0`
+Default image: `rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0`
 (use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
@@ -428,15 +428,20 @@ mst status -v
 
 ## Step 4: Install MORI
 
-### 4.0 — ROCm 7.14 dev toolchain (rocm7.14 base images only)
+### 4.0 — ROCm dev toolchain (rocm10.x / rocm7.14 base images only)
 
 **Skip on pre-7.14 images** — they already ship a full `/opt/rocm` and must not
 get a second ROCm stacked on top.
 
-The rocm7.14 pytorch image has **no `/opt/rocm` at all**: ROCm comes from the pip
-`rocm-sdk-core` wheel, which ships runtime `.so` files and headers but no CMake
-package configs. Without this step the build dies at configure time with
+The rocm10.x and rocm7.14 pytorch images have **no `/opt/rocm` at all**: ROCm
+comes from the pip `rocm-sdk-core` wheel, which ships runtime `.so` files and
+headers but no CMake package configs. Without this step the build dies at
+configure time with
 `does not contain the HIP runtime CMake package ... hip-lang-config.cmake`.
+
+Install the release in the image's tag — mixing them makes every `import mori`
+warn that it was built against another ROCm. For ROCm 10.1 (an Ubuntu 22.04
+image takes `ubuntu2204` in the repo URL):
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
@@ -444,19 +449,23 @@ set -e
 [ -d /opt/rocm/bin ] && { echo "/opt/rocm already present — skipping"; exit 0; }
 apt-get install -y --no-install-recommends wget gnupg ca-certificates
 mkdir -p --mode=0755 /etc/apt/keyrings
-wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+wget -qO - https://stable.repo.amd.com/rocm/gpg/packages.gpg \
   | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" \
   > /etc/apt/sources.list.d/amdrocm.list
 apt-get update
-apt-get install -y --no-install-recommends amdrocm-core-dev7.14-gfx942 amdrocm-core-dev7.14-gfx950
-hipconfig --version
+apt-get install -y --no-install-recommends amdrocm-core-dev10.1-gfx942 amdrocm-core-dev10.1-gfx950
+cat /opt/rocm/core/.info/version
 '
 ```
 
+A rocm7.14 image takes `amdrocm-core-dev7.14-<arch>` from the
+`https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404` repo instead, signed
+by `https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg`.
+
 No environment setup is needed for the rest of the session. CMake resolves ROCm
-as `-DROCM_PATH` → `$ROCM_PATH` → `$HIP_PATH` → `/opt/rocm` (where both the
-7.2.4 and 7.14 stacks live) and pins the compiler to an absolute
+as `-DROCM_PATH` → `$ROCM_PATH` → `$HIP_PATH` → `/opt/rocm` (where the 7.2.4,
+7.14 and 10.x stacks all live) and pins the compiler to an absolute
 `<rocm>/llvm/bin/amdclang++`; mori's libraries carry
 `RUNPATH "$ORIGIN:<rocm>/lib"`, and the JIT builds absolute `<rocm>/bin/...`
 paths off the same default. Set `ROCM_PATH` only for ROCm somewhere else (e.g. a
@@ -717,7 +726,7 @@ Some machines are configured in ways that make MORI slow without anything being 
 with MORI. The **`known-issues`** skill collects them, with detection commands and fixes.
 
 Worth a look on any newly deployed box, and mandatory reading before debugging a
-performance problem that only shows up on one machine. The most common one:
+performance problem that only shows up on one machine. The most common:
 
 - **HIP VMM peer traffic silently falls off XGMI** on kernels built without
   `CONFIG_DMABUF_MOVE_NOTIFY` / `CONFIG_PCI_P2PDMA` (stock Ubuntu 22.04 GA 5.15).
@@ -730,6 +739,16 @@ performance problem that only shows up on one machine. The most common one:
 
   Both must print `=y`. In a container without the config, see Step 8 above. Details:
   `.claude/skills/known-issues/SKILL.md`.
+
+- **amdgpu miscounts VRAM registered with a NIC** (MoRI-IO, UMBP): after registration,
+  allocations and kernel loads fail with OOM although VRAM is free. Every public
+  amdgpu-dkms release is affected, and 30.x and 31.10 – 31.60 behave differently. Check
+  `cat /sys/module/amdgpu/version` against Issue 4 of the same skill.
+
+- **AINIC firmware mishandles retransmitted RDMA READs** (MoRI-IO, UMBP): on 1.117.5 builds
+  after a-45, reads fail with flush errors and no root cause, or succeed with data missing
+  or landing late. Check `cat /sys/class/infiniband/*/fw_ver` against Issue 5 of the same
+  skill; `MORI_IO_QP_MAX_RD_ATOMIC=1` avoids it.
 
 ---
 

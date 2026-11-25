@@ -48,6 +48,7 @@ from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
+from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x  # noqa: E402
 
 
 class Dist:
@@ -73,6 +74,17 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
 
+    def allreduce_max(self, value):
+        t = torch.tensor([value], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return float(t.item())
+
+    def allgather(self, t):
+        """Every rank's CPU tensor; shapes may differ between ranks."""
+        objs = [None] * self.world
+        dist.all_gather_object(objs, t.cpu())
+        return objs
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -91,7 +103,8 @@ _FP8_DT = (
 def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
-    global QUANT, INSCALE, SWEEP, RAGGED, NOSELF
+    global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF, FRESH, REROUTE, NOWTS
+    global DROPPED
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -108,10 +121,21 @@ def _configure():
         os.environ.get("SCALE_DIM", 0)
     )  # >0 = also verify per-token scales forwarding
     COMBINE = os.environ.get("COMBINE", "gather")  # gather | scatter
-    QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwise
-    # Scale the input up so per-token/-block amax exceeds the fp8 max -> exercises the
-    # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
+    QUANT = os.environ.get("QUANT", "none")  # none | fp{8,4}_blockwise[_1x32|_1x128]
+    # The gfx125x push combine folds no weights and refuses them (it says "call
+    # combine with weights=None"), so those runs pass none and skip the weight check.
+    NOWTS = QUANT != "none" and is_gfx125x()
+    # Input magnitude: 200 puts a block's amax past the fp8 max, 0.001 below its
+    # normal range; a quantized wire must keep both within _QUANT_REL_L2.
     INSCALE = float(os.environ.get("INSCALE", 1))
+    # SPREAD=n: each 32-element group times 2^u, u uniform in [-n, n], so a scale
+    # applied to the wrong group shows up as a gross error.
+    SPREAD = int(os.environ.get("SPREAD", 0))
+    # TINY=1: every row's first 128 elements are ~1e-37 with a zero among them, under
+    # a 1x128 scale's normal range, where the scale must be 1. Without that rule
+    # max / amax overflows and the zero becomes 0 * inf; the hardware clamp happens
+    # to turn that NaN into a finite value, so this guards the rule, not a crash.
+    TINY = int(os.environ.get("TINY", 0))
     SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
     # RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on
     # ranks 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing
@@ -120,9 +144,23 @@ def _configure():
     # NOSELF=1: no token picks an expert on its own rank, so no rank receives from
     # itself.
     NOSELF = int(os.environ.get("NOSELF", 0))
+    # FRESH=1: copy the received rows and the reverse map in-stream right after
+    # dispatch, and require them to equal what the views hold after the barrier.
+    FRESH = int(os.environ.get("FRESH", 0))
+    # REROUTE=N: N more rounds per SWEEP point with new routing, each reading
+    # local_expert_count (and StdMoE's packing) straight after dispatch.
+    REROUTE = int(os.environ.get("REROUTE", 0))
+    # DROPPED=1: slots dispatch must drop, ids < 0 or >= npes * EPR: padding rows
+    # (all -1, or -1 and out of range), -1 next to valid slots, out of range ahead of
+    # them.
+    DROPPED = int(os.environ.get("DROPPED", 0))
 
 
 _configure()
+
+# Relative L2 error bound of a quantized combine, by element; rounding alone is
+# ~2.6% for fp8 e4m3 and ~11% for e2m1.
+_QUANT_REL_L2 = {"fp8": 0.05, "fp4": 0.15}
 
 
 def _window_bytes(npes):
@@ -147,6 +185,13 @@ def _run(d, comm):
         inp = torch.randn(M, HIDDEN, generator=g, dtype=torch.float32)
         if INSCALE != 1.0:
             inp = inp * INSCALE
+        if SPREAD:
+            groups = inp.view(M, HIDDEN // 32, 32)
+            u = torch.randint(-SPREAD, SPREAD + 1, (M, HIDDEN // 32, 1), generator=g)
+            inp = (groups * torch.exp2(u.float())).view(M, HIDDEN)
+        if TINY:
+            inp[:, :128] *= 1e-37
+            inp[:, 0] = 0.0
         inp = inp.to(DTYPE).to(dev)
     if NOSELF:
         idx = torch.randint(
@@ -155,6 +200,13 @@ def _run(d, comm):
         idx += (idx >= rank * EPR).to(torch.int32) * EPR
     else:
         idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32)
+    if DROPPED:
+        rows, cols = torch.arange(M), torch.arange(K)
+        oob = (num_experts + cols).to(torch.int32)
+        idx[rows % 4 == 3] = torch.where(cols % 2 == 0, oob, -1).to(torch.int32)
+        idx[(rows % 3 == 1).nonzero(as_tuple=True)[0].unsqueeze(1), cols[1::2]] = -1
+        idx[rows % 5 == 2, 0] = num_experts
+        idx[0] = -1
     idx = idx.to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
@@ -185,10 +237,23 @@ def _run(d, comm):
         max_total_recv_tokens=int(os.environ.get("MAXRECV", 0)),
     )
     if int(os.environ.get("TUNED", 0)):
-        from mori.ops.dispatch_combine_v2.tuning_configs import lookup
+        # Each backend tunes its own kernels, so take the table of the one that will
+        # run: a cco row carries no promise about the hip dispatch's geometry, and on
+        # gfx1250 it is not even launchable there (its 32-warp rows predate the hip
+        # dispatch's per-warp LDS slabs -- ROCm/mori#951).
+        from mori.ops.dispatch_combine_v2.dispatch_combine_op import _default_backend
 
         _dt = "fp4" if _IS_FP4 else ("fp8" if _IS_FP8 else "bf16")
-        cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
+        if (os.environ.get("MORI_V2_KERNEL_BACKEND") or _default_backend()) == "hip":
+            from mori.ops.dispatch_combine_v2.hip_tuning_configs import lookup
+
+            cfg.schedule = lookup(
+                npes, HIDDEN, K, dtype=_dt, experts_per_rank=EPR, quant_type=QUANT
+            )["schedule"]
+        else:
+            from mori.ops.dispatch_combine_v2.tuning_configs import lookup
+
+            cfg.schedule = lookup(npes, HIDDEN, K, dtype=_dt)["schedule"]
     with EpDispatchCombineOp(cfg, comm) as op:
         comm.barrier()
 
@@ -210,38 +275,101 @@ def _run(d, comm):
             recv_x, disp_w, out_s, disp_i, total_recv_t, routing = op.dispatch(
                 inp[:ct], wts[:ct], sc_in, idx[:ct], return_routing=True
             )
+            # Read straight after dispatch, no sync or barrier, as SGLang does.
+            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
+            lec_now = op.local_expert_count().clone() if has_lec else None
+            packed = None
+            if STDMOE:
+                px, pc, ps = op.convert_dispatch_output()
+                packed = (px, pc.clone(), ps.clone())
+            if FRESH:
+                # Copies queued right behind the dispatch kernel, before any host sync
+                # or barrier, of every row peers wrote, the reverse map included.
+                views = (recv_x, disp_w, disp_i, out_s, routing._reverse_src_view)
+                views = [v for v in views if v is not None]
+                early = [v.clone() for v in views]
             total_recv = int(total_recv_t.cpu().item())
             sync()
             comm.barrier()
-            idx_c = idx[:ct].cpu().numpy()
-            # local_expert_count: global sum over ranks == world*ct*K (every
-            # (token,k) assignment is recorded on exactly the rank owning it).
-            # Capability-gated: a backend that does not implement this says so
-            # through op.capabilities rather than by failing at the call.
-            has_lec = "local_expert_count" in getattr(op, "capabilities", frozenset())
-            lec_sum = int(op.local_expert_count().sum().cpu().item()) if has_lec else 0
+            if FRESH:
+                ok_f = all(
+                    torch.equal(e[:total_recv], v[:total_recv])
+                    for e, v in zip(early, views)
+                )
+                errs_f = d.allreduce_sum(0 if ok_f else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-FRESH ct={ct_point}: {'PASS' if errs_f == 0 else 'FAIL'} "
+                        f"(rows read before the barrier == after; recv={total_recv})",
+                        flush=True,
+                    )
+            # The PEs each token reaches: from the routing alone, or under a cap from
+            # the dest map (a dup or dropped slot is null; gfx125x never caps, and its
+            # LL128 map is not flat-encoded).
+            idx_cpu = idx[:ct].cpu()
+            valid = (idx_cpu >= 0) & (idx_cpu < npes * EPR)
+            pes = torch.where(valid, idx_cpu // EPR, -1)
+            reach = [{int(p) for p in row if p >= 0} for row in pes]
+            stride = cfg.effective_max_recv
+            if cap is not None:
+                dmap = routing.disp_dest_tok_id_map[: ct * K].cpu().view(ct, K)
+                kept = dmap < npes * stride
+                reach = [
+                    {int(f) // stride for f in row[k]} for row, k in zip(dmap, kept)
+                ]
+            # each reached row carries every k whose expert lives on its PE
+            lec_mine = sum(
+                sum(1 for p in pes[t].tolist() if p >= 0 and p in reach[t])
+                for t in range(ct)
+            )
+            # Exact per-expert reference from every rank's routing (from the rows
+            # kept, under a cap); the global sum counts the (token,k) assignments
+            # whose PE kept the token. Capability-gated: a backend without it says so.
+            if cap is None:
+                lec_ref = _lec_ref(d, idx, ct_point)
+            else:
+                lec_ref = _bincount_local(disp_i[:total_recv].cpu(), rank)
+            if has_lec:
+                lec_late = op.local_expert_count().cpu()
+                ok_lec = torch.equal(lec_now.cpu(), lec_ref) and torch.equal(
+                    lec_late, lec_ref
+                )
+                lec_sum = int(lec_late.sum())
+            else:
+                ok_lec, lec_sum = True, 0
             sync()
             comm.barrier()
+            lec_errs = d.allreduce_sum(0 if ok_lec else 1)
             lec_total = d.allreduce_sum(lec_sum)
-            lec_exp = d.allreduce_sum(ct) * K
+            lec_exp = d.allreduce_sum(lec_mine)
             if rank == 0 and has_lec:
-                ok_lec = lec_total == lec_exp
+                ok_lec = lec_total == lec_exp and lec_errs == 0
                 print(
                     f"# OP-LEC ct={ct_point}: {'PASS' if ok_lec else 'FAIL'} "
-                    f"(sum={lec_total} exp={lec_exp})",
+                    f"(sum={lec_total} exp={lec_exp}, per-expert mismatches on "
+                    f"{lec_errs} ranks)",
                     flush=True,
                 )
-            if int(os.environ.get("REPLAY", 0)) and cap is None:
-                ref = recv_x[:total_recv].clone()
+            if int(os.environ.get("REPLAY", 0)):
+                # Wipe what replay must rewrite, so a replay that writes nothing fails.
+                views = [v for v in (recv_x, disp_w, disp_i, out_s) if v is not None]
+                refs = [v[:total_recv].clone() for v in views]
+                for v in views:
+                    v[:total_recv].zero_()
+                sync()
+                comm.barrier()
                 r2 = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                ok_r = torch.equal(r2[0][:total_recv], ref)
+                outs = [v for v in (r2[0], r2[1], r2[3], r2[2]) if v is not None]
+                ok_r = int(r2[4].cpu().item()) == total_recv and all(
+                    torch.equal(o[:total_recv], ref) for o, ref in zip(outs, refs)
+                )
                 errs_r = d.allreduce_sum(0 if ok_r else 1)
                 if rank == 0:
                     print(
                         f"# OP-REPLAY ct={ct_point}: {'PASS' if errs_r == 0 else 'FAIL'} "
-                        f"(replayed layout == original)",
+                        f"(rows, weights, ids and scales rewritten as dispatched)",
                         flush=True,
                     )
             if SCALE_DIM:
@@ -299,34 +427,85 @@ def _run(d, comm):
                         f"wts={'ok' if ok_dw else 'BAD'})",
                         flush=True,
                     )
-            if cap is not None:
-                # Capped run: over-cap tokens are intentionally dropped (mori
-                # parity), so identity-verify won't hold. Validate the cap is
-                # respected and nothing OOB/crashed.
-                op.combine(recv_x, routing=routing)
-                sync()
-                comm.barrier()
-                ok = total_recv <= cap
+            # Every rank receives min(demand, capacity): all of it without a cap.
+            demand = sum(
+                sum(
+                    1
+                    for row in other.tolist()
+                    if rank in {e // EPR for e in row if e >= 0}
+                )
+                for other in d.allgather(idx_cpu)
+            )
+            ok_recv = total_recv == min(demand, stride)
+            if cap is None:
+                errs = d.allreduce_sum(0 if ok_recv else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-RECV ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"(recv={total_recv} == demand)",
+                        flush=True,
+                    )
+            else:
+                # Drops depend on atomic order, so check invariants, not which tokens.
+                maps, revs = d.allgather(dmap), d.allgather(
+                    routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu()
+                )
+                ok = ok_recv
+                for src, m in enumerate(maps):
+                    t, k = (m < npes * stride).nonzero(as_tuple=True)
+                    pe, slot = m[t, k] // stride, m[t, k] % stride
+                    for p in range(npes):
+                        sel = pe == p
+                        if not bool(sel.any()):
+                            continue
+                        s_ = slot[sel].long()
+                        ok &= bool((s_ < len(revs[p])).all())
+                        if ok:
+                            got = revs[p][s_]
+                            ok &= torch.equal(got, (src * M + t[sel]).to(got.dtype))
+                    ok &= bool((pe < npes).all())
+                sent = d.allreduce_sum(int(kept.sum()))
+                ok &= d.allreduce_sum(total_recv) == sent
                 errs = d.allreduce_sum(0 if ok else 1)
                 if rank == 0:
                     print(
                         f"# OP-CAP ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
-                        f"(recv={total_recv} <= cap={cap}, no OOB)",
+                        f"(recv={total_recv} = min(demand, cap={cap}); kept slots "
+                        f"{sent} match the recv sum and the reverse maps)",
                         flush=True,
                     )
-                continue
+            rel = 0.0  # relative L2 error of a quantized combine
             if STDMOE:
-                op.convert_dispatch_output()  # identity GEMM: packed_x = token
-                sync()
-                comm.barrier()
+                # Identity GEMM: packed_x keeps the tokens convert_dispatch_output put there.
+                ok_pk = _check_packed(
+                    packed, lec_ref, routing, recv_x, disp_i, total_recv
+                )
+                errs = d.allreduce_sum(0 if ok_pk else 1)
+                if rank == 0:
+                    print(
+                        f"# OP-STDMOE-PACK ct={ct_point}: "
+                        f"{'PASS' if errs == 0 else 'FAIL'} (count, src, rows; "
+                        f"recv={total_recv})",
+                        flush=True,
+                    )
                 op.convert_combine_input(routing)
                 sync()
                 comm.barrier()
                 out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
                 sync()
                 comm.barrier()
-                # telescopes to (sum_k wts)*input
-                ws = wts[:ct].float().cpu().sum(dim=1, keepdim=True)
+                # telescopes to (sum_k wts)*input, over the k whose PE kept the token
+                # (a dropped slot keeps nothing, with or without a cap)
+                keep = torch.tensor(
+                    [
+                        [p >= 0 and p in reach[t] for p in pes[t].tolist()]
+                        for t in range(ct)
+                    ],
+                    dtype=torch.bool,
+                ).view(ct, K)
+                w_k = wts[:ct].float().cpu()
+                w_k = torch.where(keep, w_k, torch.zeros_like(w_k))
+                ws = w_k.sum(dim=1, keepdim=True)
                 exp = (ws * inp[:ct].float().cpu()).to(DTYPE)
                 ok = torch.allclose(
                     out.float().cpu(), exp.float(), atol=5e-2, rtol=5e-2
@@ -337,15 +516,13 @@ def _run(d, comm):
                 # identity expert: recv_x already holds the dispatched tokens.
                 # Weights passed because this test checks the weight fold; an
                 # inference caller passes None and the kernel skips it.
-                out, out_w = op.combine(recv_x, wts[:ct], routing=routing)
+                out, out_w = op.combine(
+                    recv_x, None if NOWTS else wts[:ct], routing=routing
+                )
                 sync()
                 comm.barrier()
-                U = np.array(
-                    [
-                        len({int(idx_c[t, j]) // EPR for j in range(K)})
-                        for t in range(ct)
-                    ]
-                )
+                # unique destination PEs the token reached (all of them unless capped)
+                U = np.array([len(r) for r in reach])
                 exp_w = torch.from_numpy(U).view(ct, 1).float() * wts[:ct].float().cpu()
                 if _IS_FP4:
                     # fp4 combine is too lossy for a numeric hidden check (mirror v1);
@@ -359,19 +536,117 @@ def _run(d, comm):
                     lossy = QUANT != "none" or _IS_FP8
                     atol = 3e-1 if lossy else 2e-2
                     rtol = 1e-1 if lossy else 2e-2
-                    ok = torch.allclose(
+                    # e2m1 is too coarse for an elementwise bound; its L2 bound stands
+                    ok = QUANT.startswith("fp4") or torch.allclose(
                         out.float().cpu(), exp.float(), atol=atol, rtol=rtol
                     )
-                ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
+                    if QUANT != "none":
+                        # atol=0.3 passes any small-input loss; the L2 error does not
+                        ref = exp.float()
+                        err = (out.float().cpu() - ref).norm()
+                        rel = float(err / ref.norm()) if ref.norm() > 0 else 0.0
+                        ok = ok and rel < _QUANT_REL_L2[QUANT[:3]]
+                ok_w = NOWTS or torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
+            quant_err = ""
+            if QUANT != "none":
+                quant_err = f" rel_l2={d.allreduce_max(rel):.4f}"
             if rank == 0:
                 print(
                     f"# {tag} ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
-                    f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
-                    f"recv={total_recv})",
+                    f"(hidden={'ok' if ok else 'BAD'} "
+                    f"wts={'n/a' if NOWTS else ('ok' if ok_w else 'BAD')}; "
+                    f"recv={total_recv}{quant_err})",
                     flush=True,
                 )
+            if REROUTE and has_lec:
+                _reroute_rounds(
+                    d,
+                    comm,
+                    op,
+                    inp,
+                    wts,
+                    sc_in,
+                    ct,
+                    ct_point,
+                    num_experts,
+                    cap is not None,
+                )
+
+
+def _lec_ref(d, idx, ct_point):
+    """This rank's expected local_expert_count: its experts' ids over every rank's
+    routed tokens."""
+    rank, npes = d.rank, d.world
+    all_i = [torch.empty_like(idx.cpu()) for _ in range(npes)]
+    dist.all_gather(all_i, idx.cpu().contiguous())
+    ids = torch.cat(
+        [
+            all_i[r][: (ct_point * (r % 3) // 2 if RAGGED else ct_point)].flatten()
+            for r in range(npes)
+        ]
+    ).long()
+    return _bincount_local(ids, rank)
+
+
+def _bincount_local(ids, rank):
+    ids = ids.flatten().long() - rank * EPR
+    ids = ids[(ids >= 0) & (ids < EPR)]
+    return torch.bincount(ids, minlength=EPR).to(torch.int32)
+
+
+def _check_packed(packed, lec_ref, routing, recv_x, recv_i, total_recv):
+    """StdMoE packing: per-expert counts, the multiset of sources each bucket holds,
+    and each packed row equal to the recv row of its source."""
+    px, pc, ps = packed
+    if not torch.equal(pc.cpu(), lec_ref):
+        return False
+    bucket = px.shape[1]
+    tis = routing.disp_tok_id_to_src_tok_id_local[:total_recv].long()
+    ids = recv_i[:total_recv].long() - int(os.environ["RANK"]) * EPR
+    inv = torch.full((bucket,), -1, dtype=torch.long, device=tis.device)
+    inv[tis] = torch.arange(total_recv, device=tis.device)
+    for e in range(EPR):
+        n = int(pc[e])
+        src = ps[e * bucket : e * bucket + n].long()
+        rows_exp = (ids == e).nonzero(as_tuple=True)[0]
+        if not torch.equal(src.sort().values, tis[rows_exp].sort().values):
+            return False
+        rows = inv[src]
+        if bool((rows < 0).any()) or not torch.equal(px[e, :n], recv_x[rows]):
+            return False
+    return True
+
+
+def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, capped):
+    """REROUTE rounds of new routing; every read is launched straight after dispatch."""
+    dev = inp.device
+    g = torch.Generator(device="cpu").manual_seed(4321 + d.rank * 1000 + ct_point)
+    bad = 0
+    for _ in range(REROUTE):
+        idx = torch.randint(0, num_experts, (inp.shape[0], K), generator=g)
+        idx = idx.to(torch.int32)
+        out = op.dispatch(inp[:ct], wts[:ct], sc_in, idx[:ct].to(dev))
+        lec_now = op.local_expert_count().clone()
+        pc_now = op.convert_dispatch_output()[1].clone() if STDMOE else None
+        # Every rank's reads are done before any rank's next dispatch writes.
+        sync()
+        # under a cap, from the rows this rank kept, read before peers move on
+        kept = out[3][: int(out[4].cpu().item())].cpu() if capped else None
+        comm.barrier()
+        ref = _bincount_local(kept, d.rank) if capped else _lec_ref(d, idx, ct_point)
+        ok = torch.equal(lec_now.cpu(), ref)
+        if STDMOE:
+            ok = ok and torch.equal(pc_now.cpu(), ref)
+        bad += 0 if ok else 1
+    errs = d.allreduce_sum(bad)
+    if d.rank == 0:
+        print(
+            f"# OP-REROUTE ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
+            f"({REROUTE} rounds, {errs} stale reads)",
+            flush=True,
+        )
 
 
 @contextlib.contextmanager

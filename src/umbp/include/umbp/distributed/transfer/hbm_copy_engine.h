@@ -86,7 +86,8 @@ class HbmCopyEngine final : public TransferEngine {
   void Deregister(const TransferRef&) override {}
 
   // Declare a host region as kernel-addressable, enabling the gather fast path
-  // for plans whose host side lies inside it.
+  // for plans whose host side lies inside it.  A copy between two buffers on
+  // the same GPU needs no such declaration and takes the fast path as it is.
   //
   // A gather kernel cannot dereference plain mmap memory — it faults the GPU —
   // so the region must be hipHostRegister'd first, which is what
@@ -169,7 +170,10 @@ class HbmCopyEngine final : public TransferEngine {
     kTaken = 0,
     kUnrecorded,                  // debug mode off, or a plan the pass never classified
     kDisabled,                    // UMBP_DRAM_GATHER_KERNEL=0, or latched off by a failure
-    kKindNotHostDevice,           // D2D: no host side to register, so no kernel form
+    kHostToHost,                  // no GPU endpoint; never reaches this engine
+    kAcrossDevices,               // D2D between two GPUs without peer access, or an
+                                  // endpoint without a device
+    kEndpointsOverlap,            // D2D whose source and destination buffers overlap
     kNoDevice,                    // neither endpoint named a device
     kHostNotGatherable,           // host side outside every HostTierRegistration, or
                                   // registered but unreachable from this device

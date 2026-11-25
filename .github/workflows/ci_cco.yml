@@ -16,7 +16,7 @@ on:
 
 env:
   IMAGE: rocm/mori:ci-cco
-  BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+  BASE_IMAGE: rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
   CONTAINER: mori_cco_ci_${{ github.run_id }}
   CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
 
@@ -80,8 +80,9 @@ jobs:
       - &cco-start
         name: Start container
         run: |
-          # A socket ifname only when the job sets one: an empty MORI_SOCKET_IFNAME
-          # is not unset to cco, which then looks for an interface named "".
+          # A socket ifname, and HSA_USE_SVM, only when the job sets one: an empty
+          # MORI_SOCKET_IFNAME is not unset to cco, which then looks for an
+          # interface named "".
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
@@ -89,6 +90,7 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            ${HSA_USE_SVM:+-e HSA_USE_SVM=$HSA_USE_SVM} \
             ${MORI_CI_FULL:+-e MORI_CI_FULL=$MORI_CI_FULL} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
@@ -136,15 +138,19 @@ jobs:
         if: contains(fromJSON(inputs.groups), 'epv2')
         run: |
           # No GPU needed: arch-string matching, the ASIC-revision table keys and their
-          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch. The
-          # tables load from the installed package, so a build that ships no tables,
-          # or a table that fails to parse, fails here.
+          # CU fit, the per-target macro guard, the FlyDSL schedules' bounds, the AsyncLL
+          # defaults per arch, the peak / capped tuning profiles, and the combine quant
+          # type names. The tables load from the installed package, so a build that
+          # ships no tables, or a table that fails to parse, fails here.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
               tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py \
-              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
+              tests/python/ops/dispatch_combine_v2/test_tuning_configs.py \
+              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py \
+              tests/python/ops/dispatch_combine_v2/test_tuning_profile.py \
+              tests/python/ops/dispatch_combine_v2/test_quant_types.py"
 
       - name: Run CCO unit tests (fork mode, 4 ranks)
         if: contains(fromJSON(inputs.groups), 'cco')
@@ -403,15 +409,20 @@ jobs:
           #
           # This runner has no gfx1250, so what actually runs here is the portable
           # body -- the one that cannot be exercised by hand on the TDM boxes.
+          #
+          # Each dispatch dtype also feeds the HIP quantized scatter combine (the
+          # a4w4 serving shape: fp4/fp8 dispatch, bf16 expert output, quantized wire).
           for disp in fp8 fp4; do
+          for comb in gather:none scatter:fp8_blockwise_1x128 scatter:fp4_blockwise_1x32; do
             $CT exec -e MORI_V2_KERNEL_BACKEND=hip -e SCALE_DIM=224 -e HIDDEN=7168 \
-              -e DISP=$disp $CONTAINER bash -c "\
+              -e DISP=$disp -e COMBINE=${comb%%:*} -e QUANT=${comb#*:} $CONTAINER bash -c "\
               cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
               out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asym_dtype.py 2>&1) || \
                 { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
               case \"\$out\" in *FAIL*) exit 1;; esac; \
               case \"\$out\" in *ASYM-SCALES*) ;; *) echo 'no ASYM-SCALES line: scales never ran'; exit 1;; esac" || exit 1
+          done
           done
 
       - name: Run ops-v2 backend parity (FlyDSL vs HIP, EP8)
@@ -602,7 +613,8 @@ jobs:
     # passed in as part of the CCO unit test: on MI355X-AINIC-PIT-G17,
     # test_asyncll's back_to_back check fails. The other EPv2 steps run in
     # cco-unit-test.
-    if: contains(fromJSON(inputs.groups), 'epv2')
+    # Off: MI355X-AINIC, this job's only runner, is down.
+    if: false && contains(fromJSON(inputs.groups), 'epv2')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -615,11 +627,20 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+            # These hosts' amdgpu-dkms lacks 93aa919 ("drm/amdkfd: fix vram
+            # allocation failure for a special case"): hipMemCreate (VRAM with no VA
+            # yet) fails with EADDRINUSE, reported as out of memory, while any SVM
+            # range sits below its size, and libhsakmt registers every pageable
+            # buffer HIP pins for a copy as one. HSA_USE_SVM=0 registers them as
+            # userptr instead. Not in the image: with SVM off every pageable copy is
+            # pinned again. Drop it once the hosts' amdgpu-dkms carries the fix.
+            hsa_use_svm: 0
     env:
       CONTAINER: mori_cco_v2_${{ github.run_id }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
     timeout-minutes: 30
     steps:
       - *cco-fix-perms
@@ -670,25 +691,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Same pair, ifnames and NIC list as ci.yml's internode-test, which is the
-        # configuration these two hosts are known to talk over. Note the device
-        # names differ from the single-node job's rdma0-7 above.
+        # Each entry uses the same pair, ifnames and NIC list as its ci.yml
+        # internode job, which is the configuration those hosts are known to talk
+        # over.
         include:
-          - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
-            node1_host: 10.2.80.20
-            node2_host: 10.2.80.10
+          # Off: MI355X-AINIC is down; MI300X_MLX runs the job meanwhile. Its
+          # device names differ from the single-node job's rdma0-7 above.
+          # - platform: MI355X_AINIC
+          #   runner: [self-hosted, MI355X-AINIC]
+          #   node1_host: 10.2.80.20
+          #   node2_host: 10.2.80.10
+          #   node2_port: 22
+          #   node1_ifname: enp193s0f1np1
+          #   node2_ifname: enp193s0f1np1
+          #   rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+          #   rdma_sl: 3
+          #   rdma_tc: 104
+          #   hsa_use_svm: 0  # the amdgpu-dkms workaround, see cco-v2-test
+          #   ct: podman
+          #   gpu_archs: gfx950 gfx1250
+          # ci.yml's internode-test-mi300x pair: InfiniBand, so no rdma_sl/rdma_tc,
+          # and mlx5_8 is the TCP rendezvous port, not a rail.
+          - platform: MI300X_MLX
+            runner: [self-hosted, 300_mlx_p19_29]
+            node1_host: 10.194.132.110
+            node2_host: 10.194.132.71
             node2_port: 22
-            node1_ifname: enp193s0f1np1
-            node2_ifname: enp193s0f1np1
-            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
-            rdma_sl: 3
-            rdma_tc: 104
+            node1_ifname: ens14np0
+            node2_ifname: ens14np0
+            rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+            ct: docker
+            gpu_archs: gfx942
     env:
       # Overrides the workflow-level name, which is keyed by run_id alone: sharing
       # it would have this job's cleanup delete the other job's container.
       CONTAINER: mori_cco_ci_xnode_${{ github.run_id }}
-      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      CT: ${{ matrix.ct }}
+      GPU_ARCHS: ${{ matrix.gpu_archs }}
+      # Multiplexed for the same reason as ci.yml's internode-env: node2's sshd can
+      # deny a new connection, so only the first one, retried below, is checked.
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=/tmp/mori-ci-ssh-%C -o ControlPersist=30m
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
@@ -698,9 +740,12 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
     timeout-minutes: 60
     steps:
+      - *cco-fix-perms
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -712,7 +757,7 @@ jobs:
       - name: Build CI image
         run: |
           $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
-            --build-arg GPU_ARCHS="gfx950 gfx1250" --build-arg WITH_FLYDSL=1 \
+            --build-arg GPU_ARCHS="$GPU_ARCHS" --build-arg WITH_FLYDSL=1 \
             -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container on node1
@@ -725,17 +770,34 @@ jobs:
             -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
             -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
             -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e HSA_USE_SVM=$HSA_USE_SVM \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
 
+      - name: Open SSH connection to node2
+        run: |
+          for i in 1 2 3 4 5; do
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST true && exit 0
+            echo "ssh to node2 failed (attempt $i/5), retrying in 10s"
+            sleep 10
+          done
+          exit 1
+
       - name: Start container on node2
         run: |
+          # ci.yml's jobs share node2's workspace and leave root-owned build output
+          # in it under rootful docker, which the rsync below cannot overwrite.
+          # Rootless podman already maps container root to the runner user, so the
+          # chown -R below would only cost time there.
+          [ "$CT" = podman ] && [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = true ] && ROOTLESS=1 || ROOTLESS=
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
+            test -n '$ROOTLESS' || $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           "
           rsync -az --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
@@ -744,7 +806,7 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             cd $GITHUB_WORKSPACE &&
             $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
-              --build-arg GPU_ARCHS='gfx950 gfx1250' --build-arg WITH_FLYDSL=1 \
+              --build-arg GPU_ARCHS='$GPU_ARCHS' --build-arg WITH_FLYDSL=1 \
               -t $IMAGE -f docker/Dockerfile.dev . &&
             CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
               -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
@@ -753,6 +815,7 @@ jobs:
               -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e HSA_USE_SVM=$HSA_USE_SVM \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
@@ -803,6 +866,7 @@ jobs:
           # shared barrier from their own combine kernel code. Every case
           # allocates the op's default 8 QPs, so no table's count is clamped.
           for CASE in "v2 128 --num-qp 8" "v2 4096 --num-qp 8" "v2_ll 128 --num-qp 8" \
+                      "auto 128 --num-qp 8" \
                       "v2 4096 --num-qp 8 -- --active-qp-counts 1,2,4,8" \
                       "v2_ll 128 --num-qp 8 -- --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"

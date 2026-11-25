@@ -37,14 +37,13 @@ kernel writes it directly.
 
 ## 1. Set up the environment
 
-Use the **`deploy-mori`** skill (`.claude/skills/deploy-mori`) — it starts the
-container with the right device/NIC mappings, installs ROCm + NIC userspace
-libraries (AINIC / ConnectX / Thor2/BNXT) + RDMA-core, and installs MORI. The
-core of it is:
+The repository's **`deploy-mori`** agent skill (`.claude/skills/deploy-mori`)
+automates this: it starts the container with the right device/NIC mappings,
+installs ROCm + NIC userspace libraries (AINIC / ConnectX / Thor2/BNXT) +
+RDMA-core, and installs MORI. The core of it is:
 
 ```bash
 # inside the MORI container, at the repo root
-pip install pybind11 -q          # build dependency missing from pyproject
 rm -rf build                     # clear any stale cmake cache
 pip install .                    # builds + co-locates all libmori_*.so
 ```

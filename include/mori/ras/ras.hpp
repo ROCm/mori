@@ -32,22 +32,25 @@
 //   if (ras::RasRuntime* rt = ras::RasRuntime::Get()) rt->Enqueue(ras::EngineRegistered{...});
 //
 // Lifecycle:
-// - Off unless MORI_RAS_ENABLE=1.
+// - Off unless MORI_RAS_ENABLE=1. When it is set, RAS logs warnings as well as errors, unless
+//   MORI_RAS_LOG_LEVEL or MORI_GLOBAL_LOG_LEVEL chooses a level.
 // - EnsureStarted() starts the runtime once per process, from the first IOEngine. It binds the
 //   peer listener before returning, so the engine can advertise it in EngineDesc. The RAS
 //   thread runs at nice 19 and on MORI_RAS_CPU_AFFINITY's CPUs, if set.
 // - A runtime that fails to start, e.g. because every port MORI_RAS_PORT allows is taken,
 //   stays off for the life of the process: Status() reports kFailed with kDegradedInitFailed
 //   and why, and engines advertise no endpoint. A failure after start sets a degraded bit but
-//   keeps the listener open.
-// - At exit, an atexit handler stops the RAS thread. That path doesn't log: MORI_LOG caches
-//   loggers in function-local statics, which may already be destroyed. The runtime object is
-//   never freed, so a thread still calling in during exit reaches a stopped runtime, not freed
-//   memory.
+//   keeps the listener open, so peers learn of it from HELLO and heartbeats.
+// - At exit, an atexit handler stops the RAS thread, which sends LEAVE on every link first.
+//   That path doesn't log: MORI_LOG caches loggers in function-local statics, which may
+//   already be destroyed. The runtime object is never freed, so a thread still calling in
+//   during exit reaches a stopped runtime, not freed memory.
 // - RAS doesn't follow a fork. In a child of a process that asked for RAS, Get() and
 //   EnsureStarted() return nullptr, so the child's engines advertise no endpoint, and the
-//   child's exit leaves the parent's runtime alone. RAS's sockets, epoll fd and eventfd are
-//   close-on-exec; a child that doesn't exec holds copies of them until it exits.
+//   child's exit leaves the parent's runtime alone: it sends no LEAVE. RAS's sockets, epoll fd
+//   and eventfd are close-on-exec; a child that doesn't exec holds copies of them until it
+//   exits. If the parent dies first, its links stay open in that child, so peers see the death
+//   at the heartbeat timeout (20 s, scaled by MORI_RAS_TIMEOUT_FACTOR) instead of at once.
 //
 // Thread safety: every member may be called from any thread. Enqueue() never blocks.
 

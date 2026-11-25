@@ -75,6 +75,10 @@ const char* MessageTypeName(MessageType type) {
       return "RegEndpoint";
     case MessageType::AskMemoryRegion:
       return "AskMemoryRegion";
+    case MessageType::Fenced:
+      return "Fenced";
+    case MessageType::Unfenced:
+      return "Unfenced";
     default:
       return "Unknown";
   }
@@ -128,6 +132,27 @@ void Protocol::WriteMessageRegEndpoint(const MessageRegEndpoint& msg) {
   uint32_t len = static_cast<uint32_t>(buf.size());
   WriteMessageHeader({MessageType::RegEndpoint, len});
   WriteExact(&ep, buf.data(), buf.size(), "WriteMessageRegEndpoint(body)");
+}
+
+void Protocol::WriteMessageFenced() { WriteMessageHeader({MessageType::Fenced, 0}); }
+
+MessageUnfenced Protocol::ReadMessageUnfenced(size_t len) {
+  ValidateControlMessageLength(len, "MessageUnfenced");
+  std::vector<char> buf(len);
+  ReadExact(&ep, buf.data(), len, "ReadMessageUnfenced(body)");
+  try {
+    auto out = msgpack::unpack(buf.data(), len);
+    return out.get().as<MessageUnfenced>();
+  } catch (const std::exception& e) {
+    throw ProtocolError(std::string("failed to decode MessageUnfenced: ") + e.what());
+  }
+}
+
+void Protocol::WriteMessageUnfenced(const MessageUnfenced& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  WriteMessageHeader({MessageType::Unfenced, static_cast<uint32_t>(buf.size())});
+  WriteExact(&ep, buf.data(), buf.size(), "WriteMessageUnfenced(body)");
 }
 
 MessageAskMemoryRegion Protocol::ReadMessageAskMemoryRegion(size_t len) {

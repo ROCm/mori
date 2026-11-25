@@ -28,6 +28,7 @@ device tensors surfaced to the caller via from_gpu_ptr.
 import torch
 
 import flydsl.expr as fx
+from mori.jit.core import _target_arch
 from mori.tensor_utils import from_gpu_ptr
 
 from .intranode_kernels import (
@@ -49,12 +50,20 @@ from .dispatch_combine_op import (  # noqa: F401
     EpDispatchRoutingHandle,
     KernelSet,
 )
+from .quant_types import is_gfx125x_arch
 from .symm_arena import SymmArena  # noqa: F401
 
 
 class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     """FlyDSL-kernel EP op. The full v2 feature set: gather + scatter combine,
     fp8/fp4, quant, StdMoE, per-token scales, routing replay."""
+
+    @classmethod
+    def _quant_formats(cls, arch):
+        # The scatter combine's fp8 codec is wave64-only.
+        if is_gfx125x_arch(arch):
+            return ()
+        return ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """This backend has no cross-node path.
@@ -69,13 +78,23 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
             )
-        if cfg.quant_type in _FP4_QUANT_TYPES:
+        refused = self._quant_refusal(cfg, _target_arch())
+        if refused:
+            return refused
+        # The fp8 codec reads and writes bf16 rows.
+        if cfg.fp8_blockwise and cfg.combine_dtype != torch.bfloat16:
             return (
-                f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
-                "pass kernel_backend='hip'",
+                f"quant_type={cfg.quant_type!r} with combine dtype {cfg.combine_dtype} "
+                "(bf16 only)",
             )
-        # The config lets an asymmetric dtype through with fp8_blockwise for the
-        # hip push combine; this backend's fp8_blockwise scatter has no such path.
+        # The fp8 codec quantizes a token in 128-element chunks, one per wave load.
+        if cfg.fp8_blockwise and cfg.hidden_dim % 128:
+            return (
+                f"quant_type={cfg.quant_type!r} needs hidden_dim % 128 == 0 on the "
+                f"flydsl backend, got hidden_dim={cfg.hidden_dim}",
+            )
+        # The config lets an asymmetric dtype through with a quantized combine
+        # for the hip push combine; this backend's quantized scatter has no such path.
         if cfg.is_asymmetric_dtype and cfg.quant_type != "none":
             return (
                 f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "
@@ -106,7 +125,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         if (is_fp4 or is_fp8) and cfg.is_scatter:
             raise ValueError(
                 "plain fp4/fp8 token dtype is gather-only "
-                "(fp8 quant uses quant_type=fp8_direct_cast, not data_type)"
+                "(fp8 quant uses quant_type=fp8_blockwise, not data_type)"
             )
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
@@ -148,7 +167,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 regions.append(
                     (
                         "comb_scales",
-                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_dim * 4,
+                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_bytes,
                     )
                 )
         # Gate FIRST, as the hip backend does: rejecting after taking the
@@ -158,6 +177,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        self._warn_unused_low_latency()
 
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
@@ -258,9 +278,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_comb_scales=(
                         arena.offset("comb_scales") if cfg.fp8_blockwise else 0
                     ),
-                    fp8_direct_cast=cfg.fp8_direct_cast,
                     fp8_blockwise=cfg.fp8_blockwise,
-                    scale_dim=cfg.combine_scale_dim,
+                    quant_group=cfg.quant_group,
                 )
                 for (b, w) in combine_specs
             }
@@ -284,9 +303,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 for (b, w) in combine_specs
             }
 
-        self._local_expert_count_buf = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=device
-        )
+        if cfg.enable_std_moe:
+            # before the packed buffers are sized in the configured dtype
+            assert elem_size == 2, "StdMoE convert path is bf16-only"
+        self._alloc_local_buffers(cfg)
         self._local_expert_count = make_local_expert_count(
             rank=cfg.rank,
             experts_per_rank=cfg.num_experts_per_rank,
@@ -296,24 +316,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         )
 
         if cfg.enable_std_moe:
-            assert elem_size == 2, "StdMoE convert path is bf16-only"
             experts_per_rank = cfg.num_experts_per_rank
-            max_tok_per_expert = cfg.world_size * max_tok_per_rank
-            self._max_tok_per_expert = max_tok_per_expert
-            self.packed_x = torch.zeros(
-                experts_per_rank * max_tok_per_expert * hidden_dim,
-                dtype=torch.int16,
-                device=device,
-            )
-            self.packed_count = torch.zeros(
-                experts_per_rank, dtype=torch.int32, device=device
-            )
-            self.packed_src = torch.zeros(
-                experts_per_rank * max_tok_per_expert, dtype=torch.int32, device=device
-            )
-            self.slot_map = torch.full(
-                (recv_cap * topk,), -1, dtype=torch.int64, device=device
-            )
+            max_tok_per_expert = self._max_tok_per_expert
             self._convert_dispatch = make_convert_dispatch_output(
                 rank=cfg.rank,
                 experts_per_rank=experts_per_rank,
@@ -344,6 +348,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
+            local_expert_count=self._run_local_expert_count,
+            convert_dispatch=self._run_convert_dispatch if cfg.enable_std_moe else None,
+            convert_combine=self._run_convert_combine if cfg.enable_std_moe else None,
             # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
             capabilities=frozenset(
@@ -351,10 +358,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     "gather",
                     "scatter",
                     "quant",
-                    "std_moe",
                     "scales",
                     "replay",
-                    "local_expert_count",
                     "asymmetric_dtype",
                     "recv_cap",
                 }
@@ -394,49 +399,29 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
         )
 
-    def convert_dispatch_output(self):
-        """mori ConvertDispatchOutput: repack recv tokens into per-local-expert
-        buckets. Returns (packed_x, packed_count, packed_src); GEMM overwrites
-        packed_x in place."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
-        self.packed_count.zero_()
-        self.slot_map.fill_(-1)
+    def _run_convert_dispatch(self, *, total_recv):
         arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
         self._convert_dispatch(
             arena.local_ptr("disp_out"),
             arena.local_ptr("out_idx"),
             arena.local_ptr("recv_to_src_token"),
-            self.total_recv.data_ptr(),
+            total_recv.data_ptr(),
             self.packed_x.data_ptr(),
             self.packed_count.data_ptr(),
             self.packed_src.data_ptr(),
             self.slot_map.data_ptr(),
-            stream,
+            fx.Stream(torch.cuda.current_stream()),
         )
-        experts_per_rank = self.cfg.num_experts_per_rank
-        max_tok_per_expert = self._max_tok_per_expert
-        hidden_dim = self.cfg.hidden_dim
-        packed_x_view = from_gpu_ptr(
-            self.packed_x.data_ptr(),
-            (experts_per_rank, max_tok_per_expert, hidden_dim),
-            self.cfg.dispatch_dtype,
-        )
-        return packed_x_view, self.packed_count, self.packed_src
 
-    def convert_combine_input(self, routing):
-        """mori ConvertCombineInput: weighted-reduce each recv token's local-expert
-        outputs from packed_x back into out_tok. Run after GEMM, before combine."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
+    def _run_convert_combine(self, *, total_recv):
         arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
         self._convert_combine(
             arena.local_ptr("out_tok"),
             arena.local_ptr("out_wts"),
-            routing.total_recv_token_num.data_ptr(),
+            total_recv.data_ptr(),
             self.packed_x.data_ptr(),
             self.slot_map.data_ptr(),
-            stream,
+            fx.Stream(torch.cuda.current_stream()),
         )
 
     def recv_weights(self):
@@ -528,15 +513,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         return run
 
-    def local_expert_count(self):
-        """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch."""
-        self._local_expert_count_buf.zero_()
-        stream = fx.Stream(torch.cuda.current_stream())
+    def _run_local_expert_count(self, *, total_recv, out):
         self._local_expert_count(
             self.arena.local_ptr("out_idx"),
-            self.total_recv.data_ptr(),
-            self._local_expert_count_buf.data_ptr(),
-            stream,
+            total_recv.data_ptr(),
+            out.data_ptr(),
+            fx.Stream(torch.cuda.current_stream()),
         )
-        return self._local_expert_count_buf

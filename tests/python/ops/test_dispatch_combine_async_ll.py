@@ -233,7 +233,7 @@ def _test_dispatch_combine_multi_iteration(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8, 9))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast", "fp8_blockwise"))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_blockwise"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -246,8 +246,6 @@ def test_dispatch_combine(
     num_experts_per_token,
     quant_type,
 ):
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
     if quant_type == "fp8_blockwise" and data_type is not torch.bfloat16:
         pytest.skip("fp8_blockwise is only supported for bfloat16 data type")
 
@@ -281,7 +279,6 @@ def _test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
     dispatch_hidden_dim, combine_hidden_dim, _ = cross_dtype_hidden_dims(
         hidden_dim, data_type, combine_data_type
@@ -294,7 +291,6 @@ def _test_dispatch_combine_cross_dtype(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
-        quant_type=quant_type,
         combine_data_type=combine_data_type,
     )
     run_ep_dispatch_combine_test(
@@ -308,9 +304,8 @@ def _test_dispatch_combine_cross_dtype(
 
 
 # Cross-dtype coverage for AsyncLL: narrow (FP4 / FP8) dispatch paired with a
-# BF16 combine, with and without the FP8 direct-cast combine codec. The matrix
-# above ties the combine element type to config.data_type and so only ever
-# reaches the same-dtype diagonal.
+# BF16 combine. The matrix above ties the combine element type to
+# config.data_type and so only ever reaches the same-dtype diagonal.
 @pytest.mark.parametrize("world_size", (8,))
 @pytest.mark.parametrize("data_type", _all_data_types())
 @pytest.mark.parametrize("combine_data_type", (torch.bfloat16,), ids=("combine_bf16",))
@@ -318,7 +313,6 @@ def _test_dispatch_combine_cross_dtype(
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (128,))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
 def test_dispatch_combine_cross_dtype(
     torch_dist_process_manager,
     world_size,
@@ -328,9 +322,8 @@ def test_dispatch_combine_cross_dtype(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
-    quant_type,
 ):
-    skip = cross_dtype_skip_reason(quant_type, data_type, combine_data_type)
+    skip = cross_dtype_skip_reason(data_type, combine_data_type)
     if skip:
         pytest.skip(skip)
 
@@ -346,7 +339,6 @@ def test_dispatch_combine_cross_dtype(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
-                    quant_type,
                 ],
             )
         )

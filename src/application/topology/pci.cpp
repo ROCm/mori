@@ -23,13 +23,13 @@
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <libgen.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -41,12 +41,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "mori/utils/mori_log.hpp"
+
 namespace mori {
 namespace application {
 
 namespace {
-
-constexpr const char* kSysfsPciDevices = "/sys/bus/pci/devices";
 
 // PCI configuration header offsets (PCI Local Bus Specification).
 constexpr off_t kCfgHeaderType = 0x0e;
@@ -74,6 +74,10 @@ struct SysfsPciDev {
   uint8_t primaryBus{0};
   uint8_t secondaryBus{0};
   uint8_t subordinateBus{0};
+  // The devices above this one, nearest first, as sysfs nests them. The kernel
+  // built that from the hierarchy it enumerated, so it stays right when a
+  // bridge's bus registers no longer are.
+  std::vector<uint64_t> ancestors;
 
   PciBusId BusId() const { return PciBusId(domain, bus, dev, func); }
 };
@@ -83,7 +87,24 @@ bool ReadSysfsLine(const std::string& path, std::string& out) {
   return static_cast<bool>(std::getline(f, out));
 }
 
-bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
+// "<sysfs>/bus/pci/devices/<bdf>" links to ".../devices/pci0000:10/<bdf>/.../<bdf>":
+// every component above the last that is a BDF is a bridge the device sits below.
+std::vector<uint64_t> ReadSysfsAncestors(const std::string& devpath) {
+  std::vector<uint64_t> ancestors;
+  char link[PATH_MAX];
+  ssize_t len = readlink(devpath.c_str(), link, sizeof(link) - 1);
+  if (len < 0) return ancestors;
+  std::stringstream path(std::string(link, len));
+  std::string component;
+  while (std::getline(path, component, '/')) {
+    if (IsBdfString(component)) ancestors.push_back(PciBusId(component).packed);
+  }
+  if (!ancestors.empty()) ancestors.pop_back();  // the device itself
+  std::reverse(ancestors.begin(), ancestors.end());
+  return ancestors;
+}
+
+bool ReadSysfsPciDev(const std::string& root, const std::string& name, SysfsPciDev& out) {
   std::vector<uint64_t> bdf = ParseBdfFromString(name);
   if (bdf.size() != 4) return false;
   out.domain = bdf[0];
@@ -91,7 +112,8 @@ bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
   out.dev = bdf[2];
   out.func = bdf[3];
 
-  const std::string dir = std::string(kSysfsPciDevices) + "/" + name;
+  const std::string dir = root + "/" + name;
+  out.ancestors = ReadSysfsAncestors(dir);
 
   std::string line;
   if (!ReadSysfsLine(dir + "/class", line)) return false;
@@ -114,33 +136,20 @@ bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
   return true;
 }
 
-std::vector<SysfsPciDev> ScanSysfsPci() {
+std::vector<SysfsPciDev> ScanSysfsPci(const std::string& root) {
   std::vector<SysfsPciDev> devs;
-  DIR* d = opendir(kSysfsPciDevices);
+  DIR* d = opendir(root.c_str());
   if (d == nullptr) return devs;
   while (struct dirent* e = readdir(d)) {
     if (e->d_name[0] == '.') continue;
     SysfsPciDev dev;
-    if (ReadSysfsPciDev(e->d_name, dev)) devs.push_back(dev);
+    if (ReadSysfsPciDev(root, e->d_name, dev)) devs.push_back(dev);
   }
   closedir(d);
   std::sort(devs.begin(), devs.end(), [](const SysfsPciDev& a, const SysfsPciDev& b) {
     return a.BusId().packed < b.BusId().packed;
   });
   return devs;
-}
-
-bool IsUnderRootComplex(const SysfsPciDev& dev) {
-  const std::string devpath = std::string(kSysfsPciDevices) + "/" + dev.BusId().String();
-
-  char link[256], parent[256];
-  ssize_t len = readlink(devpath.c_str(), link, sizeof(link) - 1);
-  if (len < 0) return false;
-  link[len] = '\0';
-
-  strcpy(parent, dirname(link));
-  const char* last = basename(parent);
-  return strncmp(last, "pci", 3) == 0;
 }
 
 }  // namespace
@@ -336,8 +345,8 @@ bool TopoPathPci::CrossMultipleNuma() const {
 /*                                          TopoSystemPci                                         */
 /* ---------------------------------------------------------------------------------------------- */
 
-TopoSystemPci::TopoSystemPci() : pathCache() {
-  Load();
+TopoSystemPci::TopoSystemPci(const std::string& sysfsPciDevices) : pathCache() {
+  Load(sysfsPciDevices);
   Validate();
 }
 
@@ -362,12 +371,13 @@ static TopoNodePci* CreateTopoNodePciFrom(const SysfsPciDev& dev) {
   return nullptr;
 }
 
-void TopoSystemPci::Load() {
-  const std::vector<SysfsPciDev> devs = ScanSysfsPci();
+void TopoSystemPci::Load(const std::string& sysfsPciDevices) {
+  const std::vector<SysfsPciDev> devs = ScanSysfsPci(sysfsPciDevices);
 
   std::unordered_map<uint64_t, const SysfsPciDev*> dsp2dev;
   std::unordered_map<uint64_t, const SysfsPciDev*> bus2dev;
   std::unordered_set<uint32_t> domains;
+  std::unordered_set<uint64_t> unprogrammed;  // bridges whose bus numbers say nothing
 
   root = TopoNodePci::CreateVirtualRoot();
   pcis.emplace(root->BusId().packed, root);
@@ -382,7 +392,21 @@ void TopoSystemPci::Load() {
     domains.insert(dev.domain);
     pcis.emplace(node->BusId().packed, node);
 
-    if (dev.headerType == kHeaderTypeBridge) {
+    // A bridge whose primary bus is not the bus it sits on has no bus numbers
+    // programmed (a device held in reset reads all three registers as 0). Its
+    // secondary..subordinate range then names buses that are not behind it, so
+    // it claims none; what does sit behind it is placed by sysfs below.
+    const bool programmed = dev.primaryBus == dev.bus;
+    if (dev.headerType == kHeaderTypeBridge && !programmed) {
+      unprogrammed.insert(node->BusId().packed);
+      MORI_APP_WARN(
+          "TopoSystemPci: bridge {} reports primary bus {:#04x}, secondary {:#04x}, subordinate "
+          "{:#04x}; its bus numbers are not programmed, ignoring them",
+          dev.BusId().String(), static_cast<unsigned>(dev.primaryBus),
+          static_cast<unsigned>(dev.secondaryBus), static_cast<unsigned>(dev.subordinateBus));
+    }
+
+    if (dev.headerType == kHeaderTypeBridge && programmed) {
       // Use a wider counter than the bus numbers themselves: a bridge may report
       // a subordinate bus of 0xff (e.g. empty downstream ports on some NICs), and
       // a uint8_t loop variable would wrap from 0xff back to 0 and spin forever.
@@ -395,7 +419,6 @@ void TopoSystemPci::Load() {
           if (dev.primaryBus < lastDev->primaryBus) continue;
         }
         dsp2dev[dspBusId] = &dev;
-        assert(dev.bus == dev.primaryBus);
       }
     }
 
@@ -426,13 +449,30 @@ void TopoSystemPci::Load() {
         node->Type() == TopoNodePciType::VirtualRoot)
       continue;
 
+    // The nearest device sysfs enumerated this one below, among the nodes kept.
+    const uint64_t kNone = std::numeric_limits<uint64_t>::max();
+    uint64_t sysfsParent = kNone;
+    for (uint64_t ancestor : bus2dev[busId.packed]->ancestors) {
+      if (pcis.find(ancestor) != pcis.end()) {
+        sysfsParent = ancestor;
+        break;
+      }
+    }
+
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
-    if (dsp2dev.find(parentDsp) == dsp2dev.end()) {
-      assert(IsUnderRootComplex(*bus2dev[busId.packed]));
-      parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
-    } else {
+    if (sysfsParent != kNone && unprogrammed.count(sysfsParent) != 0) {
+      // Behind a bridge that claimed no bus. A bridge further up may still
+      // cover this bus number, but that is not the one it hangs off.
+      parentBus = sysfsParent;
+    } else if (dsp2dev.find(parentDsp) != dsp2dev.end()) {
       parentBus = dsp2dev[parentDsp]->BusId().packed;
+    } else if (sysfsParent != kNone) {
+      // No bridge's range covers this bus; sysfs still has where it was found.
+      parentBus = sysfsParent;
+    } else {
+      // Directly under the root complex.
+      parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
     }
 
     // Prevent loopback to self, this could happen in SR-IOV mode where all devices directly connect

@@ -29,18 +29,43 @@
 #include <atomic>
 #include <cassert>
 #include <cctype>
+#include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <numeric>
 #include <sstream>
 
 #include "mori/io/logging.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/host_utils.hpp"
+#include "src/io/fabric/copy_plan.hpp"
+#include "src/io/fabric/copy_test_hooks.hpp"
 
 namespace mori {
 namespace io {
+namespace fabric {
 namespace {
+thread_local CopyTestHooks* copyTestHooks = nullptr;
+}
+void SetCopyTestHooks(CopyTestHooks* hooks) { copyTestHooks = hooks; }
+}  // namespace fabric
+namespace {
+// Provisional MI455 default: 192 CUs x 8; tune only after hardware measurements.
+constexpr uint32_t kDefaultFabricCopyMaxBlocks = 1536;
+uint32_t ReadFabricCopyMaxBlocks() {
+  const char* value = std::getenv("MORI_IO_FABRIC_COPY_MAX_BLOCKS");
+  if (!value) return kDefaultFabricCopyMaxBlocks;
+  uint32_t parsed = 0;
+  const char* end = value + std::strlen(value);
+  auto result = std::from_chars(value, end, parsed);
+  if (result.ec == std::errc{} && result.ptr == end && parsed > 0) return parsed;
+  static std::once_flag warning;
+  std::call_once(warning, [value]() {
+    MORI_IO_WARN("FABRIC: invalid MORI_IO_FABRIC_COPY_MAX_BLOCKS='{}'; using {}", value,
+                 kDefaultFabricCopyMaxBlocks);
+  });
+  return kDefaultFabricCopyMaxBlocks;
+}
 
 // Lowercase a PCI bus ID so HIP (may return uppercase) and sysfs (lowercase)
 // spellings compare equal.
@@ -270,102 +295,39 @@ FabricBackendSession::FabricBackendSession(const FabricBackendConfig& config, vo
       streamPool(streamPool),
       eventPool(eventPool) {}
 
-hipError_t FabricBackendSession::LaunchCopy(void* dst, const void* src, size_t size,
-                                            hipStream_t stream) {
-  if (size == 0) return hipSuccess;
-
-  hipFunction_t fn = backend != nullptr ? backend->GetFabricCopyFunc(localDevice) : nullptr;
-  if (fn == nullptr) {
-    // hipMemcpyAsync livelocks on imported fabric pointers for large payloads
-    // (see fabric_copy.hip); fail fast instead of hanging, only allow it small.
-    constexpr size_t kFabricMemcpyFallbackMax = 4ull * 1024 * 1024;
-    if (size >= kFabricMemcpyFallbackMax) {
-      MORI_IO_WARN(
-          "FABRIC: fabric_copy kernel not loaded; refusing hipMemcpyAsync "
-          "fallback for {} byte transfer (>= {} B may livelock on imported "
-          "fabric pointers). Load the fabric_copy module first.",
-          size, kFabricMemcpyFallbackMax);
-      return hipErrorNotSupported;
-    }
-    return hipMemcpyAsync(dst, src, size, hipMemcpyDefault, stream);
-  }
-
-  char* dstPtr = static_cast<char*>(dst);
-  const char* srcPtr = static_cast<const char*>(src);
-  size_t nbytes = size;
-  void* args[] = {&dstPtr, &srcPtr, &nbytes};
-
-  const int threads = 256;
-  size_t units = (size + 15) / 16;  // 16B chunks (grid-stride handles remainder)
-  long long blocks = static_cast<long long>((units + threads - 1) / threads);
-  if (blocks < 1) blocks = 1;
-  if (blocks > 65535) blocks = 65535;
-
-  return hipModuleLaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1, 0, stream,
-                               args, nullptr);
-}
-
 void FabricBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                      TransferStatus* status, TransferUniqueId id, bool isRead) {
-  ScopedHipDeviceGuard deviceGuard;
-  hipError_t err = hipSetDevice(localDevice);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
-    return;
-  }
-
-  hipStream_t stream = streamPool->GetNextStream(localDevice);
-  hipEvent_t event = eventPool->GetEvent(localDevice);
-  if (stream == nullptr || event == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to get stream or event from pool");
-    if (event != nullptr) eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  void* src = isRead ? static_cast<char*>(remoteAddr) + remoteOffset
-                     : static_cast<char*>(localAddr) + localOffset;
-  void* dst = isRead ? static_cast<char*>(localAddr) + localOffset
-                     : static_cast<char*>(remoteAddr) + remoteOffset;
-
-  err = LaunchCopy(dst, src, size, stream);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: copy launch failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  err = hipEventRecord(event, stream);
-  if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  status->SetCode(StatusCode::IN_PROGRESS);
-  ArmTransferCompletion(status, event, localDevice, eventPool);
-  MORI_IO_TRACE("FABRIC: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
+  BatchReadWrite({localOffset}, {remoteOffset}, {size}, status, id, isRead);
 }
 
 void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                           const SizeVec& sizes, TransferStatus* status,
                                           TransferUniqueId id, bool isRead) {
+  assert(sizes.size() == localOffsets.size());
+  assert(sizes.size() == remoteOffsets.size());
   ScopedHipDeviceGuard deviceGuard;
-  size_t batchSize = sizes.size();
-  assert(batchSize == localOffsets.size());
-  assert(batchSize == remoteOffsets.size());
-
-  if (batchSize == 0) {
-    status->SetCode(StatusCode::SUCCESS);
-    return;
-  }
-
   hipError_t err = hipSetDevice(localDevice);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("FABRIC: Failed to set device: ") + hipGetErrorString(err));
+    return;
+  }
+  const auto funcs = backend->GetFabricCopyFunctions(localDevice);
+  std::vector<fabric::CopySegment> segments;
+  segments.reserve(sizes.size());
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    uint64_t local = reinterpret_cast<uintptr_t>(localAddr) + localOffsets[i];
+    uint64_t remote = reinterpret_cast<uintptr_t>(remoteAddr) + remoteOffsets[i];
+    segments.push_back({isRead ? remote : local, isRead ? local : remote, sizes[i]});
+  }
+  auto plan = fabric::PlanCopy(std::move(segments), backend->FabricCopyMaxBlocks(),
+                               static_cast<bool>(funcs), isRead);
+  if (!plan.error.empty()) {
+    status->Update(StatusCode::ERR_GPU_OP, plan.error);
+    return;
+  }
+  if (plan.segments.empty()) {
+    status->SetCode(StatusCode::SUCCESS);
     return;
   }
 
@@ -376,69 +338,85 @@ void FabricBackendSession::BatchReadWrite(const SizeVec& localOffsets, const Siz
     if (event != nullptr) eventPool->PutEvent(event, localDevice);
     return;
   }
-
-  // Sort by remote offset then merge contiguous runs (both sides contiguous) to
-  // cut the number of kernel launches.
-  std::vector<size_t> indices(batchSize);
-  std::iota(indices.begin(), indices.end(), 0);
-  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
-    std::sort(indices.begin(), indices.end(),
-              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
-  }
-
-  struct MergedSeg {
-    size_t localOff;
-    size_t remoteOff;
-    size_t sz;
-  };
-  std::vector<MergedSeg> segments;
-  segments.reserve(batchSize);
-  for (size_t i = 0; i < batchSize; ++i) {
-    size_t idx = indices[i];
-    if (sizes[idx] == 0) continue;
-    if (!segments.empty()) {
-      MergedSeg& last = segments.back();
-      bool localContig = (last.localOff + last.sz) == localOffsets[idx];
-      bool remoteContig = (last.remoteOff + last.sz) == remoteOffsets[idx];
-      if (localContig && remoteContig) {
-        last.sz += sizes[idx];
-        continue;
+  auto* hooks = fabric::copyTestHooks;
+  unsigned launches = 0;
+  bool submitted = false;
+  auto fail = [&](const char* operation, hipError_t original) {
+    std::string message =
+        std::string("FABRIC: ") + operation + " failed: " + hipGetErrorString(original);
+    if (submitted) {
+      if (hooks) {
+        ++hooks->drainCalls;
+        if (hooks->onDrain) hooks->onDrain(false, stream);
+      }
+      hipError_t drain = hipStreamSynchronize(stream);
+      if (hooks) {
+        if (hooks->drainError != hipSuccess) drain = hooks->drainError;
+        if (hooks->onDrain) hooks->onDrain(true, stream);
+      }
+      if (drain != hipSuccess) {
+        message += std::string("; hipStreamSynchronize drain failed: ") + hipGetErrorString(drain);
       }
     }
-    segments.push_back({localOffsets[idx], remoteOffsets[idx], sizes[idx]});
-  }
-
-  if (segments.empty()) {
-    status->SetCode(StatusCode::SUCCESS);
+    // Publish only after the drain, preserving the original submission error.
+    status->Update(StatusCode::ERR_GPU_OP, message);
     eventPool->PutEvent(event, localDevice);
-    return;
-  }
-
-  for (const auto& seg : segments) {
-    void* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
-                       : static_cast<char*>(localAddr) + seg.localOff;
-    void* dst = isRead ? static_cast<char*>(localAddr) + seg.localOff
-                       : static_cast<char*>(remoteAddr) + seg.remoteOff;
-    err = LaunchCopy(dst, src, seg.sz, stream);
-    if (err != hipSuccess) {
-      status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("FABRIC: batch copy launch failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, localDevice);
-      return;
+  };
+  auto submit = [&](auto&& launch) {
+    ++launches;
+    hipError_t result = hooks && hooks->failLaunch == launches ? hooks->launchError : launch();
+    if (result == hipSuccess) {
+      submitted = true;
+      if (hooks) ++hooks->successfulLaunches;
+    }
+    return result;
+  };
+  if (funcs) {
+    for (auto& dispatch : plan.dispatches) {
+      err = submit([&]() {
+        return std::visit(
+            [&](auto& args) {
+              using Args = std::decay_t<decltype(args)>;
+              hipFunction_t fn;
+              if constexpr (std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSingleK>>)
+                fn = funcs.single;
+              else if constexpr (std::is_same_v<Args, fabric::FabricCopyArgs<fabric::kSmallK>>)
+                fn = funcs.small;
+              else
+                fn = funcs.large;
+              void* params[] = {&args};
+              return hipModuleLaunchKernel(fn, dispatch.grid, 1, 1, 256, 1, 1, 0, stream, params,
+                                           nullptr);
+            },
+            dispatch.args);
+      });
+      if (err != hipSuccess) {
+        fail("copy launch", err);
+        return;
+      }
+    }
+  } else {
+    for (const auto& seg : plan.segments) {
+      err = submit([&]() {
+        return hipMemcpyAsync(reinterpret_cast<void*>(seg.dst),
+                              reinterpret_cast<const void*>(seg.src), seg.size, hipMemcpyDefault,
+                              stream);
+      });
+      if (err != hipSuccess) {
+        fail("hipMemcpyAsync", err);
+        return;
+      }
     }
   }
-
-  err = hipEventRecord(event, stream);
+  err = hooks && hooks->failEventRecord ? hooks->eventError : hipEventRecord(event, stream);
   if (err != hipSuccess) {
-    status->Update(StatusCode::ERR_GPU_OP,
-                   std::string("FABRIC: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, localDevice);
+    fail("hipEventRecord", err);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
   ArmTransferCompletion(status, event, localDevice, eventPool);
-  MORI_IO_TRACE("FABRIC: Batch transfer issued, id={}, segments={}, isRead={}", id, segments.size(),
+  MORI_IO_TRACE("FABRIC: Transfer issued, id={}, segments={}, isRead={}", id, plan.segments.size(),
                 isRead);
 }
 
@@ -449,7 +427,10 @@ bool FabricBackendSession::Alive() const { return true; }
 /* ---------------------------------------------------------------------------------------------- */
 FabricBackend::FabricBackend(EngineKey k, const IOEngineConfig& /*engConfig*/,
                              const FabricBackendConfig& beConfig)
-    : myEngKey(k), config(beConfig), myPid(static_cast<int>(getpid())) {
+    : myEngKey(k),
+      config(beConfig),
+      myPid(static_cast<int>(getpid())),
+      fabricCopyMaxBlocks_(ReadFabricCopyMaxBlocks()) {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
@@ -458,6 +439,7 @@ FabricBackend::FabricBackend(EngineKey k, const IOEngineConfig& /*engConfig*/,
   streamPool = std::make_unique<StreamPool>(config.numStreams);
   eventPool = std::make_unique<EventPool>(config.numEvents);
 
+  MORI_IO_INFO("FABRIC: effective MORI_IO_FABRIC_COPY_MAX_BLOCKS={}", fabricCopyMaxBlocks_);
   Initialize();
 
   std::stringstream ss;
@@ -481,8 +463,9 @@ FabricBackend::~FabricBackend() {
   }
 
   std::lock_guard<std::mutex> lock(moduleMu_);
-  for (auto& mod : fabricCopyModules_) {
-    if (mod != nullptr) (void)hipModuleUnload(mod);
+  ScopedHipDeviceGuard deviceGuard;
+  for (const auto& loaded : fabricCopyModules_) {
+    if (hipSetDevice(loaded.device) == hipSuccess) (void)hipModuleUnload(loaded.module);
   }
   fabricCopyModules_.clear();
   fabricCopyFuncs_.clear();
@@ -507,8 +490,10 @@ void FabricBackend::Initialize() {
     deviceSupportsFabric[i] = fabric::DeviceSupportsFabric(i) ? 1 : 0;
     deviceVpodKeys[i] = fabric::ReadVpodKey(i);
     if (deviceSupportsFabric[i]) {
-      MORI_IO_INFO("FABRIC: device {} supports fabric (vpod valid={} ppod_id={} vpod_id={})", i,
-                   deviceVpodKeys[i].valid, deviceVpodKeys[i].ppodId, deviceVpodKeys[i].vpodId);
+      const auto& key = deviceVpodKeys[i];
+      MORI_IO_INFO("FABRIC: device {} supports fabric (vpod valid={} ppod_id={} vpod_id={}{})", i,
+                   key.valid, key.ppodId, key.vpodId,
+                   key.valid ? "" : " reason=" + key.invalidReason);
     }
   }
 }
@@ -519,48 +504,39 @@ std::optional<int> FabricBackend::LookupVisibleDevice(const std::string& busId) 
   return it->second;
 }
 
-fabric::VpodKey FabricBackend::LocalVpodKey(int deviceId) const {
-  if (deviceId < 0 || deviceId >= numDevices) return fabric::VpodKey{};
-  return deviceVpodKeys[deviceId];
-}
-
 void FabricBackend::LoadFabricCopyModule(const std::string& hsacoPath) {
   std::lock_guard<std::mutex> lock(moduleMu_);
+  // Old kernels may still be queued/running, and callers can hold copied function
+  // handles outside moduleMu_. Keep every loaded generation until destruction.
   fabricCopyHsacoPath_ = hsacoPath;
-  fabricCopyModules_.assign(numDevices, nullptr);
-  fabricCopyFuncs_.assign(numDevices, nullptr);
-  MORI_IO_INFO("FABRIC: copy kernel registered from {}", hsacoPath);
+  fabricCopyFuncs_.assign(numDevices, CopyFunctions{});
+  MORI_IO_INFO("FABRIC: copy kernels registered from {}", hsacoPath);
 }
 
-hipFunction_t FabricBackend::GetFabricCopyFunc(int deviceId) {
+FabricBackend::CopyFunctions FabricBackend::GetFabricCopyFunctions(int deviceId) {
   std::lock_guard<std::mutex> lock(moduleMu_);
-  if (fabricCopyHsacoPath_.empty() || deviceId < 0 || deviceId >= numDevices) {
-    return nullptr;
-  }
-  if (fabricCopyFuncs_[deviceId] != nullptr) {
-    return fabricCopyFuncs_[deviceId];
-  }
+  if (fabricCopyHsacoPath_.empty() || deviceId < 0 || deviceId >= numDevices) return {};
+  if (fabricCopyFuncs_[deviceId]) return fabricCopyFuncs_[deviceId];
 
   ScopedHipDeviceGuard deviceGuard;
-  if (hipSetDevice(deviceId) != hipSuccess) return nullptr;
-
-  hipError_t err = hipModuleLoad(&fabricCopyModules_[deviceId], fabricCopyHsacoPath_.c_str());
+  if (hipSetDevice(deviceId) != hipSuccess) return {};
+  hipModule_t module = nullptr;
+  CopyFunctions funcs;
+  hipError_t err = hipModuleLoad(&module, fabricCopyHsacoPath_.c_str());
+  if (err == hipSuccess)
+    err = hipModuleGetFunction(&funcs.single, module, "fabricCopyKernelSingle");
+  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.small, module, "fabricCopyKernelSmall");
+  if (err == hipSuccess) err = hipModuleGetFunction(&funcs.large, module, "fabricCopyKernelLarge");
   if (err != hipSuccess) {
-    MORI_IO_WARN("FABRIC: Failed to load copy module on device {}: {}", deviceId,
+    MORI_IO_WARN("FABRIC: Failed to load copy kernels on device {}: {}", deviceId,
                  hipGetErrorString(err));
-    return nullptr;
+    if (module) (void)hipModuleUnload(module);
+    return {};
   }
-  err = hipModuleGetFunction(&fabricCopyFuncs_[deviceId], fabricCopyModules_[deviceId],
-                             "fabricCopyKernel");
-  if (err != hipSuccess) {
-    MORI_IO_WARN("FABRIC: Failed to get fabricCopyKernel on device {}: {}", deviceId,
-                 hipGetErrorString(err));
-    (void)hipModuleUnload(fabricCopyModules_[deviceId]);
-    fabricCopyModules_[deviceId] = nullptr;
-    return nullptr;
-  }
-  MORI_IO_INFO("FABRIC: Loaded copy kernel on device {}", deviceId);
-  return fabricCopyFuncs_[deviceId];
+  fabricCopyModules_.push_back({deviceId, module});
+  fabricCopyFuncs_[deviceId] = funcs;
+  MORI_IO_INFO("FABRIC: Loaded single, small and large copy kernels on device {}", deviceId);
+  return funcs;
 }
 
 void FabricBackend::RegisterRemoteEngine(const EngineDesc& desc) {
@@ -581,21 +557,34 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
     return;
   }
 
+  auto reject = [&](std::string reason) {
+    desc.fabricReason = std::move(reason);
+    bool first;
+    {
+      std::lock_guard<std::mutex> lock(registrationReasonsMu);
+      first = registrationReasons.insert(desc.fabricReason).second;
+    }
+    if (first) {
+      MORI_IO_WARN("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId, desc.size,
+                   desc.fabricReason);
+    } else {
+      MORI_IO_DEBUG("FABRIC: memory id={} device={} size={}: {}", desc.id, desc.deviceId, desc.size,
+                    desc.fabricReason);
+    }
+  };
   int dev = desc.deviceId;
-  // Advertise the owning device's vPOD identity so the peer's CanHandle can
-  // decide whether this memory is reachable over the same scale-up fabric.
-  if (dev >= 0 && dev < numDevices) {
-    const fabric::VpodKey& key = deviceVpodKeys[dev];
-    if (key.valid) {
-      desc.vpodId = key.vpodId;
-      desc.vpodPpodId = key.ppodId;
-    }
-    if (!deviceSupportsFabric[dev]) {
-      MORI_IO_TRACE("FABRIC: device {} does not support fabric; memory id={} not exportable", dev,
-                    desc.id);
-      return;
-    }
+  if (dev < 0 || dev >= numDevices || !deviceSupportsFabric[dev]) {
+    reject("device " + std::to_string(dev) + " does not support fabric handles");
+    return;
   }
+  const auto& key = deviceVpodKeys[dev];
+  if (!key.valid) {
+    reject("device " + std::to_string(dev) +
+           " is not on a ready UALink fabric: " + key.invalidReason);
+    return;
+  }
+  desc.vpodId = key.vpodId;
+  desc.vpodPpodId = key.ppodId;
 
   // Export a fabric shareable handle by retaining the allocation backing the
   // registered pointer. This only succeeds for VMM allocations created with the
@@ -608,8 +597,8 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
   hipError_t err = hipMemRetainAllocationHandle(&handle, reinterpret_cast<void*>(desc.data));
   if (err != hipSuccess) {
     (void)hipGetLastError();
-    MORI_IO_TRACE("FABRIC: memory id={} is not a VMM allocation ({}), fabric export skipped",
-                  desc.id, hipGetErrorString(err));
+    reject(std::string("not a fabric VMM allocation (") + hipGetErrorString(err) +
+           "); allocate it with FabricMalloc or under fabric_mem_pool()");
     return;
   }
 
@@ -618,13 +607,14 @@ void FabricBackend::RegisterMemory(MemoryDesc& desc) {
   (void)hipMemRelease(handle);  // drop the extra ref taken by Retain
   if (err != hipSuccess) {
     (void)hipGetLastError();
-    MORI_IO_TRACE("FABRIC: fabric export failed for memory id={}: {}", desc.id,
-                  hipGetErrorString(err));
+    reject(std::string("hipMemExportToShareableHandle failed: ") + hipGetErrorString(err));
     return;
   }
 
+  desc.fabricReason.clear();
   static_assert(sizeof(fh) == kFabricHandleSize, "fabric handle size mismatch");
   std::memcpy(desc.fabricHandle.data(), &fh, sizeof(fh));
+  exportedMemory_.store(true, std::memory_order_release);
 
   // The registered pointer may be a sub-allocation inside a larger fabric VMM
   // allocation (e.g. a torch tensor carved out of a MemPool segment). Record its
@@ -669,11 +659,24 @@ void FabricBackend::DeregisterMemory(const MemoryDesc& desc) {
   MORI_IO_TRACE("FABRIC: Deregistered memory id={}", desc.id);
 }
 
-void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceId) {
+void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceId,
+                                        std::string* error) {
+  auto fail = [&](const std::string& message) {
+    if (error) *error = message;
+    MORI_IO_WARN("FABRIC: {}", message);
+  };
+  auto hipFailure = [&](const char* call, hipError_t err) {
+    fail(std::string(call) + " failed for remote memory id=" + std::to_string(desc.id) +
+         " (engine " + desc.engineKey + ", " + std::to_string(desc.size) + " bytes) on device " +
+         std::to_string(localDeviceId) + ": " + hipGetErrorName(err) + " (" +
+         hipGetErrorString(err) + ")");
+  };
   if (desc.engineKey == myEngKey) {
+    if (desc.data == 0) fail("remote memory has null address");
     return reinterpret_cast<void*>(desc.data);
   }
   if (IsFabricHandleEmpty(desc.fabricHandle)) {
+    fail("remote memory has no fabric handle");
     return nullptr;
   }
 
@@ -693,8 +696,7 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
   ScopedHipDeviceGuard deviceGuard;
   hipError_t err = hipSetDevice(localDeviceId);
   if (err != hipSuccess) {
-    MORI_IO_WARN("FABRIC: Failed to set device {} for fabric import: {}", localDeviceId,
-                 hipGetErrorString(err));
+    hipFailure("hipSetDevice", err);
     return nullptr;
   }
 
@@ -703,8 +705,7 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
                                         hipMemHandleTypeFabricCompat);
   if (err != hipSuccess) {
     (void)hipGetLastError();
-    MORI_IO_WARN("FABRIC: hipMemImportFromShareableHandle failed for id={}: {}", desc.id,
-                 hipGetErrorString(err));
+    hipFailure("hipMemImportFromShareableHandle", err);
     return nullptr;
   }
 
@@ -714,16 +715,15 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
   void* va = nullptr;
   err = hipMemAddressReserve(&va, mapSize, 0, 0, 0);
   if (err != hipSuccess) {
+    hipFailure("hipMemAddressReserve", err);
     (void)hipMemRelease(handle);
-    MORI_IO_WARN("FABRIC: hipMemAddressReserve failed for id={}: {}", desc.id,
-                 hipGetErrorString(err));
     return nullptr;
   }
   err = hipMemMap(va, mapSize, 0, handle, 0);
   if (err != hipSuccess) {
+    hipFailure("hipMemMap", err);
     (void)hipMemAddressFree(va, mapSize);
     (void)hipMemRelease(handle);
-    MORI_IO_WARN("FABRIC: hipMemMap failed for id={}: {}", desc.id, hipGetErrorString(err));
     return nullptr;
   }
   hipMemAccessDesc access = {};
@@ -732,10 +732,10 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
   access.flags = hipMemAccessFlagsProtReadWrite;
   err = hipMemSetAccess(va, mapSize, &access, 1);
   if (err != hipSuccess) {
+    hipFailure("hipMemSetAccess", err);
     (void)hipMemUnmap(va, mapSize);
     (void)hipMemAddressFree(va, mapSize);
     (void)hipMemRelease(handle);
-    MORI_IO_WARN("FABRIC: hipMemSetAccess failed for id={}: {}", desc.id, hipGetErrorString(err));
     return nullptr;
   }
 
@@ -759,9 +759,10 @@ void* FabricBackend::GetImportedAddress(const MemoryDesc& desc, int localDeviceI
 void FabricBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                               const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                               TransferStatus* status, TransferUniqueId id, bool isRead) {
-  FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  std::string error;
+  FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc, &error);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
+    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: import of remote memory failed: " + error);
     return;
   }
   sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
@@ -771,9 +772,10 @@ void FabricBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
                                    const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                                    const SizeVec& sizes, TransferStatus* status,
                                    TransferUniqueId id, bool isRead) {
-  FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  std::string error;
+  FabricBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc, &error);
   if (sess == nullptr) {
-    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: Failed to create session");
+    status->Update(StatusCode::ERR_BAD_STATE, "FABRIC: import of remote memory failed: " + error);
     return;
   }
   sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
@@ -782,18 +784,15 @@ void FabricBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& l
 BackendSession* FabricBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   int localDevice = local.deviceId;
   void* localAddr = reinterpret_cast<void*>(local.data);
-  void* remoteAddr = GetImportedAddress(remote, localDevice);
-  if (localAddr == nullptr || remoteAddr == nullptr) {
-    MORI_IO_WARN("FABRIC: Failed to map memory for session (local id={}, remote id={})", local.id,
-                 remote.id);
-    return nullptr;
-  }
+  void* remoteAddr = GetImportedAddress(remote, localDevice, nullptr);
+  if (localAddr == nullptr || remoteAddr == nullptr) return nullptr;
   return new FabricBackendSession(config, localAddr, remoteAddr, localDevice, this,
                                   streamPool.get(), eventPool.get());
 }
 
 FabricBackendSession* FabricBackend::GetOrCreateSessionCached(const MemoryDesc& local,
-                                                              const MemoryDesc& remote) {
+                                                              const MemoryDesc& remote,
+                                                              std::string* error) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
 
   std::lock_guard<std::mutex> lock(sessionCacheMu);
@@ -804,12 +803,8 @@ FabricBackendSession* FabricBackend::GetOrCreateSessionCached(const MemoryDesc& 
 
   int localDevice = local.deviceId;
   void* localAddr = reinterpret_cast<void*>(local.data);
-  void* remoteAddr = GetImportedAddress(remote, localDevice);
-  if (remoteAddr == nullptr) {
-    MORI_IO_WARN("FABRIC: Failed to import remote memory for session (local.id={}, remote.id={})",
-                 local.id, remote.id);
-    return nullptr;
-  }
+  void* remoteAddr = GetImportedAddress(remote, localDevice, error);
+  if (remoteAddr == nullptr) return nullptr;
 
   auto sess = std::make_unique<FabricBackendSession>(config, localAddr, remoteAddr, localDevice,
                                                      this, streamPool.get(), eventPool.get());
@@ -835,28 +830,51 @@ bool FabricBackend::PopInboundTransferStatus(EngineKey /*remote*/, TransferUniqu
   return false;
 }
 
-bool FabricBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
-  if (local.loc != MemoryLocationType::GPU || remote.loc != MemoryLocationType::GPU) {
-    return false;
+FenceResult FabricBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // Until a fabric handle is exported, no peer can reach our memory this way. After that any
+  // peer may hold an import, registered with this engine or not: the handle travels in the
+  // MemoryDesc, and deregistering the peer or the memory revokes neither.
+  if (remote == myEngKey || !exportedMemory_.load(std::memory_order_acquire)) {
+    return FenceResult{};
   }
-  if (local.deviceId < 0 || local.deviceId >= numDevices) {
-    return false;
-  }
-  if (!deviceSupportsFabric[local.deviceId]) {
-    return false;
-  }
-  // Remote memory must be fabric-exportable (non-empty handle).
-  if (IsFabricHandleEmpty(remote.fabricHandle)) {
-    return false;
-  }
+  return UncutPath(remote, "fabric", "its import of our fabric handle cannot be revoked");
+}
 
-  // Both endpoints must sit in the same scale-up fabric domain (vPOD).
-  fabric::VpodKey localKey = LocalVpodKey(local.deviceId);
-  fabric::VpodKey remoteKey;
-  remoteKey.vpodId = remote.vpodId;
-  remoteKey.ppodId = remote.vpodPpodId;
-  remoteKey.valid = (remote.vpodId >= 0) || !remote.vpodPpodId.empty();
-  return fabric::VpodKeySame(localKey, remoteKey);
+bool FabricBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
+  return RejectReason(local, remote).empty();
+}
+
+std::string FabricBackend::RejectReason(const MemoryDesc& local, const MemoryDesc& remote) const {
+  if (local.loc != MemoryLocationType::GPU) return "local memory is not GPU memory";
+  if (remote.loc != MemoryLocationType::GPU) return "remote memory is not GPU memory";
+  if (local.deviceId < 0 || local.deviceId >= numDevices || !deviceSupportsFabric[local.deviceId]) {
+    return "local device " + std::to_string(local.deviceId) +
+           " does not support fabric handles (needs VMM and fabric handle support, ROCm >= 7.14)";
+  }
+  const auto& key = deviceVpodKeys[local.deviceId];
+  if (!key.valid) {
+    return "local device " + std::to_string(local.deviceId) +
+           " is not on a ready UALink fabric: " + key.invalidReason;
+  }
+  if (IsFabricHandleEmpty(remote.fabricHandle)) {
+    return remote.fabricReason.empty()
+               ? "remote memory has no fabric handle (the owner has no FABRIC backend, registered "
+                 "this memory before creating it, or runs an older mori)"
+               : "remote memory has no fabric handle: " + remote.fabricReason;
+  }
+  if (remote.vpodId < 0 && remote.vpodPpodId.empty()) {
+    return "remote device has no UALink vPOD identity";
+  }
+  if (key.vpodId != remote.vpodId || key.ppodId != remote.vpodPpodId) {
+    std::string reason =
+        "different vPOD: local ppod_id=" + key.ppodId + " vpod_id=" + std::to_string(key.vpodId) +
+        ", remote ppod_id=" + remote.vpodPpodId + " vpod_id=" + std::to_string(remote.vpodId);
+    if (key.ppodId.empty() != remote.vpodPpodId.empty()) {
+      reason += " (one side uses MORI_IO_FABRIC_VPOD_ID, the other reads sysfs)";
+    }
+    return reason;
+  }
+  return {};
 }
 
 }  // namespace io

@@ -41,7 +41,7 @@ import pytest
 import torch
 
 from mori.ops.gemm_ag import GemmAgOp, supports
-from mori.ops.gemm_ag.op import shape_constraint
+from mori.ops.gemm_ag.op import _tile_constraint, shape_constraint
 
 from . import kfd_settle
 
@@ -107,6 +107,26 @@ def test_pinned_chunks_divide_the_row_tiles_within_the_cap(chunks, cap, m, tile,
     op.fuses_at = lambda _m: True
     op.tile_for = lambda _m: tile
     assert GemmAgOp.chunks_for(op, m) == want
+
+
+@pytest.mark.parametrize(
+    "tile,in_dtype,quant,out_dtype,ok",
+    [
+        ((128, 256), "fp8", "ptpc", "bf16", True),
+        ((256, 256), "fp8", "mxfp8", "bf16", True),
+        ((128, 256), "fp8", "mxfp8", "bf16", False),  # mxfp8 needs BLOCK_M 256
+        ((256, 128), "fp8", "ptpc", "bf16", False),  # the fp8 GEMM's BLOCK_N is 256
+        ((128, 128), "bf16", "ptpc", "fp32", True),
+        ((256, 256), "bf16", "ptpc", "bf16", True),
+        ((256, 128), "bf16", "ptpc", "bf16", False),  # BLOCK_N=128 needs fp32 out
+        ((384, 256), "bf16", "ptpc", "fp32", False),  # BLOCK_M is 128 or 256
+        ((512, 128), "bf16", "ptpc", "fp32", False),
+    ],
+)
+def test_a_pinned_tile_is_checked_at_construction(tile, in_dtype, quant, out_dtype, ok):
+    """The layout only asks a bf16 BLOCK_M to be a multiple of 128, so 384 or
+    512 used to construct and fail when the first call compiled the GEMM."""
+    assert (_tile_constraint(tile, in_dtype, quant, out_dtype) is None) is ok
 
 
 def test_split_mode_pushes_in_one_piece():

@@ -148,11 +148,13 @@ PY
 # Recorded because two numbers from two machines are not comparable without it,
 # and because two of the three known environment issues change these results
 # materially. See the known-issues skill.
+# .info/ sits under core/ in the multi-arch (7.14+) layout.
+ROCM_RELEASE=$(cat /opt/rocm/.info/version /opt/rocm/core/.info/version 2>/dev/null | head -1 || true)
 {
     echo "# collected $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "host:            $(hostname)"
     echo "kernel:          $(uname -r)"
-    echo "rocm:            $(cat /opt/rocm/.info/version 2>/dev/null || echo unknown)"
+    echo "rocm:            ${ROCM_RELEASE:-unknown}"
     echo "git_commit:      $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "git_dirty:       $(test -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" && echo yes || echo no)"
     echo ""
@@ -194,7 +196,7 @@ print(f'visible_devices: {torch.cuda.device_count()}')
     fi
     # Issue 3: on ROCm 7.2.x the VMM path ignores the uncached request, costing
     # cco combine ~10-15us. The tell is that forcing cached changes nothing.
-    echo "issue3: ROCm $(cat /opt/rocm/.info/version 2>/dev/null | cut -d. -f1-2) -- 7.0-7.2.x is affected, 7.14+ is not"
+    echo "issue3: ROCm $(echo "$ROCM_RELEASE" | cut -d. -f1-2) -- 7.0-7.2.x is affected, 7.14+ is not"
 } > "$ENVFILE" 2>&1
 
 {

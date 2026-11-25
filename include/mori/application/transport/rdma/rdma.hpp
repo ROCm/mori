@@ -230,10 +230,12 @@ class RdmaDeviceContext {
   // ibv_reg_mr only; aborts on failure.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // dmabuf_offset: where ptr sits in the dma-buf (nonzero for a region inside an allocation).
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
-                                                          int accessFlag = MR_DEFAULT_ACCESS_FLAG);
-  // dmabuf registration with iova=0 (CCO symmetric flat-VA path; BNXT GDA). dmabuf_offset is where
-  // ptr starts inside the dma-buf (0 for an fd that covers exactly the allocation).
+                                                          int accessFlag = MR_DEFAULT_ACCESS_FLAG,
+                                                          uint64_t dmabuf_offset = 0);
+  // dmabuf registration whose iova is the dma-buf offset, so the allocation starts at iova 0 (CCO
+  // symmetric flat-VA path; BNXT GDA). dmabuf_offset is where ptr starts inside the dma-buf.
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(
       void* ptr, size_t size, int dmabuf_fd, uint64_t dmabuf_offset = 0,
       int accessFlag = MR_DEFAULT_ACCESS_FLAG);
@@ -259,6 +261,11 @@ class RdmaDeviceContext {
     assert(false && "not implemented");
   }
   virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
+  // Moves the QP to the Error state. A QP in Error accepts no further inbound
+  // requests, so a peer's writes through it stop landing in local memory. Returns
+  // true only once the transition has completed; the default does nothing and
+  // returns false, so a provider that cannot do this is never reported as fenced.
+  virtual bool ModifyEndpointToErrorNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 

@@ -272,6 +272,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("ranged_locality_prefetch", &UMBPDistributedConfig::ranged_locality_prefetch)
+      .def_readwrite("remote_single_flight", &UMBPDistributedConfig::remote_single_flight)
+      .def_readwrite("remote_single_flight_wait_ms",
+                     &UMBPDistributedConfig::remote_single_flight_wait_ms)
       .def_readwrite("local_first", &UMBPDistributedConfig::local_first)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
@@ -288,6 +291,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("address", &UMBPStandaloneProcessConfig::address)
       .def_readwrite("auto_start", &UMBPStandaloneProcessConfig::auto_start)
       .def_readwrite("startup_timeout_ms", &UMBPStandaloneProcessConfig::startup_timeout_ms)
+      .def_readwrite("lookup_timeout_ms", &UMBPStandaloneProcessConfig::lookup_timeout_ms)
       .def_readwrite("worker_node_id", &UMBPStandaloneProcessConfig::worker_node_id)
       .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
       .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);

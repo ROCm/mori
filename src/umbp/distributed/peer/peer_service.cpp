@@ -23,6 +23,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <string>
@@ -406,6 +407,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entries[i].backend_id = result.backend_id;
       entries[i].size = r.size;
       entries[i].pages = std::move(r.pages);
+      entries[i].generation = r.generation;
       total_bytes += r.size;
 
       if (omit_descs) continue;
@@ -419,11 +421,59 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       }
     }
 
+    // A reader discards the whole answer when any key is BUSY and asks again,
+    // so it will never report back on what this answer handed out.  Count it
+    // out of those copies now; otherwise they wait out their leases while the
+    // retries compete for the very staging they hold.
+    if (pool_ != nullptr &&
+        std::any_of(entries.begin(), entries.end(),
+                    [](const ResolvedKeyEntry& e) { return e.outcome == ResolveOutcome::kBusy; })) {
+      std::vector<std::string> done_keys;
+      std::vector<uint32_t> done_backends;
+      std::vector<uint64_t> done_generations;
+      for (size_t i = 0; i < entries.size(); ++i) {
+        if (!entries[i].found || entries[i].generation == 0) continue;
+        done_keys.push_back(keys[i]);
+        done_backends.push_back(entries[i].backend_id);
+        done_generations.push_back(entries[i].generation);
+      }
+      if (!done_keys.empty()) {
+        pool_->ValidateResolved(done_backends, done_keys, done_generations, /*release=*/true);
+      }
+    }
+
     // Page size is uniform across backends (BackendRegistry::Register), so a
     // batch spanning media still has one to report.
     EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(),
                                batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
+    return grpc::Status::OK;
+  }
+
+  // A remote reader's read lease is only a timer: once it lapses, the pages it
+  // resolved can be freed and refilled while its RDMA read still runs.  It asks
+  // afterwards: is each copy it read still the one this peer resolved?
+  // It neither takes nor extends a lease.  With `release` the reader also says
+  // it is done, which is the fact the timer stood in for: the copies it names
+  // stop being held for it (MediumBackend::BatchFinishReads).
+  grpc::Status ValidateReads(grpc::ServerContext* /*ctx*/,
+                             const ::umbp::ValidateReadsRequest* request,
+                             ::umbp::ValidateReadsResponse* response) override {
+    const int n = request->keys_size();
+    if (request->backend_id_size() != n || request->generation_size() != n) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "ValidateReads: keys, backend_id and generation differ in length");
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<uint32_t> backend_ids(request->backend_id().begin(), request->backend_id().end());
+    std::vector<uint64_t> generations(request->generation().begin(), request->generation().end());
+    auto valid = pool_ == nullptr
+                     ? std::vector<bool>(keys.size(), false)
+                     : pool_->ValidateResolved(backend_ids, keys, generations, request->release());
+    response->mutable_still_valid()->Reserve(n);
+    for (int i = 0; i < n; ++i) {
+      response->add_still_valid(static_cast<size_t>(i) < valid.size() && valid[i]);
+    }
     return grpc::Status::OK;
   }
 
