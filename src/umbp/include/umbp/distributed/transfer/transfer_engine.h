@@ -393,6 +393,18 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // function of the PAIR, never of either endpoint alone.
   virtual bool CanHandle(const TransferRef& src, const TransferRef& dst) const = 0;
 
+  // CanHandle() for one item of `item_bytes`.  The composite asks this when it
+  // routes an item, so an engine may carry a pair only above or below a size
+  // (e.g. a NIC copy that pays off only for large fragments).  An engine that
+  // declines here must still answer true to CanHandle(src, dst): the pair is
+  // servable, just not at this size, and CanHandle is what a caller that does
+  // not know the size asks.  Default: size does not matter.
+  virtual bool CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                              uint64_t item_bytes) const {
+    (void)item_bytes;
+    return CanHandle(src, dst);
+  }
+
   // The one planning hook; see TransferPlanBuilder.  `expected_items` is a
   // reservation hint.
   virtual std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(
