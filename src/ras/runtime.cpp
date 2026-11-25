@@ -113,6 +113,26 @@ void ShowWarningsWhenRequested() {
   }
 }
 
+// The identity the RAS thread advertises, logged once. The caller hands it over as a
+// temporary: nothing may live only on the RAS thread's stack while its loop runs, since a
+// forked child has no RAS thread, and LeakSanitizer there reports what only that stack held.
+RasProcessId CollectAndLogIdentity(const CoreParams& p, RuntimeUuid uuid) {
+  RasProcessId self = CollectIdentity(p.nodeId, p.hostname, p.host, p.pid, uuid);
+  std::string topologyProblem;
+  self.topology = CollectTopology(LiveTopologySources(), &topologyProblem);
+  if (!topologyProblem.empty()) {
+    RAS_LOG_ERROR("{}; the identity has nothing from it", topologyProblem);
+  }
+  const Topology& topo = self.topology;
+  RAS_LOG_INFO("RAS identity: {} RDMA port(s), rack '{}', leaf '{}', sources '{}'",
+               topo.nics.size(), topo.rack, topo.leaf, topo.source);
+  for (const NicAttachment& n : topo.nics) {
+    RAS_LOG_INFO("RAS RDMA port {}:{} ({} {}): rail '{}', switch '{}' port '{}'", n.device, n.port,
+                 n.netdev, n.address, n.rail, n.switchName, n.switchPort);
+  }
+  return self;
+}
+
 }  // namespace
 
 spdlog::logger* RasLogger() {
@@ -204,8 +224,7 @@ void RasCore::ThreadMain() {
   }
   pthread_setname_np(pthread_self(), "mori-ras");
 
-  links_->SetIdentity(
-      CollectIdentity(params_.nodeId, params_.hostname, params_.host, params_.pid, uuid_));
+  links_->SetIdentity(CollectAndLogIdentity(params_, uuid_));
   while (!links_->StopRequested()) links_->RunOnce(1000);
   links_->Shutdown(sendLeave_.load(std::memory_order_acquire));
   {
@@ -250,6 +269,10 @@ RasEndpoint RasCore::Endpoint() const {
 
 RuntimeSnapshot RasCore::Snapshot() const {
   return links_ ? links_->Snapshot() : RuntimeSnapshot{};
+}
+
+bool RasCore::SetLabels(const Labels& labels) {
+  return running_.load(std::memory_order_acquire) && links_->SetLabels(labels);
 }
 
 void RasCore::AddDegraded(uint32_t reasons) {
@@ -338,6 +361,11 @@ bool RasRuntime::Enqueue(RasEvent ev) {
 RuntimeSnapshot RasRuntime::Snapshot() const {
   RasCore* core = g_core.load(std::memory_order_acquire);
   return core != nullptr ? core->Snapshot() : RuntimeSnapshot{};
+}
+
+bool RasRuntime::SetLabels(const Labels& labels) {
+  RasCore* core = g_core.load(std::memory_order_acquire);
+  return core != nullptr && core->SetLabels(labels);
 }
 
 }  // namespace ras

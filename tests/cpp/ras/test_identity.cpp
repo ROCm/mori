@@ -22,12 +22,92 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "src/ras/identity.hpp"
+#include "src/ras/protocol.hpp"
 
 using namespace mori::ras;
+
+namespace {
+
+// A scratch sysfs tree, removed when the fixture goes away. The test host may have no RDMA
+// NIC, so the inventory is read from here.
+class FixtureTree {
+ public:
+  FixtureTree() {
+    char tmpl[] = "/tmp/mori_ras_identity_XXXXXX";
+    root_ = mkdtemp(tmpl);
+  }
+  ~FixtureTree() { std::filesystem::remove_all(root_); }
+  const std::string& Root() const { return root_; }
+
+  void Write(const std::string& rel, const std::string& content) {
+    std::filesystem::path path = root_ + "/" + rel;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path) << content;
+  }
+  // One RDMA port with GIDs given as {index, gid, type, ndev}.
+  struct Gid {
+    int index;
+    std::string gid;
+    std::string type;
+    std::string ndev;
+  };
+  void Port(const std::string& dev, int port, const std::string& linkLayer,
+            const std::vector<Gid>& gids) {
+    std::string base = "sys/class/infiniband/" + dev + "/ports/" + std::to_string(port) + "/";
+    Write(base + "link_layer", linkLayer + "\n");
+    Write(base + "state", "4: ACTIVE\n");
+    for (const Gid& g : gids) {
+      Write(base + "gids/" + std::to_string(g.index), g.gid + "\n");
+      Write(base + "gid_attrs/types/" + std::to_string(g.index), g.type + "\n");
+      Write(base + "gid_attrs/ndevs/" + std::to_string(g.index), g.ndev + "\n");
+    }
+  }
+
+ private:
+  std::string root_;
+};
+
+TopologySources FixtureSources(const FixtureTree& t) {
+  TopologySources s;
+  s.sysRoot = t.Root() + "/sys";
+  s.prefixLength = [](const std::string& netdev, const std::string& address) {
+    if (netdev == "enp9s0" && address == "10.3.0.7") return 24;
+    if (netdev == "enp10s0" && address == "fd00:4::7") return 64;
+    return -1;
+  };
+  return s;
+}
+
+void BuildNics(FixtureTree& t) {
+  const std::string zero = "0000:0000:0000:0000:0000:0000:0000:0000";
+  t.Port("ionic_0", 1, "Ethernet",
+         {{0, "fe80:0000:0000:0000:0262:0bff:fe12:3456", "IB/RoCE v1", "enp9s0"},
+          {1, "fe80:0000:0000:0000:0262:0bff:fe12:3456", "RoCE v2", "enp9s0"},
+          {2, "0000:0000:0000:0000:0000:ffff:0a03:0007", "IB/RoCE v1", "enp9s0"},
+          {3, "0000:0000:0000:0000:0000:ffff:0a03:0007", "RoCE v2", "enp9s0"},
+          {4, zero, "RoCE v2", "enp9s0"}});
+  t.Port("ionic_1", 1, "Ethernet",
+         {{0, "fe80:0000:0000:0000:0262:0bff:fe12:3457", "RoCE v2", "enp10s0"},
+          {1, "fd00:0004:0000:0000:0000:0000:0000:0007", "RoCE v2", "enp10s0"}});
+  t.Port("mlx5_0", 1, "InfiniBand", {{0, "fe80:0000:0000:0000:0002:c903:00ab:cdef", "", ""}});
+}
+
+const NicAttachment* FindNic(const std::vector<NicAttachment>& nics, const std::string& dev) {
+  for (const auto& n : nics) {
+    if (n.device == dev) return &n;
+  }
+  return nullptr;
+}
+
+}  // namespace
 
 TEST(RasIdentity, ParsesTheStartTimeAfterTheLastParenthesis) {
   // The comm field holds spaces and parentheses; parsing must start after the last ')'.
@@ -65,6 +145,149 @@ TEST(RasIdentity, CollectsTheEngineFieldsAndProcessFacts) {
   EXPECT_EQ(id.startTimeTicks, f.startTimeTicks);
   EXPECT_EQ(id.pidNamespace, f.pidNamespace);
   EXPECT_EQ(id.bootId, f.bootId);
+  EXPECT_TRUE(id.labels.empty());
+}
+
+TEST(RasIdentity, ReadsRoceAndInfinibandPorts) {
+  FixtureTree t;
+  BuildNics(t);
+  std::vector<NicAttachment> nics = ReadNicInventory(FixtureSources(t));
+  ASSERT_EQ(nics.size(), 3u);
+
+  const NicAttachment* v4 = FindNic(nics, "ionic_0");
+  ASSERT_NE(v4, nullptr);
+  EXPECT_EQ(v4->port, 1u);
+  EXPECT_EQ(v4->address, "10.3.0.7");  // the RoCEv2 IPv4-mapped GID, not the link-local one
+  EXPECT_EQ(v4->netdev, "enp9s0");
+  EXPECT_EQ(v4->rail, "10.3.0.0/24");
+
+  const NicAttachment* v6 = FindNic(nics, "ionic_1");
+  ASSERT_NE(v6, nullptr);
+  EXPECT_EQ(v6->address, "fd00:4::7");  // the global RoCEv2 GID, skipping fe80::
+  EXPECT_EQ(v6->netdev, "enp10s0");
+  EXPECT_EQ(v6->rail, "fd00:4::/64");
+
+  const NicAttachment* ib = FindNic(nics, "mlx5_0");
+  ASSERT_NE(ib, nullptr);
+  EXPECT_EQ(ib->address, "fe80::2:c903:ab:cdef");
+  EXPECT_EQ(ib->rail, "");  // an InfiniBand subnet prefix says nothing about rails
+}
+
+TEST(RasIdentity, FiltersNicsLikeMoriRdmaDevices) {
+  FixtureTree t;
+  BuildNics(t);
+  TopologySources s = FixtureSources(t);
+  s.rdmaDevices = "ionic_1";
+  std::vector<NicAttachment> only = ReadNicInventory(s);
+  ASSERT_EQ(only.size(), 1u);
+  EXPECT_EQ(only[0].device, "ionic_1");
+
+  s.rdmaDevices = "^ionic_1, mlx5_0";
+  std::vector<NicAttachment> rest = ReadNicInventory(s);
+  ASSERT_EQ(rest.size(), 1u);
+  EXPECT_EQ(rest[0].device, "ionic_0");
+
+  s.rdmaDevices = "no_such_device";
+  EXPECT_TRUE(ReadNicInventory(s).empty());
+  s.sysRoot = t.Root() + "/missing";
+  s.rdmaDevices.clear();
+  EXPECT_TRUE(ReadNicInventory(s).empty());
+}
+
+TEST(RasIdentity, AppliesTheTopologyFile) {
+  Topology topo;
+  topo.nics = {{"ionic_0", 1, "enp9s0", "10.3.0.7", "10.3.0.0/24", "", ""},
+               {"ionic_1", 1, "enp10s0", "fd00:4::7", "fd00:4::/64", "", ""},
+               {"mlx5_0", 1, "", "fe80::1", "", "", ""}};
+  const std::string file =
+      "# written by the job prolog\n"
+      "rack = r12\n"
+      "leaf=leaf-r12-a\n"
+      "rail.enp9s0=rail-3\n"
+      "rail.mlx5_0=ib-plane-0\n"
+      "this line is not key=value? it is, but the key is unknown\n"
+      "garbage without an equals sign\n"
+      "\n"
+      "lldp.enp9s0.via=LLDP\n"
+      "lldp.enp9s0.chassis.name=sw-r12-a\n"
+      "lldp.enp9s0.port.descr=Ethernet7 to host\n"
+      "lldp.enp9s0.port.ifname=Ethernet7\n"
+      "lldp.enp10s0.chassis.name=sw-r12-b\n"
+      "lldp.enp10s0.port.mac=00:11:22:33:44:55\n"
+      "lldp.enp11s0.chassis.name=not-a-rdma-port\n";
+  ApplyTopologyFile(file, &topo);
+  EXPECT_EQ(topo.rack, "r12");
+  EXPECT_EQ(topo.leaf, "leaf-r12-a");
+  EXPECT_EQ(topo.nics[0].rail, "rail-3");
+  EXPECT_EQ(topo.nics[0].switchName, "sw-r12-a");
+  EXPECT_EQ(topo.nics[0].switchPort, "Ethernet7");  // port.ifname beats port.descr
+  EXPECT_EQ(topo.nics[1].rail, "fd00:4::/64");
+  EXPECT_EQ(topo.nics[1].switchName, "sw-r12-b");
+  EXPECT_EQ(topo.nics[1].switchPort, "00:11:22:33:44:55");
+  EXPECT_EQ(topo.nics[2].rail, "ib-plane-0");
+  EXPECT_EQ(topo.source, "file,lldp");
+}
+
+TEST(RasIdentity, TakesTheLeafFromSlurmUnlessTheFileNamesOne) {
+  Topology topo;
+  ApplySlurmTopology("spine1.leaf7.node12", "switch.switch.node", &topo);
+  EXPECT_EQ(topo.leaf, "leaf7");
+  EXPECT_EQ(topo.source, "slurm");
+
+  Topology fromFile;
+  ApplyTopologyFile("leaf=leaf-from-file\n", &fromFile);
+  ApplySlurmTopology("spine1.leaf7.node12", "switch.switch.node", &fromFile);
+  EXPECT_EQ(fromFile.leaf, "leaf-from-file");
+  EXPECT_EQ(fromFile.source, "file");
+
+  Topology mismatched;
+  ApplySlurmTopology("leaf7.node12", "switch.switch.node", &mismatched);
+  EXPECT_EQ(mismatched.leaf, "");
+  ApplySlurmTopology("", "", &mismatched);
+  EXPECT_EQ(mismatched.source, "");
+}
+
+TEST(RasIdentity, CollectsEveryTopologySource) {
+  FixtureTree t;
+  BuildNics(t);
+  t.Write("topology", "rack=r1\nlldp.enp9s0.chassis.name=sw1\nlldp.enp9s0.port.local=7\n");
+  TopologySources s = FixtureSources(t);
+  s.topologyFile = t.Root() + "/topology";
+  s.slurmTopologyAddr = "s0.l3.n1";
+  s.slurmTopologyPattern = "switch.switch.node";
+
+  std::string problem;
+  Topology topo = CollectTopology(s, &problem);
+  EXPECT_EQ(problem, "");
+  EXPECT_EQ(topo.rack, "r1");
+  EXPECT_EQ(topo.leaf, "l3");
+  EXPECT_EQ(topo.nics.size(), 3u);
+  EXPECT_EQ(FindNic(topo.nics, "ionic_0")->switchName, "sw1");
+  EXPECT_EQ(FindNic(topo.nics, "ionic_0")->switchPort, "7");
+  EXPECT_EQ(topo.source, "sysfs,file,lldp,slurm");
+
+  // A named topology file that can't be used is skipped, and the problem says why.
+  s.topologyFile = t.Root() + "/does-not-exist";
+  Topology noFile = CollectTopology(s, &problem);
+  EXPECT_EQ(problem, "MORI_RAS_TOPOLOGY_FILE=" + s.topologyFile + " can't be read");
+  EXPECT_EQ(noFile.rack, "");
+  EXPECT_EQ(noFile.source, "sysfs,slurm");
+
+  t.Write("huge", "rack=r2\n" + std::string(64 * 1024, '#'));
+  s.topologyFile = t.Root() + "/huge";
+  problem.clear();
+  Topology huge = CollectTopology(s, &problem);
+  EXPECT_EQ(problem, "MORI_RAS_TOPOLOGY_FILE=" + s.topologyFile + " is over 64 KiB");
+  EXPECT_EQ(huge.rack, "");
+
+  // Exactly 64 KiB is still a topology file.
+  std::string atLimit = "rack=r3\n#";
+  atLimit += std::string(64 * 1024 - atLimit.size(), '#');
+  t.Write("at-limit", atLimit);
+  s.topologyFile = t.Root() + "/at-limit";
+  problem.clear();
+  EXPECT_EQ(CollectTopology(s, &problem).rack, "r3");
+  EXPECT_EQ(problem, "");
 }
 
 TEST(RasIdentity, RuntimeUuidsAreRandomVersion4) {
@@ -88,4 +311,17 @@ TEST(RasIdentity, TokensAre128RandomBits) {
     EXPECT_EQ(tok.find_first_not_of("0123456789abcdef"), std::string::npos);
     EXPECT_TRUE(seen.insert(tok).second);
   }
+}
+
+TEST(RasIdentity, LabelLimitsMatchWhatPeersAccept) {
+  EXPECT_TRUE(ValidLabels({}));
+  EXPECT_TRUE(ValidLabels({{"role", "prefill"}}));
+  Labels many;
+  for (size_t i = 0; i < proto::kMaxLabels; ++i) many["k" + std::to_string(i)] = "v";
+  EXPECT_TRUE(ValidLabels(many));
+  many["one-more"] = "v";
+  EXPECT_FALSE(ValidLabels(many));
+  EXPECT_FALSE(ValidLabels({{std::string(proto::kMaxLabelKey + 1, 'k'), "v"}}));
+  EXPECT_FALSE(ValidLabels({{"k", std::string(proto::kMaxLabelValue + 1, 'v')}}));
+  EXPECT_FALSE(ValidLabels({{"", "v"}}));
 }

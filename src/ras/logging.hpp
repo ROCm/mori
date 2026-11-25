@@ -25,11 +25,11 @@
 // runtime that can't start, an invalid MORI_RAS_* value, a setting that can't be applied, a
 // degraded loop. A lost or misconfigured peer logs a warning: a link closed without LEAVE, a
 // silent peer, a refused reconnect, a rejected token, version, or endpoint, giving up on a
-// link. Link-up, a link's first round-trip and clock-offset sample, LEAVE, and the listening
-// address log at info. Expected conditions, such as a peer without RAS, a crossing connection,
-// or a retry, log at debug: operators and post-mortem tools read warnings as failures. MORI
-// shows only errors by default, so a process that MORI_RAS_ENABLE asks RAS for logs warnings
-// too, unless a level was chosen.
+// link. The listening address, the identity and its RDMA ports, link-up, a link's first
+// round-trip and clock-offset sample, and LEAVE log at info. Expected conditions, such as a
+// peer without RAS, a crossing connection, or a retry, log at debug: operators and post-mortem
+// tools read warnings as failures. MORI shows only errors by default, so a process that
+// MORI_RAS_ENABLE asks RAS for logs warnings too, unless a level was chosen.
 //
 // RAS logs through RasLogger(), not MORI_LOG. MORI_LOG caches each logger in a function-local
 // static, and at exit those statics, spdlog's registry with them, can be destroyed while the
