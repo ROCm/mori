@@ -136,9 +136,18 @@ def run_moe_block(
     k0, k1, k2 = jax.random.split(wkey, 3)
     in_scale = 1.0 / np.sqrt(hidden_dim)
     out_scale = 1.0 / np.sqrt(inter_dim)
-    w_gate = (jax.random.normal(k0, (total_experts, hidden_dim, inter_dim), jnp.float32) * in_scale).astype(dtype)
-    w_up = (jax.random.normal(k1, (total_experts, hidden_dim, inter_dim), jnp.float32) * in_scale).astype(dtype)
-    w_down = (jax.random.normal(k2, (total_experts, inter_dim, hidden_dim), jnp.float32) * out_scale).astype(dtype)
+    w_gate = (
+        jax.random.normal(k0, (total_experts, hidden_dim, inter_dim), jnp.float32)
+        * in_scale
+    ).astype(dtype)
+    w_up = (
+        jax.random.normal(k1, (total_experts, hidden_dim, inter_dim), jnp.float32)
+        * in_scale
+    ).astype(dtype)
+    w_down = (
+        jax.random.normal(k2, (total_experts, inter_dim, hidden_dim), jnp.float32)
+        * out_scale
+    ).astype(dtype)
 
     # -- 2b. Per-rank tokens + router logits (rank dependent) --------------
     tkey = jax.random.PRNGKey(777 + rank)
@@ -178,9 +187,7 @@ def run_moe_block(
         #    disp_idx  [max_recv, topk]    their selected global expert ids
         #    num_recv  scalar              real received-token count
         #    disp_w    [max_recv, topk]    their routing weights
-        disp_out, disp_idx, num_recv, disp_w, _ = op.dispatch(
-            x, topk_w, None, topk_idx
-        )
+        disp_out, disp_idx, num_recv, disp_w, _ = op.dispatch(x, topk_w, None, topk_idx)
         valid = (jnp.arange(max_recv) < num_recv)[:, None]  # [max_recv, 1]
 
         # 4. Run only THIS rank's experts over the received tokens, weighting
@@ -223,8 +230,6 @@ def run_moe_block(
         f"(max_abs_diff={max_abs:.4e}, {n_bad} mismatched elements)"
     )
     print(f"rank {rank}: MoE output matches reference OK", flush=True)
-
-    del op
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +311,14 @@ def main():
     procs = [
         ctx.Process(
             target=_worker,
-            args=(rank, args.world_size, port, args.total_gpus, moe_kwargs, result_queue),
+            args=(
+                rank,
+                args.world_size,
+                port,
+                args.total_gpus,
+                moe_kwargs,
+                result_queue,
+            ),
         )
         for rank in range(args.world_size)
     ]
@@ -327,8 +339,7 @@ def main():
         print(f"\n=== Rank {r} FAILED ===\n{tb}")
     if failures:
         raise SystemExit(
-            f"{len(failures)} rank(s) failed: "
-            + ", ".join(str(r) for r, _ in failures)
+            f"{len(failures)} rank(s) failed: " + ", ".join(str(r) for r, _ in failures)
         )
     print("All ranks: MORI EP MoE block matches reference OK", flush=True)
 
