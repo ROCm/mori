@@ -171,43 +171,62 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
     template <typename T>
     __device__ bool push_lane_masked(const T& message, uint32_t bytes, uint32_t metadata,
                                      bool active) {
-      return push_own_messages</*kFullWave=*/true>(message, bytes, metadata, active);
+#ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
+      __builtin_trap();
+      return false;
+#else
+      detail::assert_full_wave();
+      const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, active, log2_capacity);
+      if (c.total == 0) {
+        return true;  // no active lane: claim nothing
+      }
+      uint64_t base = 0;
+      if (__lane_id() == 0) {
+        base = __hip_atomic_fetch_add(producer_index, c.total, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT);
+      }
+      base = detail::broadcast_lane0(base);
+      // The credit wait of push_lanes(), for the whole claim.
+      const uint64_t cap = uint64_t{1} << log2_capacity;
+      if (base + c.total - consumer_index_cached > cap) {
+        uint64_t fresh = 0;
+        if (__lane_id() == 0) {
+          // The chunk stores below depend on this loop's exit.
+          while (base + c.total - (fresh = detail::load_published(consumer_index)) > cap) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+        }
+        consumer_index_cached = detail::broadcast_lane0(fresh);
+      }
+      detail::write_lane_message(chunks, log2_capacity, base + c.prefix, message, bytes, metadata,
+                                 c.lines);
+      return true;
+#endif
     }
 
     /// push_lane_masked() over the executing lanes, so callable from divergent code; the first
     /// executing lane takes lane 0's role. Always returns true.
     template <typename T>
     __device__ bool push_active_lanes(const T& message, uint32_t bytes, uint32_t metadata) {
-      return push_own_messages</*kFullWave=*/false>(message, bytes, metadata, true);
-    }
-
-   private:
-    // Body of push_lane_masked() (kFullWave) and push_active_lanes().
-    template <bool kFullWave, typename T>
-    __device__ bool push_own_messages(const T& message, uint32_t bytes, uint32_t metadata,
-                                      bool active) {
 #ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
       __builtin_trap();
       return false;
 #else
-      if constexpr (kFullWave) detail::assert_full_wave();
-      const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, active, log2_capacity);
+      const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, true, log2_capacity);
       if (c.total == 0) {
         return true;  // no active lane: claim nothing
       }
       // With a partial exec, broadcast_lane0() and lane_masked_claim() see only executing lanes.
-      uint32_t leader = 0;
-      if constexpr (!kFullWave) leader = __builtin_ctzll(__builtin_amdgcn_read_exec());
+      const uint32_t leader = __builtin_ctzll(__builtin_amdgcn_read_exec());
       uint64_t base = 0;
       if (__lane_id() == leader) {
         base = __hip_atomic_fetch_add(producer_index, c.total, __ATOMIC_RELAXED,
                                       __HIP_MEMORY_SCOPE_AGENT);
       }
       base = detail::broadcast_lane0(base);
-      // The credit wait of push_lanes(), for the whole claim. Divergent calls keep their own
-      // cache, so consumer_index_cached stays wave-uniform; the leader's copy decides.
-      uint64_t& cached = kFullWave ? consumer_index_cached : divergent_consumer_index_cached;
-      const uint64_t known = kFullWave ? cached : detail::broadcast_lane0(cached);
+      // The credit wait of push_lanes(), on its own cache so that consumer_index_cached stays
+      // wave-uniform; the leader's copy decides.
+      const uint64_t known = detail::broadcast_lane0(divergent_consumer_index_cached);
       const uint64_t cap = uint64_t{1} << log2_capacity;
       if (base + c.total - known > cap) {
         uint64_t fresh = 0;
@@ -217,13 +236,13 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
             __builtin_amdgcn_s_sleep(1);
           }
         }
-        cached = detail::broadcast_lane0(fresh);
+        divergent_consumer_index_cached = detail::broadcast_lane0(fresh);
       }
       detail::write_lane_message(chunks, log2_capacity, base + c.prefix, message, bytes, metadata,
                                  c.lines);
       // Compiler fence: keeps the stores in this call. Sunk past a branch's join, they
       // would follow the other arm's claim and credit wait, which may wait on them.
-      if constexpr (!kFullWave) __builtin_amdgcn_wave_barrier();
+      __builtin_amdgcn_wave_barrier();
       return true;
 #endif
     }

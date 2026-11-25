@@ -27,8 +27,8 @@
 // - Only the device-to-host SPSC/MPSC queues and invoke; no host-to-device queues, slot.hip.hpp
 //   or upstream CMake.
 // - Pushes compile only for gfx942/gfx950; elsewhere they trap (MORI_CCO_PROXY_PUSH_UNSUPPORTED).
-// - MPSC push_active_lanes(): push_lane_masked()'s body moved to push_own_messages(), plus
-//   divergent_consumer_index_cached; invoke_active_lanes() in device_context.hip.hpp.
+// - Added MPSC push_active_lanes(), beside upstream's push_lane_masked(), with its own cache
+//   (divergent_consumer_index_cached); invoke_active_lanes() in device_context.hip.hpp.
 
 /**
  * @file queue.hpp
