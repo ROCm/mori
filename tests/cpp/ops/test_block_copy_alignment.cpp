@@ -307,6 +307,22 @@ int main() {
                        dstMemObj, deviceError);
   errors += misalignedB64.errors + misalignedB64flat.errors;
 
+  // 4-byte (dword) vector ld/st at sub-4-byte-aligned bases. The 16B and 8B ops above tolerate
+  // misalignment in hardware, but a dword access assumes natural 4-byte alignment, so this sweeps
+  // offsets 1/2/3 (mod 4) against the aligned offset 4 to catch dropped/misplaced writes.
+  for (uint32_t offset : {1u, 2u, 3u, 4u}) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "ld/st 4b, %u-byte offset", offset);
+    CaseResult result = RunCase<4>(name, offset, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+                                   dstMemObj, deviceError);
+    errors += result.errors;
+
+    std::snprintf(name, sizeof(name), "flat ld/st 4b, %u-byte offset", offset);
+    result = RunCase<4, true>(name, offset, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+                              dstMemObj, deviceError);
+    errors += result.errors;
+  }
+
   if (myPe == 0 && aligned16Ms > 0.0f) {
     if (align8Ms > 0.0f) {
       std::printf("8-byte/16-byte align BlockCopy runtime ratio: %.3fx\n", align8Ms / aligned16Ms);

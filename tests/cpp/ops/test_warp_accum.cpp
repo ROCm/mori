@@ -40,8 +40,7 @@
 //       --tokens 4096 --blocks 80 --warps 4 [--split 1] [--peer] [--scales] [--iters 50] [--check]
 //
 //   --type   f32 | bf16 | fp8 (fnuz on gfx94x, ocp otherwise) | fp8_ocp | fp8_fnuz | fp4 (fp4x2)
-//   --mode   wa  = WarpAccum<T, Vec>
-//            lf1 = WarpAccumLF<T, Vec, 1>
+//   --mode   lf1 = WarpAccumLF<T, Vec, 1>  (same code path as the WarpAccum<T, Vec> wrapper)
 //            lf2 = WarpAccumLF<T, Vec, 2>
 //   --nelems row length in T elements (for fp4 one element is a packed fp4x2 byte)
 //   --split  warps per token: each warp takes a contiguous slice of the row with granularity 1,
@@ -97,8 +96,9 @@ constexpr bool kDeviceSupports<Fp8Fnuz> = false;
 #endif
 #endif
 
-enum Mode { kModeWA = 0, kModeLF1 = 1, kModeLF2 = 2 };
-const char* kModeNames[] = {"wa", "lf1", "lf2"};
+// WarpAccum<T, Vec> forwards to WarpAccumLF<T, Vec, 1>, so it is covered by lf1; no separate mode.
+enum Mode { kModeLF1 = 0, kModeLF2 = 1 };
+const char* kModeNames[] = {"lf1", "lf2"};
 
 // srcBase[i] + token * stride (+ slice offset) is the source row; nullptr stays nullptr.
 template <typename T, int VecBytes, int M>
@@ -118,20 +118,18 @@ __global__ void AccumKernel(T* dest, T* const* srcBase, const float* scales, int
       if (ofs >= nelems) continue;
       const size_t len = (nelems - ofs < slice) ? nelems - ofs : slice;
       const size_t rowOfs = token * stride + ofs;
+      // Fill this warp's own LDS pointer row and hand it straight to the gather, exactly like the
+      // production combine kernels (e.g. dispatch_combine/intranode.hpp): no wave_barrier/fence is
+      // needed because the row is written and read by the same wave, so the compiler orders the LDS
+      // write-before-read (and the write-after-read across grid-stride iterations) via lgkmcnt. An
+      // explicit wavefront-scoped fence here is not only unnecessary but miscompiles the Unroll=2
+      // gather on ROCm 7.14, dropping writes in the second grid-stride iteration.
       for (int i = laneId; i < accumNum; i += warpSize) {
         T* base = srcBase[i];
         srcPtrs[warpId][i] = base ? base + rowOfs : nullptr;
       }
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-      __builtin_amdgcn_wave_barrier();
-      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-      if constexpr (M == kModeWA) {
-        mori::core::WarpAccum<T, VecBytes>(dest + rowOfs, srcPtrs[warpId], scales, accumNum, len);
-      } else {
-        mori::core::WarpAccumLF<T, VecBytes, M == kModeLF1 ? 1 : 2>(dest + rowOfs, srcPtrs[warpId],
-                                                                    scales, accumNum, len);
-      }
-      __builtin_amdgcn_wave_barrier();
+      mori::core::WarpAccumLF<T, VecBytes, M == kModeLF1 ? 1 : 2>(dest + rowOfs, srcPtrs[warpId],
+                                                                  scales, accumNum, len);
     }
   }
 }
@@ -297,8 +295,6 @@ void Launch(const LaunchArgs& a) {
 template <typename T, int V>
 LaunchFn PickMode(int mode) {
   switch (mode) {
-    case kModeWA:
-      return Launch<T, V, kModeWA>;
     case kModeLF1:
       return Launch<T, V, kModeLF1>;
     default:
@@ -601,9 +597,9 @@ int RunBench(Case c, int iters, bool check) {
 }
 
 int ParseMode(const std::string& s) {
-  for (int m = 0; m < 3; ++m)
+  for (int m = 0; m < static_cast<int>(sizeof(kModeNames) / sizeof(kModeNames[0])); ++m)
     if (s == kModeNames[m]) return m;
-  fprintf(stderr, "unknown mode %s (wa|lf1|lf2)\n", s.c_str());
+  fprintf(stderr, "unknown mode %s (lf1|lf2)\n", s.c_str());
   exit(1);
 }
 
@@ -674,7 +670,9 @@ int main(int argc, char** argv) {
   }
 
   std::vector<std::string> types = {"f32", "bf16", DefaultFp8(), "fp4"};
-  std::vector<int> vecs = {4, 8, 16}, modes = {kModeWA, kModeLF1, kModeLF2};
+  std::vector<int> vecs = {4, 8, 16}, modes = {kModeLF1, kModeLF2};
+  // WarpAccumLF specializes accum 1/2/4/6/8/10 (all vecs) and 9 (vec 4/8); the rest
+  // (3/5/7/11/16, and 9 at vec16) fall through to WarpAccumDynamic, so this list covers it too.
   std::vector<int> accums = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 16};
   if (!type.empty()) types = {type};
   if (!vecArg.empty()) vecs = {std::stoi(vecArg)};
