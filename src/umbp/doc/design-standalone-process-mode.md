@@ -62,8 +62,8 @@ construction, not just same-host-capable.
   shared-memory data plane requires `AF_UNIX`/`SCM_RIGHTS`; no
   drop-in TCP equivalent exists. This is deferred until a concrete
   deployment needs it.
-- Worker crash/disconnect detection and cache rehydration after a
-  server restart. Tracked as a known limitation (§8).
+- Cache rehydration after a server restart. Worker-exit registration
+  cleanup is described in §4.2; server restart remains a limitation (§8).
 
 ## 3. Architecture Overview
 
@@ -200,6 +200,36 @@ Design:
   translation.
 
 ### 4.2 Data plane: shared memory
+
+#### Worker process lifetime
+
+When `Ping` advertises `supports_process_watch`, a client registers a
+Linux pidfd over the FD socket before exporting any host or GPU memory.
+The pidfd refers to the process generation, including across PID namespaces;
+it does not depend on a container-local numeric PID remaining unique.
+This requires Linux 5.3 or later and permission to call `pidfd_open`.
+Failure to establish the advertised watch fails memory registration.
+
+The owner polls for process exit every 100 ms. On exit it revokes that
+client's external identity, removes its address mappings from resolution,
+then waits for admitted backend calls using the existing data-path lifetime
+barrier before deregistering and unmapping memory. Completed objects in
+the owner's cache remain available to other clients. There is no heartbeat
+expiry or forced cleanup timeout; a backend operation that cannot finish
+also prevents its mapping from being reclaimed.
+
+Watched host FD messages and GPU/virtual registration RPCs require a live
+watch. A late registration arriving after exit therefore cannot recreate
+an unmonitored mapping. Explicit deregistration removes the watch too;
+a later registration establishes it again. Received FDs are close-on-exec.
+
+This is capability-negotiated. Old clients still use explicit deregistration
+with a new owner, and new clients use the old protocol with an old owner;
+those mixed-version combinations do not gain automatic crash cleanup.
+This does not recover a crashed cache owner or make a failed GPU/RDMA
+operation succeed.
+
+#### Buffer registration and access
 
 UMBP and Mooncake independently converged on the same shape for the
 data plane: control messages carry a handle, KV bytes live in shared
@@ -861,11 +891,10 @@ from core memory registration via an async/retry path.
    a longer-lived sidecar that outlives several worker restarts/
    upgrades. No solution beyond the existing binary/version-pinning
    discipline.
-9. **No fd-handoff registration reaper**: if a worker sends its fd via
-   the raw fd-handoff socket and then crashes before issuing the
-   confirming gRPC `RegisterMemory` RPC, the mapping stays live in the
-   server's registry indefinitely — pre-existing, orthogonal to which
-   backend `client_` is.
+9. **Legacy registration cleanup**: automatic worker-exit cleanup requires
+   both sides to support the pidfd handshake (§4.2). An old client that
+   crashes during or after FD handoff can still leave mappings until the
+   owner exits. There is no timeout that frees mappings still in use.
 10. **Distributed-backend test coverage**: the existing
     `test_standalone_shm_ipc.cpp` suite only exercises the
     `StandaloneClient`-backed path. A `DistributedClient`-backed test

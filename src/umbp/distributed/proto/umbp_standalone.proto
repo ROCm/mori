@@ -60,6 +60,7 @@ message PingResponse {
   StandaloneBackendMode deployment_mode = 2;
   bool supports_ranged_io = 3;
   bool simulation = 4;
+  bool supports_process_watch = 5;
 }
 
 message BoolResponse {
@@ -185,6 +186,7 @@ message RegisterMemoryRequest {
   uint64 ipc_offset = 10;
   uint64 alloc_base = 11;
   reserved 12;
+  bool require_process_watch = 13;
 }
 
 message DeregisterMemoryRequest {

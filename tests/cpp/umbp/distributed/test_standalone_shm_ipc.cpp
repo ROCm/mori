@@ -26,7 +26,9 @@
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -425,6 +427,103 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationResolvesAcrossMultipleRegions) {
   server_thread.join();
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
+}
+
+TEST(StandaloneShmIpcTest, ProcessExitRevokesRegionsAndRejectsLateRegistration) {
+  const pid_t child = fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    execl("/bin/sleep", "sleep", "60", nullptr);
+    _exit(127);
+  }
+  struct ChildGuard {
+    pid_t pid;
+    ~ChildGuard() {
+      kill(pid, SIGKILL);
+      while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+      }
+    }
+  } guard{child};
+  const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, child, 0));
+  ASSERT_GE(pidfd, 0);
+
+  const std::string address = "unix:///tmp/umbp_process_exit_" + std::to_string(getpid()) + ".sock";
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1 << 20;
+  config.ssd.enabled = false;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  constexpr char id[] = "watched-worker";
+  std::string error;
+  const int watch_status = standalone::SendFdRegistration(fd_path, pidfd, id, 0, 0, 5000, &error,
+                                                          standalone::kProcessWatchVersion);
+  close(pidfd);
+  ASSERT_EQ(watch_status, 0) << error;
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+  auto buffer = allocator.Alloc(4096, options);
+  ASSERT_TRUE(buffer.valid());
+  auto allocation =
+      HostMemAllocator::LookupShmAllocation(reinterpret_cast<uintptr_t>(buffer.ptr), 4096);
+  ASSERT_TRUE(allocation.has_value());
+  const auto base = reinterpret_cast<uintptr_t>(buffer.ptr);
+  ASSERT_EQ(standalone::SendFdRegistration(fd_path, allocation->fd, id, base, 4096, 5000, &error,
+                                           standalone::kWatchedFdRegistrationVersion),
+            0);
+  // A memfd is not a valid process handle, even though it is transferable.
+  EXPECT_NE(standalone::SendFdRegistration(fd_path, allocation->fd, "not-a-pidfd", 0, 0, 5000,
+                                           &error, standalone::kProcessWatchVersion),
+            0);
+  std::memset(buffer.ptr, 0x5a, 4096);
+  auto stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  auto put = [&]() {
+    grpc::ClientContext context;
+    ::umbp::PutRequest request;
+    request.set_client_id(id);
+    request.set_key("survives-worker");
+    request.set_region_base(base);
+    request.set_size(4096);
+    ::umbp::BoolResponse response;
+    return stub->Put(&context, request, &response).ok() && response.ok();
+  };
+  ASSERT_TRUE(put());
+  ASSERT_EQ(kill(child, SIGKILL), 0);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (put() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(put());
+  // Late FD and GPU IPC RPCs cannot recreate an unmonitored mapping.
+  EXPECT_NE(standalone::SendFdRegistration(fd_path, allocation->fd, id, base, 4096, 5000, &error,
+                                           standalone::kWatchedFdRegistrationVersion),
+            0);
+  {
+    grpc::ClientContext context;
+    ::umbp::RegisterMemoryRequest request;
+    request.set_client_id(id);
+    request.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
+    request.set_require_process_watch(true);
+    ::umbp::BoolResponse response;
+    ASSERT_TRUE(stub->RegisterMemory(&context, request, &response).ok());
+    EXPECT_FALSE(response.ok());
+    EXPECT_EQ(response.error(), "client process is not registered or has exited");
+  }
+  UMBPConfig reader_config;
+  reader_config.standalone_process.emplace();
+  reader_config.standalone_process->address = address;
+  reader_config.standalone_process->auto_start = false;
+  auto reader = CreateUMBPClient(reader_config);
+  ASSERT_TRUE(reader->RegisterMemory(base, 4096));
+  std::memset(buffer.ptr, 0, 4096);
+  ASSERT_TRUE(reader->Get("survives-worker", base, 4096));
+  for (size_t i = 0; i < 4096; ++i) EXPECT_EQ(static_cast<unsigned char*>(buffer.ptr)[i], 0x5a);
+  reader->DeregisterMemory(base);
+  reader->Close();
+  allocator.Free(buffer);
 }
 
 TEST(StandaloneShmIpcTest, DeregistrationCannotUnmapAnInFlightDataOperation) {

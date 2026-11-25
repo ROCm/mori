@@ -118,6 +118,7 @@ class StandaloneProcessClient : public IUMBPClient {
   void MaybeAutoStart();
   std::string ClientId();
   void DeregisterMemoryLocked();
+  bool RegisterProcessWatch();
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
@@ -139,6 +140,8 @@ class StandaloneProcessClient : public IUMBPClient {
   bool closed_ = false;
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
+  bool supports_process_watch_ = false;
+  bool process_registered_ = false;  // protected by op_mutex_
 
   enum class RegionKind { kHostShm, kGpuIpc, kVirtual };
 

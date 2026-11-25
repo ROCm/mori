@@ -27,14 +27,19 @@
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
 #include <sys/file.h>
+#include <sys/random.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -51,8 +56,6 @@
 
 namespace mori::umbp::standalone {
 namespace {
-
-std::atomic<uint64_t> g_client_counter{0};
 
 void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* request) {
   request->set_hash(block.hash);
@@ -303,6 +306,7 @@ class StandaloneProcessClient::VirtualMemoryExporter final : public MemoryExport
       return false;
     ::umbp::RegisterMemoryRequest req;
     req.set_client_id(client.ClientId());
+    req.set_require_process_watch(client.supports_process_watch_);
     req.set_worker_base(ptr);
     req.set_size(size);
     req.set_kind(::umbp::MEMORY_KIND_VIRTUAL);
@@ -359,8 +363,19 @@ StandaloneProcessClient::~StandaloneProcessClient() { Close(); }
 std::string StandaloneProcessClient::ClientId() {
   std::lock_guard<std::mutex> lock(registration_mu_);
   if (!client_id_.empty()) return client_id_;
+  // PIDs and process-local counters repeat across containers. The server uses
+  // this ID to own registrations, so a collision can unmap another live client.
+  std::array<unsigned char, 16> nonce{};
+  size_t filled = 0;
+  while (filled < nonce.size()) {
+    const ssize_t n = getrandom(nonce.data() + filled, nonce.size() - filled, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) throw std::runtime_error("StandaloneProcessClient: cannot generate client ID");
+    filled += static_cast<size_t>(n);
+  }
   std::ostringstream oss;
-  oss << "umbp-" << getpid() << "-" << g_client_counter.fetch_add(1);
+  oss << "umbp-" << std::hex << std::setfill('0');
+  for (const auto byte : nonce) oss << std::setw(2) << static_cast<unsigned int>(byte);
   client_id_ = oss.str();
   return client_id_;
 }
@@ -378,6 +393,7 @@ bool StandaloneProcessClient::WaitReady(int timeout_ms) {
         throw std::runtime_error("StandaloneProcessClient: client/server sim mode mismatch");
       backend_mode_ = BackendModeFromProto(resp.deployment_mode());
       supports_ranged_io_ = resp.supports_ranged_io();
+      supports_process_watch_ = resp.supports_process_watch();
       return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -922,7 +938,29 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;
+  if (!RegisterProcessWatch()) return false;
   return call.Result(memory_exporter_->Register(*this, ptr, size, loc, device));
+}
+
+bool StandaloneProcessClient::RegisterProcessWatch() {
+  if (!supports_process_watch_) return true;  // Legacy owner: explicit deregistration only.
+  const std::string client_id = ClientId();
+  const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0));
+  if (pidfd < 0) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] pidfd_open failed: {}", std::strerror(errno));
+    return false;
+  }
+  std::string error;
+  const int status =
+      SendFdRegistration(fd_socket_path_, pidfd, client_id, 0, 0,
+                         standalone_config_.startup_timeout_ms, &error, kProcessWatchVersion);
+  close(pidfd);
+  if (status != 0) {
+    MORI_UMBP_ERROR("[StandaloneProcessClient] process watch registration failed: {}", error);
+    return false;
+  }
+  process_registered_ = true;
+  return true;
 }
 
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
@@ -973,6 +1011,7 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   req.set_worker_node_address(standalone_config_.worker_node_address);
   for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
   req.set_kind(::umbp::MEMORY_KIND_GPU_IPC);
+  req.set_require_process_watch(supports_process_watch_);
   req.set_device_id(device_id);
   req.set_ipc_handle(reinterpret_cast<const char*>(&handle), sizeof(handle));
   req.set_ipc_offset(ipc_offset);
@@ -1007,12 +1046,13 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
   }
 
   bool acquired_kept = false;
-  const std::string client_id = ClientId();
   try {
+    const std::string client_id = ClientId();
     std::string error;
     int status = SendFdRegistration(
         fd_socket_path_, allocation->fd, client_id, reinterpret_cast<uintptr_t>(allocation->base),
-        allocation->mapped_size, standalone_config_.startup_timeout_ms, &error);
+        allocation->mapped_size, standalone_config_.startup_timeout_ms, &error,
+        supports_process_watch_ ? kWatchedFdRegistrationVersion : kFdRegistrationVersion);
     if (status != 0) {
       throw std::runtime_error("fd handoff failed: " + error);
     }
@@ -1020,6 +1060,7 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     grpc::ClientContext ctx;
     ::umbp::RegisterMemoryRequest req;
     req.set_client_id(client_id);
+    req.set_require_process_watch(supports_process_watch_);
     req.set_worker_base(reinterpret_cast<uintptr_t>(allocation->base));
     req.set_size(allocation->mapped_size);
     req.set_worker_node_id(standalone_config_.worker_node_id);
@@ -1059,7 +1100,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   std::vector<RegisteredRegion> regions;
   {
     std::lock_guard<std::mutex> lock(registration_mu_);
-    if (regions_.empty()) return;
+    if (regions_.empty() && !process_registered_) return;
     client_id = client_id_;
     regions = regions_;
   }
@@ -1079,6 +1120,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   {
     std::lock_guard<std::mutex> lock(registration_mu_);
     regions_.clear();
+    process_registered_ = false;
   }
   for (const auto& region : regions) {
     if (region.kind == RegionKind::kHostShm) {
