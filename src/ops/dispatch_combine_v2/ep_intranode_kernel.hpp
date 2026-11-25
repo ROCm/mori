@@ -193,15 +193,22 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
   const int warpId = thdId / kCfg.waveSize;
   const unsigned long long win = args.window;
 
-  // Same drain as the spin form: __syncthreads() does not wait on vmcnt, and the
-  // fence below covers only the publishing warp's stores, so this block's copy warps
-  // must land their payload, ids, weights and scale rows before it draws a ticket.
+  // A block's peer stores must be COMPLETE and WRITTEN BACK before it arrives, as
+  // the gfx125x body releases before its own arrival. __syncthreads() does not wait
+  // on vmcnt, so every warp drains its stores into this XCD's L2 first; on a cached
+  // window they are not visible to a peer until that L2 is written back, and the
+  // publisher's release reaches the L2 of the XCD IT runs on, not the other seven.
+  // One warp issues it because buffer_wbl2 is cache-wide and the barrier has already
+  // put every warp's stores in the cache it writes back.
   __builtin_amdgcn_s_waitcnt(0);
   __syncthreads();
 
   unsigned arriveTicket = 0;
-  if (thdId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
-  if (warpId == 0) arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
+  if (warpId == 0) {
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (laneId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
+    arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
+  }
   const bool isFirstArriver = (warpId == 0) && (arriveTicket == 0u);
 
   unsigned drainTicket = kNoTicket;
@@ -217,12 +224,16 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
   // 0 .. gridDim.x: the highest TICKET, not the counter's final value.
   const unsigned kHighestTicket = gridDim.x;
   if ((warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket)) {
+    // A release, not __threadfence_system(): the signal must not pass the payload,
+    // but nothing here reads what a peer wrote, so the acquire half -- a full cache
+    // invalidate -- is bought for nothing. Hoisted out of the loop, which wide EP
+    // multi-iterates.
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
       // +1 so a zero-token destination still sees a distinct "signal arrived".
       const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
                                  1;
-      __threadfence_system();
       __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       // Cleared here, by the warp that just read it: the inbound loop below runs on
