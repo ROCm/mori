@@ -606,8 +606,11 @@ void PoolManager::MakeTierLocked(Pool* pool) {
     largest_extent = std::max(largest_extent, record * tier->extent_slots);
     slot_bytes += record;
   }
-  tier->chunk_extents = static_cast<uint32_t>(
-      std::max<uint64_t>(1, tier_options_.chunk_bytes / std::max<uint64_t>(1, largest_extent)));
+  // An allocation holds whole extents: about `chunk_bytes` of the largest
+  // part, but never more than the tier is to hold.
+  const uint64_t extents = tier_options_.capacity_bytes / (slot_bytes * tier->extent_slots);
+  tier->chunk_extents = static_cast<uint32_t>(std::max<uint64_t>(
+      1, std::min(extents, tier_options_.chunk_bytes / std::max<uint64_t>(1, largest_extent))));
   const uint64_t chunk_records = uint64_t{tier->chunk_extents} * tier->extent_slots;
   const uint64_t chunks = tier_options_.capacity_bytes / (chunk_records * slot_bytes);
   tier->max_records = static_cast<uint32_t>(std::min<uint64_t>(chunks * chunk_records, UINT32_MAX));
