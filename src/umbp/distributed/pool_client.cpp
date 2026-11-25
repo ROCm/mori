@@ -682,21 +682,23 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
 // RangesTileObject, which the write side needs — a read may take any subset of
 // an object, but a write must account for every byte it commits.
-bool RangesAreDisjointAndInBounds(size_t object_size, const std::vector<size_t>& sizes,
-                                  const std::vector<size_t>& offsets) {
-  if (object_size == 0 || sizes.empty() || sizes.size() != offsets.size()) return false;
-  std::vector<size_t> order(sizes.size());
+template <typename ReadRange>
+bool RangesAreDisjointAndInBounds(size_t object_size, size_t count, ReadRange read_range) {
+  if (object_size == 0 || count == 0) return false;
+  std::vector<size_t> order(count);
   std::iota(order.begin(), order.end(), size_t{0});
-  std::sort(order.begin(), order.end(),
-            [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return read_range(a).object_offset < read_range(b).object_offset;
+  });
   size_t previous_end = 0;
   bool first = true;
   for (size_t index : order) {
-    if (sizes[index] == 0 || IsObjectRangeOverflow(offsets[index], sizes[index], object_size)) {
+    const auto range = read_range(index);
+    if (range.size == 0 || IsObjectRangeOverflow(range.object_offset, range.size, object_size)) {
       return false;
     }
-    if (!first && offsets[index] < previous_end) return false;
-    previous_end = offsets[index] + sizes[index];
+    if (!first && range.object_offset < previous_end) return false;
+    previous_end = range.object_offset + range.size;
     first = false;
   }
   return true;
@@ -3298,23 +3300,16 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
 
 namespace {
 
-// Fills `out` rather than returning a fresh vector: the caller loops over keys
-// and one allocation per key adds up on a call carrying thousands of ranges.
-void FillReadRanges(const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
-                    const std::vector<size_t>& offsets, std::vector<PoolClient::ObjectRange>* out) {
-  out->clear();
-  out->reserve(dsts.size());
-  for (size_t r = 0; r < dsts.size(); ++r) out->push_back({dsts[r], sizes[r], offsets[r]});
-}
-
 // [first byte, last byte) of a key's ranges: what a staging medium needs to read.
-ObjectExtent ReadExtent(const std::vector<size_t>& sizes, const std::vector<size_t>& offsets) {
+template <typename ReadRange>
+ObjectExtent ReadExtent(size_t count, ReadRange read_range) {
   uint64_t lo = std::numeric_limits<uint64_t>::max();
   uint64_t hi = 0;
-  for (size_t r = 0; r < sizes.size() && r < offsets.size(); ++r) {
-    if (sizes[r] == 0) continue;
-    lo = std::min<uint64_t>(lo, offsets[r]);
-    hi = std::max<uint64_t>(hi, static_cast<uint64_t>(offsets[r]) + sizes[r]);
+  for (size_t r = 0; r < count; ++r) {
+    const auto range = read_range(r);
+    if (range.size == 0) continue;
+    lo = std::min<uint64_t>(lo, range.object_offset);
+    hi = std::max<uint64_t>(hi, static_cast<uint64_t>(range.object_offset) + range.size);
   }
   if (hi <= lo) return ObjectExtent{};  // nothing to read: let the medium decide
   return ObjectExtent{lo, hi - lo};
@@ -3514,24 +3509,43 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
                                              const std::vector<std::vector<size_t>>& src_offsets) {
+  if (!RangeBatchShapeValid(keys.size(), dsts, sizes, src_offsets))
+    return std::vector<bool>(keys.size(), false);
+  return BatchGetRanges(keys, [&](size_t i) { return dsts[i].size(); },
+      [&](size_t i, size_t r) { return ObjectRange{dsts[i][r], sizes[i][r], src_offsets[i][r]}; });
+}
+
+std::vector<bool> PoolClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+    const size_t* src_offsets, size_t ranges_per_key, size_t size_stride, size_t offset_stride) {
+  return BatchGetRanges(keys, [=](size_t) { return ranges_per_key; },
+      [=](size_t i, size_t r) {
+        return ObjectRange{reinterpret_cast<void*>(dsts[i * ranges_per_key + r]),
+                           sizes[i * size_stride + r], src_offsets[i * offset_stride + r]};
+      });
+}
+
+template <typename RangeCount, typename ReadRange>
+std::vector<bool> PoolClient::BatchGetRanges(
+    const std::vector<std::string>& keys, RangeCount range_count, ReadRange read_range) {
   RangedFollowers followers;
   std::vector<bool> results = BatchGetRangesImpl(
-      keys, dsts, sizes, src_offsets, config_.remote_single_flight ? &followers : nullptr);
+      keys, range_count, read_range, config_.remote_single_flight ? &followers : nullptr);
   // After the call above has returned: its arena lease is released and its own
   // episodes are finished, so waiting here cannot hold up the call we wait on.
   if (!followers.indices.empty()) {
-    ServeRangedFollowers(keys, dsts, sizes, src_offsets, followers, &results);
+    ServeRangedFollowers(keys, range_count, read_range, followers, &results);
   }
   return results;
 }
 
+template <typename RangeCount, typename ReadRange>
 std::vector<bool> PoolClient::BatchGetRangesImpl(
-    const std::vector<std::string>& keys, const std::vector<std::vector<void*>>& dsts,
-    const std::vector<std::vector<size_t>>& sizes,
-    const std::vector<std::vector<size_t>>& src_offsets, RangedFollowers* followers) {
+    const std::vector<std::string>& keys, RangeCount range_count, ReadRange read_range,
+    RangedFollowers* followers) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
-  if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
+  if (!initialized_ || n == 0) {
     return results;
   }
 
@@ -3558,8 +3572,10 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   // changes.
   double local_get_bytes = 0.0;
   auto record_local_get = [&](size_t index) {
-    local_get_bytes +=
-        static_cast<double>(std::accumulate(sizes[index].begin(), sizes[index].end(), size_t{0}));
+    size_t bytes = 0;
+    for (size_t r = 0; r < range_count(index); ++r)
+      bytes += read_range(index, r).size;
+    local_get_bytes += static_cast<double>(bytes);
   };
   auto flush_local_get_bytes = [&] {
     if (local_get_bytes == 0.0) return;
@@ -3602,12 +3618,13 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   std::vector<size_t> candidates;
   candidates.reserve(n);
   for (size_t i = 0; i < n; ++i) {
-    if (!sizes[i].empty()) candidates.push_back(i);
+    if (range_count(i) != 0) candidates.push_back(i);
   }
   // What each key will touch, so SSD stages one layer group, not the whole
   // object once per group (design-ssd-ranged-io.md D1).
   std::vector<ObjectExtent> extents(n);
-  for (size_t i : candidates) extents[i] = ReadExtent(sizes[i], src_offsets[i]);
+  for (size_t i : candidates)
+    extents[i] = ReadExtent(range_count(i), [&](size_t r) { return read_range(i, r); });
   // A staged medium may publish the batch in parts: each part is planned and
   // copied, and its holds dropped, before the next part is resolved.
   while (!candidates.empty()) {
@@ -3622,12 +3639,12 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
             // One key's ranges normally share a caller allocation, but nothing
             // guarantees it; a single host range makes the whole key unservable
             // from a file ref, so require all of them.
-            const std::vector<void*>& key_dsts = dsts[i];
-            for (size_t r = 0; r < key_dsts.size(); ++r) {
-              if (LocalUserBytes(key_dsts[r], sizes[i][r]).loc != mori::io::MemoryLocationType::GPU)
+            for (size_t r = 0; r < range_count(i); ++r) {
+              const auto range = read_range(i, r);
+              if (LocalUserBytes(range.user, range.size).loc != mori::io::MemoryLocationType::GPU)
                 return false;
             }
-            return !key_dsts.empty();
+            return range_count(i) != 0;
           },
           &later, &extents);
     }
@@ -3637,7 +3654,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     // The range count is a reservation hint for buffered engines; HBM builds
     // plans directly and ignores it.
     size_t range_total = 0;
-    for (size_t i : candidates) range_total += sizes[i].size();
+    for (size_t i : candidates) range_total += range_count(i);
     auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
     size_t local_item_count = 0;
     local_keys.clear();
@@ -3655,8 +3672,8 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
       if (dbg != nullptr && dbg->object_size == 0) {
         dbg->object_size = static_cast<size_t>(resolved.size);
       }
-      if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), sizes[i],
-                                        src_offsets[i])) {
+      if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), range_count(i),
+                                       [&](size_t r) { return read_range(i, r); })) {
         MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid local ranges for key='{}' size={}",
                         keys[i], resolved.size);
         continue;  // a caller bug, not a miss — do not go looking for a replica
@@ -3667,7 +3684,9 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
         PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
         // Refilled per key rather than returned fresh: one allocation for the
         // call instead of one per key.
-        FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
+        key_ranges.clear();
+        key_ranges.reserve(range_count(i));
+        for (size_t r = 0; r < range_count(i); ++r) key_ranges.push_back(read_range(i, r));
         if (resolved.file_ref.IsFile()) {
           built =
               BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items);
@@ -3753,8 +3772,8 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   // buffer: a unit that fits the buffer but not a shard would never get a slice.
   const void* caller_buffer = nullptr;
   for (size_t index : missed) {
-    if (!dsts[index].empty()) {
-      caller_buffer = dsts[index].front();
+    if (range_count(index) != 0) {
+      caller_buffer = read_range(index, 0).user;
       break;
     }
   }
@@ -3783,7 +3802,8 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   for (size_t index : missed) {
     size_t key_total = 0;
     size_t widest_span = 0;
-    for (size_t span_bytes : sizes[index]) {
+    for (size_t r = 0; r < range_count(index); ++r) {
+      const size_t span_bytes = read_range(index, r).size;
       widest_span = std::max(widest_span, span_bytes);
       key_total += span_bytes;
     }
@@ -3826,7 +3846,8 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     const size_t object_size = static_cast<size_t>(route.size);
     if (route.node_id == config_.master_config.node_id || route.size == 0 ||
         route.size > std::numeric_limits<size_t>::max() ||
-        !RangesAreDisjointAndInBounds(object_size, sizes[original], src_offsets[original])) {
+        !RangesAreDisjointAndInBounds(object_size, range_count(original),
+                                     [&](size_t j) { return read_range(original, j); })) {
       MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid route/ranges for key='{}' size={}",
                       keys[original], route.size);
       continue;
@@ -3847,8 +3868,9 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     bool split = false;
     bool servable = true;
     size_t cursor = 0;
-    for (size_t j = 0; j < sizes[original].size(); ++j) {
-      const size_t span_bytes = sizes[original][j];
+    for (size_t j = 0; j < range_count(original); ++j) {
+      const auto range = read_range(original, j);
+      const size_t span_bytes = range.size;
       if (span_bytes > scratch_size) {
         MORI_UMBP_ERROR(
             "[PoolClient] BatchGetRanges: range exceeds ranged scratch key='{}' range={} "
@@ -3857,7 +3879,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
         servable = false;
         break;
       }
-      if (src_offsets[original][j] != cursor) ascending_from_zero = false;
+      if (range.object_offset != cursor) ascending_from_zero = false;
       cursor += span_bytes;
       if (unit.bytes + span_bytes > scratch_size) {
         split = true;
@@ -3878,13 +3900,13 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
       // CPU is invisible next to a multi-MiB object and very visible next to a
       // small one, so the merge happens here instead.
       unit.packed.push_back(
-          ObjectRange{.user = dsts[original][j], .size = span_bytes, .object_offset = unit.bytes});
+          ObjectRange{.user = range.user, .size = span_bytes, .object_offset = unit.bytes});
       if (!unit.spans.empty() &&
-          unit.spans.back().object_offset + unit.spans.back().size == src_offsets[original][j]) {
+          unit.spans.back().object_offset + unit.spans.back().size == range.object_offset) {
         unit.spans.back().size += span_bytes;
       } else {
         unit.spans.push_back(
-            ByteSpan{.object_offset = src_offsets[original][j], .size = span_bytes});
+            ByteSpan{.object_offset = range.object_offset, .size = span_bytes});
       }
       unit.bytes += span_bytes;
     }
@@ -4500,10 +4522,9 @@ void PoolClient::FinishRemoteEpisodes(LedEpisodes* led) {
   led->clear();
 }
 
+template <typename RangeCount, typename ReadRange>
 void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
-                                      const std::vector<std::vector<void*>>& dsts,
-                                      const std::vector<std::vector<size_t>>& sizes,
-                                      const std::vector<std::vector<size_t>>& src_offsets,
+                                      RangeCount range_count, ReadRange read_range,
                                       const RangedFollowers& followers,
                                       std::vector<bool>* results) {
   const auto deadline = std::chrono::steady_clock::now() +
@@ -4519,18 +4540,9 @@ void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
 
   const size_t m = followers.indices.size();
   std::vector<std::string> sub_keys;
-  std::vector<std::vector<void*>> sub_dsts;
-  std::vector<std::vector<size_t>> sub_sizes;
-  std::vector<std::vector<size_t>> sub_offsets;
   sub_keys.reserve(m);
-  sub_dsts.reserve(m);
-  sub_sizes.reserve(m);
-  sub_offsets.reserve(m);
   for (size_t index : followers.indices) {
     sub_keys.push_back(keys[index]);
-    sub_dsts.push_back(dsts[index]);
-    sub_sizes.push_back(sizes[index]);
-    sub_offsets.push_back(src_offsets[index]);
   }
   // Counted before the re-read, so a key evicted in between counts as local
   // here and is still read correctly (remotely) below.
@@ -4545,8 +4557,10 @@ void PoolClient::ServeRangedFollowers(const std::vector<std::string>& keys,
 
   // Single-flight off for the re-read: a key the leader did not leave local is
   // pulled by this call itself, exactly as it would have been without the wait.
-  const std::vector<bool> again =
-      BatchGetRangesImpl(sub_keys, sub_dsts, sub_sizes, sub_offsets, /*followers=*/nullptr);
+  const std::vector<bool> again = BatchGetRangesImpl(
+      sub_keys, [&](size_t i) { return range_count(followers.indices[i]); },
+      [&](size_t i, size_t r) { return read_range(followers.indices[i], r); },
+      /*followers=*/nullptr);
   for (size_t j = 0; j < m; ++j) (*results)[followers.indices[j]] = again[j];
 }
 

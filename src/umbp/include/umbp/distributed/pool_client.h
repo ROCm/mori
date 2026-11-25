@@ -200,6 +200,10 @@ class PoolClient {
                                    const std::vector<std::vector<void*>>& dsts,
                                    const std::vector<std::vector<size_t>>& sizes,
                                    const std::vector<std::vector<size_t>>& src_offsets);
+  // Borrow valid dense descriptors until return; strides are zero or ranges_per_key.
+  std::vector<bool> BatchGetRanges(
+      const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+      const size_t* src_offsets, size_t ranges_per_key, size_t size_stride, size_t offset_stride);
   std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& object_sizes,
                                    const std::vector<std::vector<const void*>>& srcs,
@@ -1080,11 +1084,13 @@ class PoolClient {
       std::unordered_map<size_t, bool>* unit_ok, double* remote_bytes);
 
   // `followers` null disables single-flight for the call (the follower re-read).
+  template <typename RangeCount, typename ReadRange>
+  std::vector<bool> BatchGetRanges(const std::vector<std::string>& keys,
+                                  RangeCount range_count, ReadRange read_range);
+  template <typename RangeCount, typename ReadRange>
   std::vector<bool> BatchGetRangesImpl(const std::vector<std::string>& keys,
-                                       const std::vector<std::vector<void*>>& dsts,
-                                       const std::vector<std::vector<size_t>>& sizes,
-                                       const std::vector<std::vector<size_t>>& src_offsets,
-                                       RangedFollowers* followers);
+                                     RangeCount range_count, ReadRange read_range,
+                                     RangedFollowers* followers);
   // Splits whole-object units into leaders (kept, episode registered in `led`)
   // and keys another call is pulling or that are already local (moved to
   // `followers` and out of `units` / `unit_ok`).
@@ -1092,10 +1098,9 @@ class PoolClient {
                           std::unordered_map<size_t, bool>* unit_ok, LedEpisodes* led,
                           RangedFollowers* followers);
   void FinishRemoteEpisodes(LedEpisodes* led);
+  template <typename RangeCount, typename ReadRange>
   void ServeRangedFollowers(const std::vector<std::string>& keys,
-                            const std::vector<std::vector<void*>>& dsts,
-                            const std::vector<std::vector<size_t>>& sizes,
-                            const std::vector<std::vector<size_t>>& src_offsets,
+                            RangeCount range_count, ReadRange read_range,
                             const RangedFollowers& followers, std::vector<bool>* results);
 
   // Remote-only sibling of PartitionBatchGetTargets for ranged reads.  Each key

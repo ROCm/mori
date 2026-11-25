@@ -37,9 +37,11 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
@@ -681,15 +683,42 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& src_offsets) {
-  SimCall call(sim_trace_.get(), "batch_get_ranges", keys.size(), sizes);
+  if (!RangeBatchShapeValid(keys.size(), dsts, sizes, src_offsets))
+    return std::vector<bool>(keys.size(), false);
+  return BatchGetRangesImpl(keys, [&](size_t i) {
+    return std::make_tuple(dsts[i].data(), sizes[i].data(), src_offsets[i].data(), dsts[i].size());
+  });
+}
+
+std::vector<bool> StandaloneProcessClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+    const size_t* src_offsets, size_t ranges_per_key, size_t size_stride,
+    size_t offset_stride) {
+  return BatchGetRangesImpl(keys, [=](size_t i) {
+    if (ranges_per_key == 0) return std::make_tuple(dsts, sizes, src_offsets, ranges_per_key);
+    return std::make_tuple(dsts + i * ranges_per_key, sizes + i * size_stride,
+                           src_offsets + i * offset_stride, ranges_per_key);
+  });
+}
+
+template <typename ReadRow>
+std::vector<bool> StandaloneProcessClient::BatchGetRangesImpl(
+    const std::vector<std::string>& keys, ReadRow read_row) {
+  uint64_t trace_bytes = 0;
+  if (sim_trace_) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const auto [dsts, sizes, offsets, count] = read_row(i);
+      if (count != 0) trace_bytes = std::accumulate(sizes, sizes + count, trace_bytes);
+    }
+  }
+  SimCall call(sim_trace_.get(), "batch_get_ranges", keys.size(), trace_bytes);
   std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
   std::shared_lock lk(op_mutex_);
-  if (closed_ || !RangeBatchShapeValid(keys.size(), dsts, sizes, src_offsets)) return failed;
+  if (closed_) return failed;
 
   uint64_t fingerprint = 0;
   uint64_t handle = LookupKeyHandle(keys, &fingerprint);
-
   ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
   req.set_key_fingerprint(fingerprint);
@@ -699,20 +728,20 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
   {
     std::lock_guard<std::mutex> registration_lock(registration_mu_);
     for (size_t i = 0; i < keys.size(); ++i) {
-      if (dsts[i].size() > std::numeric_limits<uint32_t>::max()) return failed;
-      req.add_range_counts(static_cast<uint32_t>(dsts[i].size()));
-      for (size_t j = 0; j < dsts[i].size(); ++j) {
+      const auto [dsts, sizes, offsets, count] = read_row(i);
+      if (count > std::numeric_limits<uint32_t>::max()) return failed;
+      req.add_range_counts(static_cast<uint32_t>(count));
+      for (size_t j = 0; j < count; ++j) {
         uint64_t shm_offset = 0;
         uint64_t region_base = 0;
-        if (!OffsetForLocked(dsts[i][j], sizes[i][j], &shm_offset, &region_base)) return failed;
+        if (!OffsetForLocked(dsts[j], sizes[j], &shm_offset, &region_base)) return failed;
         req.add_shm_offsets(shm_offset);
         req.add_region_bases(region_base);
-        req.add_sizes(sizes[i][j]);
-        req.add_object_offsets(src_offsets[i][j]);
+        req.add_sizes(sizes[j]);
+        req.add_object_offsets(offsets[j]);
       }
     }
   }
-
   // At most twice: once naming a handle, and if the server no longer holds it,
   // once carrying the keys. A handle is only ever offered after the server
   // handed it out, so the retry is the rare path.

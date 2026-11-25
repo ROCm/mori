@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -298,6 +299,24 @@ std::vector<bool> DistributedClient::BatchGetRanges(
     for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
   }
   return call.Result(pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets));
+}
+
+std::vector<bool> DistributedClient::BatchGetRanges(
+    const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+    const size_t* src_offsets, size_t ranges_per_key, size_t size_stride,
+    size_t offset_stride) {
+  uint64_t trace_bytes = 0;
+  if (sim_trace_ && ranges_per_key != 0) {
+    for (size_t i = 0; i < keys.size(); ++i)
+      trace_bytes = std::accumulate(sizes + i * size_stride,
+                                    sizes + i * size_stride + ranges_per_key, trace_bytes);
+  }
+  SimCall call(sim_trace_.get(), "batch_get_ranges", keys.size(), trace_bytes);
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  return call.Result(pool_client_->BatchGetRanges(
+      keys, dsts, sizes, src_offsets, ranges_per_key, size_stride, offset_stride));
 }
 
 std::vector<bool> DistributedClient::BatchPutRanges(

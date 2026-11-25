@@ -118,6 +118,18 @@ class IUMBPClient {
                                            const std::vector<std::vector<size_t>>& sizes,
                                            const std::vector<std::vector<size_t>>& src_offsets) = 0;
 
+  // Synchronous borrowed-descriptor path. Views must remain alive and unchanged
+  // until return. Backends may adapt these to their native descriptor format.
+  // Caller supplies valid dense buffers; sizes/offsets have either
+  // ranges_per_key stride or zero (one shared row). Python validates this
+  // contract once at the binding, before any native code reads the arrays.
+  virtual std::vector<bool> BatchGetRanges(
+      const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+      const size_t* src_offsets, size_t ranges_per_key, size_t size_stride,
+      size_t offset_stride) {
+    throw std::logic_error("borrowed range descriptors are not supported by this backend");
+  }
+
   /// Atomically publish objects assembled from scattered buffers. The ranges
   /// for each key must exactly tile [0, object_sizes[i]).
   virtual std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,

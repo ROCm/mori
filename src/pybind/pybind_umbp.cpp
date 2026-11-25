@@ -20,11 +20,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <pybind11/functional.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <cstdint>
 #include <sstream>
+#include <type_traits>
 
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
@@ -36,6 +38,42 @@
 #include "umbp/umbp_client.h"
 
 namespace py = pybind11;
+
+namespace {
+// NumPy owns the storage throughout the synchronous call. Reject conversions:
+// accepting another dtype/layout by force-casting would silently copy it.
+size_t ValidateRangeArray(const py::array& array, size_t rows, size_t columns,
+                          bool allow_vector) {
+  if (!array.dtype().equal(py::dtype::of<uint64_t>()))
+    throw py::type_error("range arrays must have native uint64 dtype");
+  if (!(array.flags() & py::array::c_style) ||
+      reinterpret_cast<uintptr_t>(array.data()) % alignof(uint64_t))
+    throw py::value_error("range arrays must be C-contiguous and aligned");
+  if (allow_vector && array.ndim() == 1 && static_cast<size_t>(array.shape(0)) == columns)
+    return 0;
+  if (array.ndim() != 2 || static_cast<size_t>(array.shape(0)) != rows ||
+      static_cast<size_t>(array.shape(1)) != columns)
+    throw py::value_error("range array shapes must match pointers (sizes/offsets may be 1D)");
+  return columns;
+}
+
+std::vector<bool> BatchGetRangesFromArrays(
+    mori::umbp::IUMBPClient& self, const std::vector<std::string>& keys,
+    const py::array& pointers, const py::array& sizes, const py::array& offsets) {
+  static_assert(std::is_same_v<uint64_t, uintptr_t> && std::is_same_v<uint64_t, size_t>);
+  if (pointers.ndim() != 2) throw py::value_error("pointers must be a 2D array");
+  const size_t rows = keys.size();
+  const size_t columns = static_cast<size_t>(pointers.shape(1));
+  ValidateRangeArray(pointers, rows, columns, false);
+  const size_t size_stride = ValidateRangeArray(sizes, rows, columns, true);
+  const size_t offset_stride = ValidateRangeArray(offsets, rows, columns, true);
+  const auto* dsts = static_cast<const uintptr_t*>(pointers.data());
+  const auto* lengths = static_cast<const size_t*>(sizes.data());
+  const auto* src_offsets = static_cast<const size_t*>(offsets.data());
+  py::gil_scoped_release release;
+  return self.BatchGetRanges(keys, dsts, lengths, src_offsets, columns, size_stride, offset_stride);
+}
+}  // namespace
 
 namespace mori {
 using namespace umbp;
@@ -365,9 +403,20 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
-      .def("batch_get_ranges_into_ptr", &IUMBPClient::BatchGetRanges, py::arg("keys"),
+      .def("batch_get_ranges_into_ptr",
+           py::overload_cast<const std::vector<std::string>&,
+                             const std::vector<std::vector<uintptr_t>>&,
+                             const std::vector<std::vector<size_t>>&,
+                             const std::vector<std::vector<size_t>>&>(&IUMBPClient::BatchGetRanges),
+           py::arg("keys"),
            py::arg("ptrs"), py::arg("sizes"), py::arg("src_offsets"),
            py::call_guard<py::gil_scoped_release>())
+      .def("batch_get_ranges_from_arrays", &BatchGetRangesFromArrays,
+           py::arg("keys"), py::arg("ptrs").noconvert(), py::arg("sizes").noconvert(),
+           py::arg("src_offsets").noconvert(),
+           "Borrow native uint64 arrays without Python-element conversion. "
+           "Pointers are (objects,ranges); sizes/offsets may be shared 1D rows. "
+           "Do not modify arrays until this synchronous call returns.")
       .def("batch_put_ranges_from_ptr", &IUMBPClient::BatchPutRanges, py::arg("keys"),
            py::arg("object_sizes"), py::arg("ptrs"), py::arg("sizes"), py::arg("dst_offsets"),
            py::call_guard<py::gil_scoped_release>())
