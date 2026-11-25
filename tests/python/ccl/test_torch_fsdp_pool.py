@@ -150,8 +150,18 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
         assert pointers == expected_pointers
         if zero_copy:
             shared.blocks[0].set_all_gather_layout(comms[0].layout, recurse=False)
-            with pytest.raises(ValueError, match="bound to its comm"):
-                shared.blocks[0].set_custom_all_gather(DefaultAllGather())
+            default_comm = DefaultAllGather()
+            shared.blocks[0].set_custom_all_gather(default_comm)
+            group = _group(shared.blocks[0])
+            assert group._all_gather_comm is default_comm
+            assert group._all_gather_layout is comms[0].layout
+            assert group._all_gather_layout.comm is comms[0]
+            assert group._all_gather_layout._owner() is group
+            with pytest.raises(
+                ValueError, match="only work with DefaultAllGatherLayout"
+            ):
+                shared.blocks[0].set_custom_all_gather(comms[1])
+            assert group._all_gather_comm is default_comm
     for handle in handles:
         handle.remove()
     ready_bytes = (world_size * 4 + 15) // 16 * 16

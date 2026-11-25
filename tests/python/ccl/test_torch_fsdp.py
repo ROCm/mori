@@ -125,21 +125,33 @@ class TestMoriSdmaAllGather(unittest.TestCase):
 
     def test_fallback_selects_default_finalizer(self) -> None:
         comm = MoriSdmaAllGather()
-        copy_in, selected_layout, metadata = comm.layout.prepare(
-            AllGatherInputMetadata(
-                input_split_sizes=[2, 4],
-                input_outer_sizes=[1, 1],
-                input_numel=6,
-                world_size=2,
-                dtype=torch.float32,
-                device=torch.device("cpu"),
-                can_use_param_contiguous_output=False,
-            )
+        input_metadata = AllGatherInputMetadata(
+            input_split_sizes=[2, 4],
+            input_outer_sizes=[1, 1],
+            input_numel=6,
+            world_size=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            can_use_param_contiguous_output=False,
         )
-        self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
+        copy_in, selected_layout, metadata = comm.layout.prepare(input_metadata)
         self.assertIsInstance(selected_layout, DefaultAllGatherLayout)
+        expected_copy_in, expected_layout, expected_metadata = selected_layout.prepare(
+            input_metadata
+        )
+        self.assertEqual(copy_in, expected_copy_in)
+        self.assertIs(expected_layout, selected_layout)
+        self.assertIsNone(expected_metadata)
         self.assertIsNone(metadata)
         self.assertIsNone(comm._prepared_selection)
+        output = torch.full((12,), -1.0)
+        source, returned = copy_in(
+            [torch.arange(2.0), torch.arange(4.0)], output, [2, 4], 6, 1
+        )
+        self.assertIs(returned, output)
+        self.assertEqual(source.tolist(), [0.0, 1.0, 0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(output.tolist(), [-1.0] * 6 + source.tolist())
+        self.assertEqual(source.data_ptr(), output[6:].data_ptr())
 
     def test_uses_safe_base_copy_in(self):
         comm = MoriSdmaAllGather()
