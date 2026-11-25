@@ -211,25 +211,32 @@ class HipMemoryApi final : public MemoryApi {
     return true;
   }
 
-  // Pinned, so a copy to or from a device goes straight to these pages. The
-  // runtime's lock is taken shared: this pins gigabytes, and the copies the
-  // pools are serving must not wait for it.
+  // Pinned, so a copy to or from a device goes straight to these pages:
+  // ordinary memory, written once so that it exists where this thread's
+  // memory policy puts it, then registered. (hipHostMalloc was measured at a
+  // tenth of a GiB a second; this is several.) The runtime's lock is taken
+  // shared: the copies the pools are serving must not wait for gigabytes to
+  // be pinned.
   void* AllocateHost(uint64_t bytes, bool pinned, std::string* error) override {
-    if (!pinned) return MemoryApi::AllocateHost(bytes, false, error);
+    void* ptr = MemoryApi::AllocateHost(bytes, false, error);
+    if (ptr == nullptr || !pinned) return ptr;
+    std::memset(ptr, 0, static_cast<size_t>(bytes));
     std::shared_lock<std::shared_mutex> shared(hip_mutex_);
-    void* ptr = nullptr;
-    const hipError_t err = hipHostMalloc(&ptr, static_cast<size_t>(bytes), hipHostMallocDefault);
-    if (err != hipSuccess || ptr == nullptr) {
-      *error = HipError("hipHostMalloc", err);
+    const hipError_t err = hipHostRegister(ptr, static_cast<size_t>(bytes), hipHostRegisterDefault);
+    if (err != hipSuccess) {
+      *error = HipError("hipHostRegister", err);
+      MemoryApi::FreeHost(ptr, bytes, false);
       return nullptr;
     }
     return ptr;
   }
 
   void FreeHost(void* base, uint64_t bytes, bool pinned) override {
-    if (!pinned) return MemoryApi::FreeHost(base, bytes, false);
-    std::shared_lock<std::shared_mutex> shared(hip_mutex_);
-    (void)hipHostFree(base);
+    if (pinned) {
+      std::shared_lock<std::shared_mutex> shared(hip_mutex_);
+      (void)hipHostUnregister(base);
+    }
+    MemoryApi::FreeHost(base, bytes, false);
   }
 
   bool CopyToHost(int device, const std::vector<Fragment>& fragments, std::string* error) override {
@@ -818,11 +825,15 @@ bool PoolManager::WriteAhead() {
       const Tier* tier = pool->bound ? TierOfLocked(pool) : nullptr;
       if (tier == nullptr || tier->ready_records == 0) continue;
       size_t budget = static_cast<size_t>(tier_options_.ahead * pool->num_slots);
+      // Spare copies stand among the last ones and are passed over: look at
+      // no more than a few times the budget, this runs under the pools' lock.
+      size_t looked = 4 * budget + kAheadBatch;
       // In the order an eviction takes last copies: those it has passed over
       // first, then the coldest of the rest.
       for (const std::list<uint32_t>* list : {&pool->kept, &pool->lru}) {
         for (uint32_t slot : *list) {
-          if (budget == 0 || slots.size() >= kAheadBatch) break;
+          if (budget == 0 || looked == 0 || slots.size() >= kAheadBatch) break;
+          --looked;
           const Slot& s = pool->slots[slot];
           // A copy another pool also holds is dropped at eviction, not written.
           if (!LastCopyLocked(pool, s)) continue;
@@ -854,7 +865,7 @@ void PoolManager::TierWorker() {
     lock.unlock();
     const bool worked = WriteAhead();
     lock.lock();
-    if (!worked && !stopping_) tier_wake_.wait_for(lock, std::chrono::milliseconds(5));
+    if (!worked && !stopping_) tier_wake_.wait_for(lock, std::chrono::milliseconds(20));
   }
 }
 
