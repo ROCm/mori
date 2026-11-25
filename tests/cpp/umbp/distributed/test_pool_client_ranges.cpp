@@ -757,6 +757,53 @@ TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   EXPECT_EQ(std::memcmp(out_b.data(), remote_object.data() + 5000, out_b.size()), 0);
 }
 
+TEST_F(PoolClientRangesTest, GpuPagedRangesPreserveBytesAndFailures) {
+  if (!DeviceGatherEnabled() || !GatherPathAvailable()) GTEST_SKIP() << "gather unavailable";
+  std::vector<char> source(2 * kObjectSize);
+  for (size_t i = 0; i < source.size(); ++i)
+    source[i] = static_cast<char>(i * 43 + i / kPageSize * 11);
+  const std::vector<std::string> keys = {"paged-0", "paged-1"};
+  ASSERT_EQ(target_->BatchPut(keys, {source.data(), source.data() + kObjectSize},
+                            {kObjectSize, kObjectSize}), std::vector<bool>({true, true}));
+  void* gpu = nullptr;
+  ASSERT_EQ(hipMalloc(&gpu, 512), hipSuccess);
+  std::unique_ptr<void, decltype(&hipFree)> allocation(gpu, hipFree);
+  ASSERT_TRUE(target_->RegisterMemory(gpu, 512, mori::io::MemoryLocationType::GPU, 0,
+                                     MemoryRegistration::kLocalCopyOnly));
+  auto* dst = static_cast<char*>(gpu);
+  const std::vector<std::vector<void*>> pointers = {{dst + 16, dst + 128}, {dst + 256}};
+  const std::vector<std::vector<size_t>> sizes = {{64, 31}, {79}};
+  const std::vector<std::vector<size_t>> offsets = {{kPageSize - 16, 19}, {kPageSize - 17}};
+  std::vector<char> actual(512);
+  for (bool missing : {false, true}) {
+    ASSERT_EQ(hipMemset(gpu, 0x5a, 512), hipSuccess);
+    const auto launches_before = DeviceGatherLaunchCount();
+    ASSERT_EQ(target_->BatchGetRanges({keys[0], missing ? "absent" : keys[1]},
+                                     pointers, sizes, offsets),
+              std::vector<bool>({true, !missing}));
+    if (!missing) EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+    std::vector<char> expected(512, 0x5a);
+    std::memcpy(expected.data() + 16, source.data() + kPageSize - 16, 64);
+    std::memcpy(expected.data() + 128, source.data() + 19, 31);
+    if (!missing)
+      std::memcpy(expected.data() + 256, source.data() + kObjectSize + kPageSize - 17, 79);
+    ASSERT_EQ(hipMemcpy(actual.data(), gpu, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(actual, expected);
+  }
+  ASSERT_EQ(hipMemset(gpu, 0x5a, 512), hipSuccess);
+  for (const std::vector<size_t>& invalid : {std::vector<size_t>{kObjectSize - 8, 0}, {0, 4}}) {
+    const auto launches_before = DeviceGatherLaunchCount();
+    EXPECT_EQ(target_->BatchGetRanges({keys[0]}, {pointers[0]}, {{16, 16}}, {invalid}),
+              std::vector<bool>({false}));
+    EXPECT_EQ(DeviceGatherLaunchCount(), launches_before);
+  }
+  ASSERT_EQ(hipMemcpy(actual.data(), gpu, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(actual, std::vector<char>(512, 0x5a));
+  EXPECT_TRUE(target_->BatchGetRanges({}, {}, {}, {}).empty());
+  EXPECT_EQ(target_->BatchGetRanges({keys[0]}, {{dst}}, {{}}, {{0}}), std::vector<bool>({false}));
+  target_->DeregisterMemory(gpu);
+}
+
 TEST_F(PoolClientRangesTest, GpuRangesUseGatherKernel) {
   struct HipAllocation {
     void* ptr = nullptr;

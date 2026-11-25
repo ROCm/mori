@@ -148,6 +148,14 @@ class RealPoolPlatform final : public PoolPlatform {
   void AddHostGatherRegion(void* ptr, size_t size) override {
     if (hbm_engine_) hbm_engine_->AddHostGatherRegion(ptr, size);
   }
+  std::optional<bool> CopyPagedRanges(
+      const MediumBackend& backend, const std::vector<size_t>& candidates,
+      const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& offsets, int device) override {
+    if (!hbm_engine_) return std::nullopt;
+    return hbm_engine_->CopyPagedRanges(backend, candidates, resolved, dsts, sizes, offsets, device);
+  }
   void ClearHostGatherRegions() override {
     if (hbm_engine_) hbm_engine_->ClearHostGatherRegions();
     hbm_engine_ = nullptr;

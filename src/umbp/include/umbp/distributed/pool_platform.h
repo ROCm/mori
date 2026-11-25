@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "umbp/distributed/config.h"
@@ -53,6 +54,12 @@ class PoolPlatform {
   virtual void FreeHost(HostBufferHandle& buffer) = 0;
   virtual void AddHostGatherRegion(void*, size_t) {}
   virtual void ClearHostGatherRegions() {}
+  virtual std::optional<bool> CopyPagedRanges(
+      const MediumBackend&, const std::vector<size_t>&, const std::vector<ResolvedEntry>&,
+      const std::vector<std::vector<void*>>&, const std::vector<std::vector<size_t>>&,
+      const std::vector<std::vector<size_t>>&, int) {
+    return std::nullopt;
+  }
 };
 
 std::shared_ptr<PoolPlatform> MakePoolPlatform(const UMBPSimConfig& sim);

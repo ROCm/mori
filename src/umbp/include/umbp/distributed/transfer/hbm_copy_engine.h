@@ -25,12 +25,16 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
+
+class MediumBackend;
+struct ResolvedEntry;
 
 // The one-endpoint-is-GPU implementation of TransferEngine.
 //
@@ -102,6 +106,13 @@ class HbmCopyEngine final : public TransferEngine {
   // into, which is what decides whether a kernel beats the copy engine.
   void AddHostGatherRegion(void* base, size_t bytes);
   void ClearHostGatherRegions();
+
+  // nullopt: unsupported/no copy issued; false: execution failed; true: complete.
+  std::optional<bool> CopyPagedRanges(
+      const MediumBackend& backend, const std::vector<size_t>& candidates,
+      const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& offsets, int device);
 
   // Both endpoints addressable in this process, at least one of them GPU.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
