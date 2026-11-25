@@ -36,6 +36,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     cross_dtype_skip_reason,
     EpDispatchCombineTestCase,
     assert_worker_results,
+    check_dispatch_rows_routed_here,
     run_ep_dispatch_combine_test,
     run_ep_dispatch_local_expert_count_test,
 )
@@ -682,6 +683,110 @@ def test_dispatch_slot_assign_lane_tiling(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# ---------------------------------------------------------------------------
+# -1 routing sentinel tests (AsyncLL)
+#
+# A negative expert id drops that slot; a row routed entirely to -1 is a padding
+# row and must reach no rank. Slot assignment used to divide before checking the
+# sign, and -1 / num_experts_per_rank truncates to 0, so every padding row went to
+# PE 0 and came back through combine.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncLLSentinelTestCase(AsyncLLDispatchCombineTestCase):
+    def check_dispatch_result(
+        self,
+        op,
+        test_data,
+        dispatch_output,
+        dispatch_weights,
+        dispatch_scales,
+        dispatch_indices,
+        dispatch_recv_num_token,
+    ):
+        if self.config.num_experts_per_token % 8 == 0:
+            super().check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
+        check_dispatch_rows_routed_here(
+            op, self.config, test_data, dispatch_recv_num_token
+        )
+
+
+def _test_dispatch_combine_sentinel(
+    rank,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    sentinel_pattern,
+):
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        _AsyncLLSentinelTestCase,
+        use_max_token_num=True,
+        sentinel_pattern=sentinel_pattern,
+    )
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+# 6 is DeepSeek-V4's top-k.
+@pytest.mark.parametrize("num_experts_per_token", (8, 6))
+@pytest.mark.parametrize(
+    "sentinel_pattern",
+    ("unrouted_token", "padded_tail", "every_other", "first_only", 1),
+)
+def test_dispatch_combine_minus_one_sentinel(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    sentinel_pattern,
+):
+    """AsyncLL dispatch + combine must skip -1 routing entries, not send them to PE 0."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_sentinel,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    sentinel_pattern,
                 ],
             )
         )
