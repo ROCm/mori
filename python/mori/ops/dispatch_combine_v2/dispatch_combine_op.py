@@ -1384,7 +1384,9 @@ class EpDispatchCombineOp:
         max_num_inp_token_across_ranks=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
-        scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
+        scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32. An id < 0
+        or >= world_size * num_experts_per_rank drops its slot (-1 on padding
+        rows): a row of only such ids reaches no rank and combines to zeros.
 
         routing=: replay a prior handle (reuse the cached dest-slot layout, skip
         atomic routing). return_routing=: also return the handle. Mutually

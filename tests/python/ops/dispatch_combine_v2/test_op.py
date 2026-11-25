@@ -104,6 +104,7 @@ def _configure():
     """Read the knobs below from the environment (again for every CASES entry)."""
     global HIDDEN, K, EPR, DTYPE, _IS_FP4, _IS_FP8, STDMOE, SCALE_DIM, COMBINE
     global QUANT, INSCALE, SPREAD, TINY, SWEEP, RAGGED, NOSELF, FRESH, REROUTE, NOWTS
+    global DROPPED
     HIDDEN = int(os.environ.get("HIDDEN", 7168))
     K = int(os.environ.get("TOPK", 8))
     EPR = int(os.environ.get("EPR", 32))
@@ -149,6 +150,10 @@ def _configure():
     # REROUTE=N: N more rounds per SWEEP point with new routing, each reading
     # local_expert_count (and StdMoE's packing) straight after dispatch.
     REROUTE = int(os.environ.get("REROUTE", 0))
+    # DROPPED=1: slots dispatch must drop, ids < 0 or >= npes * EPR: padding rows
+    # (all -1, or -1 and out of range), -1 next to valid slots, out of range ahead of
+    # them.
+    DROPPED = int(os.environ.get("DROPPED", 0))
 
 
 _configure()
@@ -195,6 +200,13 @@ def _run(d, comm):
         idx += (idx >= rank * EPR).to(torch.int32) * EPR
     else:
         idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32)
+    if DROPPED:
+        rows, cols = torch.arange(M), torch.arange(K)
+        oob = (num_experts + cols).to(torch.int32)
+        idx[rows % 4 == 3] = torch.where(cols % 2 == 0, oob, -1).to(torch.int32)
+        idx[(rows % 3 == 1).nonzero(as_tuple=True)[0].unsqueeze(1), cols[1::2]] = -1
+        idx[rows % 5 == 2, 0] = num_experts
+        idx[0] = -1
     idx = idx.to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
@@ -295,7 +307,8 @@ def _run(d, comm):
             # the dest map (a dup or dropped slot is null; gfx125x never caps, and its
             # LL128 map is not flat-encoded).
             idx_cpu = idx[:ct].cpu()
-            pes = torch.where(idx_cpu >= 0, idx_cpu // EPR, -1)
+            valid = (idx_cpu >= 0) & (idx_cpu < npes * EPR)
+            pes = torch.where(valid, idx_cpu // EPR, -1)
             reach = [{int(p) for p in row if p >= 0} for row in pes]
             stride = cfg.effective_max_recv
             if cap is not None:
@@ -482,16 +495,16 @@ def _run(d, comm):
                 sync()
                 comm.barrier()
                 # telescopes to (sum_k wts)*input, over the k whose PE kept the token
+                # (a dropped slot keeps nothing, with or without a cap)
+                keep = torch.tensor(
+                    [
+                        [p >= 0 and p in reach[t] for p in pes[t].tolist()]
+                        for t in range(ct)
+                    ],
+                    dtype=torch.bool,
+                ).view(ct, K)
                 w_k = wts[:ct].float().cpu()
-                if cap is not None:
-                    keep = torch.tensor(
-                        [
-                            [p >= 0 and p in reach[t] for p in pes[t].tolist()]
-                            for t in range(ct)
-                        ],
-                        dtype=torch.bool,
-                    ).view(ct, K)
-                    w_k = torch.where(keep, w_k, torch.zeros_like(w_k))
+                w_k = torch.where(keep, w_k, torch.zeros_like(w_k))
                 ws = w_k.sum(dim=1, keepdim=True)
                 exp = (ws * inp[:ct].float().cpu()).to(DTYPE)
                 ok = torch.allclose(

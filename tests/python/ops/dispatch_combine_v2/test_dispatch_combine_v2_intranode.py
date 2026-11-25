@@ -320,6 +320,16 @@ def _cases():
         "MAXRECV": 1024,
     }
     yield "hip-bf16-stdmoe-cap", dict(hip, DTYPE="bf16", STDMOE=1, MAXRECV=1024)
+    # Slots the caller drops (id -1 or out of range): padding rows reach no rank, and
+    # a dropped slot never dedups a valid one (EPR=2: most tokens repeat a PE).
+    drop = {"DTYPE": "bf16", "DROPPED": 1}
+    yield "bf16-gather-dropped", dict(drop, COMBINE="gather")
+    yield "bf16-scatter-dropped", dict(drop, COMBINE="scatter")
+    yield "bf16-gather-replay-dropped", dict(drop, COMBINE="gather", REPLAY=1)
+    yield "bf16-stdmoe-dropped", dict(drop, COMBINE="gather", STDMOE=1)
+    yield "bf16-gather-dropped-epr2", dict(drop, COMBINE="gather", EPR=2, TOPK=6)
+    yield "hip-bf16-gather-dropped", dict(hip, **drop)
+    yield "hip-bf16-stdmoe-dropped", dict(hip, STDMOE=1, **drop)
 
 
 _CASES = dict(_cases())
