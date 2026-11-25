@@ -526,8 +526,20 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
     }
     std::vector<TransferFailure> failures;
     if (auto handle = engine_.Submit(std::move(plans))) handle->Wait(&failures);
+    // A plan the gather kernel declines (128 KiB a fragment or more) is copied
+    // with hipMemcpy. Between two devices that returns once the bytes have
+    // landed; within one device it returns as soon as the copy is queued, so
+    // those need the device synchronized before anything is handed on -- also
+    // when another plan failed, since the caller then gives the slots up.
+    std::string sync_error;
+    const bool landed =
+        by_source.count(dst_device) == 0 || inner_->Synchronize(dst_device, &sync_error);
     if (!failures.empty()) {
       *error = failures.front().message;
+      return false;
+    }
+    if (!landed) {
+      *error = sync_error;
       return false;
     }
     return true;
