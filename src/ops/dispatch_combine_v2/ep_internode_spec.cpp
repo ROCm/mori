@@ -101,6 +101,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   // Only the passes with cross-node traffic read it; the local ones (copystaging, combinesync,
   // combineall) then share one module between atomic and atomic-free ops.
   cfg.kernelCfg.noRdmaAtomics = request.noRdmaAtomics && DescriptorFor(kind).takesComm;
+  // Dispatch passes only, so the other passes keep one module with and without it.
+  cfg.kernelCfg.moeSort = request.moeSort && (kind == EpInterNodeKernel::Dispatch ||
+                                              kind == EpInterNodeKernel::DispatchLL);
   cfg.kernelCfg.windowUncached = request.windowUncached && (kind == EpInterNodeKernel::Combine ||
                                                             kind == EpInterNodeKernel::CombineLL);
   cfg.asyncLlMode = request.asyncLlMode;
@@ -137,6 +140,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   }
   if (request.noRdmaAtomics && family == EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: AsyncLL has no write-signalling (noRdmaAtomics) variant");
+  }
+  if (request.moeSort && family == EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: AsyncLL has no moeSort variant");
   }
   if (cfg.asyncLlMode != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: asyncLlMode is only supported by AsyncLL plans");

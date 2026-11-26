@@ -265,12 +265,15 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(offOutScales, "u64")                 \
   X(offSendCount, "u64")                 \
   X(offCombineStaging, "u64")            \
+  X(offMoeSort, "u64")                   \
   X(rank, "i32")                         \
   X(lsaBase, "i32")                      \
   X(rdmaBlockNum, "i32")                 \
   X(replayMode, "i32")                   \
   X(curRankNumToken, "i32")              \
   X(sdmaQueueOffset, "i32")              \
+  X(sortBlockM, "i32")                   \
+  X(sortZeroRowBytes, "i32")             \
   X(tokenIndices, "p")                   \
   X(inpTokenBuf, "p")                    \
   X(weightsBuf, "p")                     \
@@ -285,6 +288,12 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(dispatchGridBarrier, "p")            \
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")         \
+  X(sortedTokenIds, "p")                 \
+  X(sortedWeights, "p")                  \
+  X(sortedExpertIds, "p")                \
+  X(sortNumValid, "p")                   \
+  X(sortZeroState, "p")                  \
+  X(sortZeroOut, "p")                    \
   X(dispReceiverIdxMap, "p")             \
   X(segStride, "u64")
 
@@ -327,6 +336,9 @@ struct EpInterNodeArgs {
   // writing it cannot race dispatch's in-flight transfer reading the other one.
   // See asyncll_regions for why the two phases do not share.
   uint64_t offCombineStaging{0};
+  // moeSort only (kConfig.moeSort); 0 otherwise. Per local expert, a counter and a bucket of
+  // (sorted id, weight) entries that the senders fill as they place a token.
+  uint64_t offMoeSort{0};
 
   // Which world rank this is. Runtime, not Cfg, for the reason EpArgs gives:
   // as a compiled-in constant every rank on a node builds its own copy of an
@@ -342,6 +354,9 @@ struct EpInterNodeArgs {
   // AsyncLL/SDMA: per-op offset added to the destination PE when picking its SDMA
   // queue (asyncll::QueueForPe). Fills the alignment gap, so no field moves.
   int32_t sdmaQueueOffset{0};
+  // moeSort: aiter's block_size_M, and the expert-output row bytes to zero (0 = do not zero).
+  int32_t sortBlockM{0};
+  int32_t sortZeroRowBytes{0};
 
   ep_index_t* tokenIndices{nullptr};
   // void*, like the intranode EpArgs: callers cast at the use site. Keeping it
@@ -367,6 +382,16 @@ struct EpInterNodeArgs {
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* interNodeBlocksBarrier{nullptr};  // v2 / v2_ll: [0] arrivals, [1] combine release
   uint64_t* crossDeviceBarrierFlag{nullptr};
+  // moeSort outputs, aiter's moe_sorting contract: sorted ids (row | topk slot << 24),
+  // weights, a local expert id per block of sortBlockM rows, and {padded rows, received rows}.
+  ep_index_t* sortedTokenIds{nullptr};
+  float* sortedWeights{nullptr};
+  ep_index_t* sortedExpertIds{nullptr};
+  ep_index_t* sortNumValid{nullptr};
+  // moeSort with zeroing: the rows of sortZeroOut the last FC2 accumulated into, and the
+  // buffer (this rank's expert output, sortZeroRowBytes per row).
+  ep_index_t* sortZeroState{nullptr};
+  void* sortZeroOut{nullptr};
   // AsyncLL only: recv slot -> the send-buffer slot offset it arrived in, so
   // combine's send leg can put each result back where dispatch took it from.
   // v1 calls this dispReceiverIdxMap and keeps it in plain device memory too.
@@ -404,7 +429,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 42,
+static_assert(detail::kEpInterNodeArgsFieldCount == 51,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
