@@ -557,7 +557,9 @@ class All2allSdma:
         ``_TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES`` a rank into a registered output
         skip the output transit buffer and the copy out of it; smaller calls
         are not affected. A peer writes into the tensor only while this rank is
-        inside the call.
+        inside the call. The handle holds the tensor until
+        deregister_output_buffer, so its memory is not reused while peers can
+        still reach it.
         """
         if self._backend != "tdm" or not self._copy_out:
             raise RuntimeError(
@@ -571,7 +573,9 @@ class All2allSdma:
             for p, r in self._tdm_registered.items()
             if p + r[2] <= tensor.data_ptr() or tensor.data_ptr() + size <= p
         }
-        self._tdm_registered[tensor.data_ptr()] = (cpu, gpu, size)
+        # Kept alive until it is deregistered: a peer must never write into
+        # memory the allocator has handed to something else.
+        self._tdm_registered[tensor.data_ptr()] = (cpu, gpu, size, tensor)
 
     def deregister_output_buffer(self, tensor) -> None:
         """Undo register_output_buffer. Collective, like it."""
