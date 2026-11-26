@@ -28,10 +28,11 @@
 // Chunk p of `input` (elementCount elements) goes to rank p, at offset myPe * elementCount of that
 // rank's result. Where the result ends up is fixed per handle by python/mori/ccl/collective.py:
 //   output set   in the caller's output. Every rank writes its chunks into half (call % 2) of each
-//                peer's output transit buffer and its own chunk straight into output; once a
-//                peer's tiles have landed, the blocks copy them from the half into output.
-//                Consecutive calls write different halves, so nobody waits for a peer before
-//                writing.
+//                peer's output transit buffer and its own chunk straight into output. A warp
+//                raises a tile's word on the receiver as soon as the tile is out, and a warp whose
+//                own tiles are out copies tiles whose word is up from the half into output, so
+//                the copy overlaps the push (detail::CclTdmA2aCopyOverlapped). Consecutive calls
+//                write different halves, so nobody waits for a peer before writing.
 //   output null  at the start of the output transit buffer, which the caller reads after the
 //                kernel. Block 0 exchanges a start token with every peer and then lets the other
 //                blocks go, so a rank writes into a peer only once the peer has started the call,
@@ -43,16 +44,20 @@
 //
 // Every rank deals the tiles to its blocks the same way, and a tile's destination does not depend
 // on the sender, so the tiles that block b of rank s writes into rank r are the ones block b of
-// rank r has to see land. Completion therefore goes block to block, and nothing gathers a rank's
-// blocks: a block that wrote anything fences its writes and raises its word on every peer, and a
-// block with tiles landing here waits for the same block's word from every peer. With output set,
-// block 0 also waits for block 0 of every peer, which is what lets call g + 1 write without
-// waiting: a peer that has raised its word for call g has started call g, so it is done with
-// call g - 1, the last call to read the half that call g + 1 writes.
+// rank r has to see land. Completion therefore never gathers a rank's blocks. With output null it
+// goes block to block: a block that wrote anything fences its writes and raises its word on every
+// peer, and a block with tiles landing here waits for the same block's word from every peer. With
+// output set it goes tile by tile, and every rank waits for at least one tile from every peer,
+// which is what lets call g + 1 write without waiting: a peer that has raised a word for call g
+// has started call g, so it is done with call g - 1, the last call to read the half that call
+// g + 1 writes.
 //
 // Every value below only grows, so nothing is cleared after a call and a slow rank cannot miss one.
-//   words     npes x gridDim.x u64 that collective.py reserves past the caller's room in each
-//             rank's output transit buffer and zeroes: word s * gridDim.x + b is the last call in
+//   words     u64 that collective.py reserves past the caller's room in each rank's output transit
+//             buffer and zeroes. Output set: npes x tileStride of them, kCclTdmA2aWordGap apart,
+//             where tileStride is the number of tiles in halfElems / npes elements; word
+//             s * tileStride + t is the last call in which rank s finished writing tile t of its
+//             chunk here. Output null: npes x gridDim.x; word s * gridDim.x + b is the last call in
 //             which block b of rank s finished writing here.
 //   flags[s]  in the host class's npes u64 flags, output null only: the last call rank s started.
 //   sync      a per-handle array in ordinary device memory, allocated zeroed by collective.py: the
@@ -60,7 +65,7 @@
 //             that block 0 sets to g once every peer has started call g (output null).
 // Measured on 4 gfx1250 GPUs (256 CUs each) with graphs of 100 calls: exchanging one word with
 // every peer took about 3 us a call from block 0 alone and about 9 us from all 64 blocks, a fence
-// each, so only the blocks that have tiles to send or to receive take part.
+// each, so with output null only the blocks that have tiles to send or to receive take part.
 
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 #include <hip/hip_runtime.h>
@@ -141,6 +146,35 @@ __device__ __forceinline__ void CclTdmA2aWarpCopy(uint32_t* dst, const uint32_t*
     done = static_cast<size_t>(rows) * MORI_CCL_TDM_A2A_TILE_W;
   }
   for (size_t i = done + laneId; i < n; i += waveSize) dst[i] = src[i];
+}
+
+// CclTdmA2aWarpCopy with system scope on every store; on the TDM store that is bits 3-4 of the
+// builtin's last operand. Returns whether the lanes stored any of it.
+__device__ __forceinline__ bool CclTdmA2aWarpCopySys(uint32_t* dst, const uint32_t* src, size_t n,
+                                                     uint32_t* ldsTile, int laneId, int waveSize) {
+  typedef int _v4i __attribute__((ext_vector_type(4)));
+  typedef int _v8i __attribute__((ext_vector_type(8)));
+  constexpr int kCpolScopeSys = 0x18;
+  size_t done = 0;
+  const uintptr_t addrBits = reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+  const int rows = static_cast<int>(n / MORI_CCL_TDM_A2A_TILE_W);
+  if ((addrBits & 127) == 0 && rows >= 2) {
+    const gfx1250_TDM_GROUP1 g1 = CclTdmShape2D(MORI_CCL_TDM_A2A_TILE_W, rows);
+    CclTdmIssueLoad(ldsTile, src, g1);
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+    gfx1250_TDM_GROUP0 g0;
+    g0.ldsAddr(reinterpret_cast<uintptr_t>(ldsTile));
+    g0.globalAddr(reinterpret_cast<uintptr_t>(dst));
+    _v4i z4{0, 0, 0, 0};
+    _v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
+    __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, kCpolScopeSys);
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+    done = static_cast<size_t>(rows) * MORI_CCL_TDM_A2A_TILE_W;
+  }
+  for (size_t i = done + laneId; i < n; i += waveSize) {
+    __scoped_atomic_store_n(dst + i, src[i], __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  }
+  return done < n;
 }
 
 __device__ __forceinline__ void CclTdmA2aWaitPeer(const uint64_t* flag, uint64_t token, int myPe,
@@ -303,6 +337,107 @@ __device__ __forceinline__ void CclTdmA2aLl128(
   }
 }
 
+// With output set, consecutive words of a peer sit this many u64 apart, so no two share a 128-byte
+// line. Measured on 4 gfx1250 GPUs: words alone, exchanged by 64 blocks, took 9.7 us a call 8 bytes
+// apart and 6.0 us 256 bytes apart. MUST AGREE WITH _TDM_A2A_WORD_GAP_BYTES in
+// python/mori/ccl/collective.py, which reserves the words.
+constexpr size_t kCclTdmA2aWordGap = 32;
+
+// The whole TDM call with output set. Items are dealt as in the zero-copy path of
+// TdmAll2allKernel_body. After each tile for a peer, the warp raises that tile's word on the peer.
+// tileStride comes from the half, not the call, so a peer that is already in the next call, with
+// another count, never raises a word this call waits on. A warp whose own tiles are out takes
+// (landing tile, source) pairs from the LDS counter `next`, in the order the peers push them,
+// waits for the tile's word and copies the tile from the half into output: the tiles that landed
+// first are copied while later ones are still being pushed. Measured on 4 gfx1250 GPUs with graphs
+// of 100 calls at 1 GiB a rank: 814.0 us a call, against 883.5 when every block waited for all of
+// its tiles before copying any; leaving the result in the transit buffer took 613.8.
+__device__ __forceinline__ void CclTdmA2aCopyOverlapped(
+    int myPe, int npes, const uint32_t* src4, uint32_t* out4, uint32_t* localTransit,
+    const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4, uint64_t call,
+    size_t halfElems, size_t wordsElems, size_t grid, size_t blk, int warpId, size_t totalWarps,
+    unsigned* next, uint32_t* ldsTile, int laneId, int waveSize) {
+  const size_t np = static_cast<size_t>(npes);
+  const size_t me = static_cast<size_t>(myPe);
+  const size_t items =
+      (chunk4 + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) / MORI_CCL_TDM_A2A_TILE_ELEMS * np;
+  const bool rotate = grid % np == 0;
+  const size_t half = static_cast<size_t>(call & 1ULL) * halfElems;
+  const size_t tileStride =
+      (halfElems / np + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) / MORI_CCL_TDM_A2A_TILE_ELEMS;
+
+  for (size_t i = static_cast<size_t>(warpId) * grid + blk; i < items; i += totalWarps) {
+    const size_t tile = i / np;
+    const size_t destPe = rotate ? (i + i / grid) % np : i % np;
+    const size_t off = tile * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    const uint32_t* const src = src4 + destPe * chunk4 + off;
+    if (destPe == me) {
+      CclTdmA2aWarpCopy(out4 + me * chunk4 + off, src, n, ldsTile, laneId, waveSize);
+      continue;
+    }
+    uint32_t* const peer =
+        reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
+    // With system scope on the TDM store the tile is not left in this GPU's cache, so the word
+    // follows s_wait_tensorcnt(0) without the system fence of the zero-copy path, whose global_wb
+    // writes this GPU's dirty lines back: a fence per tile measured 6.4 us a call slower at 32 MiB
+    // a rank. Lanes' stores are not counted by tensorcnt, so a tile that has any takes the fence.
+    if (CclTdmA2aWarpCopySys(peer + half + me * chunk4 + off, src, n, ldsTile, laneId, waveSize)) {
+      __threadfence_system();
+    }
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (laneId == 0) {
+      uint64_t* const word = reinterpret_cast<uint64_t*>(peer + wordsElems) +
+                             (me * tileStride + tile) * kCclTdmA2aWordGap;
+      __scoped_atomic_store_n(word, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+  }
+
+  // This block pushes items blk + grid * j on every rank, and the ones bound here, which are the
+  // ones it receives, are those with j = j0, j0 + period, ...
+  size_t j0 = np;
+  for (size_t j = 0; j < np && j0 == np; ++j) {
+    const size_t i = blk + grid * j;
+    if ((rotate ? (i + i / grid) % np : i % np) == me) j0 = j;
+  }
+  if (j0 == np) return;
+  size_t period = np;
+  for (size_t j = j0 + 1; j < j0 + np && period == np; ++j) {
+    const size_t i = blk + grid * j;
+    if ((rotate ? (i + i / grid) % np : i % np) == me) period = j - j0;
+  }
+  const size_t first = blk + grid * j0;
+  const size_t stride = grid * period;
+  const size_t landing = first < items ? (items - 1 - first) / stride + 1 : 0;
+  const size_t peers = np - 1;
+  const size_t pairs = landing * peers;
+  const uint32_t* const from = localTransit + half;
+  const uint64_t* const words = reinterpret_cast<const uint64_t*>(localTransit + wordsElems);
+  while (true) {
+    unsigned q32 = 0;
+    if (laneId == 0) q32 = atomicAdd(next, 1u);
+    const size_t q = __shfl(q32, 0);
+    if (q >= pairs) break;
+    const size_t tile = (first + stride * (q / peers)) / np;
+    const size_t k = q % peers;
+    const size_t srcPe = k < me ? k : k + 1;
+    const size_t off = tile * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    if (laneId == 0) {
+      CclTdmA2aWaitPeer(words + (srcPe * tileStride + tile) * kCclTdmA2aWordGap, call, myPe,
+                        static_cast<int>(srcPe));
+    }
+    // Another GPU wrote the tile, which an agent-scope acquire does not cover.
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    const size_t at = srcPe * chunk4 + off;
+    CclTdmA2aWarpCopy(out4 + at, from + at, n, ldsTile, laneId, waveSize);
+  }
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -332,6 +467,38 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
   const uint64_t grid = gridDim.x;
   const size_t blk = blockIdx.x;
   const size_t totalWarps = grid * static_cast<size_t>(warpsPerBlock);
+
+  __shared__ uint64_t s_call;
+  __shared__ unsigned s_nextPair;
+  if (threadIdx.x == 0) {
+    s_call = __scoped_atomic_load_n(sync + blk, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) + 1ULL;
+    s_nextPair = 0;
+  }
+  __syncthreads();
+  const uint64_t call = s_call;
+
+  if (llElems != 0) {
+    detail::CclTdmA2aLl128(myPe, npes, input, out4 != nullptr ? out4 : localTransit,
+                           outputTransitMemObj, chunk4 * 4, call,
+                           (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
+                           static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId, waveSize);
+    if (threadIdx.x == 0) {
+      __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+    return;
+  }
+
+  if (out4 != nullptr) {
+    detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
+                                    localTransit, outputTransitMemObj, chunk4, call, halfElems,
+                                    wordsElems, grid, blk, warpId, totalWarps, &s_nextPair, ldsTile,
+                                    laneId, waveSize);
+    if (threadIdx.x == 0) {
+      __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+    return;
+  }
+
   const size_t tilesPerChunk =
       (chunk4 + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) / MORI_CCL_TDM_A2A_TILE_ELEMS;
   const size_t items = tilesPerChunk * static_cast<size_t>(npes);
@@ -351,42 +518,20 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
              static_cast<size_t>(laneId) * grid + blk;
   }
 
-  __shared__ uint64_t s_call;
-  if (threadIdx.x == 0) {
-    s_call = __scoped_atomic_load_n(sync + blk, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) + 1ULL;
-  }
-  __syncthreads();
-  const uint64_t call = s_call;
-
-  if (llElems != 0) {
-    detail::CclTdmA2aLl128(myPe, npes, input, out4 != nullptr ? out4 : localTransit,
-                           outputTransitMemObj, chunk4 * 4, call,
-                           (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
-                           static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId, waveSize);
+  uint64_t* go = sync + MORI_CCL_TDM_A2A_SYNC_GO;
+  if (blk == 0) {
+    if (peerLane) {
+      PublishControlFlag(flagsMemObj, myPe, call, laneId);
+      detail::CclTdmA2aWaitPeer(reinterpret_cast<const uint64_t*>(flagsMemObj->localPtr) + laneId,
+                                call, myPe, laneId);
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
-      __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+      __scoped_atomic_store_n(go, call, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
     }
-    return;
-  }
-
-  const size_t half = out4 != nullptr ? static_cast<size_t>(call & 1ULL) * halfElems : 0;
-
-  if (out4 == nullptr) {
-    uint64_t* go = sync + MORI_CCL_TDM_A2A_SYNC_GO;
-    if (blk == 0) {
-      if (peerLane) {
-        PublishControlFlag(flagsMemObj, myPe, call, laneId);
-        detail::CclTdmA2aWaitPeer(reinterpret_cast<const uint64_t*>(flagsMemObj->localPtr) + laneId,
-                                  call, myPe, laneId);
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        __scoped_atomic_store_n(go, call, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
-      }
-    } else {
-      if (threadIdx.x == 0) detail::CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
-      __syncthreads();
-    }
+  } else {
+    if (threadIdx.x == 0) detail::CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
+    __syncthreads();
   }
 
   // Item i is tile i / npes of one destination's chunk. Warp ids are warp-major (warp * grid +
@@ -396,8 +541,6 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
   // over the npes items of a tile.
   {
     const uint32_t* src4 = reinterpret_cast<const uint32_t*>(input);
-    // localPtr for the self chunk, so this does not depend on p2pPeerPtrs[myPe] being populated.
-    uint32_t* const self = out4 != nullptr ? out4 : localTransit;
     for (size_t i = static_cast<size_t>(warpId) * grid + blk; i < items; i += totalWarps) {
       const size_t tile = i / npes;
       const int destPe = static_cast<int>(rotate ? (i + i / grid) % npes : i % npes);
@@ -405,10 +548,11 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
       const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
                            ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
                            : chunk4 - off;
+      // localPtr for the self chunk, so this does not depend on p2pPeerPtrs[myPe] being populated.
       uint32_t* dstRoot =
           destPe == myPe
-              ? self
-              : reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(destPe)) + half;
+              ? localTransit
+              : reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(destPe));
       detail::CclTdmA2aWarpCopy(dstRoot + static_cast<size_t>(myPe) * chunk4 + off,
                                 src4 + static_cast<size_t>(destPe) * chunk4 + off, n, ldsTile,
                                 laneId, waveSize);
@@ -434,33 +578,13 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
       }
     }
   }
-  if (landsHere || (out4 != nullptr && blk == 0)) {
+  if (landsHere) {
     if (peerLane) detail::CclTdmA2aWaitPeer(myWord, call, myPe, laneId);
     __syncthreads();
     // Peers fenced their bytes before raising the word; match it before anything reads them. Other
     // GPUs wrote them, which an agent-scope acquire does not cover.
     if (threadIdx.x == 0) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     __syncthreads();
-  }
-
-  if (out4 != nullptr && landsHere) {
-    // This block's tiles from every peer, one (tile, peer) pair a warp in turn.
-    const uint32_t* from = localTransit + half;
-    const size_t peers = static_cast<size_t>(npes - 1);
-    size_t q = 0;
-    for (size_t i = blk; i < items; i += grid) {
-      if (static_cast<int>(rotate ? (i + i / grid) % npes : i % npes) != myPe) continue;
-      const size_t off = (i / npes) * MORI_CCL_TDM_A2A_TILE_ELEMS;
-      const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
-                           ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
-                           : chunk4 - off;
-      for (size_t k = 0; k < peers; ++k, ++q) {
-        if (q % static_cast<size_t>(warpsPerBlock) != static_cast<size_t>(warpId)) continue;
-        const size_t srcPe = k < static_cast<size_t>(myPe) ? k : k + 1;
-        const size_t at = srcPe * chunk4 + off;
-        detail::CclTdmA2aWarpCopy(out4 + at, from + at, n, ldsTile, laneId, waveSize);
-      }
-    }
   }
   if (threadIdx.x == 0) {
     __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);

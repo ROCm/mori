@@ -152,7 +152,8 @@ def _tdm_shared_mem(threads: int) -> int:
 _TDM_A2A_TILE_BYTES = 256 * 16 * 4
 # 64 blocks x 16 wave32 is the 1024 warps in flight the AllReduce launch uses.
 # Must not exceed MORI_CCL_TDM_A2A_MAX_BLOCKS: every block owns a slot in the
-# sync array, and a word per rank in the output transit buffer.
+# sync array and, without copy_output_to_user, a word per rank in the output
+# transit buffer.
 _TDM_A2A_BLOCKS = 64
 _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
 # Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block and the go word.
@@ -167,6 +168,10 @@ _TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 48
 # Each half of the output transit buffer starts on a 128 B boundary, the
 # alignment TDM needs.
 _TDM_A2A_HALF_ALIGN = 128
+# With copy_output_to_user, peers raise a word for every tile they write, and a
+# peer's consecutive words sit this far apart. Must equal kCclTdmA2aWordGap * 8
+# in the kernel header. The words start on a boundary of the same size.
+_TDM_A2A_WORD_GAP_BYTES = 256
 # Calls of at most this many bytes a rank (count * npes * 4) move as LL128
 # lines instead of TDM tiles (CclTdmA2aLl128 in the kernel header). Measured on
 # 4 gfx1250 GPUs with graphs of 100 calls: 9.87 us a call at 512 KiB against
@@ -200,6 +205,17 @@ def _resolve_all2all_ll128_max_bytes() -> int:
 
 def _align_up(n: int, a: int) -> int:
     return (n + a - 1) // a * a
+
+
+def _tdm_a2a_words_bytes(npes: int, half_bytes: int, copy_out: bool) -> int:
+    # copy_output_to_user: a word per rank and tile of the largest call a half
+    # holds, half_bytes // (4 * npes) elements a destination. Otherwise a u64
+    # per rank and block.
+    if not copy_out:
+        return npes * _TDM_A2A_BLOCKS * 8
+    tile_elems = _TDM_A2A_TILE_BYTES // 4
+    tiles = (half_bytes // 4 // npes + tile_elems - 1) // tile_elems
+    return npes * tiles * _TDM_A2A_WORD_GAP_BYTES
 
 
 def _tdm_ll128_half_bytes(npes: int, max_bytes: int) -> int:
@@ -309,15 +325,26 @@ class All2allSdma:
         # synchronizations.
         handle_copy = copy_output_to_user and self._backend != "tdm"
         handle_class = getattr(mori_cpp, "All2allSdmaHandle")
-        # The TDM kernel keeps a u64 per rank and block in the output transit
-        # buffer, after the room the caller asked for and on a u64 boundary, and
-        # after those the two halves of its LL128 area, from the next page on.
+        # The TDM kernel keeps its words in the output transit buffer, after the
+        # room the caller asked for and on a _TDM_A2A_WORD_GAP_BYTES boundary,
+        # and after those the two halves of its LL128 area, from the next page on.
         extra = 0
         ll_half = 0
         if self._backend == "tdm":
             self._tdm_ll_max = _resolve_all2all_ll128_max_bytes()
             ll_half = _tdm_ll128_half_bytes(npes, self._tdm_ll_max)
-            extra = npes * _TDM_A2A_BLOCKS * 8 + 8
+            # The room the caller asked for, split as below.
+            if input_buffer_size is not None and output_buffer_size is not None:
+                room = output_buffer_size
+            elif transit_buffer_size is not None:
+                room = transit_buffer_size // 2
+            else:
+                room = 512 * 1024 * 1024 // 2
+            # The kernel is told halves of at most this size (below), so the
+            # words cover every tile it can be asked to move.
+            half_cap = room // 2 // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
+            words_bytes = _tdm_a2a_words_bytes(npes, half_cap, copy_output_to_user)
+            extra = words_bytes + _TDM_A2A_WORD_GAP_BYTES
             if ll_half:
                 extra += _TDM_A2A_LL128_ALIGN + 2 * ll_half
             else:
@@ -355,19 +382,17 @@ class All2allSdma:
             )
             # With copy_output_to_user, consecutive calls alternate between the
             # two halves of the output transit buffer.
-            half = self._output_transit_bytes // 2
+            half = min(self._output_transit_bytes // 2, half_cap)
             self._tdm_half_bytes = half // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
             # Peers raise the words and store LL128 lines from the first call on;
             # a zeroed line shows no call number. Offsets count from the start of
             # the buffer, which ShmemMalloc puts on a 256 B boundary.
-            words_at = (self._output_transit_bytes + 7) // 8 * 8
-            ll_at = _align_up(
-                words_at + npes * _TDM_A2A_BLOCKS * 8, _TDM_A2A_LL128_ALIGN
-            )
+            words_at = _align_up(self._output_transit_bytes, _TDM_A2A_WORD_GAP_BYTES)
+            ll_at = _align_up(words_at + words_bytes, _TDM_A2A_LL128_ALIGN)
             self._tdm_ll_elems = ll_at // 4 if ll_half else 0
             _ptr_to_tensor(
                 self._handle.get_output_transit_buffer()[0] + words_at,
-                extra - 8,
+                extra - _TDM_A2A_WORD_GAP_BYTES,
                 torch.int32,
                 self._tdm_sync.device,
             ).zero_()
