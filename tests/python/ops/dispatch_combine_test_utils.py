@@ -599,6 +599,11 @@ class EpDispatchCombineTestCase:
                     # the remaining tokens keep the selected routing.
                     indices[0, :] = -1
                     sentinel_slots = []
+                elif sentinel_pattern == "padded_tail":
+                    # Graph-padding style batch: every row at or past half the
+                    # count is a padding row routed entirely to -1.
+                    indices[n // 2 :, :] = -1
+                    sentinel_slots = []
                 elif sentinel_pattern == "every_other":
                     sentinel_slots = list(range(1, k, 2))
                 elif sentinel_pattern == "first_only":
@@ -905,6 +910,36 @@ class EpDispatchCombineTestCase:
                 combine_output_weight,
                 combine_data_type=self.combine_data_type,
             )
+
+
+def check_dispatch_rows_routed_here(op, config, test_data, dispatch_recv_num_token):
+    """This rank receives exactly the source rows that route a valid expert to it.
+
+    A -1 routing id routes nowhere, so a padding row (every id -1) must reach no
+    rank, and a row whose only tie to this rank is a -1 slot must not reach it.
+    """
+    all_rank_num_token, all_rank_indices = test_data[0], test_data[1]
+    my_pe = config.rank
+    expected = set()
+    for src_rank in range(config.world_size):
+        n = int(all_rank_num_token[src_rank])
+        for t, ids in enumerate(all_rank_indices[src_rank][:n].cpu().tolist()):
+            if any(i >= 0 and i // config.num_experts_per_rank == my_pe for i in ids):
+                expected.add((src_rank, t))
+
+    got = [
+        op.decode_send_flat_idx(pos)
+        for pos in op.get_dispatch_src_token_pos().cpu().tolist()
+    ]
+    assert len(got) == int(dispatch_recv_num_token[0])
+    assert len(set(got)) == len(got), f"Rank[{my_pe}] received a source row twice"
+    stray = sorted(set(got) - expected)
+    missing = sorted(expected - set(got))
+    assert not stray and not missing, (
+        f"Rank[{my_pe}] received {len(got)} rows, expected {len(expected)}: "
+        f"{len(stray)} route nothing here (first: {stray[:4]}), "
+        f"{len(missing)} missing (first: {missing[:4]})"
+    )
 
 
 def check_local_expert_count(op, dispatch_indices, dispatch_recv_num_token):

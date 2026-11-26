@@ -144,6 +144,10 @@ class LinkManager {
     size_t inStart{0};
     std::vector<uint8_t> out;
     size_t outStart{0};
+    // Timing belongs to one connection: the peer's clock can move while the link is down, so
+    // a reconnect starts with no samples.
+    HeartbeatTracker heartbeat;
+    bool timingLogged{false};  // this connection's first sample has been logged
   };
 
   struct Link {
@@ -204,10 +208,11 @@ class LinkManager {
 
   // Reading and the protocol.
   void OnReadable(Conn* c, uint64_t now);
-  bool ProcessFrames(Conn* c, uint64_t rxMonoNs);
+  bool ProcessFrames(Conn* c, uint64_t rxMonoNs, int64_t rxWallNs);
   bool OnHelloRequest(Conn* c, const proto::RasHeader& h, const proto::Hello& hello, uint64_t now);
   bool OnHelloReply(Conn* c, const proto::RasHeader& h, const proto::Hello& hello, uint64_t now);
-  bool OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs);
+  bool OnLinkMessage(Conn* c, Link& l, const proto::Message& m, uint64_t rxMonoNs,
+                     int64_t rxWallNs);
   void RejectHello(Conn* c, proto::HelloStatus status, uint64_t now);
   void ProtocolError(Conn* c, const std::string& detail, uint64_t now);
 

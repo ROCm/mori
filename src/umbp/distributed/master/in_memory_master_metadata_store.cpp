@@ -341,8 +341,11 @@ HeartbeatResult InMemoryMasterMetadataStore::ApplyHeartbeat(
     std::unique_lock lock(meta_mutex_);
 
     auto it = clients_.find(node_id);
-    if (it == clients_.end()) {
-      MORI_UMBP_WARN("[MetadataStore] Heartbeat from unknown node: {}", node_id);
+    // An EXPIRED row lost its block locations to the reaper. A keepalive or
+    // delta gets UNKNOWN so the client re-registers and full-syncs them; a full
+    // sync carries them all and revives the row below.
+    if (it == clients_.end() || (!is_full_sync && it->second.status == ClientStatus::EXPIRED)) {
+      MORI_UMBP_WARN("[MetadataStore] Heartbeat from unknown or expired node: {}", node_id);
       return HeartbeatResult{HeartbeatResult::UNKNOWN, 0};
     }
     auto& record = it->second;

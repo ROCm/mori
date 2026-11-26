@@ -72,10 +72,8 @@ struct vmmProcessLock {
 // one that most needs to say so. ERROR, not WARN -- the default global level is
 // ERROR. Not fatal: a comm without SDMA is legal and every other path works.
 //
-// `asked` covers both ways of asking -- an explicit sdmaQueueCount and
-// MORI_ENABLE_SDMA -- because the count defaults to 0 and almost every caller
-// leaves it there. Nobody asking is the default configuration, and not wanting
-// SDMA is not an error, so that case stays silent.
+// `asked` is an explicit sdmaQueueCount > 0. A count of 0 does not want SDMA,
+// which is not an error, so that case stays silent.
 void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
   if (!asked) return;
   MORI_SHMEM_ERROR(
@@ -86,13 +84,21 @@ void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
 
 void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
-  // Idempotent: first DevComm fixes the channel count; later ones reuse it.
+  // Idempotent: the first DevComm that asks fixes the channel count; later ones,
+  // including those that ask for 0, reuse it.
   if (comm->sdmaDevHandles != nullptr) {
     int want = std::min(requestedChannels, anvil::kMaxSdmaChannelsPerPair);
     if (want > 0 && want != comm->sdmaNumQueue) {
       MORI_SHMEM_WARN("sdmaQueueCount {} ignored; comm already has {}", requestedChannels,
                       comm->sdmaNumQueue);
     }
+    return;
+  }
+
+  // Only an explicit count creates queues; MORI_ENABLE_SDMA just permits them.
+  // Idle queues still cost: each KFD sdma_<gpu_id> read scans their registers.
+  if (requestedChannels <= 0) {
+    comm->sdmaNumQueue = 0;
     return;
   }
 
@@ -106,14 +112,13 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
   if (!(comm->ctx->IsSdmaEnabled() && anySdmaCapable)) {
     bool envOn = comm->ctx->IsSdmaEnabled();
     ccoSdmaReportNoQueues(
-        requestedChannels > 0 || envOn, requestedChannels,
+        true, requestedChannels,
         !envOn ? "MORI_ENABLE_SDMA is not enabled" : "no peer reports SDMA capability");
     comm->sdmaNumQueue = 0;
     return;
   }
 
-  // requestedChannels: reqs.sdmaQueueCount, 0 = env default. Adopt the count
-  // actually connected so device-side indexing stays in bounds.
+  // Adopt the count actually connected so device-side indexing stays in bounds.
   comm->ctx->EnsureSdmaTransport(requestedChannels);
   comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
@@ -148,7 +153,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     }
   }
 #else
-  ccoSdmaReportNoQueues(requestedChannels > 0 || comm->ctx->IsSdmaEnabled(), requestedChannels,
+  ccoSdmaReportNoQueues(requestedChannels > 0, requestedChannels,
                         "this mori was built BUILD_CCO_SDMA=OFF");
   comm->sdmaNumQueue = 0;
 #endif  // BUILD_CCO_SDMA
@@ -2024,7 +2029,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // handle was exported by the same process, so for SPMT we Allgather raw
   // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
   // (See shmem's SymmMemManager::Register for the same pattern.)
-  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = env default).
+  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = none).
   ccoSdmaSetupCommQueues(comm, reqs != nullptr ? reqs->sdmaQueueCount : 0);
 
   ccoSdmaContext& sdma = hostShadow.sdma;

@@ -102,9 +102,18 @@ COMB_MODE = os.environ.get("COMB_MODE", "push")
 ASYNC_LL = int(os.environ.get("ASYNC_LL", 0)) == 1
 # "sdma" (copy engine, overlappable) or "lsa" (peer stores, faster on one node).
 ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
-if COMB_MODE not in ("pull", "push"):
-    raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
+# The AsyncLL combine's quant_type (none, fp8_blockwise_1x128, fp8_blockwise_1x32).
+#
+# ASYNC_LL=1 needs COMB_MODE=pull and CHECK=0, quant type or not. Both predate the
+# knob above: the default COMB_MODE=push hands AsyncLL the push quant type, which the
+# op refuses, and CHECK=1 raises NotImplementedError because the check asks AsyncLL
+# for combine weights.
+ASYNC_LL_QUANT = os.environ.get("ASYNC_LL_QUANT", "none")
+if COMB_MODE not in ("pull", "push", "scatter"):
+    raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push|scatter")
 _PUSH = COMB_MODE == "push"
+# COMB_MODE=scatter is the unquantized scatter combine; test_op.py checks it.
+_SCATTER = COMB_MODE == "scatter"
 # COMB_MODE=push is the quantized combine: gfx125x's push, or the gfx942/gfx950
 # scatter. Only the push has a check here; test_op.py checks the scatter.
 _GFX125X = is_gfx125x()
@@ -130,7 +139,7 @@ _PUSH_WIRE = (
     * 128
 )
 CHECK = int(os.environ.get("CHECK", 1))
-if COMB_MODE == "push" and not _GFX125X:
+if (COMB_MODE == "push" and not _GFX125X) or _SCATTER:
     CHECK = 0
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
@@ -318,7 +327,10 @@ def main():
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
-            quant_type=PUSH_QUANT if _PUSH else "none",
+            quant_type=(
+                PUSH_QUANT if _PUSH else (ASYNC_LL_QUANT if ASYNC_LL else "none")
+            ),
+            combine_mode="scatter" if _SCATTER else "gather",
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
         )
@@ -333,7 +345,8 @@ def main():
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} comb_mode={COMB_MODE}"
             f" route={ROUTE}"
-            + (f" push_quant={PUSH_QUANT} rule={PUSH_QRULE}" if _PUSH else ""),
+            + (f" push_quant={PUSH_QUANT} rule={PUSH_QRULE}" if _PUSH else "")
+            + (f" asyncll_quant={ASYNC_LL_QUANT}" if ASYNC_LL else ""),
             flush=True,
         )
 

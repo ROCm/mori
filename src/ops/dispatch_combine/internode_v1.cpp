@@ -403,8 +403,9 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
       }
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                       config.numExpertPerRank / config.gpuPerNode;
+        index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+        if (laneExpert < 0) continue;
+        int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
         if (destNode == i) {
           shouldSend |= true;
           args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
@@ -633,10 +634,14 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
     int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
+    // Sentinel lanes (-1 expert) get a unique impossible destPe, as in DispatchInterNodeRecv:
+    // -1 / numExpertPerRank truncates to 0, so without this a dropped slot reads as PE 0.
     int lanePe = -1;
     if (laneId < config.numExpertPerToken) {
-      lanePe = indices[laneId] / config.numExpertPerRank;
-      assert((lanePe < config.worldSize) && (lanePe >= 0));
+      index_t laneExpert = indices[laneId];
+      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                : (laneExpert / config.numExpertPerRank);
+      assert((laneExpert < 0) || ((lanePe < config.worldSize) && (lanePe >= 0)));
     }
     index_t srcTokId =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes +

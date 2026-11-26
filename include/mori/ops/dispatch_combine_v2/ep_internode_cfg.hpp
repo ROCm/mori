@@ -193,6 +193,10 @@ struct EpInterNodeKernelCfg {
   // only waits for its staging stores before counting them, instead of writing back L2. Combine
   // passes only.
   bool windowUncached{false};
+  // AsyncLL combine passes only: elements per scale of the fp8 combine wire, 32
+  // (E8M0) or 128 (f32); 0 = bf16 wire. Set on the combine leg alone, so the
+  // dispatch passes keep their cache entries.
+  int combineQGroup{0};
 };
 
 // The device-side config the bodies read: purely compiled-in constants, so the
@@ -233,11 +237,12 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(combineLoadFirst);
   MORI_FIELD(noRdmaAtomics);
   MORI_FIELD(windowUncached);
+  MORI_FIELD(combineQGroup);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 16,
+    EpInterNodeKernelCfg, 17,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 
@@ -266,7 +271,10 @@ inline bool EpInterNodeKernelCfgIsValid(const EpInterNodeKernelCfg& cfg) {
          cfg.numQpPerPe <= kCombineBarrierMarkerTotal && cfg.numQpToDrain >= 0 &&
          cfg.numQpToDrain <= kCombineBarrierMarkerTotal && cfg.numExpertPerRank > 0 &&
          cfg.numExpertPerToken > 0 && cfg.maxNumInpTokenPerRank > 0 && cfg.hiddenDim > 0 &&
-         (cfg.worldSize % cfg.gpuPerNode) == 0;
+         (cfg.worldSize % cfg.gpuPerNode) == 0 &&
+         // The quantized combine works in whole 128-element blocks.
+         (cfg.combineQGroup == 0 ||
+          ((cfg.combineQGroup == 32 || cfg.combineQGroup == 128) && cfg.hiddenDim % 128 == 0));
 }
 
 // The args schema, in the form plan_api publishes.

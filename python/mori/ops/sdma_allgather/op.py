@@ -149,12 +149,13 @@ class SdmaAllGatherOp:
 
         from .kernels import build_kernels
 
-        # The comm's first dev-comm fixes its queue count.
+        # The comm's first dev-comm that asks for SDMA queues fixes their count.
         if self.dev_comm.sdma_num_queue <= self.queue:
             raise RuntimeError(
                 f"SdmaAllGatherOp needs SDMA queue {self.queue}, the comm has "
                 f"{self.dev_comm.sdma_num_queue}: build mori with BUILD_CCO_SDMA=ON, set "
-                "MORI_ENABLE_SDMA=1, and create this op before other dev-comms on the comm"
+                "MORI_ENABLE_SDMA=1, and create this op before other dev-comms on the comm "
+                "that ask for SDMA queues"
             )
         if self.dev_comm.lsa_size != self.world_size:
             raise RuntimeError(

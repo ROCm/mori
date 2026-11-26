@@ -179,7 +179,12 @@ class EpDispatchCombineConfig:
     # resolved in _resolve_geometry. AsyncLL sizes its grids from the CU count instead.
     tuning_profile: str = None
     enable_std_moe: bool = False
-    max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # Recv slots a rank holds (mori maxTotalRecvTokens); 0 = the worst case ws*M.
+    # The capacity is effective_max_recv: this rounded up to a multiple of
+    # world_size, at most ws*M. One pool per receiving rank, first come first
+    # served: a slot past it is dropped (null in the dest map, adds nothing to
+    # combine), and total_recv = min(demand, capacity); equal means full.
+    max_total_recv_tokens: int = 0
     # --- internode -----------------------------------------------------------
     # GPUs per physical node. None => one node (== world_size), which is what
     # every intranode config is and keeps their behaviour unchanged. Setting it
@@ -224,9 +229,11 @@ class EpDispatchCombineConfig:
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default except on gfx125x,
-    # full intranode feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
-    # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
-    # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
+    # full intranode feature set) or "hip" (HIP/JIT: gather, the quantized combine,
+    # and on gfx942/gfx950 the recv cap, routing replay, the unquantized scatter,
+    # local_expert_count and bf16 StdMoE; dispatch transports bf16/fp32/fp8/fp4
+    # and combine reduces in bf16/fp32). "hip" is the only backend with an
+    # internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
     # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
     # default. Only consulted when constructing the BASE class; naming a
@@ -438,7 +445,8 @@ class EpDispatchCombineConfig:
         # internode path -- the backend would accept the quant type and then
         # reject the scatter this rule had just set. The internode combine is
         # unquantized, so reject here rather than rely on the scatter rule.
-        if self.quant_type != "none":
+        # AsyncLL quantizes inside its own gather combine; the backend checks it.
+        if self.quant_type != "none" and not self.async_ll:
             if self.is_internode:
                 raise ValueError(
                     f"quant_type={self.quant_type!r} is not supported on the "
@@ -586,6 +594,7 @@ class EpDispatchCombineConfig:
                     dispatch_dtype=self.dispatch_dtype,
                     combine_dtype=self.combine_dtype,
                     profile="peak" if self.async_ll else self.tuning_profile,
+                    scatter=self.is_scatter,
                 )
             else:
                 from .tuning_configs import lookup
@@ -772,7 +781,8 @@ class EpDispatchCombineConfig:
 
     @property
     def max_recv(self):
-        """Sentinel / sender-side atomic-add allocation bound (always ws*M)."""
+        """The worst-case recv count ws*M. The dest-map null is
+        ws*effective_max_recv, not this."""
         return self.world_size * self.max_num_inp_token_per_rank
 
     @property
@@ -803,6 +813,13 @@ class KernelSet:
     combine: dict[tuple, Callable]
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple, Callable] | None = None
+
+    # Local kernels over the last dispatch's recv rows; None = not served, and the
+    # capability follows. The base owns the methods and buffers; each callable
+    # takes total_recv= (local_expert_count also out=), on the current stream.
+    local_expert_count: Callable | None = None
+    convert_dispatch: Callable | None = None
+    convert_combine: Callable | None = None
 
     # The AsyncLL split (HIP only). Each is keyed like `dispatch` (KernelConfig),
     # but launches only half the pass sequence, so the caller can put its own work
@@ -871,7 +888,7 @@ class EpDispatchRoutingHandle:
         inter_node_disp_send_map,
         total_recv_token_num,
         disp_tok_id_to_src_tok_id_local=None,
-        cur_rank_num_token=0,
+        cur_rank_num_token=None,
         *,
         reverse_src_view=None,
         reverse_encode=None,
@@ -883,7 +900,9 @@ class EpDispatchRoutingHandle:
         self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
-        self.cur_rank_num_token = cur_rank_num_token
+        # None = not recorded: combine then picks as for 0, and replay refuses.
+        self.count_known = cur_rank_num_token is not None
+        self.cur_rank_num_token = cur_rank_num_token or 0
         self.max_num_inp_token_across_ranks = max_num_inp_token_across_ranks
         # Either an already-materialized reverse map (from_tensors round-trip) or
         # a live arena view to clone on first access (dispatch()).
@@ -912,8 +931,14 @@ class EpDispatchRoutingHandle:
 
     @classmethod
     def from_tensors(
-        cls, tensors, cur_rank_num_token=0, max_num_inp_token_across_ranks=_UNKNOWN_PEAK
+        cls,
+        tensors,
+        cur_rank_num_token=None,
+        max_num_inp_token_across_ranks=_UNKNOWN_PEAK,
     ):
+        """Rebuild a handle from tensors(). Pass cur_rank_num_token (the token count
+        of the dispatch that made the tensors) to replay it: replay walks that many
+        rows of the dest map, so it refuses a handle without one."""
         return cls(
             *tensors,
             cur_rank_num_token=cur_rank_num_token,
@@ -1107,7 +1132,11 @@ class EpDispatchCombineOp:
 
     @property
     def capabilities(self) -> frozenset[str]:
-        return self._kernels.capabilities
+        k = self._kernels
+        derived = {"local_expert_count"} if k.local_expert_count else set()
+        if k.convert_dispatch and k.convert_combine:
+            derived.add("std_moe")
+        return k.capabilities | derived
 
     def scale_stride_bytes(self) -> int:
         """Bytes between consecutive out_scales rows, 0 when off.
@@ -1265,6 +1294,81 @@ class EpDispatchCombineOp:
             self._reverse_view = reverse
         return reverse, None
 
+    # -- shared: the local kernels ------------------------------------------
+
+    def _alloc_local_buffers(self, cfg):
+        """The local kernels' op-owned outputs: the count, and StdMoE's packed layout."""
+        dev = self.dev
+        epr = cfg.num_experts_per_rank
+        self._local_expert_count_buf = torch.zeros(epr, dtype=torch.int32, device=dev)
+        if not cfg.enable_std_moe:
+            return
+        bucket = cfg.world_size * cfg.max_num_inp_token_per_rank
+        self._max_tok_per_expert = bucket
+        self.packed_x = torch.zeros(
+            epr * bucket * cfg.hidden_dim, dtype=cfg.dispatch_dtype, device=dev
+        )
+        self.packed_count = torch.zeros(epr, dtype=torch.int32, device=dev)
+        self.packed_src = torch.zeros(epr * bucket, dtype=torch.int32, device=dev)
+        self.slot_map = torch.full(
+            (self._recv_cap * cfg.num_experts_per_token,),
+            -1,
+            dtype=torch.int64,
+            device=dev,
+        )
+        self._packed_x_view = self.packed_x.view(epr, bucket, cfg.hidden_dim)
+
+    def local_expert_count(self):
+        """[num_experts_per_rank] int32: how many (row, k) of the last dispatch's
+        recv_indices()[:total_recv] name each of this rank's experts. Other ranks',
+        negative and out-of-range ids are skipped; a repeated id counts twice.
+
+        Valid after a dispatch until the next one (call it before combine to stay
+        backend independent). Returns one persistent buffer, rewritten by every
+        call. No host sync and no allocation, so it can be graph-captured.
+        """
+        kern = self._kernels.local_expert_count
+        if kern is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no local_expert_count for this op"
+            )
+        out = self._local_expert_count_buf
+        out.zero_()
+        kern(total_recv=self.total_recv, out=out)
+        return out
+
+    def convert_dispatch_output(self):
+        """StdMoE: pack the last dispatch's recv rows per local expert.
+
+        Returns (packed_x [num_experts_per_rank, world_size * max_tokens, hidden],
+        packed_count [num_experts_per_rank] int32, packed_src [num_experts_per_rank *
+        world_size * max_tokens] int32 = src_rank * max_tokens + src_token). The
+        expert GEMM writes over packed_x in place. Row order within a bucket is not
+        deterministic. Persistent buffers, rewritten by every call.
+        """
+        kern = self._std_moe_kernel("convert_dispatch")
+        self.packed_count.zero_()
+        self.slot_map.fill_(-1)
+        kern(total_recv=self.total_recv)
+        return self._packed_x_view, self.packed_count, self.packed_src
+
+    def convert_combine_input(self, routing):
+        """StdMoE: weighted-reduce packed_x back into the combine input,
+        combine_in_view()[r] = sum over the local k of w[r, k] * packed_x[row of
+        (r, k)], with the forwarded weights. combine() then ignores its `input`."""
+        kern = self._std_moe_kernel("convert_combine")
+        kern(total_recv=routing.total_recv_token_num)
+
+    def _std_moe_kernel(self, name):
+        if not self.cfg.enable_std_moe:
+            raise ValueError("op built without enable_std_moe")
+        kern = getattr(self._kernels, name)
+        if kern is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no StdMoE for this op"
+            )
+        return kern
+
     # -- shared: the ops ---------------------------------------------------
 
     def dispatch(
@@ -1281,7 +1385,9 @@ class EpDispatchCombineOp:
         max_num_inp_token_across_ranks=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
-        scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
+        scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32. An id < 0
+        or >= world_size * num_experts_per_rank drops its slot (-1 on padding
+        rows): a row of only such ids reaches no rank and combines to zeros.
 
         routing=: replay a prior handle (reuse the cached dest-slot layout, skip
         atomic routing). return_routing=: also return the handle. Mutually
@@ -1382,10 +1488,28 @@ class EpDispatchCombineOp:
                 "dispatch with the next combine (its recv counts and slot map are "
                 "per round), so a routing handle is only ever used by that combine"
             )
+        if self.cfg.enable_std_moe and weights is None:
+            raise ValueError(
+                "enable_std_moe: dispatch needs weights, convert_combine_input folds "
+                "the forwarded ones"
+            )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
+        # Replay reads n * topk entries of the handle's dest map, and only the handle's
+        # own tokens were written.
+        if routing is not None:
+            if not getattr(routing, "count_known", True):
+                raise ValueError(
+                    "routing replay needs the handle's token count: rebuild it with "
+                    "EpDispatchRoutingHandle.from_tensors(..., cur_rank_num_token=n)"
+                )
+            ct = routing.cur_rank_num_token
+            if n != ct:
+                raise ValueError(
+                    f"routing replay needs the handle's {ct} tokens, got {n}"
+                )
         peak = max_num_inp_token_across_ranks
         if peak is not None and not n <= peak <= cap:
             raise ValueError(
@@ -1491,9 +1615,12 @@ class EpDispatchCombineOp:
         snapshot = routing.total_recv_token_num is not self.total_recv
         _, comb_spec = self._pick(ct, snapshot, self._routing_peak(routing, snapshot))
 
-        if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
-            # StdMoE has already written the weighted-reduced tokens into out_tok;
-            # copying `input` over them would clobber that result.
+        if self.cfg.enable_std_moe:
+            # convert_combine_input already wrote the combine input to out_tok; a
+            # kernel that stages `input` itself must be pointed at it.
+            if self._kernels.stages_in_kernel:
+                input = self.combine_in_view()
+        elif not self._kernels.stages_in_kernel:
             out_tok_ptr = self.arena.local_ptr(self._region("out_tok"))
             if input.data_ptr() != out_tok_ptr:
                 dst = self.combine_in_view().view(-1)[: input.numel()]

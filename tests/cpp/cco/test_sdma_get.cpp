@@ -115,6 +115,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   // SDMA needs no GDA connectivity; the signal pool is materialized whenever the
   // comm has SDMA queues (set up in ccoCommCreate for canSDMA peers).
   mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  reqs.sdmaQueueCount = 2;
   reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_NONE;
   reqs.gdaContextCount = 0;
   reqs.gdaSignalCount = 0;

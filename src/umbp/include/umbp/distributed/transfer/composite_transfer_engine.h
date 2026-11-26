@@ -86,6 +86,10 @@ class CompositeTransferEngine final : public TransferEngine {
   // callers that want to know whether a transfer is servicable before building
   // a whole item list.
   TransferEngine* SelectEngine(const TransferRef& src, const TransferRef& dst) const;
+  // The same for an item of `item_bytes`: first engine whose CanHandleSized
+  // accepts.  This is what the planner uses per item.
+  TransferEngine* SelectEngine(const TransferRef& src, const TransferRef& dst,
+                               uint64_t item_bytes) const;
 
   // The generic per-engine series measured above, followed by whatever each
   // sub-engine publishes about its own internals (engine= already stamped on
