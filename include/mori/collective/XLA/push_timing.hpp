@@ -203,8 +203,8 @@ inline void PushTimingDump(int myPe, FILE* out = stderr) {
   snprintf(tag, sizeof(tag), "[PT %s pe=%d]", name, myPe);
   std::string s;
   const uint32_t S = T.S < 1 ? 1 : (T.S > kPushMaxSlices ? kPushMaxSlices : T.S);
-  PtAppend(s, "%s npes=%u S=%u grid=%u bytes=%llu async=%u post=%.2f issue=%.2f us\n", tag,
-           T.npes, S, T.grid, static_cast<unsigned long long>(T.bytes), T.async,
+  PtAppend(s, "%s npes=%u S=%u grid=%u bytes=%lu async=%u post=%.2f issue=%.2f us\n", tag,
+           T.npes, S, T.grid, T.bytes, T.async,
            at(T.tPost), us(T.tIssue, T.tPost));
   if (T.async) PtAppend(s, "%s done-launch entry=%.2f us\n", tag, at(T.t0[0]));
 
@@ -222,9 +222,7 @@ inline void PushTimingDump(int myPe, FILE* out = stderr) {
     spanLine("delivered", T.dlv, 0);
     PtAppend(s, "%s end=%.2f us\n", tag, at(T.tEnd));
   } else {
-    const int nb = static_cast<int>(T.grid < static_cast<uint32_t>(kPushTimingBlocks)
-                                        ? T.grid
-                                        : static_cast<uint32_t>(kPushTimingBlocks));
+    const int nb = std::min<uint32_t>(T.grid, kPushTimingBlocks);
     for (uint32_t sl = 0; sl < S; sl++) {
       char what[32];
       snprintf(what, sizeof(what), "s=%u arrive", sl);

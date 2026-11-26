@@ -61,7 +61,7 @@ static constexpr int kPushMaxSlices = 8;
 
 // Push-kernel phase timing (debug, see push_timing.hpp). 
 #ifndef MORI_PUSH_TIMING
-#define MORI_PUSH_TIMING 1
+#define MORI_PUSH_TIMING 0
 #endif
 #if MORI_PUSH_TIMING
 #define MORI_PT(...) __VA_ARGS__
