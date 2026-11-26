@@ -261,18 +261,23 @@ class HipMemoryApi final : public MemoryApi {
   }
 
  private:
-  // Every fragment on the device's own stream, waited for once, as CopyBatch.
+  // Every fragment on a stream of the device, waited for once, as CopyBatch --
+  // but a stream of its own for each direction, not the one pool-to-pool
+  // copies use: a copy to host memory has been seen to take minutes on a busy
+  // node, and a fetch from another pool, or from DRAM, must not queue behind
+  // it.
   bool HostCopy(int device, const std::vector<Fragment>& fragments, hipMemcpyKind kind,
                 std::string* error) {
     if (fragments.empty()) return true;
+    const int lane = device + (kind == hipMemcpyDeviceToHost ? kToHostLane : kFromHostLane);
     std::shared_lock<std::shared_mutex> shared(hip_mutex_);
-    std::lock_guard<std::mutex> device_lock(DeviceMutex(device));
+    std::lock_guard<std::mutex> device_lock(DeviceMutex(lane));
     ScopedDevice scope(device);
     if (!scope.ok()) {
       *error = "hipSetDevice(" + std::to_string(device) + ") failed";
       return false;
     }
-    hipStream_t stream = StreamFor(device);
+    hipStream_t stream = StreamFor(lane);
     if (stream == nullptr) {
       *error = "no copy stream on device " + std::to_string(device);
       return false;
@@ -293,6 +298,11 @@ class HipMemoryApi final : public MemoryApi {
     }
     return true;
   }
+
+  // Keys of the mutex and stream tables: a device's own number for copies
+  // between pools, and these added to it for copies to and from host memory.
+  static constexpr int kToHostLane = 1 << 16;
+  static constexpr int kFromHostLane = 2 << 16;
 
   std::mutex& DeviceMutex(int device) {
     std::lock_guard<std::mutex> lock(table_mutex_);
