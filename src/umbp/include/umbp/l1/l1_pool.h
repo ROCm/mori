@@ -51,15 +51,17 @@ namespace mori::umbp::l1 {
 // every device; each part has its own memory and layout and reports its own
 // device's progress. A copy between two pools copies part p to part p.
 //
-// DRAM tier (write-back): with host memory configured (`SetDramTier`), a
-// cached slot's content is copied into DRAM when the slot is taken for new
-// content and no other pool of the group holds that key -- the last L1 copy,
-// and only then: content an engine has just computed stays in L1 alone, and a
-// spare copy another pool also holds is simply dropped. A fetch finds a key no
-// pool holds in DRAM and copies it into the requester's slots. L1 and DRAM
-// together are then one cache whose capacities add, managed by this process.
-// The DRAM is a ring of slot records, oldest overwritten first; a key evicted
-// from L1 a second time is not copied twice while its record lives.
+// Below the pools (write-back): this class manages HBM and nothing else. With
+// a backing store set (`SetBackingStore`; in the standalone server, the UMBP
+// store the same process hosts, so DRAM on this node or wherever its master
+// routes the put), a cached slot's content is written there when the slot is
+// taken for new content and no other pool of the group holds that key -- the
+// last L1 copy, and only then: content an engine has just computed stays in L1
+// alone, and a spare copy another pool also holds is simply dropped. A fetch
+// finds a key no pool holds in the store and has it read into the requester's
+// slots. What the store keeps, for how long and on which node is the store's
+// business; this class only remembers which of the keys it still holds it has
+// already written, so that one is not written twice.
 //
 // Nothing here knows what a slot holds. A slot is `sum(region.unit_bytes)`
 // bytes, spread over the pool's regions; a key is opaque bytes.
@@ -122,16 +124,45 @@ class MemoryApi {
   // Fragments must not overlap. By default one Copy each, then Synchronize.
   virtual bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
                          std::string* error);
+};
 
-  // Host memory for the DRAM tier, not zeroed; null on failure. `pinned` asks
-  // for memory the device runtime copies to and from without staging.
-  virtual void* AllocateHost(uint64_t bytes, bool pinned, std::string* error);
-  virtual void FreeHost(void* base, uint64_t bytes, bool pinned);
-  // Copy fragments between `device` and host memory (`AllocateHost`), in the
-  // direction named, and return once all have landed. `src_device` of a
-  // fragment is not read. By default one plain memory copy each.
-  virtual bool CopyToHost(int device, const std::vector<Fragment>& fragments, std::string* error);
-  virtual bool CopyFromHost(int device, const std::vector<Fragment>& fragments, std::string* error);
+// Where the last L1 copy of a key goes when its slot is taken, and where a
+// fetch looks for a key no pool holds. The pools hand it addresses inside
+// their own memory; it moves the bytes, by whatever path it has, and decides
+// on its own what it keeps. Injectable: the standalone server supplies the
+// UMBP store it hosts, a test a fake.
+//
+// Every call may come from several threads at once, and none is made with the
+// pool manager's lock held.
+class BackingStore {
+ public:
+  struct Fragment {
+    void* address = nullptr;
+    uint64_t bytes = 0;
+  };
+  // One slot's content. The fragments stand part by part and, within a part,
+  // region by region: the same order and sizes for every pool that shares a
+  // `space`, so what one pool wrote another reads.
+  struct Block {
+    std::string key;
+    std::vector<Fragment> fragments;
+  };
+
+  virtual ~BackingStore() = default;
+  // An allocation of a pool, on `device`, that later blocks point into. Called
+  // once when a pool attaches the memory, never on the copy path.
+  virtual bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) = 0;
+  virtual void RemoveMemory(void* base) = 0;
+  // Store every block under (`space`, key) and return once its bytes are out
+  // of the pool. result[i]: block i is stored; a key already there counts.
+  virtual std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) = 0;
+  // Fill every block's fragments with what is stored under (`space`, key);
+  // the bytes have landed when this returns. result[i]: block i was filled.
+  virtual std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) = 0;
+  // result[i]: keys[i] is stored under `space`. A hint: the store may drop a
+  // key before it is read.
+  virtual std::vector<bool> Contains(const std::string& space,
+                                     const std::vector<std::string>& keys) = 0;
 };
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi();
@@ -165,28 +196,23 @@ struct PartSpec {
   uint32_t count = 1;
 };
 
-// The DRAM under the L1 pools (`PoolManager::SetDramTier`).
-struct DramTierOptions {
-  // Host bytes for evicted slots, for each group. 0: no tier, an evicted
-  // slot's content is gone.
-  uint64_t capacity_bytes = 0;
+// How the pools use their backing store (`PoolManager::SetBackingStore`).
+struct BackingStoreOptions {
   // Keep the content of this fraction of every pool's slots -- the cached last
-  // copies an eviction takes next -- already written to DRAM, by a background
-  // thread, so the eviction does not wait for the copy. 0 writes only at
-  // eviction, inside the Allocate that evicts.
+  // copies an eviction takes next -- already written to the store, by a
+  // background thread, so the eviction does not wait for the write. 0 writes
+  // only at eviction, inside the Allocate that evicts.
   double ahead = 0.0;
-  // Whether an eviction copies a last copy that was not written ahead before
-  // it hands the slot out. Off, the engine never waits for DRAM: such content
-  // is lost (and counted), which is the trade when the copy is slow.
+  // Whether an eviction writes a last copy that was not written ahead before
+  // it hands the slot out. Off, the engine never waits for the store: such
+  // content is lost (and counted), which is the trade when the write is slow.
   bool write_at_eviction = true;
-  // Slots of one extent: the unit the ring reuses, and the longest run of
-  // slots one copy moves.
-  uint32_t extent_slots = 64;
-  bool pinned = true;
-  // About what one host allocation holds; the tier's memory comes in this
-  // much at a time, in the background, and is used as it arrives.
-  uint64_t chunk_bytes = uint64_t{1} << 30;
+  // Store calls one write-back or load is split over, side by side: the store
+  // copies one call's blocks on the calling thread.
+  uint32_t threads = 4;
 };
+// From UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_WRITE_AT_EVICTION, UMBP_L1_DRAM_THREADS.
+BackingStoreOptions BackingStoreOptionsFromEnv();
 
 struct AttachResult {
   Status status;
@@ -244,16 +270,15 @@ struct PoolStats {
   uint64_t fetched_in_bytes = 0;
   uint64_t served_out_slots = 0;
   uint64_t copy_micros = 0;
-  // DRAM tier: slots of this pool written back at eviction and ahead of it,
-  // slots filled from DRAM, and evictions of a last copy DRAM did not get.
+  // Backing store: slots of this pool written to it at eviction and ahead of
+  // it, slots filled from it, and evictions of a last copy it did not get.
   uint64_t written_back_slots = 0;
   uint64_t written_ahead_slots = 0;
   uint64_t loaded_slots = 0;
   uint64_t lost_slots = 0;
+  // Time this pool's calls spent in the store: lookups, writes and loads.
+  // What the store holds and has room for is in the store's own metrics.
   uint64_t tier_micros = 0;
-  // Of the pool's group: records the DRAM holds, and has memory in for.
-  uint64_t tier_records = 0;
-  uint64_t tier_capacity = 0;
 };
 
 class PoolManager {
@@ -324,10 +349,15 @@ class PoolManager {
   // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 1;
   // 0 is plain least-recently-released).
   void SetEvictionPolicy(uint32_t keep_copies);
-  // Put DRAM under the pools. Before any pool is bound; read at construction
-  // from UMBP_L1_DRAM_BYTES (with UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_PINNED,
-  // UMBP_L1_DRAM_WRITE_AT_EVICTION).
-  void SetDramTier(const DramTierOptions& options);
+  // Put a store under the pools. Before any pool is attached: a pool's
+  // memory is made known to the store as it attaches, and a pool attached
+  // earlier does not use the store.
+  void SetBackingStore(std::shared_ptr<BackingStore> store,
+                       const BackingStoreOptions& options = {});
+  // Stop writing to and reading from the store, and wait for the writer
+  // ahead. For the store's owner, before it closes the store; the pools'
+  // memory is still taken out of it as they go.
+  void StopBackingStore();
   // Whether a grant passes over vacant slots their owner's device may still
   // be writing, evicting cold content instead, until nothing else is free.
   // Read from UMBP_L1_GRANT_SETTLED_FIRST at construction (default 1). Set
@@ -363,6 +393,10 @@ class PoolManager {
     void move_to_back(size_t i);
     // The element for `pool`, or size().
     size_t find(const Pool* pool) const;
+
+    // The backing store was given this key's content (written ahead, or it
+    // was loaded from there): its last copy needs no write when evicted.
+    bool stored = false;
 
    private:
     static constexpr size_t kInline = 3;
@@ -417,6 +451,7 @@ class PoolManager {
     void* mapped = nullptr;  // what Import returned, for Unimport
     std::string external_handle;
     uint64_t external_offset = 0;
+    bool registered = false;  // known to the backing store (`AddMemory`)
     Layout layout;
     bool bound = false;
     uint64_t committed = 0;  // how far this part's device has got
@@ -431,6 +466,10 @@ class PoolManager {
     std::vector<Part> parts;
     // Every part attached and bound: the pool has slots and can be opened.
     bool bound = false;
+    // Every part is known to the backing store: evicted last copies go there.
+    bool backed = false;
+    // Names the group and how its slots are cut, for the store's key space.
+    std::string space_prefix;
     uint32_t num_slots = 0;
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
@@ -458,34 +497,18 @@ class PoolManager {
     uint64_t tier_micros = 0;
   };
 
-  // A group's DRAM: a ring of slot records. Record i is one slot's bytes, a
-  // piece per part; records stand in extents of `extent_slots`, laid out
-  // region by region inside an extent as the slots are in a pool, so a run of
-  // neighbouring slots moves as one copy per region.
-  struct Tier {
-    uint32_t extent_slots = 0;
-    uint32_t chunk_extents = 0;  // extents one host allocation holds
-    uint32_t max_records = 0;
-    // Per part: where each region's rows start in an extent, and their size.
-    std::vector<std::vector<uint64_t>> region_start;
-    std::vector<std::vector<uint64_t>> unit_bytes;
-    std::vector<uint64_t> extent_bytes;
-    // chunks[part][c]. Record i is usable once i < ready_records.
-    std::vector<std::vector<void*>> chunks;
-    uint32_t ready_records = 0;
-    std::vector<std::string> keys;  // record -> key, empty when free
-    std::unordered_map<std::string, uint32_t> index;
-    std::vector<uint32_t> busy;  // per extent: copies in flight
-    uint32_t cursor = 0;         // the next record a write takes
-    uint64_t written = 0;
-    uint64_t loaded = 0;
-    uint64_t overwritten = 0;  // keys the ring dropped for newer ones
-  };
-
-  // A slot whose content goes to DRAM.
-  struct TierSlot {
+  // A slot whose content goes to the backing store.
+  struct StoreSlot {
     uint32_t slot = 0;
     std::string key;
+  };
+
+  // What a store call made without the lock needs: taken under it.
+  struct StoreCall {
+    std::shared_ptr<BackingStore> store;  // null: the pool has no store
+    std::string space;
+    uint64_t generation = 0;
+    uint32_t threads = 1;
   };
 
   struct Group {
@@ -493,16 +516,17 @@ class PoolManager {
     // group binds that part.
     std::vector<std::vector<uint64_t>> unit_bytes;
     Content content;
-    uint64_t slots = 0;          // of every pool bound so far: what `content` is sized for
-    std::unique_ptr<Tier> tier;  // null without a DRAM tier
+    uint64_t slots = 0;  // of every pool bound so far: what `content` is sized for
+    // Part of the store's key space. A Clear moves the group to a new one:
+    // what it wrote before can no longer be found.
+    uint64_t generation = 0;
   };
 
   struct CopyStep {
-    Pool* src = nullptr;  // null: from DRAM record `record`
+    Pool* src = nullptr;  // null: from the backing store
     uint32_t src_slot = 0;
     uint32_t dst_slot = 0;
     size_t key_index = 0;
-    uint32_t record = 0;
   };
 
   Pool* FindLocked(const std::string& pool_id);
@@ -529,31 +553,34 @@ class PoolManager {
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
   // other than the owner, which must not write where the owner still may.
   // With `victims`, an evicted slot whose content is the group's last L1 copy
-  // and not in DRAM is appended: the caller writes it back before anything
-  // writes the slot.
+  // and not yet in the backing store is appended: the caller writes it back
+  // before anything writes the slot.
   bool TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
-                      bool settled_only = false, std::vector<TierSlot>* victims = nullptr);
-  // The group's DRAM; null without one, or before a pool of the group is bound.
-  Tier* TierOfLocked(const Pool* pool) const;
-  void MakeTierLocked(Pool* pool);
+                      bool settled_only = false, std::vector<StoreSlot>* victims = nullptr);
+  // The pool's store call; `.store` is null when the pool has none.
+  StoreCall StoreCallLocked(const Pool* pool) const;
+  bool BackedLocked(const Pool* pool) const { return store_on_ && pool->backed; }
   // Whether no other pool of the group holds `slot`'s key.
-  bool LastCopyLocked(const Pool* pool, const Slot& slot) const;
-  // Whether `slot`'s content is the group's last L1 copy and not in DRAM.
+  static bool LastCopy(const Slot& slot);
+  // Whether `slot`'s content is the group's last L1 copy and the backing
+  // store has not been given it.
   bool NeedsWriteBackLocked(const Pool* pool, const Slot& slot) const;
-  // Records for up to `count` slots at the ring's cursor, within one extent,
-  // whose old keys are dropped; 0 when the tier has no memory yet. The extent
-  // counts as busy until the caller is done with it.
-  uint32_t ReserveRecordsLocked(Tier* tier, uint32_t count, uint32_t* first);
-  // Copy `slots` of `pool` into DRAM and index them there. The caller keeps
-  // the slots from changing (it holds them, or has pinned them) and holds
-  // `busy` on the pool; called without the lock. Returns how many landed.
-  size_t WriteBack(Pool* pool, const std::vector<TierSlot>& slots, bool ahead);
-  static void* RecordAddress(const Tier& tier, size_t part, size_t region, uint32_t record);
-  void GrowTier(std::string group);
-  void TierWorker();
-  // One round of writing ahead of eviction; true when something was copied.
-  bool WriteAhead();
-  void StopTierThreads();
+  // Write `slots` of `pool` to the backing store. The caller keeps the slots
+  // from changing (it holds them, or has pinned them) and holds `busy` on the
+  // pool; called without the lock. result[i]: slots[i] is stored.
+  std::vector<bool> WriteBack(Pool* pool, const std::vector<StoreSlot>& slots,
+                              const StoreCall& call, bool ahead);
+  // The fragments of `slot`, in the order every pool of its shape names them.
+  static void AppendFragments(const Pool& pool, uint32_t slot,
+                              std::vector<BackingStore::Fragment>* out);
+  // One Write (or Read) of `blocks`, split over `call.threads` store calls.
+  static std::vector<bool> StoreBlocks(const StoreCall& call,
+                                       std::vector<BackingStore::Block> blocks, bool write);
+  void StoreWorker();
+  // One round of writing ahead of eviction: slots written, or -1 when no pool
+  // had any to write.
+  int WriteAhead();
+  void StopStoreWorker();
   static bool Readable(const Pool& pool, const Slot& slot) {
     return slot.written <= pool.committed;
   }
@@ -564,8 +591,9 @@ class PoolManager {
   // Waits, without the lock, for the pool's copies to finish. Destroys nothing
   // if the pool was detached or replaced under its id in the meantime.
   void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
-  // Unmap an adopted pool's memory, free an allocated one's.
-  void ReleaseMemoryLocked(Pool* pool);
+  // Take a part's memory out of the backing store, then unmap it if adopted
+  // or free it if allocated. Without the lock: the store may make this wait
+  // for its calls in flight.
   void ReleasePart(const Part& part);
   // Whether a slot of `src` can be copied into `dst`: the same parts, each
   // with the same regions.
@@ -573,9 +601,13 @@ class PoolManager {
 
   std::shared_ptr<MemoryApi> api_;
   uint32_t keep_copies_ = 0;
-  DramTierOptions tier_options_;
-  std::vector<std::thread> tier_threads_;  // the writer ahead, and growers
-  std::condition_variable tier_wake_;
+  std::shared_ptr<BackingStore> store_;
+  // Off once the store's owner is closing it: `store_` then only takes the
+  // pools' memory back.
+  bool store_on_ = false;
+  BackingStoreOptions store_options_;
+  std::thread store_worker_;  // the writer ahead
+  std::condition_variable store_wake_;
   bool stopping_ = false;
   // A grant prefers evicting cold content to handing out a slot whose owner's
   // writes have not landed (UMBP_L1_GRANT_SETTLED_FIRST, default on).

@@ -245,8 +245,6 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           d["loaded_slots"] = stats.loaded_slots;
           d["lost_slots"] = stats.lost_slots;
           d["tier_micros"] = stats.tier_micros;
-          d["tier_records"] = stats.tier_records;
-          d["tier_capacity"] = stats.tier_capacity;
           out.append(std::move(d));
         }
         return out;

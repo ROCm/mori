@@ -197,16 +197,17 @@ message PoolStats {
   uint64 served_out_slots = 12;
   uint64 copy_micros = 13;
   uint32 parts = 14;
-  // DRAM tier (write-back): slots written at eviction and ahead of it, slots
-  // filled from DRAM, last copies evicted that DRAM did not get, time copying,
-  // and the group's DRAM records held / room.
+  // The store under the pools (write-back): slots written to it at eviction
+  // and ahead of it, slots filled from it, last copies evicted that it did not
+  // get, and the time this pool's calls spent in it. What the store holds and
+  // has room for is in the store's own metrics.
   uint64 written_back_slots = 15;
   uint64 written_ahead_slots = 16;
   uint64 loaded_slots = 17;
   uint64 lost_slots = 18;
   uint64 tier_micros = 19;
-  uint64 tier_records = 20;
-  uint64 tier_capacity = 21;
+  // Were tier_records and tier_capacity.
+  reserved 20, 21;
 }
 
 message StatsResponse {
