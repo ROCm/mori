@@ -986,7 +986,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return self._disp_infos[0]["scaleStride"]
 
     def _dispatch_warps(self, cfg, spec):
-        """The warp count a dispatch plan of this schedule row is built with. The LL
+        """The warp count a dispatch plan of this schedule row is built with. The
         dispatch's warps are its role split, so unless the caller pinned one the Cfg
         derives it from the payload (0 asks for that) instead of taking the table's.
 

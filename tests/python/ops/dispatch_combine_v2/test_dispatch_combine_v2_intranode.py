@@ -406,12 +406,13 @@ def test_dispatch_combine_v2_intranode(case, case_output):
 
 
 @pytest.mark.skipif(
-    _IS_GFX125X, reason="the dispatch drain is the gfx942/gfx950 body's"
+    _IS_GFX125X, reason="the per-block release is the gfx942/gfx950 body's"
 )
 @pytest.mark.parametrize("backend", ["default", "hip"])
 def test_dispatch_cached_window(backend):
-    """A cached cco window (CCO_UNCACHED_WINDOW=0): dispatch only drains each block's
-    peer stores before its counts, and rows read right behind it must still be complete.
+    """A cached cco window (CCO_UNCACHED_WINDOW=0): each dispatch block releases its
+    peer stores (writes its L2 back) before it arrives, and rows read right behind the
+    counts must still be complete.
     """
     env = {"CCO_UNCACHED_WINDOW": 0, "DTYPE": "bf16", "COMBINE": "gather", "FRESH": 1}
     if backend != "default":
