@@ -133,6 +133,9 @@ class HeapVAManager {
   void Reset();
 
  private:
+  // Map-based implementation (inspired by NVSHMEM for O(log n) operations)
+  using BlockMap = std::map<uintptr_t, VABlock>;
+
   /**
    * @brief Immediately coalesce a block with its adjacent free blocks
    *
@@ -140,9 +143,11 @@ class HeapVAManager {
    * neighbors of the specified block using map iterators for O(log n) lookup.
    * Called after marking a block as free.
    *
-   * @param addr Address of the block to coalesce
+   * @param it Iterator to the (already located, now-free) block to coalesce.
+   *           Must be a valid, dereferenceable iterator into blocks_; the block
+   *           it points to may be erased if it merges into its predecessor.
    */
-  void CoalesceAdjacentBlocks(uintptr_t addr);
+  void CoalesceAdjacentBlocks(BlockMap::iterator it);
 
   /**
    * @brief Coalesce all adjacent free blocks (full scan)
@@ -166,9 +171,8 @@ class HeapVAManager {
   size_t totalSize_;    // Total size of VA space
   size_t granularity_;  // Physical memory granularity (for RDMA boundary alignment)
 
-  // Map-based implementation (inspired by NVSHMEM for O(log n) operations)
   // Key: start address, Value: VABlock
-  std::map<uintptr_t, VABlock> blocks_;
+  BlockMap blocks_;
 
   // For fast neighbor lookup during coalescing
   // Key: end address (startAddr + size), Value: start address

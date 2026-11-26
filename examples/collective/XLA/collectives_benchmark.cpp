@@ -433,9 +433,6 @@ static RaggedPlan MakeRaggedPlan(const Config& cfg, int npes, size_t cap) {
   return plan;
 }
 
-// --mix: largest heap offset any PE reached in the sub-communicator phase.
-static std::atomic<size_t> gMixMark{0};
-
 struct ThreadInfo {
   int rank{-1};
   int worldSize{-1};
@@ -797,19 +794,15 @@ static void RunThreaded(const Config& cfg, const ccoUniqueId& uid, ThreadInfo& i
   if (CollectivesFacade::Create(comm, cfg.heapBytes, cfg.stagingBytes) != 0) {
     XPUT("ERROR: Failed to create CollectivesFacade");
   } else {
-    auto* start = static_cast<uint8_t*>(CollectivesFacade::Allocate(0, 1));
     rc = runOn(cfg.subBase, cfg.subN);
     if (cfg.mix) {
-      // Only the sub-communicator's PEs allocated buffers above; pad every PE's
-      // bump allocator to the same mark so the full-communicator buffers stay
-      // symmetric.
-      const size_t mark =
-          static_cast<size_t>(static_cast<uint8_t*>(CollectivesFacade::Allocate(0, 1)) - start);
-      size_t expected = gMixMark.load();
-      while (expected < mark && !gMixMark.compare_exchange_weak(expected, mark)) {
-      }
+      // Only the sub-communicator's PEs allocated buffers above, so their heaps
+      // now differ from the idle PEs'. Barrier, then reclaim every user buffer
+      // on all PEs (Reset re-pins only staging at the base), returning every PE
+      // to an identical heap state so the full-communicator buffers below land
+      // at the same symmetric offsets on every rank.
       ccoBarrierAll(comm);
-      CollectivesFacade::Allocate(gMixMark.load() - mark, 1);
+      CollectivesFacade::Reset();
       const int rcFull = runOn(0, cfg.npes);
       rc = rc != 0 ? rc : rcFull;
     }
@@ -906,11 +899,13 @@ static void Usage(const char* prog) {
 }
 
 // ---------------------------------------------------------------------------
-// Heap / VA sizing. The facade heap is a bump allocator that never reclaims, so
-// it has to cover every buffer RunCollective allocates for the selected
+// Heap / VA sizing. The facade heap sub-allocates via a first-fit allocator, so
+// it has to cover the live buffers of one RunCollective for the selected
 // collective plus the push path's staging region (which Create carves as the
-// first heap allocation). The comm's flat-VA slot must in turn hold the heap
-// plus CCO's own internal windows.
+// first heap allocation). --mix reclaims the sub-communicator buffers (via
+// Reset) before the full-communicator run, so the two phases never co-reside;
+// we still size for their sum below as a harmless over-reservation. The comm's
+// flat-VA slot must in turn hold the heap plus CCO's own internal windows.
 // ---------------------------------------------------------------------------
 // Buffer and staging bytes of one RunCollective on an npes-rank communicator.
 static std::pair<size_t, size_t> CollectiveBytes(const Config& cfg, size_t npes) {

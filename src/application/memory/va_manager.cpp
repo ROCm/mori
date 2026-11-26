@@ -229,21 +229,16 @@ bool HeapVAManager::Free(uintptr_t addr) {
   // Mark as free
   block.isFree = true;
 
-  // Immediately coalesce with adjacent free blocks (optimized strategy)
-  CoalesceAdjacentBlocks(addr);
+  // Immediately coalesce with adjacent free blocks (optimized strategy).
+  CoalesceAdjacentBlocks(it);
 
   return true;
 }
 
-void HeapVAManager::CoalesceAdjacentBlocks(uintptr_t addr) {
-  // Must be called with mutex already locked
-  // This function immediately coalesces the block at addr with adjacent free blocks
-  // Using map iterators for O(log n) neighbor lookup
-
-  auto it = blocks_.find(addr);
-  if (it == blocks_.end()) {
-    return;
-  }
+void HeapVAManager::CoalesceAdjacentBlocks(BlockMap::iterator it) {
+  // Must be called with mutex already locked, with `it` a valid iterator into
+  // blocks_ pointing at the just-freed block. This immediately coalesces that
+  // block with adjacent free blocks using map iterators for O(log n) lookup.
 
   VABlock& currentBlock = it->second;
   if (!currentBlock.isFree) {

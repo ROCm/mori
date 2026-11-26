@@ -57,6 +57,7 @@
 #include <hip/hip_runtime.h>
 
 #include "mori/cco/cco.hpp"                  // ccoComm / ccoWindow_t
+#include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/utils/check.hpp"  // HIP_RUNTIME_CHECK
 #include "mori/core/utils/utils.hpp"         // MORI_UNLIKELY
 
@@ -82,7 +83,7 @@ class CollectivesFacade {
   // (default 128; <= 0 = no cap, use the full CU count).
   enum class RsMode { kPush, kPull, kAuto };
 
-  static constexpr size_t kDefAlign = 128;
+  static constexpr size_t kDefAlign = 256;
   // Auto tuning: pull wins below kAutoPullMaxBytes of total input, except
   // 8-PE reduce-scatter (kAutoPullMaxBytesRs) and 4-PE all-reduce
   // (kAutoPullMaxBytesAr4), which cross over earlier (pull is only
@@ -224,7 +225,11 @@ class CollectivesFacade {
       return -1;
     }
     state.heapSize = heapBytes;
-    state.heapUsed = 0;
+    // First-fit allocator over the registered window. baseAddr is the real
+    // (non-zero) window pointer, so Allocate() returns dereferenceable local
+    // pointers directly and 0 unambiguously means "exhausted".
+    state.heapVA = std::make_unique<application::HeapVAManager>(
+        reinterpret_cast<uintptr_t>(state.heapBase), heapBytes, /*granularity=*/0);
 
     hipDeviceProp_t prop;
     HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, dev));
@@ -238,26 +243,10 @@ class CollectivesFacade {
     // with MORI_CCL_MAX_NBLOCKS; <= 0 disables the cap (use the full CU count).
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 128));
 
-    size_t controlBytes =
-        kCCLMaxPeers * sizeof(uint64_t) * kPermuteFlagSlots + kCommCtlBytes;
-    size_t totalBytes = maxStagingBytes + controlBytes;
-    state.staging = Allocate(totalBytes);
-    if (state.staging == nullptr) {
-      FACADE_PRINTF("failed to carve staging and control flags from heap (%zu bytes)",
-                      totalBytes);
+    state.stagingBytes = maxStagingBytes;
+    if (CarveStagingAndControl(state) != 0) {
       return -1;
     }
-    state.stagingBytes = maxStagingBytes;
-
-    // Collective-permute handshake flags (see PermuteFlagIdx / CollectivePermute*
-    // kernels), consolidated into one [kPermuteFlagSlots][kCCLMaxPeers] buffer.
-    // Slot [idx][p] of my copy is written only by PE p; never reset.
-    state.permuteCtr = reinterpret_cast<uint64_t*>(
-             static_cast<uint8_t*>(state.staging) + maxStagingBytes);
-    // Per-communicator gen-barrier flags and SDMA completion slots, one slot per
-    // contiguous PE range (see kCommCtlWords); never reset after this.
-    state.commCtl = state.permuteCtr + kPermuteFlagSlots * kCCLMaxPeers;
-    HIP_RUNTIME_CHECK(hipMemset(state.permuteCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
     // (see CollectivePermutePushKernel: [p] sends to p, [kCCLMaxPeers + p]
@@ -299,45 +288,49 @@ class CollectivesFacade {
     GetStates().clear();
   }
 
-  // Bump-allocate a peer-visible buffer from the static heap window. Returns a
-  // raw local pointer (heapBase_ + offset). Every rank MUST issue the same
-  // Allocate sequence (same sizes/order) so a given buffer sits at the same heap
-  // offset on all ranks (symmetric addressing). Returns nullptr if the heap is
-  // exhausted. `align` defaults to 128B (SDMA/b128 friendly).
+  // Allocate a peer-visible buffer from the static heap window. Returns a raw
+  // local pointer (heapBase_ + offset). Every rank MUST issue the same
+  // Allocate/Deallocate sequence (same sizes/order) so a given buffer sits at
+  // the same heap offset on all ranks (symmetric addressing).
   static void* Allocate(size_t bytes, size_t align = kDefAlign) {
     auto *state = GetState();
     if (MORI_UNLIKELY(state == nullptr)) {
       FACADE_PRINTF("Allocate: no instance");
       return nullptr;
     }
-    const size_t off = (state->heapUsed + (align - 1)) & ~(align - 1);
-    if (MORI_UNLIKELY(off + bytes > state->heapSize)) {
-      FACADE_PRINTF("Allocate: heap exhausted (need %zu at off %zu, size %zu)",
-                    bytes, off, state->heapSize);
+    const uintptr_t addr = state->heapVA->Allocate(bytes, align);
+    if (MORI_UNLIKELY(addr == 0)) {
+      FACADE_PRINTF("Allocate: heap exhausted (need %zu, size %zu)",
+                    bytes, state->heapSize);
       return nullptr;
     }
-    state->heapUsed = off + bytes;
-    return state->heapBase + off;
+    return reinterpret_cast<void*>(addr);
   }
 
-  // Bump allocator: individual frees are a no-op. Use Reset() to reclaim the
-  // whole heap between phases (all outstanding buffers become invalid).
+  // Free a buffer returned by Allocate; the range (and any adjacent free
+  // ranges) is reclaimed for later allocations. A no-op for nullptr.
   static int Deallocate(void* ptr) {
     auto *state = GetState();
     if (MORI_UNLIKELY(state == nullptr)) {
       FACADE_PRINTF("Deallocate: no instance");
       return -1;
     }
-    return 0;
+    if (ptr == nullptr) {
+      return 0;
+    }
+    return state->heapVA->Free(reinterpret_cast<uintptr_t>(ptr)) ? 0 : -1;
   }
 
+  // Reclaim every user buffer between phases, re-pinning the staging/control
+  // region as the first allocation (outstanding user buffers become invalid).
   static void Reset() {
     auto *state = GetState();
     if (MORI_UNLIKELY(state == nullptr)) {
       FACADE_PRINTF("Reset: no instance");
       return;
     }
-    state->heapUsed = 0;
+    state->heapVA->Reset();
+    CarveStagingAndControl(*state);
   }
 
   // Runtime tuning "backdoors" (replace the former RS_MODE / RS_LOG_PUSH_SLICES
@@ -495,11 +488,12 @@ class CollectivesFacade {
     uint64_t* commCtl{nullptr};  // symmetric, [kCommCtlSlots][kCommCtlWords] per-range
                                  // gen-barrier flags + SDMA completion slots
     cco::ccoComm* ccoComm{nullptr};
-    // Static heap: one symmetric window backing all user buffers (bump allocator).
+    // Static heap: one symmetric window backing all user buffers. Sub-allocated
+    // by heapVA (first-fit + coalescing) so individual frees reclaim space.
     cco::ccoWindow_t heapWin{nullptr};
     uint8_t* heapBase{nullptr};
     size_t heapSize{0};
-    size_t heapUsed{0};
+    std::unique_ptr<application::HeapVAManager> heapVA;
     // CCO-backed push: staging (above) is a sub-region of heapWin (peer-writable
     // SDMA target); devComm is the SDMA device comm.
     cco::ccoDevComm devComm{};
@@ -509,6 +503,9 @@ class CollectivesFacade {
     // Release this device's heap window, counters, and SDMA comm. Staging is a
     // sub-region of heapWin, so it needs no separate deregistration.
     ~SharedState() {
+      // heapVA holds only VA bookkeeping (no device memory); release it before
+      // the window it indexes into is torn down.
+      heapVA.reset();
       if (heapWin != nullptr) {
         cco::ccoWindowDeregister(ccoComm, heapWin);
       }
@@ -521,6 +518,35 @@ class CollectivesFacade {
       }
     }
   };
+
+  // Carve the staging buffer plus the permute/comm-control flags as the first
+  // heap allocation (offset 0) and zero the control region. Shared by Create
+  // and Reset. Staging is never freed, so it stays pinned at the heap base on
+  // every rank; permuteCtr/commCtl are fixed sub-regions of it. `stagingBytes`
+  // must already be set on `state`.
+  static int CarveStagingAndControl(SharedState& state) {
+    const size_t maxStagingBytes = state.stagingBytes;
+    const size_t controlBytes =
+        kCCLMaxPeers * sizeof(uint64_t) * kPermuteFlagSlots + kCommCtlBytes;
+    const size_t totalBytes = maxStagingBytes + controlBytes;
+    const uintptr_t stagingAddr = state.heapVA->Allocate(totalBytes, kDefAlign);
+    if (stagingAddr == 0) {
+      FACADE_PRINTF("failed to carve staging and control flags from heap (%zu bytes)",
+                    totalBytes);
+      return -1;
+    }
+    state.staging = reinterpret_cast<void*>(stagingAddr);
+    // Collective-permute handshake flags (see PermuteFlagIdx / CollectivePermute*
+    // kernels), consolidated into one [kPermuteFlagSlots][kCCLMaxPeers] buffer.
+    // Slot [idx][p] of my copy is written only by PE p; never reset.
+    state.permuteCtr = reinterpret_cast<uint64_t*>(
+        static_cast<uint8_t*>(state.staging) + maxStagingBytes);
+    // Per-communicator gen-barrier flags and SDMA completion slots, one slot per
+    // contiguous PE range (see kCommCtlWords); never reset after this.
+    state.commCtl = state.permuteCtr + kPermuteFlagSlots * kCCLMaxPeers;
+    HIP_RUNTIME_CHECK(hipMemset(state.permuteCtr, 0, controlBytes));
+    return 0;
+  }
 
   using StateMap = std::deque< std::unique_ptr<SharedState> >;
   static std::mutex& GetMutex() {
