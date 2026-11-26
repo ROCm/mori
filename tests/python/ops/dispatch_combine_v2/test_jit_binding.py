@@ -279,6 +279,45 @@ def test_describe_rejects_what_the_constructor_rejects():
         cb.EpDispatchPlan.describe(hidden_dim=7)
 
 
+# --------------------------------------------------------------------------
+# The dispatch body's geometry, which describe() settles without compiling
+# --------------------------------------------------------------------------
+
+_BIG = dict(_SMALL, hidden_dim=7168)
+
+
+def test_dispatch_derives_its_warp_count_from_the_payload():
+    # The warps are the role split of EpDispatchLLBody, not a geometry: one
+    # control warp plus a copy warp a 1 KB row. hidden 7168 bf16 is 14336 B, so
+    # 14 rows and 15 warps.
+    assert cb.EpDispatchPlan.describe(arch="gfx950", **_BIG)["warpPerBlock"] == 15
+    # A scale row adds the second control warp, and the rows are unchanged.
+    info = cb.EpDispatchPlan.describe(arch="gfx950", scale_bytes=32, **_BIG)
+    assert info["warpPerBlock"] == 16
+    # A warp count the caller pinned is still its own.
+    info = cb.EpDispatchPlan.describe(arch="gfx950", warp_per_block=8, **_BIG)
+    assert info["warpPerBlock"] == 8
+    # gfx125x renders its own body and keeps the generic dispatch default.
+    info = cb.EpDispatchPlan.describe(arch="gfx1250", **_BIG)
+    assert info["warpPerBlock"] != 15
+
+
+@pytest.mark.parametrize("extra", [dict(replay=True), dict(max_recv=32)])
+def test_dispatch_serves_replay_and_the_receive_cap(extra):
+    # Both were the portable body's alone until EpDispatchLLBody grew them: replay
+    # reads the handle's dest map instead of claiming, and a claim past max_recv is
+    # dropped before the ballot so no copy warp sends to it.
+    assert cb.EpDispatchPlan.describe(arch="gfx950", **{**_BIG, **extra})
+
+
+def test_dispatch_refuses_a_world_past_the_wavefront():
+    # Lane p of the routing warp owns destination p. max_recv follows the world so
+    # this trips the wavefront check rather than looking like a receive cap.
+    req = dict(_BIG, world_size=128, max_recv=128 * 64)
+    with pytest.raises(RuntimeError, match="must fit in a wavefront"):
+        cb.EpDispatchPlan.describe(arch="gfx950", **req)
+
+
 def _device_arch():
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 

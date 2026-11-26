@@ -31,6 +31,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace mori::umbp::l1 {
@@ -280,7 +281,10 @@ class PoolManager {
   OpenResult Open(const std::string& pool_id);
   // Up to `count` slots: vacant ones first (lowest id), then — only until
   // `min_count` slots are produced — the least recently released cached slot.
-  // Returned slots are held by the owner and carry no key.
+  // A vacant slot the owner's device may still be writing (released since its
+  // last Commit) comes last of all, and never beyond `min_count`: a fetch
+  // into it would wait for that device. Returned slots are held by the owner
+  // and carry no key.
   AllocateResult Allocate(const std::string& pool_id, uint32_t count,
                           uint32_t min_count = kAllRequired);
   static constexpr uint32_t kAllRequired = UINT32_MAX;
@@ -324,25 +328,83 @@ class PoolManager {
   // from UMBP_L1_DRAM_BYTES (with UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_PINNED,
   // UMBP_L1_DRAM_WRITE_AT_EVICTION).
   void SetDramTier(const DramTierOptions& options);
+  // Whether a grant passes over vacant slots their owner's device may still
+  // be writing, evicting cold content instead, until nothing else is free.
+  // Read from UMBP_L1_GRANT_SETTLED_FIRST at construction (default 1). Set
+  // before any pool is in use.
+  void SetGrantSettledFirst(bool on);
 
  private:
   enum class SlotState : uint8_t { kVacant, kCached, kHeld, kFilling };
 
+  struct Pool;
+
+  struct Holder {
+    Pool* pool = nullptr;
+    uint32_t slot = 0;
+  };
+
+  // The slots that hold one key, oldest first: nearly always one or two, so
+  // they sit in the index entry itself.
+  class Holders {
+   public:
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    Holder* begin() { return more_.empty() ? inline_ : more_.data(); }
+    Holder* end() { return begin() + size_; }
+    const Holder* begin() const { return more_.empty() ? inline_ : more_.data(); }
+    const Holder* end() const { return begin() + size_; }
+    Holder& operator[](size_t i) { return begin()[i]; }
+    const Holder& operator[](size_t i) const { return begin()[i]; }
+    void push_back(const Holder& holder);
+    // Drop element `i`, keeping the others' order.
+    void erase(size_t i);
+    // Make element `i` the newest.
+    void move_to_back(size_t i);
+    // The element for `pool`, or size().
+    size_t find(const Pool* pool) const;
+
+   private:
+    static constexpr size_t kInline = 3;
+    Holder inline_[kInline];
+    uint32_t size_ = 0;
+    std::vector<Holder> more_;  // every element, once there are more than kInline
+  };
+
+  // A group's content index: key -> who holds it. An entry never moves, so a
+  // slot points at the entry of the key it holds and reaches its holders
+  // without a lookup.
+  using Content = std::unordered_map<std::string, Holders>;
+  using ContentEntry = Content::value_type;
+
+  static constexpr uint32_t kNoSlot = UINT32_MAX;
+
   struct Slot {
     SlotState state = SlotState::kVacant;
+    // A cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
+    bool kept = false;
     uint32_t pins = 0;  // in-flight copies reading this slot
+    // Its neighbours in that list.
+    uint32_t prev = kNoSlot;
+    uint32_t next = kNoSlot;
     // Each settles once the pool's `committed` reaches it. A slot may be read
     // from outside when its content has landed, and filled from outside when
     // its owner has stopped using it; releasing a published slot does not
     // unsettle what it holds.
     uint64_t written = 0;
     uint64_t released = 0;
-    bool has_key = false;
-    std::string key;
-    // Where a cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
-    std::list<uint32_t>::iterator lru_it;
-    bool kept = false;
+    // The key this slot holds, as its entry in the group's index; null: none.
+    ContentEntry* content = nullptr;
   };
+
+  // Slots linked through `Slot::prev` / `Slot::next`.
+  struct SlotList {
+    uint32_t head = kNoSlot;
+    uint32_t tail = kNoSlot;
+    uint32_t size = 0;
+  };
+
+  struct Group;
 
   // One allocation of a pool, on one device.
   struct Part {
@@ -365,17 +427,21 @@ class PoolManager {
     // Tells this pool from a later one attached under the same id.
     uint64_t serial = 0;
     std::string group;
+    Group* content_group = nullptr;  // set once every part is bound
     std::vector<Part> parts;
     // Every part attached and bound: the pool has slots and can be opened.
     bool bound = false;
     uint32_t num_slots = 0;
     std::vector<Slot> slots;
     std::set<uint32_t> vacant;
-    std::list<uint32_t> lru;  // cached slots, coldest first
+    // Vacant slots their owner's device may still be writing, by the stamp
+    // that settles each: handed out only when nothing else can be
+    // (`settled_first_`), and moved to `vacant` once `committed` passes them.
+    std::set<std::pair<uint64_t, uint32_t>> unsettled;
+    SlotList lru;  // cached slots, coldest first
     // Cached slots an eviction passed over as last copies (`keep_copies`),
     // oldest first. Evicted from only when `lru` has nothing to take.
-    std::list<uint32_t> kept;
-    std::unordered_map<std::string, uint32_t> index;
+    SlotList kept;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
     uint64_t committed = 0;  // how far the owner's devices have got: the slowest part
@@ -422,16 +488,12 @@ class PoolManager {
     std::string key;
   };
 
-  struct Holder {
-    Pool* pool = nullptr;
-    uint32_t slot = 0;
-  };
-
   struct Group {
     // Per part index, the slot size of each region; empty until a pool of the
     // group binds that part.
     std::vector<std::vector<uint64_t>> unit_bytes;
-    std::unordered_map<std::string, std::vector<Holder>> holders;
+    Content content;
+    uint64_t slots = 0;          // of every pool bound so far: what `content` is sized for
     std::unique_ptr<Tier> tier;  // null without a DRAM tier
   };
 
@@ -444,6 +506,9 @@ class PoolManager {
   };
 
   Pool* FindLocked(const std::string& pool_id);
+  static void PushBack(Pool* pool, SlotList* list, uint32_t slot);
+  static void PushFront(Pool* pool, SlotList* list, uint32_t slot);
+  static void Unlink(Pool* pool, SlotList* list, uint32_t slot);
   // Stop advertising `slot`'s key. The slot keeps its state.
   void UnindexLocked(Pool* pool, uint32_t slot);
   // Take a cached slot off whichever list it stands in.
@@ -451,12 +516,15 @@ class PoolManager {
   // Whether evicting `slot` leaves `keep_copies_` newer copies of its key in
   // the group (or it has no key).
   bool IsSpareLocked(const Pool* pool, uint32_t slot) const;
-  // `key` gained a holder, its newest: the copy this pushes out of the newest
+  // A key gained a holder, its newest: the copy this pushes out of the newest
   // `keep_copies_` is spare, and the coldest spare copy of its pool.
-  void HolderAddedLocked(Group* group, const std::string& key);
+  void HolderAddedLocked(Holders* holders);
   // The owner took `slot` for a request: its copy is the newest of its key.
   void HolderUsedLocked(Pool* pool, uint32_t slot);
   void ResetSlotsLocked(Pool* pool);
+  // `slot` becomes vacant / a vacant slot is taken by its owner.
+  void VacateLocked(Pool* pool, uint32_t slot);
+  void UnvacateLocked(Pool* pool, uint32_t slot);
   // A free slot for new content, or false. Appends the key it destroyed; with
   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
   // other than the owner, which must not write where the owner still may.
@@ -509,6 +577,9 @@ class PoolManager {
   std::vector<std::thread> tier_threads_;  // the writer ahead, and growers
   std::condition_variable tier_wake_;
   bool stopping_ = false;
+  // A grant prefers evicting cold content to handing out a slot whose owner's
+  // writes have not landed (UMBP_L1_GRANT_SETTLED_FIRST, default on).
+  bool settled_first_ = true;
   mutable std::mutex mutex_;
   std::condition_variable idle_;
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;

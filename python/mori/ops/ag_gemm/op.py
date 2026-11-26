@@ -158,8 +158,8 @@ class AgGemmOp:
                     f"AgGemmOp needs {sdma_queues} SDMA queue(s) per peer but the "
                     f"communicator has {self.dev_comm.sdma_num_queue}: build mori "
                     f"with BUILD_CCO_SDMA=ON, set MORI_ENABLE_SDMA=1, and make sure "
-                    f"the first dev-comm created on this communicator asked for at "
-                    f"least that many"
+                    f"the first dev-comm on this communicator that asked for SDMA "
+                    f"queues asked for at least that many"
                 )
             if self.dev_comm.lsa_size != self.world_size:
                 raise RuntimeError(

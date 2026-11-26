@@ -109,6 +109,11 @@ message AllocateRequest {
   // Slots the caller cannot do without: cached content is evicted only to
   // reach this many. A caller that asks ahead of need sets it below `count`,
   // so asking ahead never destroys content early.
+  //
+  // A vacant slot the owner released since its last Commit is granted only
+  // within `min_count`, and only when no settled slot is vacant and nothing
+  // can be evicted: a fetch into such a slot has to wait for the owner's
+  // device, and holds up everything fetched with it.
   uint32 min_count = 3;
 }
 

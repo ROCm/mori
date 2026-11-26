@@ -167,183 +167,449 @@ struct EpMultiWarpIter {
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
-// One routed slot's weights, expert ids, payload and scale row, sent to its
-// destination slot. The routing pass and the replay pass share it.
-template <EpCfg kCfg, typename T>
-__device__ __forceinline__ void EpPublishSlot(EpArgs args, int laneId, int destPe, int destTokId,
-                                              int srcTokId) {
-  constexpr int kTopk = kCfg.numExpertPerToken;
-  constexpr size_t kHidden = static_cast<size_t>(kCfg.hiddenDim);
-  const unsigned long long win = args.window;
-  if (laneId < kTopk) {
-    if constexpr (kCfg.useWeights) {
-      if (args.weightsBuf) {
-        EpPeer<float>(win, destPe, args.offOutWts)[destTokId * kTopk + laneId] =
-            args.weightsBuf[srcTokId * kTopk + laneId];
-      }
-    }
-    EpPeer<int>(win, destPe, args.offOutIdx)[destTokId * kTopk + laneId] =
-        args.tokenIndices[srcTokId * kTopk + laneId];
-  }
-
-  core::WarpCopy(EpPeer<T>(win, destPe, args.offDispOut) + destTokId * kHidden,
-                 reinterpret_cast<const T*>(args.inpTokenBuf) + srcTokId * kHidden, kHidden);
-  // The scale row follows its token to the same slot. No staging detour like the
-  // gfx1250 body needs: this body already copies straight to the peer per token,
-  // and on these parts a peer vector store is not the slow path TDM exists for.
-  // Laid out at EpScaleStride even here, where the alignment buys nothing:
-  // one layout per consumer, whatever arch produced it.
-  if constexpr (kCfg.scaleBytes > 0) {
-    constexpr int kSrcDw = kCfg.scaleBytes / 4;
-    constexpr int kDstDw = EpScaleStride(kCfg) / 4;
-    if (args.scalesBuf) {
-      unsigned int* dstS =
-          EpPeer<unsigned int>(win, destPe, args.offOutScales) + (size_t)destTokId * kDstDw;
-      core::WarpCopy(
-          dstS, reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)srcTokId * kSrcDw,
-          kSrcDw);
-      for (int e = kSrcDw + laneId; e < kDstDw; e += kCfg.waveSize) dstS[e] = 0u;
-    }
-  }
-}
-
-template <EpCfg kCfg, typename T>
-__device__ void EpDispatchBody(EpArgs args) {
+// Dispatch's tail, shared by both bodies: every block reports in, then this rank's
+// per-destination counts go out and everyone else's come back.
+//
+// Tickets on the arrival counter rather than a spin on it, after the gfx125x body
+// (ep_intranode_1250x.hpp). Every block draws one; the FIRST arriver drains the
+// peers' signal slots and then draws a second; the HIGHEST draw publishes the
+// counts. Holding the highest ticket implies both preconditions of that store --
+// every block in, so destPeTokenCounter is a complete sum, and the drain observed.
+//
+// Two things this buys over spinning in block 0:
+//   * the drain -- waiting for each peer to have consumed the PREVIOUS call's
+//     signal -- is a fabric round trip on uncached peer memory, and its address
+//     depends only on destPe, so it needs nothing the barrier gives. On the first
+//     arriver it is spent while the other blocks are still copying; after the
+//     barrier it is exposed.
+//   * the warp that waits is whichever block got here first, not block 0, which
+//     may arrive early and then spin for the whole of everyone else's work.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
   constexpr int kNpes = kCfg.worldSize;
+  constexpr unsigned kNoTicket = ~0u;
   const int myPe = args.rank;
-  constexpr int kTopk = kCfg.numExpertPerToken;
-  constexpr int kExpertPerRank = kCfg.numExpertPerRank;
-  constexpr size_t kHidden = static_cast<size_t>(kCfg.hiddenDim);
-  const int kNullFlat = EpNullFlat<kCfg>();
-
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
   const int warpId = thdId / kCfg.waveSize;
-  const int warpNum = kCfg.warpPerBlock;
-  const int globalWarpId = blockIdx.x * warpNum + warpId;
-  const int globalWarpNum = gridDim.x * warpNum;
-
   const unsigned long long win = args.window;
 
-  // Reset the count Phase 2 accumulates into. Ordered before those adds by the
-  // __syncthreads() below (same warp); combine only reads it.
-  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
-
-  // Phase 1: route and send. One warp per (token, top-k slot).
-  if constexpr (kCfg.replay) {
-    // Replay: the handle's dest map names every slot, so nothing is claimed.
-    if (args.tokenIndices && args.inpTokenBuf) {
-      for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
-        const int flat = args.dispDestTokIdMap[i];
-        const int destPe = EpPeFromFlat<kCfg>(flat);
-        if (flat < 0 || destPe >= kNpes) continue;
-        const int destTokId = EpLocalTokFromFlat<kCfg>(flat);
-        const int srcTokId = i / kTopk;
-        if (laneId == 0) {
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
-              EpSrcTokIndex<kCfg>(myPe, srcTokId);
-        }
-        EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
-      }
-    }
-  } else if (args.tokenIndices && args.inpTokenBuf) {
-    for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
-      const int srcTokId = i / kTopk;
-      int destPe;
-      int destTokId = 0;
-
-      const int destExpert = args.tokenIndices[i];
-      // A negative expert id is the caller's "drop this slot" sentinel; the
-      // null flat index makes combine treat the slot as a nullptr source.
-      if (destExpert < 0) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = kNullFlat;
-        continue;
-      }
-      destPe = destExpert / kExpertPerRank;
-      // Out-of-range expert ids would index a peer pointer out of bounds. Drop
-      // through the same sentinel; the whole warp skips coherently because
-      // destPe is warp-uniform here.
-      if (destPe < 0 || destPe >= kNpes) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = kNullFlat;
-        continue;
-      }
-
-      // Dedup: if an earlier top-k slot of this token already targets destPe,
-      // the payload is already on its way.
-      int condition = 0;
-      if (laneId < (i % kTopk)) {
-        const int otherExpert = args.tokenIndices[srcTokId * kTopk + laneId];
-        condition = (otherExpert >= 0) && (destPe == (otherExpert / kExpertPerRank));
-      }
-      if (__any(condition)) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = kNullFlat;
-        continue;
-      }
-
-      if (laneId == 0) {
-        // Claim a slot in the destination's recv buffer. Remote atomic on the
-        // peer's copy of tokOff; SYSTEM scope because it crosses devices.
-        destTokId = __hip_atomic_fetch_add(EpPeer<int>(win, destPe, args.offTokOff), 1,
-                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        // Under a recv cap a slot past it is dropped: null in the map, nothing sent.
-        if (!EpRecvCapped(kCfg) || destTokId < EpMaxRecv(kCfg)) {
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[i] = EpFlatIndex<kCfg>(destPe, destTokId);
-          // Tell the destination which global source token owns that slot, so
-          // combine can route the reduction back.
-          EpPeer<int>(win, destPe, args.offRecvToSrc)[destTokId] =
-              EpSrcTokIndex<kCfg>(myPe, srcTokId);
-        } else {
-          args.dispDestTokIdMap[i] = kNullFlat;
-          destTokId = -1;
-        }
-      }
-      destTokId = __shfl(destTokId, 0);
-      if constexpr (EpRecvCapped(kCfg)) {
-        if (destTokId < 0) continue;
-      }
-
-      EpPublishSlot<kCfg, T>(args, laneId, destPe, destTokId, srcTokId);
-    }
-  }
-
-  // Drain this block's peer stores before it arrives, as FlyDSL does: the signal fence
-  // below covers warp 0's stores only. No release: a cached window passes FRESH without
-  // one, and a per-block release costs 6-40% of dispatch.
+  // A block's peer stores must be COMPLETE and WRITTEN BACK before it arrives, as
+  // the gfx125x body releases before its own arrival. __syncthreads() does not wait
+  // on vmcnt, so every warp drains its stores into this XCD's L2 first; on a cached
+  // window they are not visible to a peer until that L2 is written back, and the
+  // publisher's release reaches the L2 of the XCD IT runs on, not the other seven.
+  // One warp issues it because buffer_wbl2 is cache-wide and the barrier has already
+  // put every warp's stores in the cache it writes back.
   __builtin_amdgcn_s_waitcnt(0);
   __syncthreads();
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
-  // Phase 2: one warp announces this rank's per-destination counts, then reads
-  // back everyone else's. The grid barrier is hoisted before the peer loop so
-  // that wide EP (worldSize > waveSize) multi-iterates safely.
-  if (globalWarpId == 0) {
-    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  unsigned arriveTicket = 0;
+  if (warpId == 0) {
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (laneId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
+    arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
+  }
+  const bool isFirstArriver = (warpId == 0) && (arriveTicket == 0u);
 
+  unsigned drainTicket = kNoTicket;
+  if (isFirstArriver) {
+    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
+      EpWaitEq(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, 0);
+    }
+    if (laneId == 0) drainTicket = atomicAdd(args.gridBarrier, 1u);
+    drainTicket = (unsigned)__shfl((int)drainTicket, 0);
+  }
+
+  // atomicAdd returns the pre-increment value, so gridDim.x + 1 draws read
+  // 0 .. gridDim.x: the highest TICKET, not the counter's final value.
+  const unsigned kHighestTicket = gridDim.x;
+  if ((warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket)) {
+    // A release, not __threadfence_system(): the signal must not pass the payload,
+    // but nothing here reads what a peer wrote, so the acquire half -- a full cache
+    // invalidate -- is bought for nothing. Hoisted out of the loop, which wide EP
+    // multi-iterates.
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
       // +1 so a zero-token destination still sees a distinct "signal arrived".
       const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
                                  1;
-      int* signal = EpPeer<int>(win, destPe, args.offRecvNum) + myPe;
-      EpWaitEq(signal, 0);
-      __threadfence_system();
-      __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      // Cleared here, by the warp that just read it: the inbound loop below runs on
+      // the first arriver, which may reach it before this warp has read the sum.
+      args.destPeTokenCounter[destPe] = 0;
     }
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
 
+  // Inbound rides the first arriver so it is already parked when the peers' signals
+  // land. It cannot move above the outbound store on the same warp: this rank would
+  // wait on a peer that is waiting on this rank, with neither having sent. Separate
+  // tickets are what break that cycle.
+  if (isFirstArriver) {
+    int myRecv = 0;
     int* recvTokenNums = EpLocal<int>(win, args.offRecvNum);
     for (int srcPe = laneId; srcPe < kNpes; srcPe += kCfg.waveSize) {
       int* signal = recvTokenNums + srcPe;
-      const int recvTokenNum = EpWaitGt(signal, 0) - 1;
+      myRecv += EpWaitGt(signal, 0) - 1;
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[srcPe] = 0;
+    }
+    // One store instead of an atomicAdd a source -- and the total no longer depends
+    // on the body having zeroed it, which block 0 did and block 0 is not necessarily
+    // the warp that lands here.
+    for (int off = kCfg.waveSize / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off);
+    if (laneId == 0) {
+      *args.totalRecvTokenNum = myRecv;
+      EpLocal<int>(win, args.offTokOff)[0] = 0;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/*                            Intranode dispatch                            */
+/* ------------------------------------------------------------------------- */
+// Ported from EP v1's EpDispatchIntraNodeLLKernel_body (intranode_ll.hpp), and since
+// then the only intranode dispatch off gfx125x. One block owns one token at a time and its warps
+// split by role:
+//
+//   warp 0       control plane: route the NEXT token, then forward the current
+//                token's expert ids and weights to its destinations
+//   warp 1       the scale row, when Cfg.scaleBytes > 0
+//   the others   data plane: load a slice of the payload once into registers and
+//                store the same registers to every destination
+//
+// The route sits in LDS, double buffered, so the control warp's atomics for token
+// N+1 overlap the copy of token N; one block barrier a token. A copy warp's slice
+// is not a runtime division as in v1: warpPerBlock, hiddenDim and the dtype are Cfg
+// constants, so EpRow* fix how many rows each warp takes and the compiler unrolls the
+// row loop to exactly that.
+
+template <int kMaxDests>
+struct EpRoute {
+  int numDests;
+  int srcTok;
+  int destRank[kMaxDests];
+  int recvSlot[kMaxDests];
+};
+
+// v_readlane of a 64-bit pointer: the result is uniform, so the address stays in
+// SGPRs for the stores that follow.
+template <typename P>
+__device__ __forceinline__ P* EpReadLanePtr(P* ptr, int srcLane) {
+  const unsigned long long v = reinterpret_cast<unsigned long long>(ptr);
+  const uint32_t lo = __builtin_amdgcn_readlane(static_cast<uint32_t>(v), srcLane);
+  const uint32_t hi = __builtin_amdgcn_readlane(static_cast<uint32_t>(v >> 32), srcLane);
+  return reinterpret_cast<P*>((static_cast<unsigned long long>(hi) << 32) | lo);
+}
+
+// Warp 0 only. Lane k < topk names the rank of expert slot k; lane p < worldSize
+// then reads all topk slots through readlane and learns whether (and through which
+// slot) the token goes to rank p. The loop runs topk times, a Cfg constant: v1
+// unrolled a fixed 8, which dropped the slots past it. The lowest slot that targets a
+// rank owns the copy, as in the portable body.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchComputeRoute(const EpArgs& args, int tokenId,
+                                                       EpRoute<EpMaxDests(kCfg)>& route,
+                                                       int& didAlloc, int& slotForMe, int& mySlot) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kNpes = kCfg.worldSize;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+
+  route.srcTok = tokenId;
+
+  int targetPe = -1;
+  if (laneId < kTopk) {
+    const int expert = args.tokenIndices[tokenId * kTopk + laneId];
+    const int pe = expert >= 0 ? expert / kCfg.numExpertPerRank : -1;
+    targetPe = pe < kNpes ? pe : -1;
+  }
+
+  slotForMe = -1;
+#pragma unroll
+  for (int k = kTopk - 1; k >= 0; --k) {
+    const int peK = __builtin_amdgcn_readlane(targetPe, k);
+    slotForMe = (peK == laneId) ? k : slotForMe;
+  }
+
+  didAlloc = 0;
+  mySlot = 0;
+  if (slotForMe >= 0) {
+    didAlloc = 1;
+    mySlot = __hip_atomic_fetch_add(EpPeer<int>(args.window, laneId, args.offTokOff), 1,
+                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    // Under a receive cap a slot past it is dropped. The offset is still consumed,
+    // as the portable body consumes it: the claim is what orders the ranks, and a
+    // dropped claim must not renumber the ones that fit. Dropping before the ballot
+    // keeps the destination out of the route, so no copy warp sends to it, and
+    // EpDispatchWriteMap leaves its map slot null.
+    if constexpr (EpRecvCapped(kCfg)) {
+      if (mySlot >= EpMaxRecv(kCfg)) didAlloc = 0;
+    }
+  }
+
+  const unsigned long long active = __ballot(didAlloc);
+  if (didAlloc) {
+    const int pos = __popcll(active & ((1ull << laneId) - 1));
+    route.destRank[pos] = laneId;
+    route.recvSlot[pos] = mySlot;
+  }
+  if (laneId == 0) route.numDests = __popcll(active);
+}
+
+// Replay: the handle's dest map already names every slot, so nothing is claimed and
+// nothing is written back. Lane k reads top-k slot k rather than owning destination
+// k, so the rank is decoded instead of being the lane -- which is why destPe is an
+// output here and not simply laneId. Dedup happened when the map was written: a
+// duplicate slot is already EpNullFlat, so the surviving slots are exactly the
+// distinct destinations the route wants.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchReplayRoute(const EpArgs& args, int tokenId,
+                                                      EpRoute<EpMaxDests(kCfg)>& route,
+                                                      int& didAlloc, int& destPe, int& mySlot) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kNpes = kCfg.worldSize;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+
+  route.srcTok = tokenId;
+  didAlloc = 0;
+  destPe = -1;
+  mySlot = 0;
+  if (laneId < kTopk) {
+    const int flat = args.dispDestTokIdMap[tokenId * kTopk + laneId];
+    const int pe = EpPeFromFlat<kCfg>(flat);
+    if (flat >= 0 && pe < kNpes) {
+      didAlloc = 1;
+      destPe = pe;
+      mySlot = EpLocalTokFromFlat<kCfg>(flat);
+    }
+  }
+
+  const unsigned long long active = __ballot(didAlloc);
+  if (didAlloc) {
+    const int pos = __popcll(active & ((1ull << laneId) - 1));
+    route.destRank[pos] = destPe;
+    route.recvSlot[pos] = mySlot;
+  }
+  if (laneId == 0) route.numDests = __popcll(active);
+}
+
+// Deferred past the block barrier so the copy warps are not held up by it.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchWriteMap(const EpArgs& args, int tokenId, int didAlloc,
+                                                   int slotForMe, int mySlot) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+
+  // Which rank this lane speaks for: its own in the routing pass, the one it
+  // decoded in replay.
+  const int destPe = kCfg.replay ? slotForMe : laneId;
+  if constexpr (!kCfg.replay) {
+    if (laneId < kTopk) args.dispDestTokIdMap[tokenId * kTopk + laneId] = EpNullFlat<kCfg>();
+  }
+  if (didAlloc) {
+    atomicAdd(args.destPeTokenCounter + destPe, 1);
+    EpPeer<int>(args.window, destPe, args.offRecvToSrc)[mySlot] =
+        EpSrcTokIndex<kCfg>(args.rank, tokenId);
+    if constexpr (!kCfg.replay) {
+      args.dispDestTokIdMap[tokenId * kTopk + slotForMe] = EpFlatIndex<kCfg>(laneId, mySlot);
+    }
+  }
+}
+
+// The routing pass or the replay pass, whichever this Cfg renders. slotForMe carries
+// the map slot to write in the first and the decoded rank in the second; EpDispatchWriteMap
+// reads it the same way.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchRoute(const EpArgs& args, int tokenId,
+                                                EpRoute<EpMaxDests(kCfg)>& route, int& didAlloc,
+                                                int& slotForMe, int& mySlot) {
+  if constexpr (kCfg.replay) {
+    EpDispatchReplayRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
+  } else {
+    EpDispatchComputeRoute<kCfg>(args, tokenId, route, didAlloc, slotForMe, mySlot);
+  }
+}
+
+template <EpCfg kCfg, typename T>
+__device__ void EpDispatchBody(EpArgs args) {
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kCtrl = EpCtrlWarps(kCfg);
+  constexpr int kCopyWarps = EpCopyWarps(kCfg);
+  constexpr int kRows = EpRowsPerToken(kCfg);
+  constexpr int kMaxRows = EpMaxRowCount(kCfg);
+  constexpr bool kEvenRows = (kRows % kCopyWarps) == 0;
+  constexpr bool kPartialRow = EpLastRowVecs(kCfg) < kCfg.waveSize;
+  constexpr size_t kRowBytes = EpRowBytes(kCfg);
+  constexpr size_t kTokBytes = EpTokenBytes(kCfg);
+  constexpr int kChunk = kMaxRows < 4 ? kMaxRows : 4;
+  // No warp has a short chunk: every row of every chunk exists.
+  constexpr bool kRowsAlwaysLive = kEvenRows && (kMaxRows % kChunk) == 0;
+
+  const int thdId = threadIdx.x;
+  const int laneId = thdId & (kCfg.waveSize - 1);
+  const int warpId = thdId / kCfg.waveSize;
+  const unsigned long long win = args.window;
+  const int numTokens = args.numTokens;
+
+  using Vec = typename core::VecTypeSelector<16>::dataType;
+
+  __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2];
+
+  const int copyWarp = warpId - kCtrl;
+  const int rowCount = kEvenRows ? kRows / kCopyWarps : EpRowCount(kCfg, copyWarp);
+  const int rowBegin = EpRowBegin(kCfg, copyWarp);
+  const size_t laneOff = static_cast<size_t>(laneId) * 16;
+  Vec pre[kChunk];
+
+  if (args.tokenIndices && args.inpTokenBuf) {
+    // Prologue: warp 0 routes the first token this block owns -- a remote atomic a
+    // destination, and nothing else in the block can start until it lands.
+    //
+    // So the copy warps read that token's payload here, BEFORE the barrier. A token's
+    // source address is blockIdx.x alone; only the DESTINATION needs the route. The
+    // barrier waits on lgkmcnt only, so these loads stay in flight across it and the
+    // atomic's latency is spent on them. Where a block holds one token -- every call
+    // with no more tokens than blocks -- this prologue IS the kernel.
+    int nextDid = 0, nextSlotK = -1, nextSlot = 0;
+    if (warpId == 0 && blockIdx.x < numTokens) {
+      EpDispatchRoute<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
+    } else if (warpId >= kCtrl && blockIdx.x < numTokens && rowCount > 0) {
+      const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
+                           static_cast<size_t>(blockIdx.x) * kTokBytes +
+                           static_cast<size_t>(rowBegin) * kRowBytes;
+#pragma unroll
+      for (int u = 0; u < kChunk; ++u) {
+        bool live = kRowsAlwaysLive || u < rowCount;
+        if constexpr (kPartialRow)
+          live = live && !(rowBegin + u == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+        if (live) pre[u] = core::load<16>(src + u * kRowBytes + laneOff);
+      }
+    }
+    __syncthreads();
+    if (warpId == 0 && blockIdx.x < numTokens) {
+      EpDispatchWriteMap<kCfg>(args, blockIdx.x, nextDid, nextSlotK, nextSlot);
     }
 
-    if (laneId == 0) EpLocal<int>(win, args.offTokOff)[0] = 0;
+    for (int tokenIdx = blockIdx.x; tokenIdx < numTokens; tokenIdx += gridDim.x) {
+      const int pingPong = (tokenIdx / gridDim.x) & 1;
+      const auto& route = routeBuf[pingPong];
+
+      if (warpId == 0) {
+        const int nextTok = tokenIdx + gridDim.x;
+        if (nextTok < numTokens) {
+          EpDispatchRoute<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK,
+                                nextSlot);
+          EpDispatchWriteMap<kCfg>(args, nextTok, nextDid, nextSlotK, nextSlot);
+        }
+      } else if (kCfg.scaleBytes > 0 && warpId == 1) {
+        if constexpr (kCfg.scaleBytes > 0) {
+          constexpr int kSrcDw = kCfg.scaleBytes / 4;
+          constexpr int kDstDw = EpScaleStride(kCfg) / 4;
+          constexpr int kIters = (kDstDw + kCfg.waveSize - 1) / kCfg.waveSize;
+          const int numDests = route.numDests;
+          if (numDests > 0 && args.scalesBuf) {
+            const unsigned int* src = reinterpret_cast<const unsigned int*>(args.scalesBuf) +
+                                      static_cast<size_t>(route.srcTok) * kSrcDw;
+            unsigned int v[kIters];
+#pragma unroll
+            for (int i = 0; i < kIters; ++i) {
+              const int e = laneId + i * kCfg.waveSize;
+              v[i] = e < kSrcDw ? src[e] : 0u;
+            }
+            for (int d = 0; d < numDests; ++d) {
+              const int rank = __builtin_amdgcn_readfirstlane(route.destRank[d]);
+              const int slot = __builtin_amdgcn_readfirstlane(route.recvSlot[d]);
+              unsigned int* dst = EpPeer<unsigned int>(win, rank, args.offOutScales) +
+                                  static_cast<size_t>(slot) * kDstDw;
+#pragma unroll
+              for (int i = 0; i < kIters; ++i) {
+                const int e = laneId + i * kCfg.waveSize;
+                if (e < kDstDw) dst[e] = v[i];
+              }
+            }
+          }
+        }
+      } else {
+        const int numDests = route.numDests;
+
+        // The expert ids and weights go out from here too, a destination to a copy
+        // warp: on warp 0 they were a serial loop over every destination, and at one
+        // token a block that loop WAS the kernel (ablation at 1 token a rank, EP8,
+        // hidden 7168: 10.7us with no token work at all, 15.5 with the metadata on
+        // warp 0 and no payload, 17.1 complete).
+        if (numDests > 0) {
+          const int srcTok = route.srcTok;
+          float wt = 0.0f;
+          int idx = 0;
+          if (laneId < kTopk) {
+            if constexpr (kCfg.useWeights) {
+              if (args.weightsBuf) wt = args.weightsBuf[srcTok * kTopk + laneId];
+            }
+            idx = args.tokenIndices[srcTok * kTopk + laneId];
+          }
+          for (int d = copyWarp; d < numDests; d += kCopyWarps) {
+            const int rank = __builtin_amdgcn_readfirstlane(route.destRank[d]);
+            const int slot = __builtin_amdgcn_readfirstlane(route.recvSlot[d]);
+            if (laneId < kTopk) {
+              if constexpr (kCfg.useWeights) {
+                if (args.weightsBuf) {
+                  EpPeer<float>(win, rank, args.offOutWts)[slot * kTopk + laneId] = wt;
+                }
+              }
+              EpPeer<int>(win, rank, args.offOutIdx)[slot * kTopk + laneId] = idx;
+            }
+          }
+        }
+
+        if (numDests > 0 && rowCount > 0) {
+          // Lane i holds destination i's address; the warps alternate the order so
+          // neighbours do not all start on the same peer.
+          uint8_t* dstReg = nullptr;
+          if (laneId < numDests) {
+            const int di = (copyWarp & 1) ? numDests - 1 - laneId : laneId;
+            dstReg = EpPeer<uint8_t>(win, route.destRank[di], args.offDispOut) +
+                     static_cast<size_t>(route.recvSlot[di]) * kTokBytes +
+                     static_cast<size_t>(rowBegin) * kRowBytes;
+          }
+          const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
+                               static_cast<size_t>(route.srcTok) * kTokBytes +
+                               static_cast<size_t>(rowBegin) * kRowBytes;
+          // The prologue already read chunk 0 of this block's first token.
+          bool pre_ok = tokenIdx == blockIdx.x;
+
+          for (int c0 = 0; c0 < rowCount; c0 += kChunk) {
+            Vec v[kChunk];
+#pragma unroll
+            for (int u = 0; u < kChunk; ++u) {
+              const int row = c0 + u;
+              bool live = kRowsAlwaysLive || row < rowCount;
+              if constexpr (kPartialRow)
+                live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+              if (live)
+                v[u] =
+                    (pre_ok && c0 == 0) ? pre[u] : core::load<16>(src + row * kRowBytes + laneOff);
+            }
+            for (int d = 0; d < numDests; ++d) {
+              uint8_t* dst = EpReadLanePtr(dstReg, d);
+#pragma unroll
+              for (int u = 0; u < kChunk; ++u) {
+                const int row = c0 + u;
+                bool live = kRowsAlwaysLive || row < rowCount;
+                if constexpr (kPartialRow)
+                  live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+                if (live) core::store<16>(dst + row * kRowBytes + laneOff, v[u]);
+              }
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
   }
+
+  EpDispatchNotify<kCfg>(args);
 }
 
 /* ------------------------------------------------------------------------- */

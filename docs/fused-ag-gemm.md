@@ -121,7 +121,7 @@ contract, cleanup, fp8 operands). For this operator:
 | FlyDSL | `pip install 'amd_mori[flydsl]'`. `import mori.ops.ag_gemm` works without it; `AgGemmOp` and `supports` import FlyDSL on first access. |
 | Build | MORI built with `BUILD_CCO_SDMA=ON` (the default). |
 | Environment | `MORI_ENABLE_SDMA=1`, set before `Communicator.init`. |
-| SDMA queues | `sdma_queues` per peer (default 1). The first device communicator created on a communicator fixes its queue count; there are at most 8 per GPU pair. |
+| SDMA queues | `sdma_queues` per peer (default 1). The first device communicator on a communicator that asks for SDMA queues fixes its queue count; there are at most 8 per GPU pair. |
 | Ranks | P from 2 to 8, every rank in one node (one LSA domain). |
 | VMM | `per_rank_vmm` holds the window of every operator on the communicator. |
 
@@ -501,7 +501,7 @@ fails. Before trusting a number of your own, read
 | Error or symptom | What it means |
 |---|---|
 | `ModuleNotFoundError: No module named 'flydsl'` on `AgGemmOp` | Install the extra: `pip install 'amd_mori[flydsl]'`. |
-| `RuntimeError: AgGemmOp needs 1 SDMA queue(s) per peer but the communicator has 0` | MORI was built without `BUILD_CCO_SDMA=ON`, `MORI_ENABLE_SDMA=1` was not set before `Communicator.init`, or the first device communicator on this communicator asked for fewer queues than `sdma_queues`. |
+| `RuntimeError: AgGemmOp needs 1 SDMA queue(s) per peer but the communicator has 0` | MORI was built without `BUILD_CCO_SDMA=ON`, `MORI_ENABLE_SDMA=1` was not set before `Communicator.init`, or the first device communicator on this communicator that asked for SDMA queues asked for fewer than `sdma_queues`. |
 | `RuntimeError: ag_gemm self-test failed: the slot from rank S holds X, expected S+1` | The puts move nothing; check the same two settings. Without the test, calls would return wrong rows without an error. |
 | `RuntimeError: AgGemmOp needs every rank in one LSA domain (one node)` | The ranks span nodes. The operator is single-node only. |
 | `RuntimeError: ccoMemAlloc failed: -1`, "slot exhausted" in the log | `per_rank_vmm` has no room for the window. Size it from `window_bytes_for()`, adding up every operator on the communicator. |

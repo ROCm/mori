@@ -253,5 +253,32 @@ class AsyncLLSegmentedTest(unittest.TestCase):
         self.assertEqual(regions["inter_dispatch_staging"], 8 * 50 * 7168 * 2)
 
 
+class AsyncLLSdmaQueuesTest(unittest.TestCase):
+    """The count AsyncLL asks cco for. cco creates queues only for a count > 0,
+    so this must never return 0."""
+
+    def queues(self, env, model=None, gpu_per_node=8):
+        from mori.ops.dispatch_combine_v2.hip_backend import _asyncll_sdma_queues
+
+        with patch.dict(os.environ, env, clear=True):
+            return _asyncll_sdma_queues(model, gpu_per_node)
+
+    def test_default_is_one_per_peer_capped_by_model(self):
+        self.assertEqual(self.queues({}), 8)
+        self.assertEqual(self.queues({}, gpu_per_node=4), 4)
+        self.assertEqual(self.queues({}, model="mi308x"), 3)
+
+    def test_env_wins_and_is_clamped(self):
+        env = "MORI_SDMA_NUM_CHANNELS"
+        self.assertEqual(self.queues({env: "3"}), 3)
+        self.assertEqual(self.queues({env: "1"}, model="mi308x"), 1)
+        self.assertEqual(self.queues({env: "12"}), 8)
+
+    def test_invalid_env_falls_back_to_the_default(self):
+        env = "MORI_SDMA_NUM_CHANNELS"
+        for raw in ("0", "-2", "abc", ""):
+            self.assertEqual(self.queues({env: raw}), 8, raw)
+
+
 if __name__ == "__main__":
     unittest.main()

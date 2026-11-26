@@ -450,14 +450,72 @@ TEST_F(L1PoolTest, FetchDoesNotFillASlotTheOwnerJustReleased) {
   EXPECT_EQ(fetched.slots, (std::vector<uint32_t>{all.slots[3]}));
 }
 
+TEST_F(L1PoolTest, AGrantLeavesAJustReleasedSlotUntilItsOwnersWritesHaveLanded) {
+  Cache(1, {"old0", "old1"}, 20);            // slots 0 and 1, cached and settled
+  ASSERT_TRUE(manager->Commit("p1", 1).ok);  // its owner reports progress
+  // Slots 2 and 3 are released without a key while a forward may still be
+  // writing them: vacant, but not yet for anyone else to fill.
+  AllocateResult two = manager->Allocate("p1", 2);
+  ASSERT_EQ(two.slots, (std::vector<uint32_t>{2, 3}));
+  ASSERT_TRUE(
+      manager->Apply("p1", {Op{OpKind::kRelease, 2, ""}, Op{OpKind::kRelease, 3, ""}}, 100).ok);
+  EXPECT_EQ(StatsOf("p1").vacant, kSlots - 2);
+  // Grants pass over them: the settled vacant slots first...
+  EXPECT_EQ(manager->Allocate("p1", 4).slots, (std::vector<uint32_t>{4, 5, 6, 7}));
+  // ...then cold content, rather than a slot a fetch would have to wait for...
+  AllocateResult evicting = manager->Allocate("p1", 1);
+  EXPECT_EQ(evicting.slots, (std::vector<uint32_t>{0}));
+  EXPECT_EQ(evicting.evicted_keys, (std::vector<std::string>{"old0"}));
+  // ...and asked ahead of need, nothing at all.
+  EXPECT_TRUE(manager->Allocate("p1", 4, 0).slots.empty());
+  // Once the owner's device has caught up they are ordinary vacant slots,
+  // taken before anything is evicted.
+  ASSERT_TRUE(manager->Commit("p1", 100).ok);
+  AllocateResult settled = manager->Allocate("p1", 4, 0);
+  EXPECT_EQ(settled.slots, (std::vector<uint32_t>{2, 3}));
+  EXPECT_TRUE(settled.evicted_keys.empty());
+  EXPECT_EQ(StatsOf("p1").cached, 1u);
+}
+
+TEST_F(L1PoolTest, AGrantTakesAnUnsettledSlotOnlyWhenNothingElseIsFree) {
+  AllocateResult all = manager->Allocate("p1", kSlots);
+  ASSERT_EQ(all.slots.size(), kSlots);
+  ASSERT_TRUE(manager->Commit("p1", 1).ok);
+  ASSERT_TRUE(
+      manager->Apply("p1", {Op{OpKind::kRelease, 5, ""}, Op{OpKind::kRelease, 6, ""}}, 100).ok);
+  // Nothing settled is free and nothing is cached: what the caller must have
+  // comes from the unsettled slots, oldest release first; what it only asked
+  // ahead for does not.
+  EXPECT_EQ(manager->Allocate("p1", 2, 1).slots, (std::vector<uint32_t>{5}));
+  // The owner can also take one back by name.
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kHold, 6, ""}}).ok);
+  EXPECT_EQ(StatsOf("p1").held, kSlots);
+  EXPECT_EQ(StatsOf("p1").vacant, 0u);
+  EXPECT_TRUE(manager->Allocate("p1", 1).slots.empty());
+}
+
+TEST_F(L1PoolTest, AGrantHoldsNothingBackWithThePolicyOffOrAnOwnerThatNeverCommits) {
+  // p0's owner has never reported progress: nothing of p0 can be filled from
+  // outside anyway, and a just-released slot is granted like any other.
+  ASSERT_EQ(manager->Allocate("p0", 1).slots, (std::vector<uint32_t>{0}));
+  ASSERT_TRUE(manager->Apply("p0", {Op{OpKind::kRelease, 0, ""}}, 100).ok);
+  EXPECT_EQ(manager->Allocate("p0", 1).slots, (std::vector<uint32_t>{0}));
+  // p1's owner does, and the policy is off.
+  manager->SetGrantSettledFirst(false);
+  ASSERT_TRUE(manager->Commit("p1", 1).ok);
+  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{0}));
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, 0, ""}}, 100).ok);
+  EXPECT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{0}));
+}
+
 TEST_F(L1PoolTest, FetchIntoDefersUntilPreviousOwnersWritesComplete) {
   Cache(0, {"a"}, 10);
   const uint32_t dst = manager->Allocate("p1", 1).slots.at(0);
   Fill(1, dst, 77);
   ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst, ""}}, 100).ok);
-  // Regranting is safe for the owner's own stream. It does not settle that
+  // Taking it back is safe for the owner's own stream. It does not settle that
   // stream for an external background fetch, which is what dst_slots starts.
-  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst}));
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kHold, dst, ""}}).ok);
   FetchOptions options;
   options.dst_slots = {dst};
   bool old_write_finished = false;
@@ -494,7 +552,7 @@ TEST_F(L1PoolTest, FetchIntoWaitsForTheOwnersCommitThenCopiesEverything) {
   const auto dst = manager->Allocate("p1", 2).slots;
   ASSERT_EQ(dst.size(), 2u);
   ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst[1], ""}}, 100).ok);
-  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst[1]}));
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kHold, dst[1], ""}}).ok);
   FetchOptions options;
   options.dst_slots = dst;
   // The owner's device catches up while the fetch waits.
@@ -518,7 +576,7 @@ TEST_F(L1PoolTest, FetchIntoReturnsOnlyTheLeadingSettledDestinations) {
   Fill(1, dst[1], 88);
   Fill(1, dst[2], 99);
   ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kRelease, dst[1], ""}}, 100).ok);
-  ASSERT_EQ(manager->Allocate("p1", 1).slots, (std::vector<uint32_t>{dst[1]}));
+  ASSERT_TRUE(manager->Apply("p1", {Op{OpKind::kHold, dst[1], ""}}).ok);
   FetchOptions options;
   options.dst_slots = dst;
   FetchResult partial = manager->Fetch("p1", {"a", "b", "c"}, options);
@@ -1218,6 +1276,62 @@ TEST_F(L1PartsTest, EveryPartOfAnEvictedSlotGoesToDramAndBack) {
   EXPECT_TRUE(ShardHolds(1, fetched.slots[0], 57));
   EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
   EXPECT_EQ(StatsOf("r1").loaded_slots, 1u);
+}
+
+TEST_F(L1PoolTest, AKeyHeldByManyPoolsIsTrackedThroughEveryHolderComingAndGoing) {
+  // Six pools: more holders of one key than an index entry keeps in place.
+  const int pools = 6;
+  for (int device = 2; device < pools; ++device) {
+    const std::string id = "p" + std::to_string(device);
+    ASSERT_TRUE(manager->Attach(id, "g", device, kBytes).status.ok);
+    ASSERT_TRUE(manager->BindLayout(id, TestLayout()).ok);
+    ASSERT_EQ(manager->Open(id).num_slots, kSlots);
+  }
+  auto pool = [](int device) { return "p" + std::to_string(device); };
+  FetchOptions probe;
+  probe.probe_only = true;
+  // p0 publishes; every other pool copies it in turn, each from the last.
+  Cache(0, {"shared", "tail"}, 10);
+  for (int device = 1; device < pools; ++device) {
+    FetchResult got = manager->Fetch(pool(device), {"shared", "tail"});
+    ASSERT_EQ(got.slots.size(), 2u) << device;
+    EXPECT_EQ(got.copied_slots, 2u);
+    EXPECT_TRUE(Holds(device, got.slots[0], 10));
+    EXPECT_TRUE(Holds(device, got.slots[1], 11));
+  }
+  // Holders leave one at a time, oldest first, then from the middle: whoever
+  // is left still serves the key, and a pool that dropped it sees it as
+  // another pool's again.
+  for (int device : {0, 1, 4, 2}) {
+    AllocateResult all = manager->Allocate(pool(device), kSlots);
+    ASSERT_EQ(all.slots.size(), kSlots);
+    EXPECT_EQ(all.evicted_keys.size(), 2u) << device;
+    std::vector<Op> back;
+    for (uint32_t slot : all.slots) back.push_back(Op{OpKind::kRelease, slot, ""});
+    ASSERT_TRUE(manager->Apply(pool(device), back).ok);
+    EXPECT_EQ(StatsOf(pool(device)).cached, 0u);
+    EXPECT_EQ(manager->Fetch(pool(device), {"shared", "tail"}, probe).available, 2u) << device;
+  }
+  // Two holders left (p3, p5). One of them republishes the key in another
+  // slot: the old slot is free again, and the key still has two holders.
+  AllocateResult extra = manager->Allocate("p3", 1);
+  ASSERT_EQ(extra.slots.size(), 1u);
+  ASSERT_TRUE(manager
+                  ->Apply("p3", {Op{OpKind::kPublish, extra.slots[0], "shared"},
+                                 Op{OpKind::kRelease, extra.slots[0], ""}})
+                  .ok);
+  EXPECT_EQ(StatsOf("p3").cached, 2u);
+  EXPECT_EQ(StatsOf("p3").vacant, kSlots - 2);
+  // The last holders go; then nobody has it.
+  for (int device : {3, 5}) {
+    ASSERT_TRUE(manager->Clear(pool(device)).ok);
+  }
+  EXPECT_EQ(manager->Fetch("p0", {"shared"}, probe).available, 0u);
+  // And it can come back.
+  Cache(1, {"shared"}, 40);
+  FetchResult again = manager->Fetch("p0", {"shared"});
+  ASSERT_EQ(again.slots.size(), 1u);
+  EXPECT_TRUE(Holds(0, again.slots[0], 40));
 }
 
 TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {

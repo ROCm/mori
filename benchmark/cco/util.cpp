@@ -385,9 +385,11 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   // DevComm tuned to the chosen transport.
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   if (args.transport == Transport::kLsa || args.transport == Transport::kSdma) {
-    // Both intra-node backends need no GDA connectivity. The SDMA signal pool is
-    // materialized by ccoDevCommCreate whenever the comm has SDMA queues (built
-    // in ccoCommCreate when MORI_ENABLE_SDMA is on and peers are canSDMA).
+    // Both intra-node backends need no GDA connectivity. SDMA queues per peer
+    // come from MORI_SDMA_NUM_CHANNELS (default 2); MORI_ENABLE_SDMA must be on.
+    if (args.transport == Transport::kSdma) {
+      reqs.sdmaQueueCount = env::GetPositiveIntOr("MORI_SDMA_NUM_CHANNELS", 2);
+    }
     reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
