@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI CCO Guide &mdash; MORI development (af3f8323) documentation</title>
+  <title>MORI CCO Guide &mdash; MORI development (19c2398f) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=54955a0f"></script>
+      <script src="_static/documentation_options.js?v=f127fd2d"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -332,6 +332,11 @@ with the same size.</p></li>
 </tr>
 </tbody>
 </table>
+<p>The NICs are opened only when a peer needs RDMA. That happens at communicator
+creation when some peers are outside the LSA team, or at the first <code class="docutils literal notranslate"><span class="pre">FULL</span></code> device
+communicator (NIC loopback to LSA peers). A job whose ranks all share one LSA
+team, such as a single node or a scale-up fabric spanning hosts, never touches a
+NIC under <code class="docutils literal notranslate"><span class="pre">NONE</span></code>, <code class="docutils literal notranslate"><span class="pre">CROSSNODE</span></code> or <code class="docutils literal notranslate"><span class="pre">RAIL</span></code>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">reqs</span> <span class="o">=</span> <span class="n">CCODevCommRequirements</span><span class="p">()</span>          <span class="c1"># safe defaults</span>
 <span class="n">reqs</span><span class="o">.</span><span class="n">gda_connection_type</span> <span class="o">=</span> <span class="n">GDA_CONNECTION_CROSSNODE</span>
 <span class="n">reqs</span><span class="o">.</span><span class="n">gda_signal_count</span> <span class="o">=</span> <span class="mi">128</span>
