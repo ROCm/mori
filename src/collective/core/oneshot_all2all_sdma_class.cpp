@@ -133,6 +133,8 @@ All2allSdma<T>::~All2allSdma() {
     }
   }
   registered_outputs_.clear();
+  if (reg_ack_ != nullptr && shmem::ShmemIsInitialized()) shmem::ShmemFree(reg_ack_);
+  reg_ack_ = nullptr;
 
   // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction
   if (flags_) {

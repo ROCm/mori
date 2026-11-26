@@ -615,8 +615,12 @@ __device__ __forceinline__ void CclTdmA2aStart(
       if (laneId == 0) {
         *sameMask = sameBits;
         *reachMask = reachBits;
-        __scoped_atomic_store_n(masks, sameBits, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-        __scoped_atomic_store_n(masks + 1, reachBits, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        // Each mask goes under the call number, so that a block that reads one knows it is this
+        // call's and waits for it otherwise, whatever the order the stores become visible in.
+        __scoped_atomic_store_n(masks, (call << 32) | sameBits, __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_DEVICE);
+        __scoped_atomic_store_n(masks + 1, (call << 32) | reachBits, __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_DEVICE);
       }
     }
     __syncthreads();
@@ -627,8 +631,12 @@ __device__ __forceinline__ void CclTdmA2aStart(
     if (threadIdx.x == 0) {
       CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
       if (masks != nullptr) {
-        *sameMask = __scoped_atomic_load_n(masks, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-        *reachMask = __scoped_atomic_load_n(masks + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        CclTdmA2aWaitLocal(masks, call << 32, myPe, "the masks of block 0");
+        CclTdmA2aWaitLocal(masks + 1, call << 32, myPe, "the masks of block 0");
+        *sameMask =
+            __scoped_atomic_load_n(masks, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) & 0xFFFFFFFFULL;
+        *reachMask = __scoped_atomic_load_n(masks + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) &
+                     0xFFFFFFFFULL;
       }
     }
     __syncthreads();

@@ -96,10 +96,85 @@ class All2allSdma {
   std::map<uintptr_t, RegisteredOutput> registered_outputs_;
   uint64_t register_count_ = 0;
 
-  // Whether the runtime can export this memory to other processes. For some allocations
-  // hipIpcGetMemHandle fails every time ("invalid argument"), and the symmetric registration
-  // treats that as fatal, so it is asked first.
-  static bool can_export(void* ptr) {
+  // Where the peers leave, during a registration, whether they read this rank's buffer through
+  // their mapping: one word a rank, in the symmetric heap.
+  uint64_t* reg_ack_ = nullptr;
+  application::SymmMemObjPtr reg_ack_obj_;
+  static constexpr uint64_t kRegMark = 0x6d6f72695f613261ULL;
+
+  static void reg_copy(void* dst, const void* src, hipMemcpyKind kind) {
+    if (hipMemcpy(dst, src, sizeof(uint64_t), kind) != hipSuccess) {
+      (void)hipGetLastError();
+      throw std::runtime_error("All2allSdma: copy during an output registration failed");
+    }
+  }
+
+  // Whether every peer really reaches this rank's buffer through the mapping it was given, and
+  // this rank tells every peer the same about theirs. COLLECTIVE: all ranks run it together.
+  // The local checks of can_export are not enough: a buffer can start its allocation and be
+  // exported, and the peers still end up with a mapping of some other, larger block of this
+  // rank (seen when the runtime served the allocation out of a block it had kept), so that
+  // what they write never arrives. So each rank marks the first word of its buffer, the peers
+  // read it through their mappings (reading cannot damage anything a wrong mapping points
+  // at), and each leaves its verdict with the owner. The word is put back afterwards.
+  bool peers_reach(const application::SymmMemObjPtr& obj, void* ptr, uint64_t id, bool marked) {
+    if (reg_ack_ == nullptr) {
+      reg_ack_ = static_cast<uint64_t*>(shmem::ShmemMalloc(npes_ * sizeof(uint64_t)));
+      if (reg_ack_ == nullptr) throw std::runtime_error("All2allSdma: ack ShmemMalloc failed");
+      reg_ack_obj_ = shmem::ShmemQueryMemObjPtr(reg_ack_);
+      if (!reg_ack_obj_.IsValid()) throw std::runtime_error("All2allSdma: ack object missing");
+    }
+    const uint64_t zero = 0;
+    uint64_t saved = 0;
+    if (marked) {
+      const uint64_t mark = kRegMark ^ (id << 8) ^ static_cast<uint64_t>(myPe_);
+      reg_copy(&saved, ptr, hipMemcpyDeviceToHost);
+      reg_copy(ptr, &mark, hipMemcpyHostToDevice);
+    }
+    for (int pe = 0; pe < npes_; ++pe) reg_copy(reg_ack_ + pe, &zero, hipMemcpyHostToDevice);
+    shmem::ShmemBarrierAll();
+
+    for (int pe = 0; pe < npes_; ++pe) {
+      if (pe == myPe_) continue;
+      uint64_t seen = 0;
+      void* mapped = reinterpret_cast<void*>(obj.cpu->p2pPeerPtrs[pe]);
+      bool ok = mapped != nullptr;
+      if (ok && hipMemcpy(&seen, mapped, sizeof(seen), hipMemcpyDeviceToHost) != hipSuccess) {
+        (void)hipGetLastError();
+        ok = false;
+      }
+      ok = ok && seen == (kRegMark ^ (id << 8) ^ static_cast<uint64_t>(pe));
+      const uint64_t verdict = (id << 1) | (ok ? 1ULL : 0ULL);
+      reg_copy(reinterpret_cast<uint64_t*>(reg_ack_obj_.cpu->p2pPeerPtrs[pe]) + myPe_, &verdict,
+               hipMemcpyHostToDevice);
+    }
+    shmem::ShmemBarrierAll();
+
+    bool reached = marked;
+    if (marked) reg_copy(ptr, &saved, hipMemcpyHostToDevice);
+    for (int pe = 0; pe < npes_; ++pe) {
+      if (pe == myPe_) continue;
+      uint64_t verdict = 0;
+      reg_copy(&verdict, reg_ack_ + pe, hipMemcpyDeviceToHost);
+      if (verdict != ((id << 1) | 1ULL)) reached = false;
+    }
+    return reached;
+  }
+
+  // Whether the peers can be given this buffer. Two things were seen to go wrong, both a property
+  // of the memory and both repeatable. For some allocations hipIpcGetMemHandle fails every time
+  // ("invalid argument"), which the symmetric registration treats as fatal. And when the buffer
+  // does not start its allocation (the caller's allocator carved it out of a larger block), the
+  // peers' writes through the mapping they get land elsewhere in that allocation: every call
+  // into such a buffer came out wrong, and every call into one that starts its allocation right.
+  static bool can_export(void* ptr, size_t size) {
+    hipDeviceptr_t base = nullptr;
+    size_t allocSize = 0;
+    if (hipMemGetAddressRange(&base, &allocSize, ptr) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+    if (base != ptr || allocSize < size) return false;
     hipIpcMemHandle_t probe;
     if (hipIpcGetMemHandle(&probe, ptr) == hipSuccess) return true;
     (void)hipGetLastError();
@@ -266,9 +341,10 @@ class All2allSdma {
    * this base and size is returned as is; entries that overlap a new one are stale (the allocator
    * reused the memory) and dropped.
    *
-   * A buffer the runtime cannot export is not an error: this rank registers a stand-in so that
-   * the collective completes, and reports direct = false. It can then still write straight into
-   * the peers' buffers, and the peers send its share through the output transit buffer.
+   * A buffer the peers cannot be given (see can_export) is not an error: this rank registers a
+   * stand-in so that the collective completes, and reports direct = false. It can then still
+   * write straight into the peers' buffers, and the peers send its share through the output
+   * transit buffer.
    */
   RegisteredOutputInfo register_output_buffer(void* ptr, size_t size) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
@@ -286,7 +362,7 @@ class All2allSdma {
         ++it;
       }
     }
-    const bool direct = can_export(ptr);
+    const bool direct = can_export(ptr, size);
     void* standIn = nullptr;
     if (!direct) {
       // Allocations that cannot be exported are kept until one that can is found, so that the
@@ -295,7 +371,7 @@ class All2allSdma {
       for (int tries = 0; tries < 8 && standIn == nullptr; ++tries) {
         void* candidate = nullptr;
         if (hipMalloc(&candidate, kStandInBytes) != hipSuccess) break;
-        if (can_export(candidate)) {
+        if (can_export(candidate, kStandInBytes)) {
           standIn = candidate;
         } else {
           refused.push_back(candidate);
@@ -311,8 +387,9 @@ class All2allSdma {
         standIn != nullptr ? standIn : ptr, standIn != nullptr ? kStandInBytes : size, false);
     if (!obj.IsValid()) throw std::runtime_error("All2allSdma: output register failed");
     const uint64_t id = ++register_count_;
-    registered_outputs_[base] = {obj, size, id, direct, standIn};
-    return {obj, id, direct};
+    const bool reached = peers_reach(obj, ptr, id, direct);
+    registered_outputs_[base] = {obj, size, id, reached, standIn};
+    return {obj, id, reached};
   }
 
   /**
