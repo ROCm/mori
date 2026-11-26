@@ -68,4 +68,9 @@ class StorageIoDriver {
 
 std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend, uint32_t queue_depth);
 
+// For tests: an io_uring driver whose next `eagain_completions` successful
+// completions report -EAGAIN instead, as when the kernel could not issue them.
+std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriverForTest(uint32_t queue_depth,
+                                                                     uint32_t eagain_completions);
+
 }  // namespace mori::umbp
