@@ -258,11 +258,11 @@ __global__ void storek_u(uint4* __restrict__ d, size_t n) {
   for (; i < n; i += stride) d[i] = srcpat4<U>(i);
 }
 // ---- pipelined-TDM read (gfx1250): async fabric->LDS loads + local store ----
-using sg0v = int __attribute__((ext_vector_type(4)));
-using sg1v = int __attribute__((ext_vector_type(8)));
-using sg2v = int __attribute__((ext_vector_type(4)));
-using sg3v = int __attribute__((ext_vector_type(4)));
-using sgxv = int __attribute__((ext_vector_type(8)));
+using sg0v = unsigned int __attribute__((ext_vector_type(4)));
+using sg1v = unsigned int __attribute__((ext_vector_type(8)));
+using sg2v = unsigned int __attribute__((ext_vector_type(4)));
+using sg3v = unsigned int __attribute__((ext_vector_type(4)));
+using sgxv = unsigned int __attribute__((ext_vector_type(8)));
 __device__ void s_wait_tensorcnt(short) __asm("llvm.amdgcn.s.wait.tensorcnt");
 // Cache policy exists in two independent places and both were left at zero/default until now.
 // The instruction's CPOL immediate: TH in bits 0-2, SCOPE in 3-4, NV in 5.

@@ -157,8 +157,8 @@ template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src,
                                              const gfx1250_TDM_GROUP1& g1) {
   MORI_TDM_CHECK_ADDR(src);
-  typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
-  typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
+  typedef unsigned int _tdm_v4i __attribute__((ext_vector_type(4)));
+  typedef unsigned int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0;
   g0.ldsAddr((uintptr_t)ldsTile);
   g0.globalAddr((uintptr_t)src);
@@ -185,8 +185,8 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int n
 template <typename T, int TH = 0, int SCOPE = 0, int CPOL = 0>
 __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
   MORI_TDM_CHECK_ADDR(dst);
-  typedef int _tdm_v4i __attribute__((ext_vector_type(4)));
-  typedef int _tdm_v8i __attribute__((ext_vector_type(8)));
+  typedef unsigned int _tdm_v4i __attribute__((ext_vector_type(4)));
+  typedef unsigned int _tdm_v8i __attribute__((ext_vector_type(8)));
   gfx1250_TDM_GROUP0 g0;
   g0.ldsAddr((uintptr_t)ldsTile);
   g0.globalAddr((uintptr_t)dst);
