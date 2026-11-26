@@ -132,9 +132,17 @@ class PeerPool {
                                               const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
-  // check discards. Takes no read lease, but renews recency: a client looks
-  // keys up to load them next, and evicting them in between fails that load.
+  // check discards. Changes nothing: no lease, no recency.  A lookup asks about
+  // more than its client loads (a hybrid model asks for its state at every
+  // boundary and loads one), so the keys to protect are the ones the client
+  // decides to load, which it passes to BatchLease.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // The keys a client is about to load: which are held here, in request order,
+  // each leased for `ttl` on the first medium in read order that holds it (the
+  // one the read will come from) and renewed in recency, as the read will be.
+  // A key reported held cannot be evicted from that medium before the lease
+  // ends; a medium without leases (SSD) only renews recency.
+  std::vector<bool> BatchLease(const std::vector<std::string>& keys, std::chrono::milliseconds ttl);
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
@@ -243,6 +251,11 @@ class PeerPool {
                                                              std::chrono::milliseconds wait);
 
   void TouchLocked(const std::string& key);
+  // Asks each medium in read order, about the keys no earlier one held, and
+  // marks the keys `ask` reports held.  Caller holds lifecycle_mutex_ shared.
+  std::vector<bool> FirstHolders(
+      const std::vector<std::string>& keys,
+      const std::function<std::vector<bool>(MediumBackend&, const std::vector<std::string>&)>& ask);
   void ForgetAccessLocked(const std::string& key);
   // Whether this read should promote the key out of `source_tier`, per that
   // tier's trigger. Counts the read for an kOnHits tier, so call it once per read.

@@ -1358,4 +1358,40 @@ TEST(PageBackendTouch, DoesNothingUntilTheOrderIsTracked) {
   EXPECT_EQ(backend->Touch({"a"}), 0u);
 }
 
+TEST(PageBackendLease, FencesEvictionAndRenewsRecency) {
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{1});
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  EXPECT_EQ(backend->Lease({"a", "missing", "a"}, std::chrono::milliseconds{50}),
+            (std::vector<bool>{true, false, true}));
+  EXPECT_TRUE(backend->Lease({}, std::chrono::milliseconds{50}).empty());
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c"}));
+  auto evicted = backend->Evict({"a"});
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0].bytes_freed, 0u);
+  // The lease is over and "a" is the most recent, as after the read it announced.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
+}
+
+TEST(PageBackendLease, NeverShortensALongerLease) {
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{200});
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  ASSERT_TRUE(backend->BatchResolve({"a"}, false).front().found);
+  backend->Lease({"a"}, std::chrono::milliseconds{1});
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b"}));
+}
+
+TEST(PageBackendLease, LeasesWithoutAnOrderToRenew) {
+  auto backend = MakeAllocator();
+  PutKey(*backend, "a");
+  EXPECT_EQ(backend->Lease({"a"}, std::chrono::milliseconds{60000}), (std::vector<bool>{true}));
+  auto evicted = backend->Evict({"a"});
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0].bytes_freed, 0u);
+}
+
 }  // namespace mori::umbp

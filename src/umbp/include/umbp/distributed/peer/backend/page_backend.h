@@ -326,6 +326,11 @@ class PageBackend : public MediumBackend {
   // Moves held keys to the recent end of the order, as a read would, without
   // the read's lease.  0 until TrackEvictionOrder().
   size_t Touch(const std::vector<std::string>& keys) override;
+  // Renews the read lease (never shortening it) and the recency of each held
+  // key under the shared lock Evict() excludes, so a key reported held keeps
+  // its pages until the lease ends.
+  std::vector<bool> Lease(const std::vector<std::string>& keys,
+                          std::chrono::milliseconds ttl) override;
 
   // ==================== Reaper ====================
 

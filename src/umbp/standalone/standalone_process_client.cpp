@@ -852,6 +852,40 @@ size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& ke
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+std::vector<bool> StandaloneProcessClient::BatchLease(const std::vector<std::string>& keys,
+                                                      uint32_t ttl_ms) {
+  SimCall call(sim_trace_.get(), "batch_lease", keys.size(), 0);
+  if (closing_ || keys.empty()) return std::vector<bool>(keys.size(), false);
+  {
+    std::shared_lock lk(op_mutex_);
+    if (closed_) return std::vector<bool>(keys.size(), false);
+    grpc::ClientContext ctx;
+    SetLookupDeadline(&ctx, standalone_config_.lookup_timeout_ms);
+    ::umbp::BatchLeaseRequest req;
+    for (const auto& key : keys) req.add_keys(key);
+    req.set_ttl_ms(ttl_ms);
+    ::umbp::BatchBoolResponse resp;
+    const grpc::Status status = stub_->BatchLease(&ctx, req, &resp);
+    if (status.ok() && resp.ok_size() == static_cast<int>(keys.size())) {
+      return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
+    }
+    if (status.error_code() != grpc::StatusCode::UNIMPLEMENTED) {
+      if (!status.ok())
+        WarnLookupFailure("BatchLease", status, standalone_config_.lookup_timeout_ms);
+      return std::vector<bool>(keys.size(), false);
+    }
+  }
+  // Nothing to lease with: existence is the most an older server can confirm.
+  static std::once_flag warned;
+  std::call_once(warned, [this] {
+    MORI_UMBP_WARN(
+        "[StandaloneProcessClient] server {} predates BatchLease; keys about to be read are "
+        "only looked up",
+        address_);
+  });
+  return call.Result(BatchExists(keys));
+}
+
 size_t StandaloneProcessClient::BatchTouch(const std::vector<std::string>& keys) {
   if (closing_ || keys.empty()) return 0;
   std::shared_lock lk(op_mutex_);

@@ -72,6 +72,8 @@ class StandaloneProcessClient : public IUMBPClient {
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
   size_t BatchPrefetch(const std::vector<std::string>& keys) override;
   size_t BatchTouch(const std::vector<std::string>& keys) override;
+  // A server built before BatchLease is answered with BatchExists.
+  std::vector<bool> BatchLease(const std::vector<std::string>& keys, uint32_t ttl_ms) override;
 
   void ConfigureKvIndexer(const KvIndexerConfig& config) override;
 

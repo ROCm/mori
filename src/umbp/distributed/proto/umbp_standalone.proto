@@ -19,6 +19,8 @@ service UMBPStandalone {
   rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
   // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // IUMBPClient::BatchLease; a server without it answers UNIMPLEMENTED.
+  rpc BatchLease(BatchLeaseRequest) returns (BatchBoolResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -84,6 +86,11 @@ message KeyRequest {
 
 message BatchKeysRequest {
   repeated string keys = 1;
+}
+
+message BatchLeaseRequest {
+  repeated string keys = 1;
+  uint32 ttl_ms = 2;
 }
 
 message PutRequest {

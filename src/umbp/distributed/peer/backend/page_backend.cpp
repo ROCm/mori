@@ -912,6 +912,31 @@ size_t PageBackend::Touch(const std::vector<std::string>& keys) {
   return held.size();
 }
 
+std::vector<bool> PageBackend::Lease(const std::vector<std::string>& keys,
+                                     std::chrono::milliseconds ttl) {
+  std::vector<bool> held(keys.size(), false);
+  if (keys.empty()) return held;
+  // Shared, like the resolve paths: the lease is an atomic CAS-max and the LRU
+  // has its own lock.  Evict() takes the lock exclusively, so a key found here
+  // is leased before any eviction can look at it again.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const int64_t deadline = SteadyNs(std::chrono::steady_clock::now() + ttl);
+  std::vector<std::pair<const std::string*, OwnedSlot*>> found;
+  found.reserve(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = owned_.find(keys[i]);
+    if (it == owned_.end()) continue;
+    RenewLeaseAtomic(it->second, deadline);
+    found.emplace_back(&keys[i], &it->second);
+    held[i] = true;
+  }
+  if (track_eviction_order_ && !found.empty()) {
+    std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+    for (auto& [key, slot] : found) TouchLruLocked(*key, *slot);
+  }
+  return held;
+}
+
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
   if (slot.in_lru) {

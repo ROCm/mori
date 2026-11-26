@@ -5323,6 +5323,36 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
   return out;
 }
 
+std::vector<bool> PoolClient::BatchLease(const std::vector<std::string>& keys, uint32_t ttl_ms) {
+  if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
+  constexpr uint32_t kMaxLeaseMs = 10 * 60 * 1000;
+  std::vector<bool> out(keys.size(), false);
+  if (default_pool_ != nullptr) {
+    out = default_pool_->BatchLease(keys, std::chrono::milliseconds(std::min(ttl_ms, kMaxLeaseMs)));
+    out.resize(keys.size(), false);
+  }
+  // What this node does not hold may be on a peer.  The read will route there
+  // and the owner's read lease covers it from the resolve on; until then it is
+  // unprotected, as it is with every lookup.
+  if (!HasMaster()) return out;
+  std::vector<std::string> unknown;
+  std::vector<size_t> unknown_indices;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (!out[i]) {
+      unknown.push_back(keys[i]);
+      unknown_indices.push_back(i);
+    }
+  }
+  if (unknown.empty()) return out;
+  std::vector<bool> remote;
+  auto status = master_client_->BatchLookup(unknown, &remote);
+  if (!status.ok() || remote.size() != unknown.size()) return out;
+  for (size_t j = 0; j < unknown_indices.size(); ++j) {
+    if (remote[j]) out[unknown_indices[j]] = true;
+  }
+  return out;
+}
+
 size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty() || default_pool_ == nullptr) return 0;
   // In the master eviction modes victims follow the master's recency, which

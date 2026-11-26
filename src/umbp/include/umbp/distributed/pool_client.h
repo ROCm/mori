@@ -218,6 +218,9 @@ class PoolClient {
   // node's media.  In the master eviction modes the keys also join the local
   // reads reported to the master.  Never contacts another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // IUMBPClient::BatchLease: leases what this node holds; the rest is answered
+  // as BatchExists answers it, without protection.
+  std::vector<bool> BatchLease(const std::vector<std::string>& keys, uint32_t ttl_ms);
 
   MasterClient& Master();
 
