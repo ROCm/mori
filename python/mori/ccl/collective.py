@@ -155,9 +155,18 @@ _TDM_A2A_TILE_BYTES = 256 * 16 * 4
 # sync array and, without copy_output_to_user, a word per rank in the output
 # transit buffer.
 _TDM_A2A_BLOCKS = 64
+# MORI_CCL_ALL2ALL_BLOCKS overrides the block count per handle, for comparison
+# only: 64 is what ships. Must equal MORI_CCL_TDM_A2A_MAX_BLOCKS.
+_TDM_A2A_MAX_BLOCKS = 128
 _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
 # Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block and the go word.
-_TDM_A2A_SYNC_WORDS = 64 + 1
+_TDM_A2A_SYNC_WORDS = _TDM_A2A_MAX_BLOCKS + 1
+# With copy_output_to_user, calls of at least this many bytes a rank
+# (count * npes * 4) push every tile first, exchange one word a block and then
+# copy (CclTdmA2aCopyAfterPush in the kernel header); smaller ones raise a word
+# per tile and copy while they push. The kernel decides; this must equal
+# kCclTdmA2aCopyAfterPushMinBytes there.
+_TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES = 64 * 1024 * 1024
 # sizeof(CclAll2allArgs<uint32_t>), the struct prepare_sync fills. The TDM
 # kernel takes those bytes followed by the sync pointer, the caller's output,
 # the 4-byte elements in a transit half, the 4-byte elements before the words,
@@ -203,16 +212,34 @@ def _resolve_all2all_ll128_max_bytes() -> int:
     return value
 
 
+def _resolve_all2all_blocks() -> int:
+    raw = os.environ.get("MORI_CCL_ALL2ALL_BLOCKS", "").strip()
+    if not raw:
+        return _TDM_A2A_BLOCKS
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= _TDM_A2A_MAX_BLOCKS:
+        raise ValueError(
+            f"MORI_CCL_ALL2ALL_BLOCKS must be a block count from 1 to "
+            f"{_TDM_A2A_MAX_BLOCKS}, got {raw!r}"
+        )
+    return value
+
+
 def _align_up(n: int, a: int) -> int:
     return (n + a - 1) // a * a
 
 
-def _tdm_a2a_words_bytes(npes: int, half_bytes: int, copy_out: bool) -> int:
+def _tdm_a2a_words_bytes(
+    npes: int, half_bytes: int, copy_out: bool, blocks: int = _TDM_A2A_BLOCKS
+) -> int:
     # copy_output_to_user: a word per rank and tile of the largest call a half
     # holds, half_bytes // (4 * npes) elements a destination. Otherwise a u64
     # per rank and block.
     if not copy_out:
-        return npes * _TDM_A2A_BLOCKS * 8
+        return npes * blocks * 8
     tile_elems = _TDM_A2A_TILE_BYTES // 4
     tiles = (half_bytes // 4 // npes + tile_elems - 1) // tile_elems
     return npes * tiles * _TDM_A2A_WORD_GAP_BYTES
@@ -332,6 +359,7 @@ class All2allSdma:
         ll_half = 0
         if self._backend == "tdm":
             self._tdm_ll_max = _resolve_all2all_ll128_max_bytes()
+            self._tdm_blocks = _resolve_all2all_blocks()
             ll_half = _tdm_ll128_half_bytes(npes, self._tdm_ll_max)
             # The room the caller asked for, split as below.
             if input_buffer_size is not None and output_buffer_size is not None:
@@ -343,7 +371,9 @@ class All2allSdma:
             # The kernel is told halves of at most this size (below), so the
             # words cover every tile it can be asked to move.
             half_cap = room // 2 // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
-            words_bytes = _tdm_a2a_words_bytes(npes, half_cap, copy_output_to_user)
+            words_bytes = _tdm_a2a_words_bytes(
+                npes, half_cap, copy_output_to_user, self._tdm_blocks
+            )
             extra = words_bytes + _TDM_A2A_WORD_GAP_BYTES
             if ll_half:
                 extra += _TDM_A2A_LL128_ALIGN + 2 * ll_half
@@ -439,7 +469,7 @@ class All2allSdma:
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 32
         ).value = (self._tdm_ll_elems if ll else 0)
         _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
-            (_TDM_A2A_BLOCKS,),
+            (self._tdm_blocks,),
             (_TDM_THREADS,),
             _TDM_A2A_SHARED_MEM,
             s,

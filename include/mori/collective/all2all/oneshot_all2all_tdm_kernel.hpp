@@ -32,7 +32,9 @@
 //                raises a tile's word on the receiver as soon as the tile is out, and a warp whose
 //                own tiles are out copies tiles whose word is up from the half into output, so
 //                the copy overlaps the push (detail::CclTdmA2aCopyOverlapped). Consecutive calls
-//                write different halves, so nobody waits for a peer before writing.
+//                write different halves, so nobody waits for a peer before writing. Calls of at
+//                least kCclTdmA2aCopyAfterPushMinBytes a rank push every tile first, raise one
+//                word per (peer, block) and copy afterwards (detail::CclTdmA2aCopyAfterPush).
 //   output null  at the start of the output transit buffer, which the caller reads after the
 //                kernel. Block 0 exchanges a start token with every peer and then lets the other
 //                blocks go, so a rank writes into a peer only once the peer has started the call,
@@ -89,10 +91,10 @@ namespace collective {
 #define MORI_CCL_TDM_A2A_TILE_ELEMS (MORI_CCL_TDM_A2A_TILE_W * MORI_CCL_TDM_A2A_TILE_H)
 #define MORI_CCL_TDM_A2A_TILE_BYTES (MORI_CCL_TDM_A2A_TILE_ELEMS * 4)
 
-// Layout of sync, in u64 words. MUST AGREE WITH _TDM_A2A_SYNC_WORDS and _TDM_A2A_BLOCKS in
+// Layout of sync, in u64 words. MUST AGREE WITH _TDM_A2A_SYNC_WORDS and _TDM_A2A_MAX_BLOCKS in
 // python/mori/ccl/collective.py: the grid may exceed neither the block slots nor the words that
 // collective.py reserves.
-#define MORI_CCL_TDM_A2A_MAX_BLOCKS 64
+#define MORI_CCL_TDM_A2A_MAX_BLOCKS 128
 #define MORI_CCL_TDM_A2A_SYNC_GO MORI_CCL_TDM_A2A_MAX_BLOCKS
 #define MORI_CCL_TDM_A2A_SYNC_WORDS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 1)
 
@@ -438,16 +440,122 @@ __device__ __forceinline__ void CclTdmA2aCopyOverlapped(
   }
 }
 
+// Calls of at least this many bytes a rank (count * npes * 4) with output set go through
+// CclTdmA2aCopyAfterPush instead of CclTdmA2aCopyOverlapped. MUST AGREE WITH
+// _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES in python/mori/ccl/collective.py, which only documents and
+// tests the boundary.
+constexpr size_t kCclTdmA2aCopyAfterPushMinBytes = 64ULL << 20;
+
+// The whole TDM call with output set, for large calls: every warp pushes its tiles, then the block
+// raises one word on every peer, and then the same warps copy what landed into output.
+//
+// Measured on 4 gfx1250 GPUs with graphs of 100 calls at 1 GiB a rank. Inside a compute unit a copy
+// does not overlap a push, wherever its warps sit: 4 warps pushing took 570.9 us, 4 other warps
+// copying took 236.4 us, and both together 857.4 us. A word per tile cost the pushing warp 2.5 us
+// a tile (812.6 us against 570.9). So the words CclTdmA2aCopyOverlapped pays for buy no overlap
+// once the push is long, and one word a block does the same job: 700.3 us a call against 813.6,
+// 185.5 against 211.9 at 256 MiB a rank and 57.5 against 61.3 at 64 MiB. At 32 and 16 MiB a rank
+// the exchange between all blocks costs more than it saves (37.4 us against 36.6, 27.8 against
+// 22.8), which is where the bound above comes from.
+//
+// Item i = t * (npes - 1) + k is tile t of the chunk for rank (myPe + 1 + k) % npes, and warp
+// g = warpId * grid + blk takes items g, g + totalWarps, ... The tile that lands here under index i
+// comes from rank (myPe - 1 - k) mod npes and was pushed by warp g of that rank, so the words of
+// block blk cover exactly the tiles block blk copies. The word of (rank s, block b) is u64
+// (s * wordStride + b) * wordGap of the words: with output set the caller passes the per-tile
+// words' stride and gap and guarantees that grid of them exist per rank; values only grow, so a
+// call through either function never mistakes the other's word for its own.
+// Every block raises and waits, so a rank ends call g only once every peer has pushed all of call
+// g, which orders the halves as CclTdmA2aCopyOverlapped does. Needs npes >= 2.
+//
+// The tiles go to element peerOff of each peer's output transit buffer and the chunk this rank
+// keeps to res4. With `from` set, what landed is then copied from `from` into res4; with nullptr
+// the result stays where it landed (the zero-copy call, whose res4 is the transit buffer). There
+// the same order of work measured 593.8 us a call at 1 GiB a rank against 614.3 for the loop that
+// mixes this rank's own tiles into the push and lets only the blocks with tiles raise and wait,
+// 162.6 against 171.1 at 256 MiB, 36.9 against 38.8 at 32 MiB, and 29.9 against 28.7 at 16 MiB.
+constexpr size_t kCclTdmA2aPushFirstMinBytes = 32ULL << 20;
+__device__ __forceinline__ void CclTdmA2aCopyAfterPush(
+    int myPe, int npes, const uint32_t* src4, uint32_t* res4, const uint32_t* from,
+    uint32_t* localTransit, const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4,
+    uint64_t call, size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap,
+    size_t grid, size_t blk, int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId,
+    int waveSize) {
+  const size_t np = static_cast<size_t>(npes);
+  const size_t me = static_cast<size_t>(myPe);
+  const size_t peers = np - 1;
+  const size_t tiles = (chunk4 + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) / MORI_CCL_TDM_A2A_TILE_ELEMS;
+  const size_t items = tiles * peers;
+  const size_t first = static_cast<size_t>(warpId) * grid + blk;
+
+  for (size_t i = first; i < items; i += totalWarps) {
+    const size_t destPe = (me + 1 + i % peers) % np;
+    const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    uint32_t* const peer =
+        reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
+    CclTdmA2aWarpCopySys(peer + peerOff + me * chunk4 + off, src4 + destPe * chunk4 + off, n,
+                         ldsTile, laneId, waveSize);
+  }
+
+  // One lane per peer, all in warp 0, as in the zero-copy path. s_wait_tensorcnt(0) retired the
+  // engine and the tiles went out at system scope; the fence of warp 0 after the barrier covers
+  // what the lanes of any warp stored of a tile's tail.
+  const bool peerLane = warpId == 0 && laneId < npes && laneId != myPe;
+  __syncthreads();
+  if (warpId == 0) {
+    __threadfence_system();
+    if (peerLane) {
+      uint64_t* const word =
+          reinterpret_cast<uint64_t*>(
+              reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(laneId)) +
+              wordsElems) +
+          (me * wordStride + blk) * wordGap;
+      __scoped_atomic_store_n(word, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+  }
+
+  // The chunk this rank keeps, while the peers' words are on their way.
+  for (size_t t = first; t < tiles; t += totalWarps) {
+    const size_t off = t * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    const size_t at = me * chunk4 + off;
+    CclTdmA2aWarpCopy(res4 + at, src4 + at, n, ldsTile, laneId, waveSize);
+  }
+
+  if (peerLane) {
+    CclTdmA2aWaitPeer(reinterpret_cast<const uint64_t*>(localTransit + wordsElems) +
+                          (static_cast<size_t>(laneId) * wordStride + blk) * wordGap,
+                      call, myPe, laneId);
+  }
+  __syncthreads();
+  // Other GPUs wrote the tiles, which an agent-scope acquire does not cover.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  if (from == nullptr) return;
+  for (size_t i = first; i < items; i += totalWarps) {
+    const size_t srcPe = (me + np - 1 - i % peers) % np;
+    const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    const size_t at = srcPe * chunk4 + off;
+    CclTdmA2aWarpCopy(res4 + at, from + at, n, ldsTile, laneId, waveSize);
+  }
+}
+
 }  // namespace detail
 
 template <typename T>
-__device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
-                                      const application::SymmMemObjPtr inputTransitMemObj,
-                                      const application::SymmMemObjPtr outputTransitMemObj,
-                                      const application::SymmMemObjPtr flagsMemObj,
-                                      size_t elementCount, uint64_t* sync, T* output,
-                                      size_t halfElems, size_t wordsElems, size_t llElems,
-                                      size_t llHalfElems) {
+__device__ __forceinline__ void TdmAll2allKernel_body(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr inputTransitMemObj,
+    const application::SymmMemObjPtr outputTransitMemObj,
+    const application::SymmMemObjPtr flagsMemObj, size_t elementCount, uint64_t* sync, T* output,
+    size_t halfElems, size_t wordsElems, size_t llElems, size_t llHalfElems) {
   static_assert(sizeof(T) % 4 == 0, "TdmAll2allKernel moves 4-byte words");
   (void)inputTransitMemObj;
   if (elementCount == 0 || npes <= 0) return;
@@ -489,10 +597,26 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
   }
 
   if (out4 != nullptr) {
-    detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
-                                    localTransit, outputTransitMemObj, chunk4, call, halfElems,
-                                    wordsElems, grid, blk, warpId, totalWarps, &s_nextPair, ldsTile,
-                                    laneId, waveSize);
+    // The same on every rank: it depends on the call's size and the handle's half only.
+    const size_t tileStride =
+        (halfElems / static_cast<size_t>(npes) + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) /
+        MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const bool afterPush =
+        npes >= 2 &&
+        chunk4 * 4 * static_cast<size_t>(npes) >= detail::kCclTdmA2aCopyAfterPushMinBytes &&
+        tileStride >= grid;
+    if (afterPush) {
+      const size_t half = static_cast<size_t>(call & 1ULL) * halfElems;
+      detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
+                                     localTransit + half, localTransit, outputTransitMemObj, chunk4,
+                                     call, half, wordsElems, tileStride, detail::kCclTdmA2aWordGap,
+                                     grid, blk, warpId, totalWarps, ldsTile, laneId, waveSize);
+    } else {
+      detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
+                                      localTransit, outputTransitMemObj, chunk4, call, halfElems,
+                                      wordsElems, grid, blk, warpId, totalWarps, &s_nextPair,
+                                      ldsTile, laneId, waveSize);
+    }
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
@@ -532,6 +656,19 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
   } else {
     if (threadIdx.x == 0) detail::CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
     __syncthreads();
+  }
+
+  // Large calls: push, one word per (peer, block), and nothing to copy. The words are the same
+  // ones the loop below raises, word (rank, block) at u64 rank * grid + block.
+  if (npes >= 2 && chunk4 * 4 * static_cast<size_t>(npes) >= detail::kCclTdmA2aPushFirstMinBytes) {
+    detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input),
+                                   localTransit, nullptr, localTransit, outputTransitMemObj, chunk4,
+                                   call, 0, wordsElems, grid, 1, grid, blk, warpId, totalWarps,
+                                   ldsTile, laneId, waveSize);
+    if (threadIdx.x == 0) {
+      __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+    return;
   }
 
   // Item i is tile i / npes of one destination's chunk. Warp ids are warp-major (warp * grid +

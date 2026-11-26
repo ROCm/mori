@@ -70,8 +70,10 @@ _CHECK_COUNTS = (
 )
 _CHECK_CALLS = 3
 _BENCH_BYTES_PER_GPU = tuple(k << 10 for k in (64, 128, 256, 512)) + tuple(
-    m << 20 for m in (1, 2, 4, 8, 16, 32)
+    m << 20 for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 )
+# Sizes above this are checked once instead of _CHECK_CALLS times.
+_CHECK_ONCE_BYTES = 32 << 20
 
 
 def _chunk(src_pe, dest_pe, npes, call, count, device):
@@ -94,7 +96,10 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     shmem.shmem_torch_process_group_init("default")
 
     from mori.ccl import All2allSdma
-    from mori.ccl.collective import _TDM_A2A_LL128_MAX_BYTES
+    from mori.ccl.collective import (
+        _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES,
+        _TDM_A2A_LL128_MAX_BYTES,
+    )
 
     my_pe, npes = shmem.shmem_mype(), shmem.shmem_npes()
     assert (my_pe, npes) == (rank, world_size)
@@ -112,10 +117,20 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
 
     # The largest call that moves as LL128 lines, and the smallest that does not.
     ll_edge = _TDM_A2A_LL128_MAX_BYTES // (4 * npes)
-    check_counts = list(_CHECK_COUNTS) + [ll_edge, ll_edge + 1]
+    # Into output, the smallest call that pushes everything before it copies, the largest that
+    # copies while it pushes, and one of the former with a tail of rows and of lanes.
+    ap_edge = -(-_TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES // (4 * npes))
+    check_counts = list(_CHECK_COUNTS) + [
+        ll_edge,
+        ll_edge + 1,
+        ap_edge - 1,
+        ap_edge,
+        ap_edge + 5 * 256 + 7,
+    ]
     bench_counts = [b // 4 // npes for b in _BENCH_BYTES_PER_GPU] if bench else []
     max_count = max(check_counts + bench_counts)
-    nbytes = max_count * npes * 4
+    # A whole number of pages: the handle rounds a half down to the 128 B TDM needs.
+    nbytes = -(-max_count * npes * 4 // 4096) * 4096
     handles = {
         # Calls alternate between the halves of the output transit buffer.
         "into output": All2allSdma(
@@ -186,7 +201,8 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
 
     for mode in handles:
         for count in check_counts + bench_counts:
-            for _ in range(_CHECK_CALLS):
+            once = count * npes * 4 > _CHECK_ONCE_BYTES
+            for _ in range(1 if once else _CHECK_CALLS):
                 check(mode, count)
         check(mode, 8 * 4096, use_async=True)
 
@@ -278,6 +294,12 @@ def _run(world_size, bench=False, rounds=5, iters=100, warmup=2):
     os.environ["MORI_ENABLE_SDMA"] = "0"
     os.environ["HSA_ENABLE_SDMA"] = "0"
     os.environ.pop("MORI_CCL_ALL2ALL_BACKEND", None)
+    # Three handles, each with an input buffer and up to two halves of output transit buffer of
+    # the largest size, plus their words and LL128 areas.
+    largest = max(_BENCH_BYTES_PER_GPU) if bench else 2 * _CHECK_ONCE_BYTES + (1 << 20)
+    os.environ.setdefault(
+        "MORI_SHMEM_HEAP_SIZE", str(max(4 << 30, 9 * largest + (1 << 30)))
+    )
     torch.multiprocessing.spawn(
         _worker,
         args=(world_size, get_free_port(), bench, rounds, iters, warmup),
