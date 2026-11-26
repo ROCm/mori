@@ -978,6 +978,7 @@ class EpDispatchCombineOp:
     # recv without a send raises rather than hitting a missing attribute.
     _async_pending_dispatch_tokens = None
     _async_pending_dispatch_input = None
+    _async_pending_dispatch_scales = None
     _async_pending_dispatch_map = None
     _async_pending_combine = None
 
@@ -1584,6 +1585,9 @@ class EpDispatchCombineOp:
         if kernels is not self._kernels.dispatch:
             self._async_pending_dispatch_tokens = n
             self._async_pending_dispatch_input = input
+            # With MORI_ASYNCLL_DIRECT=1 the copy engines read the scale rows in place too,
+            # until dispatch_recv drains them: keep the caller's tensor from being reused.
+            self._async_pending_dispatch_scales = scales
             self._async_pending_dispatch_map = dest_map
 
         count = self.total_recv.clone() if snapshot else self.total_recv
@@ -1817,7 +1821,8 @@ class EpDispatchCombineOp:
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
         only valid after :meth:`dispatch_recv`. With MORI_ASYNCLL_DIRECT=1 the copy
-        engines read ``input`` until then, so do not write it in between.
+        engines read ``input`` and ``scales`` until then, so do not write either in
+        between.
         """
         with self._asyncll_call("dispatch_send"):
             return self._dispatch_impl(
@@ -1848,6 +1853,7 @@ class EpDispatchCombineOp:
             # caller's input alive until the next round. combine_recv already drops
             # its whole tuple the same way.
             self._async_pending_dispatch_input = None
+            self._async_pending_dispatch_scales = None
             self._async_pending_dispatch_map = None
 
     def combine_send(self, input, weights=None, indices=None, *, routing):

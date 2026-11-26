@@ -121,10 +121,11 @@ These options are read once when an op is constructed:
    * - ``MORI_ASYNCLL_DIRECT``
      - ``0``. Set ``1`` to have the copy engines read the tokens where the
        caller left them: dispatch posts each peer's rows from the input, one
-       packet per run of adjacent source tokens, and combine posts each peer's
-       rows from the expert output, so neither send phase gathers them first.
-       The dispatch input and the combine input are read until the matching
-       ``dispatch_recv`` / ``combine_recv``: do not write either in between,
+       packet per run of adjacent source tokens (and, in the segmented layout,
+       one more for the run's scale rows), and combine posts each peer's rows
+       from the expert output, so neither send phase gathers them first. The
+       dispatch input and scales and the combine input are read until the
+       matching ``dispatch_recv`` / ``combine_recv``: do not write them in between,
        and do not pass a tensor this op returns from a receive as the dispatch
        input. The op's arena then leaves out the send staging the engines no
        longer read, about a third of it, so every rank must use the same

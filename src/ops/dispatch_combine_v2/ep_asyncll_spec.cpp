@@ -247,10 +247,11 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     case EpAsyncLLKernel::CombineSendTransferSeg:
       geometry.gridX = static_cast<unsigned>(worldSize);
       geometry.blockX = static_cast<unsigned>(cfg.waveSize);
-      // Direct dispatch posts a packet per run of rows: four waves fill the queue in turn.
+      // Direct dispatch places a packet per run of rows (two with scales), every wave of the
+      // block in turn; sixteen waves beat four once a peer gets thousands of rows, and tie below.
       if (cfg.asyncLlDirect && (kind == EpAsyncLLKernel::DispatchSendTransfer ||
                                 kind == EpAsyncLLKernel::DispatchSendTransferSeg))
-        geometry.blockX = static_cast<unsigned>(cfg.waveSize) * 4;
+        geometry.blockX = static_cast<unsigned>(cfg.waveSize) * 16;
       geometry.sharedBytes = 0;
       break;
 
