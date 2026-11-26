@@ -128,8 +128,8 @@ All2allSdma<T>::~All2allSdma() {
 
   // Python may destroy the handle after shmem_finalize(), when nothing can be deregistered.
   if (shmem::ShmemIsInitialized()) {
-    for (auto& entry : registered_outputs_) {
-      shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(entry.first), entry.second.size);
+    for (auto it = registered_outputs_.begin(); it != registered_outputs_.end(); ++it) {
+      drop_registered(it);
     }
   }
   registered_outputs_.clear();

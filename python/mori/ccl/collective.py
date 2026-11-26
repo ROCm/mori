@@ -159,8 +159,9 @@ _TDM_A2A_BLOCKS = 64
 # only: 64 is what ships. Must equal MORI_CCL_TDM_A2A_MAX_BLOCKS.
 _TDM_A2A_MAX_BLOCKS = 128
 _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
-# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block and the go word.
-_TDM_A2A_SYNC_WORDS = _TDM_A2A_MAX_BLOCKS + 1
+# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block, the go word and the
+# two masks of the registered-output handshake.
+_TDM_A2A_SYNC_WORDS = _TDM_A2A_MAX_BLOCKS + 3
 # With copy_output_to_user, calls of at least this many bytes a rank
 # (count * npes * 4) push every tile first, exchange one word a block and then
 # copy (CclTdmA2aCopyAfterPush in the kernel header); smaller ones raise a word
@@ -172,9 +173,10 @@ _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES = 64 * 1024 * 1024
 # the 4-byte elements in a transit half, the 4-byte elements before the words,
 # the 4-byte elements before the LL128 area and in a half of it, and the two
 # pointers of the registered output's symmetric object, zero when the output is
-# not registered (CclTdmAll2allArgs, which static_asserts every offset).
+# not registered, and the word that says which registration it is
+# (CclTdmAll2allArgs, which static_asserts every offset).
 _TDM_A2A_BASE_ARGS_BYTES = 72
-_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 64
+_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 72
 # Each half of the output transit buffer starts on a 128 B boundary, the
 # alignment TDM needs.
 _TDM_A2A_HALF_ALIGN = 128
@@ -211,6 +213,32 @@ def _resolve_all2all_ll128_max_bytes() -> int:
             f"MORI_CCL_ALL2ALL_LL128_MAX_BYTES must be a byte count >= 0, got {raw!r}"
         )
     return value
+
+
+# MORI_CCL_ALL2ALL_AUTO_REGISTER=1 makes a handle register, on its own, every
+# output a large call is given (see All2allSdma.register_output_buffer), as
+# RCCL does with its user buffers. Off by default: the registration is
+# collective, so it is only safe when every rank passes a new output in the
+# same call, and it is skipped while a graph is being captured. The handle
+# keeps the last few registered this way.
+_TDM_A2A_AUTO_REGISTER_KEEP = 4
+
+
+# Data pointers of the outputs some handle of this process holds registered. Two
+# registrations of the same memory would share one entry of the symmetric
+# memory pool, and dropping either would take the other's mappings with it.
+_TDM_A2A_REGISTERED_PTRS = set()
+
+
+def _env_ranks(name: str) -> set:
+    # Test hooks: a comma separated list of ranks.
+    raw = os.environ.get(name, "").strip()
+    return {int(t) for t in raw.split(",") if t.strip()}
+
+
+def _resolve_all2all_auto_register() -> bool:
+    raw = os.environ.get("MORI_CCL_ALL2ALL_AUTO_REGISTER", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _resolve_all2all_blocks() -> int:
@@ -433,8 +461,23 @@ class All2allSdma:
             mori_cpp.shmem_barrier_all()
             self._tdm_args = ctypes.create_string_buffer(_TDM_A2A_ARGS_BYTES)
             # Outputs registered for direct delivery, by data pointer: the two
-            # pointers of the symmetric object and the size in bytes.
+            # pointers of the symmetric object, the size in bytes, the tensor,
+            # the number of the registration and whether the peers reach this
+            # rank's buffer. _tdm_reg_count is the number of registrations so
+            # far, the same on every rank.
             self._tdm_registered = {}
+            self._tdm_reg_count = 0
+            # Test hooks: on the listed ranks a registered output counts as not
+            # exportable (MORI_CCL_ALL2ALL_TEST_NO_DIRECT) or is launched as if
+            # it were not registered (MORI_CCL_ALL2ALL_TEST_NO_REG), which
+            # exercises the mixed cases the start tokens sort out.
+            self._tdm_test_no_direct = my_pe in _env_ranks(
+                "MORI_CCL_ALL2ALL_TEST_NO_DIRECT"
+            )
+            self._tdm_test_no_reg = my_pe in _env_ranks("MORI_CCL_ALL2ALL_TEST_NO_REG")
+            # Outputs this handle registered by itself, oldest first.
+            self._tdm_auto = copy_output_to_user and _resolve_all2all_auto_register()
+            self._tdm_auto_outputs = []
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES
             ).value = self._tdm_sync.data_ptr()
@@ -461,6 +504,25 @@ class All2allSdma:
                 + (" (half of it, with copy_output_to_user)" if self._copy_out else "")
             )
 
+    def _tdm_auto_register(self, output_data, count: int) -> None:
+        # With MORI_CCL_ALL2ALL_AUTO_REGISTER: a large call into an output that
+        # is not registered registers it first, on every rank at this same
+        # call, and drops the oldest one registered this way beyond a few.
+        need = count * self.npes * 4
+        if not self._tdm_auto or need < _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            # A registration allocates and copies on the device, which a stream
+            # that is being captured into a graph refuses: register before.
+            return
+        reg = self._tdm_registered.get(output_data.data_ptr())
+        if reg is not None and reg[2] >= need:
+            return
+        while len(self._tdm_auto_outputs) >= _TDM_A2A_AUTO_REGISTER_KEEP:
+            self.deregister_output_buffer(self._tdm_auto_outputs.pop(0))
+        self.register_output_buffer(output_data)
+        self._tdm_auto_outputs.append(output_data)
+
     def _launch_tdm(self, args, output_ptr: int, count: int, s: int) -> None:
         # hipModuleLaunchKernel copies the argument bytes at launch, and a graph
         # capture keeps that copy, so the buffer is reused for every call.
@@ -473,9 +535,14 @@ class All2allSdma:
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 32
         ).value = (self._tdm_ll_elems if ll else 0)
         # A registered output big enough for this call: the kernel lets the
-        # peers write large calls straight into it.
+        # peers that hold the same registration write large calls straight
+        # into it. Once a handle has registered anything, large calls start
+        # with a handshake in which the ranks tell each other which
+        # registration their output belongs to (bit 1 of the word).
         reg = self._tdm_registered.get(output_ptr) if self._copy_out else None
-        if reg is not None and count * self.npes * 4 > reg[2]:
+        if reg is not None and (
+            count * self.npes * 4 > reg[2] or self._tdm_test_no_reg
+        ):
             reg = None
         ctypes.c_uint64.from_buffer(
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 48
@@ -483,6 +550,12 @@ class All2allSdma:
         ctypes.c_uint64.from_buffer(
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 56
         ).value = (reg[1] if reg else 0)
+        word = 2 if self._tdm_reg_count else 0
+        if reg:
+            word |= (reg[4] << 2) | int(reg[5])
+        ctypes.c_uint64.from_buffer(
+            self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 64
+        ).value = word
         _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
             (self._tdm_blocks,),
             (_TDM_THREADS,),
@@ -502,6 +575,7 @@ class All2allSdma:
         if self._backend == "tdm":
             # Ordered on the stream like any kernel: no host synchronization,
             # so it can be captured into a graph.
+            self._tdm_auto_register(output_data, count)
             self._launch_tdm(args, output_data.data_ptr(), count, s)
             return time.perf_counter() - t0
         _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
@@ -518,6 +592,7 @@ class All2allSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         if self._backend == "tdm":
+            self._tdm_auto_register(output_data, count)
             self._launch_tdm(args, output_data.data_ptr(), count, s)
         else:
             _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
@@ -558,7 +633,9 @@ class All2allSdma:
         skip the output transit buffer and the copy out of it; smaller calls
         are not affected, and a tensor smaller than that is not registered at
         all. A peer writes into the tensor only while this rank is
-        inside the call. The handle holds the tensor until
+        inside the call. A rank whose tensor the runtime cannot export to the
+        peers still takes part: it receives through the output transit buffer
+        as before and sends directly. The handle holds the tensor until
         deregister_output_buffer, so its memory is not reused while peers can
         still reach it.
         """
@@ -573,20 +650,46 @@ class All2allSdma:
             # tensors come out of allocator blocks that cannot always be exported
             # to the peers (hipIpcGetMemHandle then fails, which ends the process).
             return
-        cpu, gpu = self._handle.register_output_buffer(tensor.data_ptr(), size)
-        self._tdm_registered = {
-            p: r
+        ptr = tensor.data_ptr()
+        if ptr in _TDM_A2A_REGISTERED_PTRS and ptr not in self._tdm_registered:
+            raise RuntimeError(
+                "this output is registered with another All2allSdma handle; "
+                "deregister it there first"
+            )
+        cpu, gpu, number, direct = self._handle.register_output_buffer(
+            tensor.data_ptr(), size
+        )
+        self._tdm_reg_count = max(self._tdm_reg_count, number)
+        direct = direct and not self._tdm_test_no_direct
+        stale = [
+            p
             for p, r in self._tdm_registered.items()
-            if p + r[2] <= tensor.data_ptr() or tensor.data_ptr() + size <= p
-        }
+            if p + r[2] > ptr and ptr + size > p
+        ]
+        for p in stale:
+            del self._tdm_registered[p]
+            _TDM_A2A_REGISTERED_PTRS.discard(p)
         # Kept alive until it is deregistered: a peer must never write into
         # memory the allocator has handed to something else.
-        self._tdm_registered[tensor.data_ptr()] = (cpu, gpu, size, tensor)
+        _TDM_A2A_REGISTERED_PTRS.add(ptr)
+        self._tdm_registered[tensor.data_ptr()] = (
+            cpu,
+            gpu,
+            size,
+            tensor,
+            number,
+            direct,
+        )
 
     def deregister_output_buffer(self, tensor) -> None:
         """Undo register_output_buffer. Collective, like it."""
         if self._tdm_registered.pop(tensor.data_ptr(), None) is not None:
             self._handle.deregister_output_buffer(tensor.data_ptr())
+            _TDM_A2A_REGISTERED_PTRS.discard(tensor.data_ptr())
+
+    def __del__(self):
+        for p in getattr(self, "_tdm_registered", {}):
+            _TDM_A2A_REGISTERED_PTRS.discard(p)
 
     def get_output_transit_buffer(self, dtype=None, device=None):
         # On the TDM transport with copy_output_to_user, the result is in the

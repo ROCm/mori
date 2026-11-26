@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -84,8 +85,36 @@ class All2allSdma {
   struct RegisteredOutput {
     application::SymmMemObjPtr obj;
     size_t size;
+    // The number of the collective registration that made obj, from 1; the same on every rank.
+    uint64_t id;
+    // Whether the peers reach this rank's buffer through their obj. False when the runtime
+    // could not export the buffer and a stand-in was registered in its place.
+    bool direct;
+    // The stand-in, or nullptr.
+    void* standIn;
   };
   std::map<uintptr_t, RegisteredOutput> registered_outputs_;
+  uint64_t register_count_ = 0;
+
+  // Whether the runtime can export this memory to other processes. For some allocations
+  // hipIpcGetMemHandle fails every time ("invalid argument"), and the symmetric registration
+  // treats that as fatal, so it is asked first.
+  static bool can_export(void* ptr) {
+    hipIpcMemHandle_t probe;
+    if (hipIpcGetMemHandle(&probe, ptr) == hipSuccess) return true;
+    (void)hipGetLastError();
+    return false;
+  }
+
+  void drop_registered(typename std::map<uintptr_t, RegisteredOutput>::iterator it) {
+    void* registered =
+        it->second.standIn != nullptr ? it->second.standIn : reinterpret_cast<void*>(it->first);
+    shmem::ShmemSymmetricDeregister(
+        registered, it->second.standIn != nullptr ? kStandInBytes : it->second.size);
+    if (it->second.standIn != nullptr) (void)hipFree(it->second.standIn);
+  }
+
+  static constexpr size_t kStandInBytes = 2 * 1024 * 1024;
 
   // Disable copy constructor and assignment operator
   All2allSdma(const All2allSdma&) = delete;
@@ -223,31 +252,67 @@ class All2allSdma {
   void resetFlags();
 
   /**
-   * @brief Registers a caller output for direct delivery. COLLECTIVE: every rank calls it at the
-   * same point with its own buffer of the same size, and later passes that buffer as the output
-   * of the same calls. Cached: an output already registered with this base and size is returned
-   * as is; entries that overlap a new one are stale (the allocator reused the memory) and dropped.
-   * @return The symmetric object the kernel reaches the peers' buffers through
+   * @brief What register_output_buffer hands to the kernel launch.
    */
-  application::SymmMemObjPtr register_output_buffer(void* ptr, size_t size) {
+  struct RegisteredOutputInfo {
+    application::SymmMemObjPtr obj;  // reaches the buffers the peers registered in the same call
+    uint64_t id;                     // number of that collective registration, from 1
+    bool direct;                     // the peers reach this rank's buffer too
+  };
+
+  /**
+   * @brief Registers a caller output for direct delivery. COLLECTIVE: every rank calls it at the
+   * same point with its own buffer of the same size. Cached: an output already registered with
+   * this base and size is returned as is; entries that overlap a new one are stale (the allocator
+   * reused the memory) and dropped.
+   *
+   * A buffer the runtime cannot export is not an error: this rank registers a stand-in so that
+   * the collective completes, and reports direct = false. It can then still write straight into
+   * the peers' buffers, and the peers send its share through the output transit buffer.
+   */
+  RegisteredOutputInfo register_output_buffer(void* ptr, size_t size) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
     auto exact = registered_outputs_.find(base);
-    if (exact != registered_outputs_.end() && exact->second.size == size) return exact->second.obj;
+    if (exact != registered_outputs_.end() && exact->second.size == size) {
+      return {exact->second.obj, exact->second.id, exact->second.direct};
+    }
     for (auto it = registered_outputs_.begin(); it != registered_outputs_.end();) {
       const uintptr_t b = it->first;
       const size_t s = it->second.size;
       if (base < b + s && b < base + size) {
-        shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(b), s);
+        drop_registered(it);
         it = registered_outputs_.erase(it);
       } else {
         ++it;
       }
     }
+    const bool direct = can_export(ptr);
+    void* standIn = nullptr;
+    if (!direct) {
+      // Allocations that cannot be exported are kept until one that can is found, so that the
+      // allocator does not hand the same one out again.
+      std::vector<void*> refused;
+      for (int tries = 0; tries < 8 && standIn == nullptr; ++tries) {
+        void* candidate = nullptr;
+        if (hipMalloc(&candidate, kStandInBytes) != hipSuccess) break;
+        if (can_export(candidate)) {
+          standIn = candidate;
+        } else {
+          refused.push_back(candidate);
+        }
+      }
+      for (void* p : refused) (void)hipFree(p);
+      if (standIn == nullptr) {
+        throw std::runtime_error("All2allSdma: no exportable memory for an output registration");
+      }
+    }
     // Reached over P2P only, never an RDMA source or destination.
-    application::SymmMemObjPtr obj = shmem::ShmemSymmetricRegister(ptr, size, false);
+    application::SymmMemObjPtr obj = shmem::ShmemSymmetricRegister(
+        standIn != nullptr ? standIn : ptr, standIn != nullptr ? kStandInBytes : size, false);
     if (!obj.IsValid()) throw std::runtime_error("All2allSdma: output register failed");
-    registered_outputs_[base] = {obj, size};
-    return obj;
+    const uint64_t id = ++register_count_;
+    registered_outputs_[base] = {obj, size, id, direct, standIn};
+    return {obj, id, direct};
   }
 
   /**
@@ -256,21 +321,8 @@ class All2allSdma {
   void deregister_output_buffer(void* ptr) {
     auto it = registered_outputs_.find(reinterpret_cast<uintptr_t>(ptr));
     if (it == registered_outputs_.end()) return;
-    shmem::ShmemSymmetricDeregister(ptr, it->second.size);
+    drop_registered(it);
     registered_outputs_.erase(it);
-  }
-
-  /**
-   * @brief The object of an output registered with exactly this base and at least `size` bytes,
-   * or a null object. Exact base only: the allocator may carve a new buffer out of a freed
-   * registered one, whose peer pointers no longer belong to it.
-   */
-  application::SymmMemObjPtr find_registered_output(const void* ptr, size_t size) const {
-    auto it = registered_outputs_.find(reinterpret_cast<uintptr_t>(ptr));
-    if (it == registered_outputs_.end() || it->second.size < size) {
-      return application::SymmMemObjPtr{};
-    }
-    return it->second.obj;
   }
 };
 

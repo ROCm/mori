@@ -26,7 +26,8 @@ The test runs with SDMA off in mori (MORI_ENABLE_SDMA=0) and in the ROCm
 runtime (HSA_ENABLE_SDMA=0), and checks that asking for the SDMA transport is
 refused. Both ways of delivering the result are checked: into the caller's
 output (copy_output_to_user=True), into an output every rank registered
-(register_output_buffer), and left in the output transit buffer.
+(register_output_buffer, or by the handle itself with
+MORI_CCL_ALL2ALL_AUTO_REGISTER=1), and left in the output transit buffer.
 
 Every call sends data that depends on the call number, so a chunk left in a
 transit buffer by an earlier call cannot pass for the current one. The sizes
@@ -169,6 +170,32 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         output_buffer_size=2 * nbytes,
         copy_output_to_user=True,
     )
+    # Registered as above, but rank 1 behaves as if its outputs could not be exported (it then
+    # receives through the transit buffer), and in the second handle the last rank launches as
+    # if its output were not registered (it then sends and receives through the transit buffer).
+    for mode, env, ranks in (
+        ("registered, 1 transit", "MORI_CCL_ALL2ALL_TEST_NO_DIRECT", "1"),
+        ("registered, 1 without", "MORI_CCL_ALL2ALL_TEST_NO_REG", str(npes - 1)),
+    ):
+        os.environ[env] = ranks
+        handles[mode] = All2allSdma(
+            my_pe,
+            npes,
+            input_buffer_size=nbytes,
+            output_buffer_size=2 * nbytes,
+            copy_output_to_user=True,
+        )
+        del os.environ[env]
+    # Registers by itself every output a large call is given.
+    os.environ["MORI_CCL_ALL2ALL_AUTO_REGISTER"] = "1"
+    handles["auto"] = All2allSdma(
+        my_pe,
+        npes,
+        input_buffer_size=nbytes,
+        output_buffer_size=2 * nbytes,
+        copy_output_to_user=True,
+    )
+    del os.environ["MORI_CCL_ALL2ALL_AUTO_REGISTER"]
     backends = {m: h._backend for m, h in handles.items()}
     assert set(backends.values()) == {"tdm"}, backends
     stream = torch.cuda.Stream(device=dev)
@@ -182,7 +209,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         call = calls[mode]
         inp = torch.cat([_chunk(my_pe, d, npes, call, count, dev) for d in range(npes)])
         out = torch.full((npes * count,), -1, dtype=torch.int32, device=dev)
-        if mode == "registered":
+        if mode.startswith("registered"):
             h.register_output_buffer(out)
         torch.cuda.synchronize()
         with torch.cuda.stream(stream):
@@ -192,7 +219,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
             else:
                 h(inp, out, count, stream)
         torch.cuda.synchronize()
-        if mode == "registered":
+        if mode.startswith("registered"):
             h.deregister_output_buffer(out)
         if mode == "in transit":
             out = h.get_output_transit_buffer(dtype=torch.int32)[: npes * count]
@@ -223,16 +250,20 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = {m: {b: [] for b in _BENCH_BYTES_PER_GPU} for m in handles}
-        registered = None
         for b, count in zip(_BENCH_BYTES_PER_GPU, bench_counts):
             inp = torch.ones(npes * count, dtype=torch.int32, device=dev)
             out = torch.empty_like(inp)
-            if registered is not None:
-                handles["registered"].deregister_output_buffer(registered)
-            handles["registered"].register_output_buffer(out)
-            registered = out
             # No loop variable holds a handle: every handle must be gone by shmem_finalize.
             for mode in handles:
+                # One handle at a time holds the output: two registrations of the
+                # same memory would undo each other.
+                if mode.startswith("registered"):
+                    handles[mode].register_output_buffer(out)
+                if mode == "auto":
+                    # Registers on a call outside a capture; the captured calls
+                    # then land directly.
+                    handles[mode](inp, out, count, stream)
+                    torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 torch.cuda.synchronize()
                 with torch.cuda.graph(graph, stream=stream):
@@ -254,8 +285,8 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     times[mode][b].append(t.item())
                 del graph
-        handles["registered"].deregister_output_buffer(registered)
-        registered = None
+                if mode.startswith("registered"):
+                    handles[mode].deregister_output_buffer(out)
         # The flags must still agree after thousands of back-to-back calls.
         for mode in handles:
             check(mode, bench_counts[-1])
@@ -271,7 +302,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
                     us = statistics.median(times[mode][b])
                     alg = b / us / 1000.0
                     print(
-                        f"[a2a-tdm] {mode:<11} {_fmt_bytes(b):>7} per GPU  {us:8.2f} us "
+                        f"[a2a-tdm] {mode:<21} {_fmt_bytes(b):>7} per GPU  {us:8.2f} us "
                         f"({'/'.join(f'{x:.2f}' for x in times[mode][b])})  "
                         f"algBw {alg:7.1f} GB/s  busBw {alg * (npes - 1) / npes:7.1f} GB/s",
                         flush=True,
@@ -314,11 +345,11 @@ def _run(world_size, bench=False, rounds=5, iters=100, warmup=2):
     os.environ["MORI_ENABLE_SDMA"] = "0"
     os.environ["HSA_ENABLE_SDMA"] = "0"
     os.environ.pop("MORI_CCL_ALL2ALL_BACKEND", None)
-    # Four handles, each with an input buffer and up to two halves of output transit buffer of
+    # Seven handles, each with an input buffer and up to two halves of output transit buffer of
     # the largest size, plus their words and LL128 areas.
     largest = max(_BENCH_BYTES_PER_GPU) if bench else 2 * _CHECK_ONCE_BYTES + (1 << 20)
     os.environ.setdefault(
-        "MORI_SHMEM_HEAP_SIZE", str(max(4 << 30, 12 * largest + (1 << 30)))
+        "MORI_SHMEM_HEAP_SIZE", str(max(4 << 30, 21 * largest + (1 << 30)))
     )
     torch.multiprocessing.spawn(
         _worker,

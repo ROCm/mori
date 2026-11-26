@@ -177,13 +177,14 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "register_output_buffer",
           [](All2allU32& self, uintptr_t ptr, size_t size) -> py::tuple {
-            auto obj = self.register_output_buffer(reinterpret_cast<void*>(ptr), size);
-            return py::make_tuple(reinterpret_cast<uintptr_t>(obj.cpu),
-                                  reinterpret_cast<uintptr_t>(obj.gpu));
+            auto info = self.register_output_buffer(reinterpret_cast<void*>(ptr), size);
+            return py::make_tuple(reinterpret_cast<uintptr_t>(info.obj.cpu),
+                                  reinterpret_cast<uintptr_t>(info.obj.gpu), info.id, info.direct);
           },
           py::arg("ptr"), py::arg("size"),
           "Register a GPU buffer the peers write an all2all result into directly (collective); "
-          "returns the two pointers of its symmetric object")
+          "returns the two pointers of its symmetric object, the number of the registration and "
+          "whether the peers reach this rank's buffer")
       .def(
           "deregister_output_buffer",
           [](All2allU32& self, uintptr_t ptr) {

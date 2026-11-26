@@ -188,7 +188,7 @@ extern "C" __global__ void TdmAll2allKernel_u32(CclTdmAll2allArgs args) {
   TdmAll2allKernel_body<uint32_t>(
       a.myPe, a.npes, a.input, a.inputTransitMemObj, a.outputTransitMemObj, a.flagsMemObj,
       a.elementCount, args.sync, static_cast<uint32_t*>(args.output), args.halfElems,
-      args.wordsElems, args.llElems, args.llHalfElems, args.outputMemObj);
+      args.wordsElems, args.llElems, args.llHalfElems, args.outputMemObj, args.outputReg);
 }
 #endif
 

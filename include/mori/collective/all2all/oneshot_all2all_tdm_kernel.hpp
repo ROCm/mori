@@ -99,7 +99,9 @@ namespace collective {
 // collective.py reserves.
 #define MORI_CCL_TDM_A2A_MAX_BLOCKS 128
 #define MORI_CCL_TDM_A2A_SYNC_GO MORI_CCL_TDM_A2A_MAX_BLOCKS
-#define MORI_CCL_TDM_A2A_SYNC_WORDS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 1)
+// Two masks block 0 leaves for the other blocks before the go word, registered outputs only.
+#define MORI_CCL_TDM_A2A_SYNC_MASKS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 1)
+#define MORI_CCL_TDM_A2A_SYNC_WORDS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 3)
 
 // The SDMA kernel's arguments plus what the host class does not own. MUST AGREE WITH _launch_tdm
 // in python/mori/ccl/collective.py, which copies the 72 bytes prepare_sync fills and writes the
@@ -118,10 +120,15 @@ struct CclTdmAll2allArgs {
   uint64_t llElems;
   // 4-byte elements from the start of one half of the LL128 area to the next, a multiple of 128.
   uint64_t llHalfElems;
-  // `output` as a symmetric object when every rank registered its output
-  // (All2allSdma::register_output_buffer), a null object otherwise. Large calls then land in the
-  // peers' outputs directly.
+  // The symmetric object of the registration `output` belongs to
+  // (All2allSdma::register_output_buffer), through which this rank reaches the buffers the peers
+  // registered in the same collective call; a null object when output is not registered.
   application::SymmMemObjPtr outputMemObj;
+  // Bit 0: the peers reach this rank's output through their object (false when the runtime could
+  // not export it). Bit 1: the handle has registered outputs, which every rank knows alike and
+  // which turns the start handshake on for large calls. Bits 2 up: the number of the
+  // registration output belongs to, 0 if none.
+  uint64_t outputReg;
 };
 static_assert(offsetof(CclTdmAll2allArgs, sync) == 72, "collective.py writes sync at byte 72");
 static_assert(offsetof(CclTdmAll2allArgs, output) == 80, "collective.py writes output at byte 80");
@@ -135,7 +142,9 @@ static_assert(offsetof(CclTdmAll2allArgs, llHalfElems) == 112,
               "collective.py writes llHalfElems at byte 112");
 static_assert(offsetof(CclTdmAll2allArgs, outputMemObj) == 120,
               "collective.py writes outputMemObj at byte 120");
-static_assert(sizeof(CclTdmAll2allArgs) == 136, "collective.py packs 136 bytes");
+static_assert(offsetof(CclTdmAll2allArgs, outputReg) == 136,
+              "collective.py writes outputReg at byte 136");
+static_assert(sizeof(CclTdmAll2allArgs) == 144, "collective.py packs 144 bytes");
 
 namespace detail {
 
@@ -484,16 +493,20 @@ constexpr size_t kCclTdmA2aCopyAfterPushMinBytes = 64ULL << 20;
 // mixes this rank's own tiles into the push and lets only the blocks with tiles raise and wait,
 // 162.6 against 171.1 at 256 MiB, 36.9 against 38.8 at 32 MiB, and 29.9 against 28.7 at 16 MiB.
 //
-// landObj is where the tiles land on a peer: the output transit buffer, or the outputs the ranks
-// registered, in which case peerOff is 0, res4 is this rank's registered output and nothing is
-// copied either. The words always live in the output transit buffer.
+// Registered outputs: a tile for a rank whose bit is set in sendDirect goes straight into that
+// rank's registered output, reached through outputMemObj, instead of its transit buffer, and a
+// tile from a rank whose bit is set in recvDirect is already in res4 and is not copied. Measured
+// with every bit set: 598.2 us a call at 1 GiB a rank against 694.4 through the transit buffer,
+// 165.0 against 185.6 at 256 MiB and 56.6 against 58.5 at 64 MiB. The words always live in the
+// output transit buffer.
 constexpr size_t kCclTdmA2aPushFirstMinBytes = 32ULL << 20;
 __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     int myPe, int npes, const uint32_t* src4, uint32_t* res4, const uint32_t* from,
-    uint32_t* localTransit, const application::SymmMemObjPtr& landObj,
-    const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4, uint64_t call,
-    size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap, size_t grid, size_t blk,
-    int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId, int waveSize) {
+    uint32_t* localTransit, const application::SymmMemObjPtr& outputMemObj, uint64_t sendDirect,
+    uint64_t recvDirect, const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4,
+    uint64_t call, size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap,
+    size_t grid, size_t blk, int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId,
+    int waveSize) {
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
   const size_t peers = np - 1;
@@ -507,10 +520,16 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
                          ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
                          : chunk4 - off;
-    uint32_t* const peer =
-        reinterpret_cast<uint32_t*>(landObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
-    CclTdmA2aWarpCopySys(peer + peerOff + me * chunk4 + off, src4 + destPe * chunk4 + off, n,
-                         ldsTile, laneId, waveSize);
+    uint32_t* peer;
+    if (((sendDirect >> destPe) & 1ULL) != 0) {
+      peer = reinterpret_cast<uint32_t*>(outputMemObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
+    } else {
+      peer = reinterpret_cast<uint32_t*>(
+                 outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(destPe))) +
+             peerOff;
+    }
+    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * chunk4 + off, n, ldsTile, laneId,
+                         waveSize);
   }
 
   // One lane per peer, all in warp 0, as in the zero-copy path. s_wait_tensorcnt(0) retired the
@@ -552,6 +571,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
   if (from == nullptr) return;
   for (size_t i = first; i < items; i += totalWarps) {
     const size_t srcPe = (me + np - 1 - i % peers) % np;
+    if (((recvDirect >> srcPe) & 1ULL) != 0) continue;
     const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
                          ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
@@ -565,22 +585,52 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
 // buffer, or a registered output) only once that peer has started the call. Block 0 exchanges a
 // start token with every peer, one lane per peer so that a lane still waiting never holds back
 // another lane's publish, and then lets the other blocks go through the go word.
-__device__ __forceinline__ void CclTdmA2aStart(int myPe, int npes,
-                                               const application::SymmMemObjPtr& flagsMemObj,
-                                               uint64_t* go, uint64_t call, size_t blk, int warpId,
-                                               int laneId) {
+// The token is what this rank publishes and atLeast the least value that means a peer has started
+// this call: the call number for both in the zero-copy call; with registered outputs the token
+// also carries this rank's registration in its low 32 bits, under the call number.
+//
+// With masks set (registered outputs), the peer lanes of block 0 then compare the tokens they
+// waited for with this rank's registration myReg and leave two masks, one bit a rank, in masks[0]
+// and masks[1] before the go word, and every block ends with them in sameMask and reachMask: the
+// ranks whose output of this call belongs to the same registration, and those of them whose
+// buffer the peers reach. Only block 0 reads the tokens: every warp of every block reading the
+// same three words at system scope measured 120 us a call.
+__device__ __forceinline__ void CclTdmA2aStart(
+    int myPe, int npes, const application::SymmMemObjPtr& flagsMemObj, uint64_t* go, uint64_t call,
+    uint64_t token, uint64_t atLeast, size_t blk, int warpId, int laneId, uint64_t* masks = nullptr,
+    uint32_t myReg = 0, uint64_t* sameMask = nullptr, uint64_t* reachMask = nullptr) {
   if (blk == 0) {
-    if (warpId == 0 && laneId < npes && laneId != myPe) {
-      PublishControlFlag(flagsMemObj, myPe, call, laneId);
-      CclTdmA2aWaitPeer(reinterpret_cast<const uint64_t*>(flagsMemObj->localPtr) + laneId, call,
-                        myPe, laneId);
+    const bool peerLane = warpId == 0 && laneId < npes && laneId != myPe;
+    const uint64_t* const flag = reinterpret_cast<const uint64_t*>(flagsMemObj->localPtr) + laneId;
+    if (peerLane) {
+      PublishControlFlag(flagsMemObj, myPe, token, laneId);
+      CclTdmA2aWaitPeer(flag, atLeast, myPe, laneId);
+    }
+    if (masks != nullptr && warpId == 0) {
+      uint32_t peerTok = 0;
+      if (peerLane) peerTok = static_cast<uint32_t>(LoadControlFlag(flag));
+      const bool same = peerLane && myReg != 0 && (peerTok >> 1) == myReg;
+      const uint64_t sameBits = __ballot(same);
+      const uint64_t reachBits = __ballot(same && (peerTok & 1U) != 0);
+      if (laneId == 0) {
+        *sameMask = sameBits;
+        *reachMask = reachBits;
+        __scoped_atomic_store_n(masks, sameBits, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        __scoped_atomic_store_n(masks + 1, reachBits, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+      }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(go, call, __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
     }
   } else {
-    if (threadIdx.x == 0) CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
+    if (threadIdx.x == 0) {
+      CclTdmA2aWaitLocal(go, call, myPe, "block 0 to see every peer");
+      if (masks != nullptr) {
+        *sameMask = __scoped_atomic_load_n(masks, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        *reachMask = __scoped_atomic_load_n(masks + 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+      }
+    }
     __syncthreads();
   }
 }
@@ -593,7 +643,7 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
     const application::SymmMemObjPtr outputTransitMemObj,
     const application::SymmMemObjPtr flagsMemObj, size_t elementCount, uint64_t* sync, T* output,
     size_t halfElems, size_t wordsElems, size_t llElems, size_t llHalfElems,
-    const application::SymmMemObjPtr outputMemObj) {
+    const application::SymmMemObjPtr outputMemObj, uint64_t outputReg) {
   static_assert(sizeof(T) % 4 == 0, "TdmAll2allKernel moves 4-byte words");
   (void)inputTransitMemObj;
   if (elementCount == 0 || npes <= 0) return;
@@ -615,6 +665,8 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
   const size_t totalWarps = grid * static_cast<size_t>(warpsPerBlock);
 
   __shared__ uint64_t s_call;
+  __shared__ uint64_t s_sameMask;
+  __shared__ uint64_t s_reachMask;
   __shared__ unsigned s_nextPair;
   if (threadIdx.x == 0) {
     s_call = __scoped_atomic_load_n(sync + blk, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) + 1ULL;
@@ -643,21 +695,32 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
         npes >= 2 &&
         chunk4 * 4 * static_cast<size_t>(npes) >= detail::kCclTdmA2aCopyAfterPushMinBytes &&
         tileStride >= grid;
-    if (afterPush && outputMemObj.gpu != nullptr) {
-      // Every rank registered its output: the peers' tiles land in it, after the start handshake.
-      detail::CclTdmA2aStart(myPe, npes, flagsMemObj, sync + MORI_CCL_TDM_A2A_SYNC_GO, call, blk,
-                             warpId, laneId);
-      detail::CclTdmA2aCopyAfterPush(
-          myPe, npes, reinterpret_cast<const uint32_t*>(input), out4, nullptr, localTransit,
-          outputMemObj, outputTransitMemObj, chunk4, call, 0, wordsElems, tileStride,
-          detail::kCclTdmA2aWordGap, grid, blk, warpId, totalWarps, ldsTile, laneId, waveSize);
-    } else if (afterPush) {
+    if (afterPush) {
+      // Ranks whose registered output this rank writes straight into, and ranks that write
+      // straight into this rank's, one bit a rank. Both stay 0 on a handle without registrations.
+      uint64_t sendDirect = 0;
+      uint64_t recvDirect = 0;
+      if ((outputReg & 2ULL) != 0) {
+        // The handle has registered outputs: the ranks tell each other, in the start token, which
+        // registration their output of this call belongs to and whether peers reach it. A tile
+        // lands in the receiver's output when sender and receiver hold the same registration and
+        // the receiver's buffer could be exported, and in its transit half otherwise; both sides
+        // decide from the two tokens, so ranks need not agree beforehand.
+        const uint64_t myId = outputReg >> 2;
+        const uint64_t token = (call << 32) | ((myId << 1) & 0xFFFFFFFEULL) | (outputReg & 1ULL);
+        detail::CclTdmA2aStart(myPe, npes, flagsMemObj, sync + MORI_CCL_TDM_A2A_SYNC_GO, call,
+                               token, call << 32, blk, warpId, laneId,
+                               sync + MORI_CCL_TDM_A2A_SYNC_MASKS, static_cast<uint32_t>(myId),
+                               &s_sameMask, &s_reachMask);
+        if (outputMemObj.gpu != nullptr) sendDirect = s_reachMask;
+        if ((outputReg & 1ULL) != 0) recvDirect = s_sameMask;
+      }
       const size_t half = static_cast<size_t>(call & 1ULL) * halfElems;
       detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
-                                     localTransit + half, localTransit, outputTransitMemObj,
-                                     outputTransitMemObj, chunk4, call, half, wordsElems,
-                                     tileStride, detail::kCclTdmA2aWordGap, grid, blk, warpId,
-                                     totalWarps, ldsTile, laneId, waveSize);
+                                     localTransit + half, localTransit, outputMemObj, sendDirect,
+                                     recvDirect, outputTransitMemObj, chunk4, call, half,
+                                     wordsElems, tileStride, detail::kCclTdmA2aWordGap, grid, blk,
+                                     warpId, totalWarps, ldsTile, laneId, waveSize);
     } else {
       detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
                                       localTransit, outputTransitMemObj, chunk4, call, halfElems,
@@ -689,14 +752,14 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
              static_cast<size_t>(laneId) * grid + blk;
   }
 
-  detail::CclTdmA2aStart(myPe, npes, flagsMemObj, sync + MORI_CCL_TDM_A2A_SYNC_GO, call, blk,
-                         warpId, laneId);
+  detail::CclTdmA2aStart(myPe, npes, flagsMemObj, sync + MORI_CCL_TDM_A2A_SYNC_GO, call, call, call,
+                         blk, warpId, laneId);
 
   // Large calls: push, one word per (peer, block), and nothing to copy. The words are the same
   // ones the loop below raises, word (rank, block) at u64 rank * grid + block.
   if (npes >= 2 && chunk4 * 4 * static_cast<size_t>(npes) >= detail::kCclTdmA2aPushFirstMinBytes) {
     detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input),
-                                   localTransit, nullptr, localTransit, outputTransitMemObj,
+                                   localTransit, nullptr, localTransit, outputTransitMemObj, 0, 0,
                                    outputTransitMemObj, chunk4, call, 0, wordsElems, grid, 1, grid,
                                    blk, warpId, totalWarps, ldsTile, laneId, waveSize);
     if (threadIdx.x == 0) {
