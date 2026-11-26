@@ -64,6 +64,7 @@ struct PeerCapabilities {
   //  * canRDMA is true whenever a NIC was selected for this Context, even
   //    for same-host peers. This lets future FULL-style policies allocate
   //    NIC QPs to intra-node peers (NIC loopback for uniform addressing).
+  //    It stays false until EnsureRdmaTransport() has run.
   bool sameHost{false};     // peer is on the same physical node
   bool sameProcess{false};  // peer is in the same OS process (loopback IPC ok)
   bool canP2P{false};       // intra-node GPU peer access *likely* reachable
@@ -73,7 +74,8 @@ struct PeerCapabilities {
 
 class Context {
  public:
-  Context(BootstrapNetwork& bootNet);
+  // deferRdma leaves the NICs unopened until EnsureRdmaTransport().
+  explicit Context(BootstrapNetwork& bootNet, bool deferRdma = false);
   ~Context();
 
   int LocalRank() const { return bootNet.GetLocalRank(); }
@@ -113,6 +115,9 @@ class Context {
     return allRdmaDeviceContexts;
   }
   bool RdmaTransportEnabled() const { return GetRdmaDeviceContext() != nullptr; }
+
+  // Open the NICs, select this GPU's and set canRDMA. Idempotent and local (no collective).
+  void EnsureRdmaTransport();
   RdmaDeviceContext* GetRailContext(int peerRank) const {
     const int nCtx = static_cast<int>(allRdmaDeviceContexts.size());
     int peerLocalGpu = peerRank % nCtx;
@@ -184,7 +189,7 @@ class Context {
 
  private:
   void CollectHostNames();
-  void InitializeTopologyAndTransports();
+  void InitializeTopologyAndTransports(bool deferRdma);
 
   // Apply Context's built-in policy to derive a single TransportType from a
   // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.
@@ -218,6 +223,7 @@ class Context {
   // One context per available RDMA device/port, indexed by NIC index (0..numNics-1).
   // QP-to-NIC mapping is via the agreed-rail formula, not a direct index.
   std::vector<std::unique_ptr<RdmaDeviceContext>> allRdmaDeviceContexts;
+  bool rdmaInitDone{false};
 
   std::vector<RdmaEndpoint> rdmaEps;
   bool initialEndpointsBuilt{false};

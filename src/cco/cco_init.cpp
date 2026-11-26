@@ -514,8 +514,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
 
-  // Step 2: context (RDMA endpoints + transport-type negotiation).
-  comm->ctx = new application::Context(*comm->bootNet);
+  // Step 2: context (peer capabilities). NICs stay closed until a peer needs RDMA (below).
+  comm->ctx = new application::Context(*comm->bootNet, /*deferRdma=*/true);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
   // Cache the bound device once (used by topology detection below and later by
@@ -758,6 +758,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   // Every peer is LSA-mapped on a single node, so windows need no MR until a FULL DevComm.
   comm->windowMrsEnabled = comm->lsaSize < comm->worldSize;
+  // Peers outside the LSA team are reached over RDMA; otherwise only a FULL DevComm opens the NIC.
+  if (comm->lsaSize < comm->worldSize) comm->ctx->EnsureRdmaTransport();
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
@@ -1701,6 +1703,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     MORI_SHMEM_TRACE("ccoDevCommCreate: single-node, CROSSNODE -> NONE");
     connType = CCO_GDA_CONNECTION_NONE;
   }
+  // FULL reaches LSA peers by NIC loopback; keyed on the requested type so all ranks open theirs.
+  if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL) comm->ctx->EnsureRdmaTransport();
 
   ccoDevComm hostShadow = {};
   hostShadow.rank = comm->rank;
@@ -2084,9 +2088,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                   comm->rank, numWindows, signalCount, counterCount, (void*)resourceWindow);
 
   // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
-  // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
-  // this DevComm has materialized resources for that transport — useful for
-  // verifying gdaConnectionType behavior end-to-end.
+  // peer's capability (canP2P/canSDMA/canRDMA; RDMA only once this comm has
+  // opened its NIC) alongside whether this DevComm has materialized resources
+  // for that transport — useful for verifying gdaConnectionType behavior end-to-end.
   if (const char* env = std::getenv("MORI_CCO_LOG_TRANSPORT")) {
     if (env[0] != '0') {
       const char* connTypeStr = "?";
@@ -2111,11 +2115,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       // interleaving when ranks fork-write to the same stderr concurrently.
       std::string buf;
       buf.reserve(256 + 64 * comm->worldSize);
-      char line[160];
+      char line[192];
       snprintf(line, sizeof(line),
                "[cco] DevComm rank=%d/%d connType=%s — transport map "
-               "(CAP=hardware capability, ACT=materialized by this DevComm):\n",
-               comm->rank, comm->worldSize, connTypeStr);
+               "(CAP=capability, ACT=materialized by this DevComm%s):\n",
+               comm->rank, comm->worldSize, connTypeStr,
+               comm->ctx->GetRdmaContext() ? "" : "; NIC not opened, no peer needs RDMA");
       buf += line;
       buf += "  peer  | cap                | active\n";
       buf += "  ------+--------------------+--------------------\n";

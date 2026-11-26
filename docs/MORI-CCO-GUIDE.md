@@ -146,6 +146,12 @@ win = comm.register_window(mem.ptr, mem.size)   # RegisteredWindow: .handle, .lo
 | `lsa_barrier_count` | # of intra-node (LSA) barriers |
 | `sdma_queue_count` | # of SDMA queues per peer. 0 (the default) creates none; SDMA also needs `MORI_ENABLE_SDMA=1`. The first device communicator on a communicator that asks for queues fixes the count |
 
+The NICs are opened only when a peer needs RDMA. That happens at communicator
+creation when some peers are outside the LSA team, or at the first `FULL` device
+communicator (NIC loopback to LSA peers). A job whose ranks all share one LSA
+team, such as a single node or a scale-up fabric spanning hosts, never touches a
+NIC under `NONE`, `CROSSNODE` or `RAIL`.
+
 ```python
 reqs = CCODevCommRequirements()          # safe defaults
 reqs.gda_connection_type = GDA_CONNECTION_CROSSNODE
