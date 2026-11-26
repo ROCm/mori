@@ -136,12 +136,21 @@ class AsyncLLOptionsTest(unittest.TestCase):
         self.assertEqual(seq["combine_send"], ("combine_sendtransfer",))
 
     def test_fused_receive_grid_ceiling_reaches_only_the_fused_mode(self):
-        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_blocks
         for env, mode, expected in [
             ({}, 2, 0),
-            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 2, 64),
-            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 1, 0),
-            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 0, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_BLOCKS": "64"}, 2, 64),
+            ({"MORI_ASYNCLL_FUSED_RECV_BLOCKS": "64"}, 1, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_BLOCKS": "64"}, 0, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "32"}, 2, 32),
+            (
+                {
+                    "MORI_ASYNCLL_FUSED_RECV_CTAS": "32",
+                    "MORI_ASYNCLL_FUSED_RECV_BLOCKS": "64",
+                },
+                2,
+                64,
+            ),
         ]:
             with (
                 self.subTest(env=env, mode=mode),
@@ -151,12 +160,12 @@ class AsyncLLOptionsTest(unittest.TestCase):
         for value in ("-1", "half"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 with patch.dict(
-                    os.environ, {"MORI_ASYNCLL_FUSED_RECV_CTAS": value}, clear=True
+                    os.environ, {"MORI_ASYNCLL_FUSED_RECV_BLOCKS": value}, clear=True
                 ):
                     resolve(2)
 
     def test_fused_receive_ceiling_follows_the_cu_mask(self):
-        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_blocks
         for env, dev, expected in [
             ({}, 0, 0),  # unrestricted: the native default, half the device
             ({"HSA_CU_MASK": "0-7:0-63"}, 3, 32),
@@ -165,7 +174,11 @@ class AsyncLLOptionsTest(unittest.TestCase):
             ({"HSA_CU_MASK": "1:0-63"}, 0, 0),  # mask names other GPUs only
             ({"HSA_CU_MASK": "0:0-511"}, 0, 0),  # not a restriction
             ({"HSA_CU_MASK": "0:0x0f"}, 0, 0),  # unreadable: whole device
-            ({"HSA_CU_MASK": "0-7:0-63", "MORI_ASYNCLL_FUSED_RECV_CTAS": "48"}, 0, 48),
+            (
+                {"HSA_CU_MASK": "0-7:0-63", "MORI_ASYNCLL_FUSED_RECV_BLOCKS": "48"},
+                0,
+                48,
+            ),
         ]:
             with (
                 self.subTest(env=env, dev=dev),
@@ -516,8 +529,8 @@ class AsyncLLSegmentedTest(unittest.TestCase):
 def _fake_plan_type(name):
     # Grid as EpAsyncLLGeometry derives it: capped copy passes, a per-peer transfer.
     field = {
-        "dispatch_slotassign": "asyncLlSendCtas",
-        "combine_recvcopy_seg": "asyncLlRecvCtas",
+        "dispatch_slotassign": "asyncLlSendBlocks",
+        "combine_recvcopy_seg": "asyncLlRecvBlocks",
     }.get(name)
 
     class Plan:
@@ -529,7 +542,7 @@ def _fake_plan_type(name):
         def describe(cls, **request):
             grid = 8
             if field:
-                ceiling = 128 if field == "asyncLlRecvCtas" else 256
+                ceiling = 128 if field == "asyncLlRecvBlocks" else 256
                 grid = min(request[field] or ceiling, ceiling)
             return {"gridX": grid, "blockX": 256, "sharedBytes": 0, "cacheDir": ""}
 
@@ -546,15 +559,15 @@ def _fake_plan_type(name):
     return Plan
 
 
-class AsyncLLCtasScheduleTest(unittest.TestCase):
+class AsyncLLBlocksScheduleTest(unittest.TestCase):
     def parse(self, side, value):
-        env = {f"MORI_ASYNCLL_{side}_CTAS_SCHEDULE": value}
+        env = {f"MORI_ASYNCLL_{side}_BLOCKS_SCHEDULE": value}
         with patch.dict(os.environ, env, clear=True):
-            return EpDispatchCombineOpHip._asyncll_ctas_schedule(side)
+            return EpDispatchCombineOpHip._asyncll_blocks_schedule(side)
 
     def test_parse(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(EpDispatchCombineOpHip._asyncll_ctas_schedule("RECV"))
+            self.assertIsNone(EpDispatchCombineOpHip._asyncll_blocks_schedule("RECV"))
         self.assertIsNone(self.parse("RECV", " , "))
         self.assertEqual(
             self.parse("RECV", "128:64,1024:128,0:0"), ((128, 64), (1024, 128), (0, 0))
@@ -585,7 +598,7 @@ class AsyncLLCtasScheduleTest(unittest.TestCase):
             "combine_send": ("combine_sendtransfer_seg",),
             "combine_recv": ("combine_recvcopy_seg",),
         }
-        base = dict(asyncLlSendCtas=0, asyncLlRecvCtas=64, asyncLlFusedRecvCtas=0)
+        base = dict(asyncLlSendBlocks=0, asyncLlRecvBlocks=64, asyncLlFusedRecvBlocks=0)
         plans_by_pass = {
             n: plan_type(n)(**base) for names in seq.values() for n in names
         }
@@ -613,8 +626,8 @@ class AsyncLLCtasScheduleTest(unittest.TestCase):
     def test_buckets_reuse_plans_the_cap_does_not_change(self):
         op, plans_by_pass, groups, buckets = self.build(
             {
-                "MORI_ASYNCLL_SEND_CTAS_SCHEDULE": "1024:8,0:32",
-                "MORI_ASYNCLL_RECV_CTAS_SCHEDULE": "128:64,1024:128",
+                "MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE": "1024:8,0:32",
+                "MORI_ASYNCLL_RECV_BLOCKS_SCHEDULE": "128:64,1024:128",
             }
         )
         send = buckets["dispatch_send"]

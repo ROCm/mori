@@ -149,7 +149,7 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   }
 
   if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2)
-    throw std::runtime_error("AsyncLL mode must be 0 (legacy), 1 (early), or 2 (fused CTA)");
+    throw std::runtime_error("AsyncLL mode must be 0 (legacy), 1 (early), or 2 (fused receive)");
   const bool early = cfg.asyncLlMode != 0;
   const bool fused = cfg.asyncLlMode == 2;
   if (early && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode)
@@ -277,9 +277,22 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
       break;
   }
 
+  // The segmented dispatch receive copies no tokens: it fills the rows past each count, a few
+  // words each. On gfx942/gfx950 (wave64, the RECV_TRIM body) two rows per thread of the largest
+  // round run as fast as the whole device, so the grid covers that and no more.
+  if (kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg && cfg.waveSize == 64) {
+    // The largest round: worldSize segments of the largest stride the op accepts.
+    const long long rows = EpInterNodeDeviceCfgOf(cfg.kernelCfg).MaxNumTokensToRecv();
+    const long long perBlock = 2LL * geometry.blockX;
+    // At most two rows per thread, in a multiple of worldSize blocks.
+    const long long want =
+        ((rows + perBlock - 1) / perBlock + worldSize - 1) / worldSize * worldSize;
+    if (want < geometry.gridX) geometry.gridX = static_cast<unsigned>(want);
+  }
+
   // A fused copy holds its whole grid resident while it waits for its peers
-  // (see EpInterNodeCfg::asyncLlFusedRecvCtas). RecvCopy strides over its
-  // tokens, so a narrower grid only does the same work in fewer CTAs.
+  // (see EpInterNodeCfg::asyncLlFusedRecvBlocks). RecvCopy strides over its
+  // tokens, so a narrower grid only does the same work in fewer blocks.
   const bool fusedCopy =
       cfg.asyncLlMode == 2 &&
       (kind == EpAsyncLLKernel::DispatchRecvCopy || kind == EpAsyncLLKernel::CombineRecvCopy ||
@@ -288,20 +301,21 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
   const bool sendCopy =
       kind == EpAsyncLLKernel::DispatchSlotAssign || kind == EpAsyncLLKernel::DispatchSendCopy ||
       kind == EpAsyncLLKernel::DispatchSendCopySeg || kind == EpAsyncLLKernel::CombineSendCopy;
-  if (sendCopy && cfg.asyncLlSendCtas > 0) {
-    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlSendCtas, worldSize));
+  if (sendCopy && cfg.asyncLlSendBlocks > 0) {
+    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlSendBlocks, worldSize));
     if (cap < geometry.gridX) geometry.gridX = cap;
   }
   const bool recvCopy = kind == EpAsyncLLKernel::DispatchRecvCopy ||
                         kind == EpAsyncLLKernel::CombineRecvCopy ||
                         kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg ||
                         kind == EpAsyncLLKernel::CombineRecvCopySeg;
-  if (recvCopy && cfg.asyncLlRecvCtas > 0) {
-    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlRecvCtas, worldSize));
+  if (recvCopy && cfg.asyncLlRecvBlocks > 0) {
+    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlRecvBlocks, worldSize));
     if (cap < geometry.gridX) geometry.gridX = cap;
   }
-  if (fusedCopy && cfg.asyncLlFusedRecvCtas > 0) {
-    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlFusedRecvCtas, worldSize));
+  if (fusedCopy && cfg.asyncLlFusedRecvBlocks > 0) {
+    const auto cap =
+        static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlFusedRecvBlocks, worldSize));
     if (cap < geometry.gridX) geometry.gridX = cap;
   }
   return geometry;

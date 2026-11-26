@@ -467,7 +467,7 @@ def test_asyncll_sends_on_the_resolved_active_count(allocated, active, expected)
     op._asyncll_mode = 0
     op._asyncll_direct_on = False
     op._asyncll_fuse_meta_on = False
-    op._asyncll_fused_ctas = 0
+    op._asyncll_fused_blocks = 0
     assert op._asyncll_request(cfg, "bf16", 32, 4)["numQpPerPe"] == expected
 
 

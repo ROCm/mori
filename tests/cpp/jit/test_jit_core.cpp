@@ -697,13 +697,13 @@ TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
   // Only the fused mode resolves a ceiling, and only its receive copies use it.
   for (int mode : {0, 1}) {
     const auto cfg = AsyncLLCfgForMode(mode);
-    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, 0);
+    EXPECT_EQ(cfg.asyncLlFusedRecvBlocks, 0);
     for (const auto kind : kinds) {
       EXPECT_EQ(EpAsyncLLGeometry(cfg, kind).gridX, static_cast<unsigned>(cfg.mpCount));
     }
   }
   const auto fused = AsyncLLCfgForMode(2);
-  EXPECT_EQ(fused.asyncLlFusedRecvCtas, fused.mpCount / 2);
+  EXPECT_EQ(fused.asyncLlFusedRecvBlocks, fused.mpCount / 2);
   for (const auto kind : kinds) {
     EXPECT_EQ(EpAsyncLLGeometry(fused, kind).gridX, static_cast<unsigned>(fused.mpCount / 2));
   }
@@ -715,24 +715,59 @@ TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
   request.worldSize = 4;
   request.gpuPerNode = 4;
   request.asyncLlMode = 2;
-  for (const auto& [ctas, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
-    request.asyncLlFusedRecvCtas = ctas;
+  for (const auto& [blocks, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
+    request.asyncLlFusedRecvBlocks = blocks;
     const auto cfg = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
                                         EpInterNodeFamily::AsyncLL);
-    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, ctas);
+    EXPECT_EQ(cfg.asyncLlFusedRecvBlocks, blocks);
     EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvCopy).gridX,
               static_cast<unsigned>(grid));
   }
 
-  request.asyncLlFusedRecvCtas = -1;
+  request.asyncLlFusedRecvBlocks = -1;
   EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
                                   EpInterNodeFamily::AsyncLL),
                std::runtime_error);
   request.asyncLlMode = 1;
-  request.asyncLlFusedRecvCtas = 16;
+  request.asyncLlFusedRecvBlocks = 16;
   EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
                                   EpInterNodeFamily::AsyncLL),
                std::runtime_error);
+}
+
+TEST(AsyncLLMode, SegmentedDispatchReceiveGridCoversTwoRowsPerThread) {
+  EpInterNodeRequest request;
+  request.worldSize = 8;
+  request.gpuPerNode = 8;
+  request.mpCount = 256;
+  request.warpPerBlock = 16;
+  const auto make = [&](const char* arch) {
+    return MakeEpInterNodeCfg(arch, request, EpInterNodeKernel::Dispatch,
+                              EpInterNodeFamily::AsyncLL);
+  };
+  for (const auto& [tokens, grid] :
+       std::vector<std::pair<int, unsigned>>{{128, 8}, {4096, 16}, {16384, 64}, {65536, 256}}) {
+    request.maxNumInpTokenPerRank = tokens;
+    const auto cfg = make("gfx950");
+    const auto finalize = EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvFinalizeSeg);
+    ASSERT_EQ(finalize.blockX, 1024u);
+    EXPECT_EQ(finalize.gridX, grid) << tokens;
+    // The receive that copies tokens keeps the device.
+    EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::CombineRecvCopySeg).gridX, 256u);
+  }
+  // The largest round follows the receive bound: 16384 total rows over 8 ranks.
+  request.maxNumInpTokenPerRank = 16384;
+  request.maxTotalRecvTokens = 16384;
+  EXPECT_EQ(EpAsyncLLGeometry(make("gfx950"), EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX, 8u);
+  request.maxTotalRecvTokens = 0;
+  // A receive ceiling still applies on top.
+  request.asyncLlRecvBlocks = 16;
+  EXPECT_EQ(EpAsyncLLGeometry(make("gfx950"), EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX, 16u);
+  // gfx1250 (wave32) runs the untrimmed body and keeps the whole device.
+  request.asyncLlRecvBlocks = 0;
+  request.maxNumInpTokenPerRank = 128;
+  EXPECT_EQ(EpAsyncLLGeometry(make("gfx1250"), EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX,
+            256u);
 }
 
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {

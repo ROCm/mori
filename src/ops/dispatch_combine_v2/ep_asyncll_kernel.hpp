@@ -112,7 +112,7 @@
 #define MORI_ASYNCLL_COMBINE_UNROLL 2
 #endif
 // 1: segmented receives load addresses and map entries before the wait, drain beside the poll,
-// and skip the wait in CTAs with no work.
+// and skip the wait in blocks with no work.
 #ifndef MORI_ASYNCLL_RECV_TRIM
 #if defined(CCO_GFX125X)
 #define MORI_ASYNCLL_RECV_TRIM 0
@@ -1486,7 +1486,7 @@ __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
     // Metadata only (SendTransfer posts the hidden rows from the input). One group of numEpt
     // lanes per TOKEN: lane j holds the token's entry j and element j of each field, loaded
     // once, and the group writes that row into every record the token claimed. Only stores
-    // follow the loads, so a few CTAs keep up.
+    // follow the loads, so a few blocks keep up.
     asyncll::DirectWriteMetaAuto<kConfig>(args, config, hiddenBytes, xferBytes, -1);
     return;
   }
@@ -2997,7 +2997,7 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
 
 #if MORI_ASYNCLL_RECV_TRIM
 // RecvFinalizeSeg below with a shorter load chain. kWait: wave 0 polls the counts and stages them.
-// CTA 0 always reads the counts, so the kernel still ends after every one; rowless CTAs exit.
+// Block 0 always reads the counts, so the kernel still ends after every one; rowless blocks exit.
 template <EpInterNodeKernelCfg kConfig, typename T, bool kWait, typename Drain>
 __device__ __forceinline__ void EpDispatchAsyncLLRecvFinalizeSegTrim_body(
     EpDispatchCombineArgs args, Drain drain) {
@@ -3036,7 +3036,7 @@ __device__ __forceinline__ void EpDispatchAsyncLLRecvFinalizeSegTrim_body(
         announced = *slot;
       }
     }
-    // Orders the CTA's later reads after the counts; the barrier hands it on.
+    // Orders the block's later reads after the counts; the barrier hands it on.
     if constexpr (kWait) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     // Biased by one; 0 (no count) reads as an empty segment rather than wrapping to "full".
     if (laneId < npes)
@@ -3055,18 +3055,55 @@ __device__ __forceinline__ void EpDispatchAsyncLLRecvFinalizeSegTrim_body(
     mode = core::AtomicLoadRelaxedSystem(
         reinterpret_cast<uint64_t*>(words + asyncll::SegStrideSlot(config, laneId)));
 
-  for (int r = globalThdId; r < rows; r += globalThdNum) {
-    const int srcPe = r / stride;
-    if (r - srcPe * stride < segRows[srcPe]) {
-      reverse[r] = srcTok[r];
-      continue;
+  // Holes get an expert id this rank masks off, weight 0 and zeroed scales.
+  const int liveThreads = min(blockNum, max(1, (rows + thdNum - 1) / thdNum)) * thdNum;
+  if (rows <= liveThreads) {
+    // One row per thread: its own stores, issued as soon as its count is known.
+    const int r = globalThdId;
+    if (r < rows) {
+      const int srcPe = r / stride;
+      if (r - srcPe * stride < segRows[srcPe]) {
+        reverse[r] = srcTok[r];
+      } else {
+        reverse[r] = -1;
+        for (int k = 0; k < config.numExpertPerToken; ++k) {
+          indices[static_cast<size_t>(r) * config.numExpertPerToken + k] = invalidExpert;
+          weights[static_cast<size_t>(r) * config.numExpertPerToken + k] = 0.0f;
+        }
+        for (size_t w = 0; w < scaleWords; ++w) scales[static_cast<size_t>(r) * scaleWords + w] = 0;
+      }
     }
-    reverse[r] = -1;
-    for (int k = 0; k < config.numExpertPerToken; ++k) {
-      indices[static_cast<size_t>(r) * config.numExpertPerToken + k] = invalidExpert;
-      weights[static_cast<size_t>(r) * config.numExpertPerToken + k] = 0.0f;
+  } else {
+    // Several rows per thread. The srcTok loads of kRowBatch rows go out together, and each
+    // segment's holes are one contiguous range of words, written by adjacent lanes: per-row
+    // stores would cost a memory transaction per word in this window.
+    constexpr int kRowBatch = 8;
+    for (int base = globalThdId; base < rows; base += liveThreads * kRowBatch) {
+      index_t tok[kRowBatch];
+#pragma unroll
+      for (int u = 0; u < kRowBatch; ++u) {
+        const int r = base + u * liveThreads;
+        const int srcPe = r < rows ? r / stride : 0;
+        tok[u] = (r < rows && r - srcPe * stride < segRows[srcPe]) ? srcTok[r] : index_t{-1};
+      }
+#pragma unroll
+      for (int u = 0; u < kRowBatch; ++u) {
+        const int r = base + u * liveThreads;
+        if (r < rows) reverse[r] = tok[u];
+      }
     }
-    for (size_t w = 0; w < scaleWords; ++w) scales[static_cast<size_t>(r) * scaleWords + w] = 0;
+    const size_t topk = config.numExpertPerToken;
+    for (int s = 0; s < npes; ++s) {
+      const size_t holeBegin = static_cast<size_t>(s) * stride + segRows[s];
+      const size_t holeEnd = static_cast<size_t>(s + 1) * stride;
+      for (size_t e = holeBegin * topk + globalThdId; e < holeEnd * topk; e += liveThreads) {
+        indices[e] = invalidExpert;
+        weights[e] = 0.0f;
+      }
+      for (size_t e = holeBegin * scaleWords + globalThdId; e < holeEnd * scaleWords;
+           e += liveThreads)
+        scales[e] = 0;
+    }
   }
 
   if (tail) {
@@ -3319,7 +3356,7 @@ __device__ void EpCombineAsyncLLRecvCopySeg_body(EpDispatchCombineArgs args) {
 // The control wave checks one outgoing queue per lane. Thread-scope quiet has
 // no collective barrier and these queues only wait on independently progressing
 // SDMA engines. Kernel completion waits for this wave, so sources remain owned
-// until all outgoing copies finish, without making other CTAs wait on this CTA.
+// until all outgoing copies finish, without making other blocks wait on this block.
 template <EpInterNodeKernelCfg kConfig>
 __device__ __forceinline__ void EpAsyncLLFusedQuiet(EpDispatchCombineArgs args,
                                                     const ::mori::cco::ccoDevComm& comm) {
@@ -3336,8 +3373,9 @@ __device__ __forceinline__ void EpAsyncLLFusedQuiet(EpDispatchCombineArgs args,
 }
 
 #if MORI_ASYNCLL_RECV_TRIM
-// EpAsyncLLFusedQuiet's queues, drained from wave 1 of the last (least loaded) CTA beside its poll.
-// Called first, before any block-size load; kSolo: a one-wave block drains from wave 0.
+// EpAsyncLLFusedQuiet's queues, drained from wave 1 of the last block beside its poll; that block
+// has rows only when a round fills the whole grid. Called first, before any block-size load;
+// kSolo: a one-wave block drains from wave 0.
 template <EpInterNodeKernelCfg kConfig, bool kSolo>
 __device__ __forceinline__ void EpAsyncLLSegDrain(const EpDispatchCombineArgs& args,
                                                   const ::mori::cco::ccoDevComm& comm) {
@@ -3356,8 +3394,8 @@ __device__ __forceinline__ void EpAsyncLLSegDrain(const EpDispatchCombineArgs& a
       lane - args.lsaBase, asyncll::QueueForPe(comm, lane, args.sdmaQueueOffset));
 }
 
-// CombineRecvCopySeg fused, with a shorter chain. CTA 0 always waits, so the kernel still ends
-// after every epoch; CTAs with no work exit.
+// CombineRecvCopySeg fused, with a shorter chain. Block 0 always waits, so the kernel still ends
+// after every epoch; blocks with no work exit.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAsyncLLRecvCopySegTrim_body(EpDispatchCombineArgs args,
                                                      const ::mori::cco::ccoDevComm& comm) {
@@ -3465,12 +3503,12 @@ __device__ void EpDispatchAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
         __builtin_amdgcn_s_sleep(1);
     }
     // Pair the successful system-scope observations with an acquire before
-    // handing the ready data to every consumer wave in this CTA.
+    // handing the ready data to every consumer wave in this block.
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
   }
   // HIP's barrier includes global/local workgroup release and acquire fences:
-  // propagate the first wave's system acquire to every consumer in this CTA.
-  // All threads participate, including CTAs whose copy body has no work.
+  // propagate the first wave's system acquire to every consumer in this block.
+  // All threads participate, including blocks whose copy body has no work.
   __syncthreads();
   EpDispatchAsyncLLRecvCopy_body<kConfig, T>(args);
 }
@@ -3495,7 +3533,7 @@ __device__ void EpCombineAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
   EpCombineAsyncLLRecvCopy_body<kConfig, T>(args);
 }
 
-// The segmented receives fused the same way: wait in every CTA, then the pass body.
+// The segmented receives fused the same way: wait in every block, then the pass body.
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvFinalizeSegFused_body(EpDispatchCombineArgs args,
                                                            const ::mori::cco::ccoDevComm& comm) {

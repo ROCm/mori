@@ -1672,7 +1672,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "MORI_ASYNCLL_FUSED_RECV and MORI_ASYNCLL_SKIP_RESET require "
                 "MORI_ASYNCLL_EARLY_NOTIFY=1"
             )
-        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
+        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused wait.
         return (2 if fused else int(early)), skip_reset
 
     @staticmethod
@@ -1698,27 +1698,29 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return value == "1" and bool(direct) and bool(segmented)
 
     @staticmethod
-    def _asyncll_fused_recv_ctas(mode, device_index=0, mp_count=0):
+    def _asyncll_fused_recv_blocks(mode, device_index=0, mp_count=0):
         # Grid ceiling for the fused receive copies; 0 lets the native factory
-        # pick half the device. MORI_ASYNCLL_FUSED_RECV_CTAS is only a tuning
+        # pick half the device. MORI_ASYNCLL_FUSED_RECV_BLOCKS is only a tuning
         # override: the default exists so that fusion cannot starve another
-        # stream's sends into a deadlock.
-        name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
+        # stream's sends into a deadlock. The old name, _CTAS, is still read.
+        name = "MORI_ASYNCLL_FUSED_RECV_BLOCKS"
+        if name not in os.environ and "MORI_ASYNCLL_FUSED_RECV_CTAS" in os.environ:
+            name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
         value = os.environ.get(name, "0")
         try:
-            ctas = int(value)
+            blocks = int(value)
         except ValueError:
-            ctas = -1
-        if ctas < 0:
+            blocks = -1
+        if blocks < 0:
             raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
         if mode != 2:
             return 0
-        if ctas > 0:
-            return ctas
+        if blocks > 0:
+            return blocks
         # "Half the device" has to mean half of what this process can use. The
         # native default is mpCount / 2, and mpCount is the whole device even when
         # HSA_CU_MASK leaves the process a fraction of it: at 64 of 256 CUs two
-        # 128-CTA fused grids fill every slot, and the ranks deadlock as if there
+        # 128-block fused grids fill every slot, and the ranks deadlock as if there
         # were no ceiling at all.
         usable = _hsa_cu_mask_cus(device_index, mp_count)
         if usable is not None and 0 < usable < mp_count:
@@ -1777,40 +1779,47 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlDirect"] = self._asyncll_direct_on
         request["asyncLlFuseMeta"] = self._asyncll_fuse_meta_on
-        # Grid ceiling for the send-side copy passes; 0 = the whole device.
-        send_ctas = int(os.environ.get("MORI_ASYNCLL_SEND_CTAS", "0"))
-        if send_ctas < 0:
-            raise ValueError(f"MORI_ASYNCLL_SEND_CTAS must be >= 0, got {send_ctas}")
-        request["asyncLlSendCtas"] = send_ctas
-        recv_ctas = int(os.environ.get("MORI_ASYNCLL_RECV_CTAS", "0"))
-        if recv_ctas < 0:
-            raise ValueError(f"MORI_ASYNCLL_RECV_CTAS must be >= 0, got {recv_ctas}")
-        request["asyncLlRecvCtas"] = recv_ctas
-        request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
+        # Grid ceilings for the send- and receive-side copy passes; 0 = the whole device.
+        for side, field in (
+            ("SEND", "asyncLlSendBlocks"),
+            ("RECV", "asyncLlRecvBlocks"),
+        ):
+            name = f"MORI_ASYNCLL_{side}_BLOCKS"
+            value = os.environ.get(name, "0")
+            try:
+                blocks = int(value)
+            except ValueError:
+                blocks = -1
+            if blocks < 0:
+                raise ValueError(
+                    f"{name} must be a non-negative integer, got {value!r}"
+                )
+            request[field] = blocks
+        request["asyncLlFusedRecvBlocks"] = self._asyncll_fused_blocks
         return request
 
     @staticmethod
-    def _asyncll_ctas_schedule(side):
-        # MORI_ASYNCLL_{SEND,RECV}_CTAS_SCHEDULE="tokens:ctas,...": the grid cap per call by
+    def _asyncll_blocks_schedule(side):
+        # MORI_ASYNCLL_{SEND,RECV}_BLOCKS_SCHEDULE="tokens:blocks,...": the grid cap per call by
         # token count. A call takes the first bucket with T <= tokens (ascending); tokens 0
-        # matches any T and goes last. ctas 0 = uncapped. A T past every bound keeps
-        # MORI_ASYNCLL_{side}_CTAS. None when unset or empty.
-        name = f"MORI_ASYNCLL_{side}_CTAS_SCHEDULE"
+        # matches any T and goes last. blocks 0 = uncapped. A T past every bound keeps
+        # MORI_ASYNCLL_{side}_BLOCKS. None when unset or empty.
+        name = f"MORI_ASYNCLL_{side}_BLOCKS_SCHEDULE"
         buckets = {}
         for item in (x.strip() for x in os.environ.get(name, "").split(",")):
             if not item:
                 continue
             try:
-                bound, ctas = (int(v) for v in item.split(":"))
+                bound, blocks = (int(v) for v in item.split(":"))
             except ValueError:
-                bound = ctas = -1
-            if bound < 0 or ctas < 0:
+                bound = blocks = -1
+            if bound < 0 or blocks < 0:
                 raise ValueError(
-                    f"{name} takes 'tokens:ctas' pairs of non-negative integers, got {item!r}"
+                    f"{name} takes 'tokens:blocks' pairs of non-negative integers, got {item!r}"
                 )
             if bound in buckets:
                 raise ValueError(f"{name} lists the token bound {bound} twice")
-            buckets[bound] = ctas
+            buckets[bound] = blocks
         if not buckets:
             return None
         return tuple(sorted(buckets.items(), key=lambda b: (b[0] == 0, b[0])))
@@ -1823,7 +1832,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 return group
 
     def _build_asyncll_buckets(self, cfg, request_for, plans_by_pass, layouts):
-        """Launch groups per token bucket of the CTAS_SCHEDULE envs.
+        """Launch groups per token bucket of the BLOCKS_SCHEDULE envs.
 
         `layouts` is ((sequences, groups), ...); returns one dict per entry, group ->
         ((bound or None, launch group), ...), empty when neither env is set. A group
@@ -1835,13 +1844,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         from mori.jit.v2 import plan_api
 
         schedules = {
-            "send": self._asyncll_ctas_schedule("SEND"),
-            "recv": self._asyncll_ctas_schedule("RECV"),
+            "send": self._asyncll_blocks_schedule("SEND"),
+            "recv": self._asyncll_blocks_schedule("RECV"),
         }
         out = [{} for _ in layouts]
         if not any(schedules.values()):
             return out
-        field = {"send": "asyncLlSendCtas", "recv": "asyncLlRecvCtas"}
+        field = {"send": "asyncLlSendBlocks", "recv": "asyncLlRecvBlocks"}
 
         def shape(info):
             return info["gridX"], info["blockX"], info["sharedBytes"]
@@ -1859,8 +1868,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 base = request_for(group)
                 single = [plans_by_pass[n] for n in names]
                 buckets, lines = [], []
-                for bound, ctas in schedule:
-                    request = dict(base, **{field[side]: ctas})
+                for bound, blocks in schedule:
+                    request = dict(base, **{field[side]: blocks})
                     plans = []
                     for name in names:
                         plan_t = cb.asyncll_plan(name)
@@ -1874,8 +1883,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                             ):
                                 plan.close()
                                 raise RuntimeError(
-                                    f"AsyncLL {name}: {field[side]}={ctas} built a second "
-                                    "module; the CTA caps must stay geometry-only"
+                                    f"AsyncLL {name}: {field[side]}={blocks} built a second "
+                                    "module; the block caps must stay geometry-only"
                                 )
                             plan.bind(rdmaBlockNum=0, replayMode=0)
                             self._plans.append(plan)
@@ -1896,7 +1905,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     # Past every bound: the op's single-cap group.
                     buckets.append((None, groups[group]))
                     lines.append(
-                        f"{group} T>{buckets[-2][0]}: MORI_ASYNCLL_{side.upper()}_CTAS"
+                        f"{group} T>{buckets[-2][0]}: MORI_ASYNCLL_{side.upper()}_BLOCKS"
                     )
                 # Every bucket is the single-cap group: launch as without a schedule.
                 if all(launch is groups[group] for _, launch in buckets):
@@ -1904,7 +1913,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 buckets_out[group] = tuple(buckets)
                 desc.extend(lines)
         if cfg.rank == 0 and desc:
-            logger.info("AsyncLL CTA schedule: %s", "; ".join(dict.fromkeys(desc)))
+            logger.info("AsyncLL block schedule: %s", "; ".join(dict.fromkeys(desc)))
         return out
 
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
@@ -1928,7 +1937,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._asyncll_fuse_meta_on = self._asyncll_fuse_meta(
             self._asyncll_direct_on, cfg.async_ll_segmented
         )
-        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(
+        self._asyncll_fused_blocks = self._asyncll_fused_recv_blocks(
             self._asyncll_mode, self._device_index, self._multi_processor_count
         )
         sequences = self._asyncll_seq(cfg, self._asyncll_mode, self._asyncll_direct_on)
