@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include "mori/collective/XLA/collectives_common.hpp"
+#include "mori/collective/XLA/push_timing.hpp"
 #include "mori/collective/XLA/all_gather_kernels.hpp" // for detail::PullCopyInterleaved
 namespace mori {
 namespace ccl {
@@ -54,15 +55,22 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPairs pairs,
                                    uint64_t* __restrict__ barrierCtr,
                                    uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
+  MORI_PT(const uint64_t tEntry = wall_clock64();)
   // Every lane of the first wave reads my slot before lane myPe posts. A
   // kAsyncDone launch finds the start's pushGen - 1 there, so it gets the same.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
 
   if constexpr (Flags & kAsyncStart) {
+    // A start-only launch is the timing base; its done launch records t0.
+    MORI_PT_IF(
+      PtShape(PushTimingKind::kAllToAll, npes, 1, chunkBytes, Flags == kAsyncStart);
+      if constexpr (Flags == kAsyncStart) PT().tStart = tEntry;
+    )
     // A peer finishing its previous launch only proves our chunk reached it; each
     // peer's queue polls for its arrival in this launch before writing its recv slot.
     PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
+    MORI_PT_IF(PT().tPost = wall_clock64();)
 
     // Push each send slot p to peer p's recv slot for sender myPe (self
     // included). My recv slot has the SAME byte offset within the heap window on
@@ -86,17 +94,21 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPairs pairs,
                              peer != myPe ? BarrierGate(barrierCtr, peer) : nullptr,
                              static_cast<uint32_t>(pushGen - 1)};
         });
+    MORI_PT_IF(PT().tIssue = wall_clock64();)
   }
   if constexpr ((Flags & kAsyncDone) == 0) return;
+  MORI_PT_IF(PT().t0[0] = tEntry;)
 
   // === Wait until all npes senders (self-copy included) signalled, ===
   // and until my chunks landed at every peer, so the sources are reusable on return.
   if (threadIdx.x < warpSize) {
-    WaitArrivedAndDelivered(arrived, /*slot=*/0, pushGen, myPe, npes, stride4G);
+    WaitArrivedAndDelivered(arrived, /*slot=*/0, pushGen, myPe, npes, stride4G
+                            MORI_PT_ARGS(PT().arr[0], PT().dlv));
   }
   __syncthreads();
   // System-scope ACQUIRE: recv slots were written by peers' SDMA over XGMI.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  MORI_PT_IF(PT().tEnd = wall_clock64();)
 
   // Recv buffers already fully written by SDMA. The block read pushGen at
   // entry, so it can advance the generation for the next launch now.

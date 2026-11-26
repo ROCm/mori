@@ -122,6 +122,15 @@ target_link_libraries(collectives_benchmark mori_application_static mori_cco hip
 # compiler remarks during the normal build of this TU.
 target_compile_options(collectives_benchmark PRIVATE -Rpass-analysis=kernel-resource-usage)
 
+# Same benchmark with the push-kernel phase timing compiled in (MORI_PUSH_TIMING,
+# see XLA/push_timing.hpp). Opt-in through the configure environment, since
+# setup.py does not forward arbitrary -D options.
+if(DEFINED ENV{MORI_PUSH_TIMING_BENCH})
+  add_executable(collectives_benchmark_timing collective/XLA/collectives_benchmark.cpp)
+  target_link_libraries(collectives_benchmark_timing mori_cco hip::host hip::device)
+  target_compile_definitions(collectives_benchmark_timing PRIVATE MORI_PUSH_TIMING=1)
+endif()
+
 # Find MPI package (required by intra-node examples)
 find_package(MPI REQUIRED)
 

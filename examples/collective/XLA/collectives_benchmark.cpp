@@ -456,6 +456,8 @@ static int BenchAndVerify(const Config& cfg, ccoComm* comm, int myPe, hipStream_
 
   float totalMs = 0, minMs = 1e9f, maxMs = 0;
   hipError_t launchErr = hipSuccess;
+  // MORI_PUSH_TIMING builds: report the last push launch of this run only.
+  MORI_PT(HIP_RUNTIME_CHECK(PushTimingReset());)
   // No per-iteration host barrier: the push and pull kernels synchronize with
   // their peers in-kernel (GenBarrier).
   for (int iter = 0; iter < nWarmup + nRuns; iter++) {
@@ -473,6 +475,8 @@ static int BenchAndVerify(const Config& cfg, ccoComm* comm, int myPe, hipStream_
       maxMs = std::max(maxMs, iterMs);
     }
   }
+
+  MORI_PT(if (launchErr == hipSuccess) PushTimingDump(myPe);)
 
   // After every PE's last kernel has been stream-synced, each PE has observed all
   // incoming completion signals -> every outgoing DMA has landed. This host

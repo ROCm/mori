@@ -18,6 +18,10 @@
 #   WARMUP/ITERS benchmark iterations      [2/5]
 #   RUN_TIMEOUT  seconds per run           [120]
 #   LOG_DIR      per-run logs + summary.md [ci-logs/collective-bench]
+#   LABEL        prefix for run names and the summary title (e.g. "timing ") []
+#
+# Logs from a binary built with MORI_PUSH_TIMING=1 carry "[PT <coll> pe=N]"
+# lines (push kernels only); each such run also gets a timing table in summary.md.
 set -uo pipefail
 
 COLL=
@@ -80,9 +84,83 @@ if [[ -f /lib/x86_64-linux-gnu/libnuma.so.1 ]]; then
   export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1${LD_PRELOAD:+:$LD_PRELOAD}
 fi
 
-title="$COLL mode=$MODE logS=$LOGS npes=$NPES"
-tag="${COLL}_${MODE}_logS${LOGS}"
+LABEL=${LABEL:-}
+title="${LABEL}$COLL mode=$MODE logS=$LOGS npes=$NPES"
+tag="${LABEL// /_}${COLL}_${MODE}_logS${LOGS}"
 rows=()
+timingTables=()
+
+# Condenses the MORI_PUSH_TIMING report of one run into markdown: every cell is
+# "mean / max" over PEs (and over blocks 1.. for the blk1+ columns; block 0 also
+# issues the SDMA scatter, so it gets its own). All values in us, relative to
+# the launch entry on the reporting PE.
+push_timing_table() {
+  awk '
+    function num(key,   r) {
+      if (match($0, "(^| )" key "=-?[0-9.]+")) {
+        r = substr($0, RSTART, RLENGTH); sub(/.*=/, "", r); return r + 0
+      }
+      return 0
+    }
+    function at(key,   r) {
+      if (match($0, key "=p[0-9]+@-?[0-9.]+")) {
+        r = substr($0, RSTART, RLENGTH); sub(/.*@/, "", r); return r + 0
+      }
+      return 0
+    }
+    function acc(name, s, v) {
+      sum[name, s] += v; cnt[name, s]++
+      if (!((name, s) in mx) || v > mx[name, s]) mx[name, s] = v
+    }
+    function cell(name, s) {
+      if (!cnt[name, s]) return "-"
+      return sprintf("%.2f / %.2f", sum[name, s] / cnt[name, s], mx[name, s])
+    }
+    !/^\[PT [a-z0-9]+ pe=[0-9]+\] / || !/ us$/ { next }
+    { coll = $2 }
+    / npes=[0-9]+ S=/ { S = num("S"); grid = num("grid"); acc("post", 0, num("post")); acc("issue", 0, num("issue")); next }
+    / done-launch entry=/ { acc("dentry", 0, num("entry")); next }
+    / s=[0-9]+ arrive first=/ {
+      s = num("s"); acc("first", s, at("first")); acc("last", s, at("last")); acc("spread", s, num("spread")); next
+    }
+    / s=[0-9]+ blk[0-9]+ wait=/ {
+      s = num("s"); b = ($0 ~ / blk0 /) ? "0" : "n"
+      acc("wait" b, s, num("wait")); acc("reduce" b, s, num("reduce")); acc("sdone", s, num("done")); next
+    }
+    / bcast prepost=/ { acc("prepost", 0, num("prepost")); next }
+    / count b=[01] blk[1-9][0-9]* fence=/ { acc("fence", num("b"), num("fence")); next }
+    / tail owner=/ { acc("own", 0, num("counted")); next }
+    / bcast b=[01] arrive first=/ { b = num("b"); acc("blast", b, at("last")); acc("bdone", b, num("done")); next }
+    / bcast delivered first=/ { acc("bdlv", 0, at("last")); next }
+    / arrive first=/ { acc("first", 0, at("first")); acc("last", 0, at("last")); acc("spread", 0, num("spread")); next }
+    / delivered first=/ { acc("dlv", 0, at("last")); if (num("done")) acc("dlvdone", 0, num("done")); next }
+    / end=/ { acc("end", 0, num("end")); if ($0 ~ /after-own=/) acc("afterown", 0, num("after-own")); next }
+    END {
+      if (!cnt["post", 0]) exit
+      printf "%s S=%d grid=%d | blk0 arrival post %s, SDMA issue %s", coll, S, grid, cell("post", 0), cell("issue", 0)
+      if (cnt["dentry", 0]) printf ", done-launch entry %s", cell("dentry", 0)
+      printf "\n\n"
+      if (coll == "ag" || coll == "a2a") {
+        print "| first arrival | last arrival | arrival spread | last delivered | end |"
+        print "|---|---|---|---|---|"
+        printf "| %s | %s | %s | %s | %s |\n", cell("first", 0), cell("last", 0), cell("spread", 0), cell("dlv", 0), cell("end", 0)
+        exit
+      }
+      print "| slice | wait blk1+ | reduce blk1+ | wait blk0 | reduce blk0 | first arrival | last arrival | arrival spread | slice done |"
+      print "|---|---|---|---|---|---|---|---|---|"
+      for (s = 0; s < S; s++)
+        printf "| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", s, cell("waitn", s), cell("reducen", s), \
+               cell("wait0", s), cell("reduce0", s), cell("first", s), cell("last", s), cell("spread", s), cell("sdone", s)
+      if (coll == "rs") printf "\nblk0 last copy delivered at %s, wait done at %s\n", cell("dlv", 0), cell("dlvdone", 0)
+      if (coll == "ar") {
+        printf "\nbroadcast: prepost %s | count-in fence+sync blk1+ b0 %s, b1 %s | tail owner counted at %s\n", \
+               cell("prepost", 0), cell("fence", 0), cell("fence", 1), cell("own", 0)
+        printf "b0 last arrival %s (done %s) | b1 last arrival %s (done %s) | own b1 delivered %s | end %s (+%s after count)\n", \
+               cell("blast", 0), cell("bdone", 0), cell("blast", 1), cell("bdone", 1), cell("bdlv", 0), cell("end", 0), cell("afterown", 0)
+      }
+    }
+  ' "$1"
+}
 nPass=0; nFail=0; nSkip=0
 
 for size in $SIZES; do
@@ -113,6 +191,11 @@ for size in $SIZES; do
       fi
       printf '%-8s %s\n' "$status" "$name"
       rows+=("| $dtype | $op | $size | $status | $avg |")
+      if grep -q '^\[PT ' "$log"; then
+        table=$(push_timing_table "$log")
+        echo "$table"
+        timingTables+=("#### $name ($avg)" "" "$table" "")
+      fi
     done
   done
 done
@@ -125,6 +208,11 @@ summary="$LOG_DIR/summary.md"
   echo "|---|---|---|---|---|---|"
   printf '%s\n' "${rows[@]}"
   echo
+  if [[ ${#timingTables[@]} -gt 0 ]]; then
+    echo "Push timing, us, mean / max over PEs; times relative to the launch entry on each PE."
+    echo
+    printf '%s\n' "${timingTables[@]}"
+  fi
 } >>"$summary"
 
 echo "== $title: $nPass pass, $nFail fail, $nSkip skip =="
