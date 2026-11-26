@@ -766,7 +766,8 @@ jobs:
       - name: Start container
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
-          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+          # io_uring on: the SSD tier's io_uring storage driver is tested here.
+          MORI_CI_ALLOW_IO_URING=1 CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -794,6 +795,23 @@ jobs:
             cd $GITHUB_WORKSPACE/build/tests/cpp/umbp &&
             timeout 300 ctest --output-on-failure --no-tests=error
           "
+
+      # A test that asks for the io_uring backend still passes when the
+      # container cannot create a ring: the SSD tier falls back to the POSIX
+      # driver with a warning, and the driver-level cases print SKIPPED.  Fail
+      # here instead, so the io_uring driver cannot drop out of CI unnoticed.
+      - name: UMBP io_uring tests ran on io_uring
+        run: |
+          $CT exec $CONTAINER bash -c '
+            cd '"$GITHUB_WORKSPACE"'/build/tests/cpp/umbp &&
+            log=Testing/Temporary/LastTest.log &&
+            test -f "$log" || exit 1
+            grep -E "io_uring.*\.\.\. " "$log" || true
+            if grep -n -E "io_uring unavailable|falling back to POSIX backend" "$log"; then
+              echo "::error::io_uring is not usable in the test container; the io_uring tests ran on POSIX or skipped"
+              exit 1
+            fi
+          '
 
       # Five client primitives -- put / get / exists / put_ranges / get_ranges
       # -- swept over 1, 2, 4 and 8 concurrent client processes, against a

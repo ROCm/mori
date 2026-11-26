@@ -18,6 +18,15 @@ set -euo pipefail
 #                          --privileged. nicctl needs CAP_SYS_ADMIN/SYS_RAWIO
 #                          for PCI config/BAR access, so `mori check` skips its
 #                          firmware/QoS/DCQCN steps under this mode.
+#   MORI_CI_ALLOW_IO_URING — Set to 1 to let the container use io_uring when
+#                          MORI_CI_NO_PRIVILEGED=1. The runtime's default
+#                          seccomp profile denies io_uring_setup/enter/register,
+#                          so the UMBP io_uring storage driver cannot start and
+#                          its tests fall back to POSIX or skip, and still pass.
+#                          This lifts the whole seccomp filter, so the NUMA
+#                          calls it denies (mbind, move_pages) work as well;
+#                          it adds no capability. A --privileged container
+#                          has no filter to lift.
 #   MORI_CI_CACHE_VOLUME — Named volume for the build caches that outlive the
 #                          container (default mori_ci_cache); empty disables it.
 
@@ -198,7 +207,10 @@ fi
 PRIV_ARGS=(--privileged)
 if [[ "${MORI_CI_NO_PRIVILEGED:-0}" == "1" ]]; then
     PRIV_ARGS=(--cap-add=IPC_LOCK --cap-add=NET_ADMIN)
-    echo "[ci_run] MORI_CI_NO_PRIVILEGED=1 | caps: ${PRIV_ARGS[*]}"
+    if [[ "${MORI_CI_ALLOW_IO_URING:-0}" == "1" ]]; then
+        PRIV_ARGS+=(--security-opt seccomp=unconfined)
+    fi
+    echo "[ci_run] MORI_CI_NO_PRIVILEGED=1 | args: ${PRIV_ARGS[*]}"
 fi
 
 # Every CI job starts a fresh container and builds mori in it. ccache (setup.py
