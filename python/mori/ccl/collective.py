@@ -556,7 +556,8 @@ class All2allSdma:
         the output of the same calls. Calls of at least
         ``_TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES`` a rank into a registered output
         skip the output transit buffer and the copy out of it; smaller calls
-        are not affected. A peer writes into the tensor only while this rank is
+        are not affected, and a tensor smaller than that is not registered at
+        all. A peer writes into the tensor only while this rank is
         inside the call. The handle holds the tensor until
         deregister_output_buffer, so its memory is not reused while peers can
         still reach it.
@@ -567,6 +568,11 @@ class All2allSdma:
                 "copy_output_to_user=True"
             )
         size = tensor.numel() * tensor.element_size()
+        if size < _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES:
+            # No call into it could be large enough to land directly, and small
+            # tensors come out of allocator blocks that cannot always be exported
+            # to the peers (hipIpcGetMemHandle then fails, which ends the process).
+            return
         cpu, gpu = self._handle.register_output_buffer(tensor.data_ptr(), size)
         self._tdm_registered = {
             p: r
