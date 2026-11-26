@@ -36,15 +36,19 @@
 //                kernel. Block 0 exchanges a start token with every peer and then lets the other
 //                blocks go, so a rank writes into a peer only once the peer has started the call,
 //                which means the peer is done with the previous result.
+// Calls for which collective.py sets llElems skip all of the below and move as LL128 lines
+// (detail::CclTdmA2aLl128): every rank stores its chunks into the LL128 area of each peer's output
+// transit buffer, and every rank polls its own area and writes what lands into the result, in
+// either mode. Such a call raises no word and exchanges no token.
 //
 // Every rank deals the tiles to its blocks the same way, and a tile's destination does not depend
-// on the sender, so the tiles that block b of rank s writes into rank r are the ones block b of rank
-// r has to see land. Completion therefore goes block to block, and nothing gathers a rank's blocks:
-// a block that wrote anything fences its writes and raises its word on every peer, and a block with
-// tiles landing here waits for the same block's word from every peer. With output set, block 0 also
-// waits for block 0 of every peer, which is what lets call g + 1 write without waiting: a peer that
-// has raised its word for call g has started call g, so it has finished call g - 1, the last call to
-// read the half that call g + 1 writes.
+// on the sender, so the tiles that block b of rank s writes into rank r are the ones block b of
+// rank r has to see land. Completion therefore goes block to block, and nothing gathers a rank's
+// blocks: a block that wrote anything fences its writes and raises its word on every peer, and a
+// block with tiles landing here waits for the same block's word from every peer. With output set,
+// block 0 also waits for block 0 of every peer, which is what lets call g + 1 write without
+// waiting: a peer that has raised its word for call g has started call g, so it is done with
+// call g - 1, the last call to read the half that call g + 1 writes.
 //
 // Every value below only grows, so nothing is cleared after a call and a slow rank cannot miss one.
 //   words     npes x gridDim.x u64 that collective.py reserves past the caller's room in each
@@ -54,9 +58,9 @@
 //   sync      a per-handle array in ordinary device memory, allocated zeroed by collective.py: the
 //             last call of each block, from which the block reads its call number, and a go word
 //             that block 0 sets to g once every peer has started call g (output null).
-// Measured on 4 gfx1250 GPUs (256 CUs each) with graphs of 100 calls: exchanging one word with every
-// peer took about 3 us a call from block 0 alone and about 9 us from all 64 blocks, a fence each, so
-// only the blocks that have tiles to send or to receive take part.
+// Measured on 4 gfx1250 GPUs (256 CUs each) with graphs of 100 calls: exchanging one word with
+// every peer took about 3 us a call from block 0 alone and about 9 us from all 64 blocks, a fence
+// each, so only the blocks that have tiles to send or to receive take part.
 
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
 #include <hip/hip_runtime.h>
@@ -73,8 +77,8 @@ namespace mori {
 namespace collective {
 
 // Tile geometry, in 4-byte elements: 1 KiB rows like the AllReduce tiles, 16 rows, 16 KiB a warp.
-// MUST AGREE WITH _TDM_A2A_TILE_BYTES in python/mori/ccl/collective.py, which reserves this much LDS
-// per warp; reserving less is an LDS overrun.
+// MUST AGREE WITH _TDM_A2A_TILE_BYTES in python/mori/ccl/collective.py, which reserves this much
+// LDS per warp; reserving less is an LDS overrun.
 #define MORI_CCL_TDM_A2A_TILE_W 256
 #define MORI_CCL_TDM_A2A_TILE_H 16
 #define MORI_CCL_TDM_A2A_TILE_ELEMS (MORI_CCL_TDM_A2A_TILE_W * MORI_CCL_TDM_A2A_TILE_H)
@@ -99,6 +103,11 @@ struct CclTdmAll2allArgs {
   uint64_t halfElems;
   // 4-byte elements from the start of the output transit buffer to the words, an even number.
   uint64_t wordsElems;
+  // 4-byte elements from the start of the output transit buffer to the LL128 area, a multiple of
+  // 128, or 0 to move the call through TDM.
+  uint64_t llElems;
+  // 4-byte elements from the start of one half of the LL128 area to the next, a multiple of 128.
+  uint64_t llHalfElems;
 };
 static_assert(offsetof(CclTdmAll2allArgs, sync) == 72, "collective.py writes sync at byte 72");
 static_assert(offsetof(CclTdmAll2allArgs, output) == 80, "collective.py writes output at byte 80");
@@ -106,14 +115,18 @@ static_assert(offsetof(CclTdmAll2allArgs, halfElems) == 88,
               "collective.py writes halfElems at byte 88");
 static_assert(offsetof(CclTdmAll2allArgs, wordsElems) == 96,
               "collective.py writes wordsElems at byte 96");
-static_assert(sizeof(CclTdmAll2allArgs) == 104, "collective.py packs 104 bytes");
+static_assert(offsetof(CclTdmAll2allArgs, llElems) == 104,
+              "collective.py writes llElems at byte 104");
+static_assert(offsetof(CclTdmAll2allArgs, llHalfElems) == 112,
+              "collective.py writes llHalfElems at byte 112");
+static_assert(sizeof(CclTdmAll2allArgs) == 120, "collective.py packs 120 bytes");
 
 namespace detail {
 
 // One warp copies n <= MORI_CCL_TDM_A2A_TILE_ELEMS four-byte elements from src to dst through its
 // LDS tile. TDM takes whole rows, at least two of them (the EP planner in
-// src/ops/dispatch_combine_v2/tdm_align.hpp never issues a one-row shape either), and only when both
-// addresses sit on a 128 B boundary. The lanes copy the rest.
+// src/ops/dispatch_combine_v2/tdm_align.hpp never issues a one-row shape either), and only when
+// both addresses sit on a 128 B boundary. The lanes copy the rest.
 __device__ __forceinline__ void CclTdmA2aWarpCopy(uint32_t* dst, const uint32_t* src, size_t n,
                                                   uint32_t* ldsTile, int laneId, int waveSize) {
   size_t done = 0;
@@ -159,6 +172,137 @@ __device__ __forceinline__ void CclTdmA2aWaitLocal(const uint64_t* word, uint64_
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 }
 
+// LL128: a 128-byte line holds 120 payload bytes and, in its last 8, the number of the call it
+// belongs to. A receiver that reads its own call number in every line of a unit knows the unit's
+// payload is this call's, so the path needs no fence and no word. One wave32 store of 16 bytes a
+// lane fills a 512-byte unit of 4 lines and 480 payload bytes: lane l writes slot l % 8 of line
+// l / 8, and slot 7 carries 8 payload bytes and the call number. This relies on a peer seeing a
+// line that one store wrote either whole or not at all.
+constexpr size_t kCclLlUnitBytes = 512;
+constexpr size_t kCclLlLinePayload = 120;
+constexpr size_t kCclLlUnitPayload = 480;
+typedef int CclLlV4i __attribute__((ext_vector_type(4)));
+
+// Eight bytes at byte h (a multiple of 8) of a chunk of `limit` bytes (a multiple of 4), zeros past
+// its end. al8: the chunk starts on an 8-byte boundary.
+__device__ __forceinline__ uint2 CclLlLoad8(const char* src, size_t h, size_t limit, bool al8) {
+  if (h + 8 <= limit) {
+    if (al8) return *reinterpret_cast<const uint2*>(src + h);
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(src + h);
+    return make_uint2(p[0], p[1]);
+  }
+  if (h < limit) return make_uint2(*reinterpret_cast<const uint32_t*>(src + h), 0u);
+  return make_uint2(0u, 0u);
+}
+
+__device__ __forceinline__ void CclLlStore8(char* dst, size_t h, uint2 v, size_t limit, bool al8) {
+  if (h + 8 <= limit) {
+    if (al8) {
+      *reinterpret_cast<uint2*>(dst + h) = v;
+    } else {
+      uint32_t* p = reinterpret_cast<uint32_t*>(dst + h);
+      p[0] = v.x;
+      p[1] = v.y;
+    }
+  } else if (h < limit) {
+    *reinterpret_cast<uint32_t*>(dst + h) = v.x;
+  }
+}
+
+// The whole call as LL128 lines, wave32 only. Rank s's lines for call c sit in half c & 1 of every
+// receiver's LL128 area (llOffBytes is this call's half), unit u of its chunk at byte
+// (s * units + u) * 512 of the half. A rank stores call c + 2 into a half only after finishing
+// call c + 1, which needed every peer to have started call c + 1 and so to be done reading call c
+// out of that half; a TDM call in between orders it the same way, as it too waits for every peer.
+// The area holds nothing but lines and is zeroed before the first call, so a line left there by an
+// earlier call always shows an older call number. Warp `warp` takes every totalWarps-th pair from
+// itself on, sending and then receiving: pair (k, u) is unit u of the chunk for rank myPe + 1 + k
+// and of the chunk from rank myPe - 1 - k.
+__device__ __forceinline__ void CclTdmA2aLl128(
+    int myPe, int npes, const void* input, void* result,
+    const application::SymmMemObjPtr& outputTransitMemObj, size_t chunkBytes, uint64_t call,
+    size_t llOffBytes, size_t warp, size_t totalWarps, int laneId, int waveSize) {
+  const size_t units = (chunkBytes + kCclLlUnitPayload - 1) / kCclLlUnitPayload;
+  const size_t np = static_cast<size_t>(npes);
+  const size_t me = static_cast<size_t>(myPe);
+  const size_t pairs = (np - 1) * units;
+  const int lp = laneId & 7;
+  const size_t laneOff =
+      static_cast<size_t>(laneId >> 3) * kCclLlLinePayload + static_cast<size_t>(lp) * 16;
+  const char* const in8 = static_cast<const char*>(input);
+  char* const out8 = static_cast<char*>(result);
+  const bool inAl8 = ((reinterpret_cast<uintptr_t>(input) | chunkBytes) & 7) == 0;
+  const bool outAl8 = ((reinterpret_cast<uintptr_t>(result) | chunkBytes) & 7) == 0;
+
+  for (size_t i = warp; i < pairs; i += totalWarps) {
+    const size_t k = i / units;
+    const size_t u = i - k * units;
+    const size_t dest = (me + 1 + k) % np;
+    const char* const src = in8 + dest * chunkBytes;
+    const size_t h = u * kCclLlUnitPayload + laneOff;
+    const uint2 a = CclLlLoad8(src, h, chunkBytes, inAl8);
+    const uint2 b = lp == 7
+                        ? make_uint2(static_cast<uint32_t>(call), static_cast<uint32_t>(call >> 32))
+                        : CclLlLoad8(src, h + 8, chunkBytes, inAl8);
+    char* const dst =
+        reinterpret_cast<char*>(outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(dest))) +
+        llOffBytes + (me * units + u) * kCclLlUnitBytes + static_cast<size_t>(laneId) * 16;
+    *reinterpret_cast<uint4*>(dst) = make_uint4(a.x, a.y, b.x, b.y);
+  }
+
+  {
+    const size_t chunk4 = chunkBytes / 4;
+    const uint32_t* const s4 = reinterpret_cast<const uint32_t*>(in8 + me * chunkBytes);
+    uint32_t* const d4 = reinterpret_cast<uint32_t*>(out8 + me * chunkBytes);
+    const bool al16 =
+        ((reinterpret_cast<uintptr_t>(s4) | reinterpret_cast<uintptr_t>(d4)) & 15) == 0;
+    const size_t per = static_cast<size_t>(waveSize) * 4;
+    for (size_t j = warp * per; j < chunk4; j += totalWarps * per) {
+      const size_t e = j + static_cast<size_t>(laneId) * 4;
+      if (al16 && e + 4 <= chunk4) {
+        *reinterpret_cast<uint4*>(d4 + e) = *reinterpret_cast<const uint4*>(s4 + e);
+      } else {
+        for (size_t q = e; q < e + 4 && q < chunk4; ++q) d4[q] = s4[q];
+      }
+    }
+  }
+
+  const char* const land =
+      reinterpret_cast<const char*>(outputTransitMemObj->localPtr) + llOffBytes;
+  for (size_t i = warp; i < pairs; i += totalWarps) {
+    const size_t k = i / units;
+    const size_t u = i - k * units;
+    const size_t srcPe = (me + np - 1 - k) % np;
+    const CclLlV4i* const p = reinterpret_cast<const CclLlV4i*>(
+        land + (srcPe * units + u) * kCclLlUnitBytes + static_cast<size_t>(laneId) * 16);
+    CclLlV4i x;
+    int spin = 0;
+    bool warned = false;
+    while (true) {
+      asm volatile("" ::: "memory");
+      x = __builtin_nontemporal_load(p);
+      const uint64_t seen =
+          (static_cast<uint64_t>(static_cast<uint32_t>(x.w)) << 32) | static_cast<uint32_t>(x.z);
+      if (__ballot(lp == 7 && seen != call) == 0ull) break;
+      if (++spin > 100000000 && !warned) {
+        if (laneId == 0) {
+          printf("PE %d: TdmAll2all timeout waiting for LL128 lines from peer %d (call %llu)\n",
+                 myPe, static_cast<int>(srcPe), static_cast<unsigned long long>(call));
+        }
+        warned = true;
+      }
+    }
+    char* const dst = out8 + srcPe * chunkBytes;
+    const size_t h = u * kCclLlUnitPayload + laneOff;
+    CclLlStore8(dst, h, make_uint2(static_cast<uint32_t>(x.x), static_cast<uint32_t>(x.y)),
+                chunkBytes, outAl8);
+    if (lp != 7) {
+      CclLlStore8(dst, h + 8, make_uint2(static_cast<uint32_t>(x.z), static_cast<uint32_t>(x.w)),
+                  chunkBytes, outAl8);
+    }
+  }
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -167,7 +311,8 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
                                       const application::SymmMemObjPtr outputTransitMemObj,
                                       const application::SymmMemObjPtr flagsMemObj,
                                       size_t elementCount, uint64_t* sync, T* output,
-                                      size_t halfElems, size_t wordsElems) {
+                                      size_t halfElems, size_t wordsElems, size_t llElems,
+                                      size_t llHalfElems) {
   static_assert(sizeof(T) % 4 == 0, "TdmAll2allKernel moves 4-byte words");
   (void)inputTransitMemObj;
   if (elementCount == 0 || npes <= 0) return;
@@ -212,6 +357,18 @@ __device__ void TdmAll2allKernel_body(int myPe, int npes, T* input,
   }
   __syncthreads();
   const uint64_t call = s_call;
+
+  if (llElems != 0) {
+    detail::CclTdmA2aLl128(myPe, npes, input, out4 != nullptr ? out4 : localTransit,
+                           outputTransitMemObj, chunk4 * 4, call,
+                           (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
+                           static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId, waveSize);
+    if (threadIdx.x == 0) {
+      __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+    return;
+  }
+
   const size_t half = out4 != nullptr ? static_cast<size_t>(call & 1ULL) * halfElems : 0;
 
   if (out4 == nullptr) {

@@ -159,13 +159,55 @@ _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
 _TDM_A2A_SYNC_WORDS = 64 + 1
 # sizeof(CclAll2allArgs<uint32_t>), the struct prepare_sync fills. The TDM
 # kernel takes those bytes followed by the sync pointer, the caller's output,
-# the 4-byte elements in a transit half and the 4-byte elements before the
-# words (CclTdmAll2allArgs, which static_asserts every offset).
+# the 4-byte elements in a transit half, the 4-byte elements before the words,
+# and the 4-byte elements before the LL128 area and in a half of it
+# (CclTdmAll2allArgs, which static_asserts every offset).
 _TDM_A2A_BASE_ARGS_BYTES = 72
-_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 32
+_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 48
 # Each half of the output transit buffer starts on a 128 B boundary, the
 # alignment TDM needs.
 _TDM_A2A_HALF_ALIGN = 128
+# Calls of at most this many bytes a rank (count * npes * 4) move as LL128
+# lines instead of TDM tiles (CclTdmA2aLl128 in the kernel header). Measured on
+# 4 gfx1250 GPUs with graphs of 100 calls: 9.87 us a call at 512 KiB against
+# 13.36 us through TDM, and 14.91 against 13.57 at 1 MiB.
+# MORI_CCL_ALL2ALL_LL128_MAX_BYTES overrides it per handle and 0 turns the path
+# off; every rank must use the same value. Receivers poll the lines, which has
+# been verified only on GPUs whose local memory the driver maps MTYPE_RW.
+_TDM_A2A_LL128_MAX_BYTES = 512 * 1024
+# Must equal kCclLlUnitBytes and kCclLlUnitPayload in the kernel header.
+_TDM_A2A_LL128_UNIT_BYTES = 512
+_TDM_A2A_LL128_UNIT_PAYLOAD = 480
+# Each half of the LL128 area starts on a page, which is also a whole number of
+# 128 B lines.
+_TDM_A2A_LL128_ALIGN = 4096
+
+
+def _resolve_all2all_ll128_max_bytes() -> int:
+    raw = os.environ.get("MORI_CCL_ALL2ALL_LL128_MAX_BYTES", "").strip()
+    if not raw:
+        return _TDM_A2A_LL128_MAX_BYTES
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(
+            f"MORI_CCL_ALL2ALL_LL128_MAX_BYTES must be a byte count >= 0, got {raw!r}"
+        )
+    return value
+
+
+def _align_up(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
+def _tdm_ll128_half_bytes(npes: int, max_bytes: int) -> int:
+    # Room for the largest LL128 call, max_bytes // (4 * npes) elements a
+    # destination: npes chunks of whole 512 B units.
+    chunk = max_bytes // (4 * npes) * 4
+    units = (chunk + _TDM_A2A_LL128_UNIT_PAYLOAD - 1) // _TDM_A2A_LL128_UNIT_PAYLOAD
+    return _align_up(npes * units * _TDM_A2A_LL128_UNIT_BYTES, _TDM_A2A_LL128_ALIGN)
 
 
 _TORCH_DTYPE_TO_NUMPY = {
@@ -268,8 +310,18 @@ class All2allSdma:
         handle_copy = copy_output_to_user and self._backend != "tdm"
         handle_class = getattr(mori_cpp, "All2allSdmaHandle")
         # The TDM kernel keeps a u64 per rank and block in the output transit
-        # buffer, after the room the caller asked for and on a u64 boundary.
-        extra = npes * _TDM_A2A_BLOCKS * 8 + 8 if self._backend == "tdm" else 0
+        # buffer, after the room the caller asked for and on a u64 boundary, and
+        # after those the two halves of its LL128 area, from the next page on.
+        extra = 0
+        ll_half = 0
+        if self._backend == "tdm":
+            self._tdm_ll_max = _resolve_all2all_ll128_max_bytes()
+            ll_half = _tdm_ll128_half_bytes(npes, self._tdm_ll_max)
+            extra = npes * _TDM_A2A_BLOCKS * 8 + 8
+            if ll_half:
+                extra += _TDM_A2A_LL128_ALIGN + 2 * ll_half
+            else:
+                self._tdm_ll_max = 0
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(
@@ -305,8 +357,14 @@ class All2allSdma:
             # two halves of the output transit buffer.
             half = self._output_transit_bytes // 2
             self._tdm_half_bytes = half // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
-            # Peers raise the words on every call, from the first one on.
+            # Peers raise the words and store LL128 lines from the first call on;
+            # a zeroed line shows no call number. Offsets count from the start of
+            # the buffer, which ShmemMalloc puts on a 256 B boundary.
             words_at = (self._output_transit_bytes + 7) // 8 * 8
+            ll_at = _align_up(
+                words_at + npes * _TDM_A2A_BLOCKS * 8, _TDM_A2A_LL128_ALIGN
+            )
+            self._tdm_ll_elems = ll_at // 4 if ll_half else 0
             _ptr_to_tensor(
                 self._handle.get_output_transit_buffer()[0] + words_at,
                 extra - 8,
@@ -323,10 +381,13 @@ class All2allSdma:
             ).value = self._tdm_sync.data_ptr()
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 16
-            ).value = self._tdm_half_bytes // 4
+            ).value = (self._tdm_half_bytes // 4)
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 24
-            ).value = words_at // 4
+            ).value = (words_at // 4)
+            ctypes.c_uint64.from_buffer(
+                self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 40
+            ).value = (ll_half // 4)
 
     def _check_tdm_count(self, count: int) -> None:
         # The TDM kernel writes count * npes uint32 into every rank's output
@@ -341,13 +402,17 @@ class All2allSdma:
                 + (" (half of it, with copy_output_to_user)" if self._copy_out else "")
             )
 
-    def _launch_tdm(self, args, output_ptr: int, s: int) -> None:
+    def _launch_tdm(self, args, output_ptr: int, count: int, s: int) -> None:
         # hipModuleLaunchKernel copies the argument bytes at launch, and a graph
         # capture keeps that copy, so the buffer is reused for every call.
         ctypes.memmove(self._tdm_args, args, _TDM_A2A_BASE_ARGS_BYTES)
         ctypes.c_uint64.from_buffer(
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 8
-        ).value = output_ptr if self._copy_out else 0
+        ).value = (output_ptr if self._copy_out else 0)
+        ll = count * self.npes * 4 <= self._tdm_ll_max
+        ctypes.c_uint64.from_buffer(
+            self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 32
+        ).value = (self._tdm_ll_elems if ll else 0)
         _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
             (_TDM_A2A_BLOCKS,),
             (_TDM_THREADS,),
@@ -367,7 +432,7 @@ class All2allSdma:
         if self._backend == "tdm":
             # Ordered on the stream like any kernel: no host synchronization,
             # so it can be captured into a graph.
-            self._launch_tdm(args, output_data.data_ptr(), s)
+            self._launch_tdm(args, output_data.data_ptr(), count, s)
             return time.perf_counter() - t0
         _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
             (1,), (64,), 0, s, args
@@ -383,7 +448,7 @@ class All2allSdma:
             input_data.data_ptr(), output_data.data_ptr(), count, s
         )
         if self._backend == "tdm":
-            self._launch_tdm(args, output_data.data_ptr(), s)
+            self._launch_tdm(args, output_data.data_ptr(), count, s)
         else:
             _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
                 (1,), (64,), 0, s, args
@@ -415,7 +480,7 @@ class All2allSdma:
     def get_output_transit_buffer(self, dtype=None, device=None):
         # On the TDM transport with copy_output_to_user, the result is in the
         # caller's output and this buffer is the kernel's scratch. The TDM
-        # kernel's words after the caller's room are left out.
+        # kernel's words and LL128 area after the caller's room are left out.
         dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
         ptr = self._handle.get_output_transit_buffer()[0]
         return _ptr_to_tensor(ptr, self._output_transit_bytes, dtype, device)

@@ -33,6 +33,12 @@ cover whole TDM tiles, a TDM tail of a few rows, tails short enough to be left
 to the lanes, and chunk sizes whose offsets are not 128 B aligned, which the
 kernel copies with the lanes alone.
 
+Calls of up to _TDM_A2A_LL128_MAX_BYTES a rank move as LL128 lines and larger
+ones as TDM tiles. A third handle, built with MORI_CCL_ALL2ALL_LL128_MAX_BYTES=0,
+sends every size through TDM, so both paths see the small sizes. The sizes also
+include the largest LL128 call and one element more, and consecutive calls of a
+handle switch between the two paths.
+
 --bench times both ways at power-of-two sizes per GPU. Back-to-back calls are
 captured into one HIP graph and replayed, so the host's launch cost does not cap
 the small sizes; the kernel keeps its call count in device memory, which is what
@@ -63,7 +69,9 @@ _CHECK_COUNTS = (
     1 << 19,
 )
 _CHECK_CALLS = 3
-_BENCH_BYTES_PER_GPU = (64 << 10,) + tuple(m << 20 for m in (1, 2, 4, 8, 16, 32))
+_BENCH_BYTES_PER_GPU = tuple(k << 10 for k in (64, 128, 256, 512)) + tuple(
+    m << 20 for m in (1, 2, 4, 8, 16, 32)
+)
 
 
 def _chunk(src_pe, dest_pe, npes, call, count, device):
@@ -86,6 +94,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     shmem.shmem_torch_process_group_init("default")
 
     from mori.ccl import All2allSdma
+    from mori.ccl.collective import _TDM_A2A_LL128_MAX_BYTES
 
     my_pe, npes = shmem.shmem_mype(), shmem.shmem_npes()
     assert (my_pe, npes) == (rank, world_size)
@@ -101,20 +110,41 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     del os.environ["MORI_CCL_ALL2ALL_BACKEND"]
     assert refused, "MORI_CCL_ALL2ALL_BACKEND=sdma was accepted on gfx125x"
 
+    # The largest call that moves as LL128 lines, and the smallest that does not.
+    ll_edge = _TDM_A2A_LL128_MAX_BYTES // (4 * npes)
+    check_counts = list(_CHECK_COUNTS) + [ll_edge, ll_edge + 1]
     bench_counts = [b // 4 // npes for b in _BENCH_BYTES_PER_GPU] if bench else []
-    max_count = max(list(_CHECK_COUNTS) + bench_counts)
+    max_count = max(check_counts + bench_counts)
     nbytes = max_count * npes * 4
     handles = {
         # Calls alternate between the halves of the output transit buffer.
         "into output": All2allSdma(
-            my_pe, npes, input_buffer_size=nbytes, output_buffer_size=2 * nbytes,
+            my_pe,
+            npes,
+            input_buffer_size=nbytes,
+            output_buffer_size=2 * nbytes,
             copy_output_to_user=True,
         ),
         "in transit": All2allSdma(
-            my_pe, npes, input_buffer_size=nbytes, output_buffer_size=nbytes,
+            my_pe,
+            npes,
+            input_buffer_size=nbytes,
+            output_buffer_size=nbytes,
             copy_output_to_user=False,
         ),
     }
+    ll_env = os.environ.pop("MORI_CCL_ALL2ALL_LL128_MAX_BYTES", None)
+    os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"] = "0"
+    handles["TDM only"] = All2allSdma(
+        my_pe,
+        npes,
+        input_buffer_size=nbytes,
+        output_buffer_size=2 * nbytes,
+        copy_output_to_user=True,
+    )
+    del os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"]
+    if ll_env is not None:
+        os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"] = ll_env
     backends = {m: h._backend for m, h in handles.items()}
     assert set(backends.values()) == {"tdm"}, backends
     stream = torch.cuda.Stream(device=dev)
@@ -155,7 +185,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         failed += int(bad != 0)
 
     for mode in handles:
-        for count in list(_CHECK_COUNTS) + bench_counts:
+        for count in check_counts + bench_counts:
             for _ in range(_CHECK_CALLS):
                 check(mode, count)
         check(mode, 8 * 4096, use_async=True)
@@ -228,7 +258,9 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     shmem.shmem_finalize()
     dist.destroy_process_group()
     if failed:
-        raise AssertionError(f"PE {rank}: TDM all2all output mismatch in {failed} call(s)")
+        raise AssertionError(
+            f"PE {rank}: TDM all2all output mismatch in {failed} call(s)"
+        )
 
 
 def _gfx125x():
