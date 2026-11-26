@@ -175,6 +175,22 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("cancel_async", &All2allU32::cancel_async)
       .def("reset_flags", &All2allU32::resetFlags)
       .def(
+          "register_output_buffer",
+          [](All2allU32& self, uintptr_t ptr, size_t size) -> py::tuple {
+            auto obj = self.register_output_buffer(reinterpret_cast<void*>(ptr), size);
+            return py::make_tuple(reinterpret_cast<uintptr_t>(obj.cpu),
+                                  reinterpret_cast<uintptr_t>(obj.gpu));
+          },
+          py::arg("ptr"), py::arg("size"),
+          "Register a GPU buffer the peers write an all2all result into directly (collective); "
+          "returns the two pointers of its symmetric object")
+      .def(
+          "deregister_output_buffer",
+          [](All2allU32& self, uintptr_t ptr) {
+            self.deregister_output_buffer(reinterpret_cast<void*>(ptr));
+          },
+          py::arg("ptr"), "Deregister a previously registered output buffer (collective)")
+      .def(
           "get_output_transit_buffer",
           [](All2allU32& self) -> py::tuple {
             void* ptr = self.getOutputTransitBuffer();

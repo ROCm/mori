@@ -126,6 +126,14 @@ All2allSdma<T>::~All2allSdma() {
     cancel_async();
   }
 
+  // Python may destroy the handle after shmem_finalize(), when nothing can be deregistered.
+  if (shmem::ShmemIsInitialized()) {
+    for (auto& entry : registered_outputs_) {
+      shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(entry.first), entry.second.size);
+    }
+  }
+  registered_outputs_.clear();
+
   // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction
   if (flags_) {
     printf("All2allSdma destroyed: PE %d\n", myPe_);

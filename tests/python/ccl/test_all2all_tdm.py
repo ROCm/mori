@@ -25,7 +25,8 @@
 The test runs with SDMA off in mori (MORI_ENABLE_SDMA=0) and in the ROCm
 runtime (HSA_ENABLE_SDMA=0), and checks that asking for the SDMA transport is
 refused. Both ways of delivering the result are checked: into the caller's
-output (copy_output_to_user=True) and left in the output transit buffer.
+output (copy_output_to_user=True), into an output every rank registered
+(register_output_buffer), and left in the output transit buffer.
 
 Every call sends data that depends on the call number, so a chunk left in a
 transit buffer by an earlier call cannot pass for the current one. The sizes
@@ -160,6 +161,14 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     del os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"]
     if ll_env is not None:
         os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"] = ll_env
+    # Its outputs are registered on every rank, so large calls land in them directly.
+    handles["registered"] = All2allSdma(
+        my_pe,
+        npes,
+        input_buffer_size=nbytes,
+        output_buffer_size=2 * nbytes,
+        copy_output_to_user=True,
+    )
     backends = {m: h._backend for m, h in handles.items()}
     assert set(backends.values()) == {"tdm"}, backends
     stream = torch.cuda.Stream(device=dev)
@@ -173,6 +182,8 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         call = calls[mode]
         inp = torch.cat([_chunk(my_pe, d, npes, call, count, dev) for d in range(npes)])
         out = torch.full((npes * count,), -1, dtype=torch.int32, device=dev)
+        if mode == "registered":
+            h.register_output_buffer(out)
         torch.cuda.synchronize()
         with torch.cuda.stream(stream):
             if use_async:
@@ -181,6 +192,8 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
             else:
                 h(inp, out, count, stream)
         torch.cuda.synchronize()
+        if mode == "registered":
+            h.deregister_output_buffer(out)
         if mode == "in transit":
             out = h.get_output_transit_buffer(dtype=torch.int32)[: npes * count]
         bad = 0
@@ -210,9 +223,14 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = {m: {b: [] for b in _BENCH_BYTES_PER_GPU} for m in handles}
+        registered = None
         for b, count in zip(_BENCH_BYTES_PER_GPU, bench_counts):
             inp = torch.ones(npes * count, dtype=torch.int32, device=dev)
             out = torch.empty_like(inp)
+            if registered is not None:
+                handles["registered"].deregister_output_buffer(registered)
+            handles["registered"].register_output_buffer(out)
+            registered = out
             # No loop variable holds a handle: every handle must be gone by shmem_finalize.
             for mode in handles:
                 graph = torch.cuda.CUDAGraph()
@@ -236,6 +254,8 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
                     dist.all_reduce(t, op=dist.ReduceOp.MAX)
                     times[mode][b].append(t.item())
                 del graph
+        handles["registered"].deregister_output_buffer(registered)
+        registered = None
         # The flags must still agree after thousands of back-to-back calls.
         for mode in handles:
             check(mode, bench_counts[-1])
@@ -294,11 +314,11 @@ def _run(world_size, bench=False, rounds=5, iters=100, warmup=2):
     os.environ["MORI_ENABLE_SDMA"] = "0"
     os.environ["HSA_ENABLE_SDMA"] = "0"
     os.environ.pop("MORI_CCL_ALL2ALL_BACKEND", None)
-    # Three handles, each with an input buffer and up to two halves of output transit buffer of
+    # Four handles, each with an input buffer and up to two halves of output transit buffer of
     # the largest size, plus their words and LL128 areas.
     largest = max(_BENCH_BYTES_PER_GPU) if bench else 2 * _CHECK_ONCE_BYTES + (1 << 20)
     os.environ.setdefault(
-        "MORI_SHMEM_HEAP_SIZE", str(max(4 << 30, 9 * largest + (1 << 30)))
+        "MORI_SHMEM_HEAP_SIZE", str(max(4 << 30, 12 * largest + (1 << 30)))
     )
     torch.multiprocessing.spawn(
         _worker,

@@ -27,7 +27,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <stdexcept>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
@@ -76,6 +78,14 @@ class All2allSdma {
 
   // Not reentrant: previous launch must complete before next prepare_*.
   CclAll2allArgs<T> jit_args_;
+
+  // Caller outputs registered for direct delivery, by base pointer: the peers write their chunks
+  // straight into them, so nothing is copied out of the output transit buffer.
+  struct RegisteredOutput {
+    application::SymmMemObjPtr obj;
+    size_t size;
+  };
+  std::map<uintptr_t, RegisteredOutput> registered_outputs_;
 
   // Disable copy constructor and assignment operator
   All2allSdma(const All2allSdma&) = delete;
@@ -211,6 +221,57 @@ class All2allSdma {
    * @brief Resets flags (sets to 0)
    */
   void resetFlags();
+
+  /**
+   * @brief Registers a caller output for direct delivery. COLLECTIVE: every rank calls it at the
+   * same point with its own buffer of the same size, and later passes that buffer as the output
+   * of the same calls. Cached: an output already registered with this base and size is returned
+   * as is; entries that overlap a new one are stale (the allocator reused the memory) and dropped.
+   * @return The symmetric object the kernel reaches the peers' buffers through
+   */
+  application::SymmMemObjPtr register_output_buffer(void* ptr, size_t size) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+    auto exact = registered_outputs_.find(base);
+    if (exact != registered_outputs_.end() && exact->second.size == size) return exact->second.obj;
+    for (auto it = registered_outputs_.begin(); it != registered_outputs_.end();) {
+      const uintptr_t b = it->first;
+      const size_t s = it->second.size;
+      if (base < b + s && b < base + size) {
+        shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(b), s);
+        it = registered_outputs_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // Reached over P2P only, never an RDMA source or destination.
+    application::SymmMemObjPtr obj = shmem::ShmemSymmetricRegister(ptr, size, false);
+    if (!obj.IsValid()) throw std::runtime_error("All2allSdma: output register failed");
+    registered_outputs_[base] = {obj, size};
+    return obj;
+  }
+
+  /**
+   * @brief Drops a registered output. COLLECTIVE like register_output_buffer.
+   */
+  void deregister_output_buffer(void* ptr) {
+    auto it = registered_outputs_.find(reinterpret_cast<uintptr_t>(ptr));
+    if (it == registered_outputs_.end()) return;
+    shmem::ShmemSymmetricDeregister(ptr, it->second.size);
+    registered_outputs_.erase(it);
+  }
+
+  /**
+   * @brief The object of an output registered with exactly this base and at least `size` bytes,
+   * or a null object. Exact base only: the allocator may carve a new buffer out of a freed
+   * registered one, whose peer pointers no longer belong to it.
+   */
+  application::SymmMemObjPtr find_registered_output(const void* ptr, size_t size) const {
+    auto it = registered_outputs_.find(reinterpret_cast<uintptr_t>(ptr));
+    if (it == registered_outputs_.end() || it->second.size < size) {
+      return application::SymmMemObjPtr{};
+    }
+    return it->second.obj;
+  }
 };
 
 }  // namespace collective

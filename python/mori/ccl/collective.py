@@ -170,10 +170,11 @@ _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES = 64 * 1024 * 1024
 # sizeof(CclAll2allArgs<uint32_t>), the struct prepare_sync fills. The TDM
 # kernel takes those bytes followed by the sync pointer, the caller's output,
 # the 4-byte elements in a transit half, the 4-byte elements before the words,
-# and the 4-byte elements before the LL128 area and in a half of it
-# (CclTdmAll2allArgs, which static_asserts every offset).
+# the 4-byte elements before the LL128 area and in a half of it, and the two
+# pointers of the registered output's symmetric object, zero when the output is
+# not registered (CclTdmAll2allArgs, which static_asserts every offset).
 _TDM_A2A_BASE_ARGS_BYTES = 72
-_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 48
+_TDM_A2A_ARGS_BYTES = _TDM_A2A_BASE_ARGS_BYTES + 64
 # Each half of the output transit buffer starts on a 128 B boundary, the
 # alignment TDM needs.
 _TDM_A2A_HALF_ALIGN = 128
@@ -431,6 +432,9 @@ class All2allSdma:
             torch.cuda.synchronize()
             mori_cpp.shmem_barrier_all()
             self._tdm_args = ctypes.create_string_buffer(_TDM_A2A_ARGS_BYTES)
+            # Outputs registered for direct delivery, by data pointer: the two
+            # pointers of the symmetric object and the size in bytes.
+            self._tdm_registered = {}
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES
             ).value = self._tdm_sync.data_ptr()
@@ -468,6 +472,17 @@ class All2allSdma:
         ctypes.c_uint64.from_buffer(
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 32
         ).value = (self._tdm_ll_elems if ll else 0)
+        # A registered output big enough for this call: the kernel lets the
+        # peers write large calls straight into it.
+        reg = self._tdm_registered.get(output_ptr) if self._copy_out else None
+        if reg is not None and count * self.npes * 4 > reg[2]:
+            reg = None
+        ctypes.c_uint64.from_buffer(
+            self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 48
+        ).value = (reg[0] if reg else 0)
+        ctypes.c_uint64.from_buffer(
+            self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 56
+        ).value = (reg[1] if reg else 0)
         _get_ccl_func("TdmAll2allKernel_u32").launch_struct(
             (self._tdm_blocks,),
             (_TDM_THREADS,),
@@ -531,6 +546,37 @@ class All2allSdma:
 
     def reset_flags(self):
         self._handle.reset_flags()
+
+    def register_output_buffer(self, tensor) -> None:
+        """Let the peers write results straight into ``tensor`` (TDM transport,
+        copy_output_to_user).
+
+        Collective: every rank calls it at the same point with its own tensor of
+        the same size, and then passes that tensor, from its first element, as
+        the output of the same calls. Calls of at least
+        ``_TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES`` a rank into a registered output
+        skip the output transit buffer and the copy out of it; smaller calls
+        are not affected. A peer writes into the tensor only while this rank is
+        inside the call.
+        """
+        if self._backend != "tdm" or not self._copy_out:
+            raise RuntimeError(
+                "register_output_buffer needs the TDM transport and "
+                "copy_output_to_user=True"
+            )
+        size = tensor.numel() * tensor.element_size()
+        cpu, gpu = self._handle.register_output_buffer(tensor.data_ptr(), size)
+        self._tdm_registered = {
+            p: r
+            for p, r in self._tdm_registered.items()
+            if p + r[2] <= tensor.data_ptr() or tensor.data_ptr() + size <= p
+        }
+        self._tdm_registered[tensor.data_ptr()] = (cpu, gpu, size)
+
+    def deregister_output_buffer(self, tensor) -> None:
+        """Undo register_output_buffer. Collective, like it."""
+        if self._tdm_registered.pop(tensor.data_ptr(), None) is not None:
+            self._handle.deregister_output_buffer(tensor.data_ptr())
 
     def get_output_transit_buffer(self, dtype=None, device=None):
         # On the TDM transport with copy_output_to_user, the result is in the
