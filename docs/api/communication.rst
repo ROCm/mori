@@ -117,13 +117,69 @@ These options are read once when an op is constructed:
      - ``0``, meaning half the compute units this process may use: the
        device's, or its share under ``HSA_CU_MASK``. Grid ceiling for the
        fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
+   * - ``MORI_ASYNCLL_DIRECT``
+     - ``0``. Set ``1`` to have the copy engines read the tokens where the
+       caller left them: dispatch posts each peer's rows from the input, one
+       packet per run of adjacent source tokens, and combine posts each peer's
+       rows from the expert output, so neither send phase gathers them first.
+       The dispatch input and the combine input are read until the matching
+       ``dispatch_recv`` / ``combine_recv``: do not write either in between,
+       and do not pass a tensor this op returns from a receive as the dispatch
+       input. The op's arena then leaves out the send staging the engines no
+       longer read, about a third of it, so every rank must use the same
+       value. Needs early notification; ignored
+       without it. Not available with a quantized combine (``quant_type``),
+       which is packed on the send side. gfx942 and gfx950 only.
+   * - ``MORI_ASYNCLL_FUSE_META``
+     - ``1``. With ``MORI_ASYNCLL_DIRECT=1`` on an op whose
+       ``async_ll_recv_layout`` resolves to ``"segmented"``, slot assignment
+       also writes the metadata rows, so a segmented round's ``dispatch_send``
+       runs two passes instead of three. ``0`` keeps the separate metadata
+       pass. Ignored without direct sources or the segmented layout.
+   * - ``MORI_ASYNCLL_SEND_CTAS``
+     - ``0``, meaning the whole device. Grid ceiling for the send-side copy
+       passes: slot assignment and the dispatch and combine gathers (not the
+       LSA transport's fused dispatch gather). A positive value is rounded down
+       to a multiple of the world size, and up to the world size if smaller; it
+       never widens a pass's default grid.
+   * - ``MORI_ASYNCLL_RECV_CTAS``
+     - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
+       passes: the dispatch and combine receive copies, in either receive
+       layout. Rounded like ``MORI_ASYNCLL_SEND_CTAS``. With
+       ``MORI_ASYNCLL_FUSED_RECV=1`` the lower of this and the fused receive
+       ceiling (``MORI_ASYNCLL_FUSED_RECV_CTAS``, half the usable compute units
+       by default) applies.
+   * - ``MORI_ASYNCLL_SEND_CTAS_SCHEDULE``,
+       ``MORI_ASYNCLL_RECV_CTAS_SCHEDULE``
+     - Unset: one ceiling per op, from the two variables above. Set to
+       ``tokens:ctas`` pairs, for example ``128:64,0:128``, to pick the
+       ceiling per call: the first pair with T <= ``tokens`` applies,
+       ``tokens`` 0 matches any T, and a T past every bound keeps the single
+       ceiling. The send schedule uses the call's token count; the receive
+       schedule uses the matching send's token count, or the segment stride
+       for a segmented ``dispatch_recv``. ``ctas`` follows the rounding above
+       and 0 means no ceiling. All entries share one compiled module.
 
-The first three variables accept ``0`` or ``1``. Skipping the reset or fusing
-receive requires early notification. Set all three to ``0`` for the legacy sequence.
-LSA and multi-node ops retain their existing protocol and ignore these SDMA
-options. The resolved notification mode is part of every native Plan's
+``MORI_ASYNCLL_EARLY_NOTIFY``, ``MORI_ASYNCLL_SKIP_RESET``,
+``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_DIRECT`` and
+``MORI_ASYNCLL_FUSE_META`` accept ``0`` or ``1``; the ``*_CTAS`` variables
+accept a non-negative integer and the schedules a comma-separated list of
+``tokens:ctas`` pairs. Skipping the reset or fusing receive requires
+early notification. Set the first three to ``0`` for the legacy sequence.
+LSA and multi-node ops retain their existing protocol and ignore the SDMA
+options; ``MORI_ASYNCLL_SEND_CTAS`` and ``MORI_ASYNCLL_RECV_CTAS`` apply to
+every AsyncLL op. The resolved notification mode is part of every native Plan's
 configuration and generated source, so different ops can coexist without
 changing the protocol of an already constructed Plan.
+
+For two-batch overlap on the fewest compute units, use the segmented receive
+layout with ``MORI_ASYNCLL_DIRECT=1`` (plus ``MORI_ASYNCLL_FUSED_RECV=1`` when
+both micro-batches run on one stream; see below), with schedules such as
+``MORI_ASYNCLL_SEND_CTAS_SCHEDULE=1024:8,0:32`` and
+``MORI_ASYNCLL_RECV_CTAS_SCHEDULE=128:64,0:128``. Both send phases then run on
+eight CTAs, the dispatch receive only marks the unused rows of each segment,
+and the combine receive, the one phase whose time follows its CTA count, is
+sized by the token count.
 
 The default targets single-node gfx950 and gfx1250 overlap. On MI355X (gfx950,
 EP8, hidden 7168, top-6), early notification beat the legacy sequence at every

@@ -102,6 +102,8 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
   cfg.asyncLlMode = request.asyncLlMode;
   cfg.kernelCfg.combineQGroup = request.combineQGroup;
+  cfg.asyncLlDirect = request.asyncLlDirect;
+  cfg.asyncLlFuseMeta = request.asyncLlFuseMeta;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -141,6 +143,30 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (cfg.kernelCfg.combineQGroup != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: combineQGroup is only supported by AsyncLL plans");
   }
+  if (cfg.asyncLlDirect && cfg.asyncLlMode == 0) {
+    throw std::runtime_error(
+        "mori ep v2: asyncLlDirect requires early notification (asyncLlMode > 0)");
+  }
+  if (cfg.asyncLlFuseMeta && !cfg.asyncLlDirect) {
+    throw std::runtime_error("mori ep v2: asyncLlFuseMeta requires asyncLlDirect");
+  }
+  if (cfg.asyncLlDirect && cfg.kernelCfg.combineQGroup != 0) {
+    throw std::runtime_error("mori ep v2: asyncLlDirect sends the combine input unquantized");
+  }
+  if (request.asyncLlSendCtas < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlSendCtas must be >= 0");
+  }
+  if (request.asyncLlSendCtas != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: asyncLlSendCtas is only supported by AsyncLL plans");
+  }
+  cfg.asyncLlSendCtas = request.asyncLlSendCtas;
+  if (request.asyncLlRecvCtas < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlRecvCtas must be >= 0");
+  }
+  if (request.asyncLlRecvCtas != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: asyncLlRecvCtas is only supported by AsyncLL plans");
+  }
+  cfg.asyncLlRecvCtas = request.asyncLlRecvCtas;
   if (request.asyncLlFusedRecvCtas < 0) {
     throw std::runtime_error("mori ep v2: asyncLlFusedRecvCtas must be >= 0");
   }

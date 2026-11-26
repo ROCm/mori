@@ -1044,6 +1044,9 @@ namespace cco {
 const unsigned int CCO_SDMA_OP_COPY = 1;
 const unsigned int CCO_SDMA_OP_POLL_REGMEM = 8;
 const unsigned int CCO_SDMA_OP_ATOMIC = 10;
+const unsigned int CCO_SDMA_OP_WRITE = 2;
+const unsigned int CCO_SDMA_OP_FENCE = 5;
+const unsigned int CCO_SDMA_SUBOP_WRITE_LINEAR = 0;
 
 const unsigned int CCO_SDMA_SUBOP_COPY_LINEAR = 0;
 const unsigned int CCO_SDMA_ATOMIC_ADD64 = 47;
@@ -1353,6 +1356,61 @@ typedef struct CCO_SDMA_PKT_COPY_BROADCAST_TAG {
 } CCO_SDMA_PKT_COPY_BROADCAST;
 static_assert(sizeof(CCO_SDMA_PKT_COPY_BROADCAST) == 9 * sizeof(uint32_t),
               "SDMA copy-broadcast packet must be exactly 9 dwords");
+
+// Immediate writes: the value rides in the packet, so nothing has to be in memory before the
+// doorbell. gfx9 layouts (sdma_pkt_struct.h SDMA_PKT_WRITE_UNTILED / SDMA_PKT_FENCE); not
+// validated on gfx12.5.
+//
+// WRITE_LINEAR with N data dwords at a dword-aligned dst. count is N - 1, as the amdgpu driver's
+// SDMA ring test (one dword, COUNT(0)) and PTE writes (ndw - 1) use it.
+template <unsigned int N>
+struct CCO_SDMA_PKT_WRITE_IMM {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 16;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+  unsigned int DST_ADDR_LO;
+  unsigned int DST_ADDR_HI;
+  union {
+    struct {
+      unsigned int count : 22;
+      unsigned int reserved_0 : 2;
+      unsigned int sw : 2;
+      unsigned int reserved_1 : 6;
+    };
+    unsigned int DW_3_DATA;
+  } COUNT_UNION;
+  unsigned int DATA[N];
+};
+using CCO_SDMA_PKT_WRITE32 = CCO_SDMA_PKT_WRITE_IMM<1>;
+using CCO_SDMA_PKT_WRITE64 = CCO_SDMA_PKT_WRITE_IMM<2>;
+static_assert(sizeof(CCO_SDMA_PKT_WRITE32) == 5 * sizeof(uint32_t),
+              "SDMA write-linear (1 dword) packet must be exactly 5 dwords");
+static_assert(sizeof(CCO_SDMA_PKT_WRITE64) == 6 * sizeof(uint32_t),
+              "SDMA write-linear (2 dwords) packet must be exactly 6 dwords");
+
+// FENCE: a 32-bit immediate at a dword-aligned addr, written once the queue's earlier operations
+// have completed (the amdgpu driver's job-completion packet). Header is op only: SDMA 4.x
+// (vega10_sdma_pkt_open.h, sdma_v4_4_2 emit_fence) has no mtype field there.
+typedef struct CCO_SDMA_PKT_FENCE_TAG {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 16;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+  unsigned int ADDR_LO;
+  unsigned int ADDR_HI;
+  unsigned int DATA;
+} CCO_SDMA_PKT_FENCE;
+static_assert(sizeof(CCO_SDMA_PKT_FENCE) == 4 * sizeof(uint32_t),
+              "SDMA fence packet must be exactly 4 dwords");
 
 // ── from anvil_device.hpp (device path only; host queue-setup constants omitted) ──
 constexpr uint32_t CCO_SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
@@ -1671,7 +1729,8 @@ inline constexpr uint64_t ccoSdmaSignalBytes() {
 // Bytes one lane's slot occupies, and how far apart consecutive lanes sit.
 template <bool localSignal, bool remoteSignal, bool signalPerCopy>
 inline constexpr uint64_t ccoSdmaStrideBytes() {
-  return CCO_SDMA_COPY_BYTES + (signalPerCopy ? ccoSdmaSignalBytes<localSignal, remoteSignal>() : 0);
+  return CCO_SDMA_COPY_BYTES +
+         (signalPerCopy ? ccoSdmaSignalBytes<localSignal, remoteSignal>() : 0);
 }
 
 // Bytes a group of `n` lanes must reserve.
@@ -1721,9 +1780,9 @@ struct ccoSdmaRect {
 };
 
 inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const ccoSdmaRect& r) {
-  ccoSdmaWritePacket(queueBuf, at,
-                     ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes,
-                                           r.height));
+  ccoSdmaWritePacket(
+      queueBuf, at,
+      ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes, r.height));
 }
 
 #if defined(CCO_GFX125X)
@@ -1786,6 +1845,33 @@ inline __device__ void ccoSdmaWriteBroadcast(uint32_t* queueBuf, uint64_t at, vo
   pkt.DST1_ADDR_HI = (uint32_t)((uintptr_t)dstPtr1 >> 32);
   pkt.DST2_ADDR_LO = (uint32_t)(uintptr_t)dstPtr2;
   pkt.DST2_ADDR_HI = (uint32_t)((uintptr_t)dstPtr2 >> 32);
+  ccoSdmaWritePacket(queueBuf, at, pkt);
+}
+
+constexpr uint64_t CCO_SDMA_WRITE32_BYTES = sizeof(CCO_SDMA_PKT_WRITE32);
+constexpr uint64_t CCO_SDMA_WRITE64_BYTES = sizeof(CCO_SDMA_PKT_WRITE64);
+constexpr uint64_t CCO_SDMA_FENCE_BYTES = sizeof(CCO_SDMA_PKT_FENCE);
+
+template <unsigned int N>
+inline __device__ void ccoSdmaWriteImm(uint32_t* queueBuf, uint64_t at, void* dstPtr,
+                                       const uint32_t (&data)[N]) {
+  CCO_SDMA_PKT_WRITE_IMM<N> pkt = {};
+  pkt.HEADER_UNION.op = CCO_SDMA_OP_WRITE;
+  pkt.HEADER_UNION.sub_op = CCO_SDMA_SUBOP_WRITE_LINEAR;
+  pkt.DST_ADDR_LO = (uint32_t)(uintptr_t)dstPtr;
+  pkt.DST_ADDR_HI = (uint32_t)((uintptr_t)dstPtr >> 32);
+  pkt.COUNT_UNION.count = N - 1;
+  for (unsigned int i = 0; i < N; ++i) pkt.DATA[i] = data[i];
+  ccoSdmaWritePacket(queueBuf, at, pkt);
+}
+
+inline __device__ void ccoSdmaWriteFence(uint32_t* queueBuf, uint64_t at, void* dstPtr,
+                                         uint32_t value) {
+  CCO_SDMA_PKT_FENCE pkt = {};
+  pkt.HEADER_UNION.op = CCO_SDMA_OP_FENCE;
+  pkt.ADDR_LO = (uint32_t)(uintptr_t)dstPtr;
+  pkt.ADDR_HI = (uint32_t)((uintptr_t)dstPtr >> 32);
+  pkt.DATA = value;
   ccoSdmaWritePacket(queueBuf, at, pkt);
 }
 
@@ -2634,6 +2720,53 @@ struct ccoSdma {
       ccoSdmaDrainQueue(handle);
     }
     coop.sync();  // completion visible to the whole group before returning
+  }
+
+  // Batched placement on one (peer, queueId), for a caller that places many copies at once:
+  // reserve once, let any lanes write COPY packets into the reserved range, publish once.
+  //   queueHandle: the queue, looked up once per caller.
+  //   reserve:     one lane; the monotonic byte offset of `bytes` (less than
+  //                CCO_SDMA_QUEUE_SIZE) of ring space.
+  //   ring:        the ring the packets go into.
+  //   placeCopy:   any lane; a COPY packet at `at` (CCO_SDMA_COPY_BYTES each).
+  //   publish:     one lane, after every placer's stores have drained (ccoSdmaPublishStores)
+  //                and are ordered before it (e.g. a barrier); rings the doorbell in
+  //                reservation order, like put.
+  __device__ inline ccoSdmaQueueDeviceHandle* queueHandle(int peer, int queueId) const {
+    return *impl::global(comm.sdma.deviceHandles + peer * comm.sdma.sdmaNumQueue + queueId);
+  }
+  __device__ static inline uint64_t reserve(ccoSdmaQueueDeviceHandle* q, uint64_t bytes) {
+    ccoSdmaQueueDeviceHandle h = *impl::global(q);
+    return h.ReserveSlot(bytes, q);
+  }
+  __device__ static inline uint32_t* ring(ccoSdmaQueueDeviceHandle* q) {
+    return impl::global(q)->queueBuf;
+  }
+  __device__ static inline void placeCopy(uint32_t* ring, uint64_t at, void* dst, void* src,
+                                          size_t bytes) {
+    ccoSdmaWriteCopy(ring, at, src, dst, bytes);
+  }
+  __device__ static inline void publish(ccoSdmaQueueDeviceHandle* q, uint64_t base, uint64_t end) {
+    ccoSdmaQueueDeviceHandle h = *impl::global(q);
+    h.submitPacket(base, end);
+  }
+  // Immediate packets for the same reserved range; any lane, `dst` dword aligned, gfx9 only.
+  //   placeWrite32/64: WRITE_LINEAR of `value` (CCO_SDMA_WRITE32/64_BYTES); executed in ring
+  //                    order like a COPY, but nothing waits for earlier writes to complete.
+  //   placeFence:      FENCE of the 32-bit `value` (CCO_SDMA_FENCE_BYTES); written only once
+  //                    the queue's earlier operations have completed.
+  __device__ static inline void placeWrite32(uint32_t* ring, uint64_t at, void* dst,
+                                             uint32_t value) {
+    const uint32_t data[1] = {value};
+    ccoSdmaWriteImm(ring, at, dst, data);
+  }
+  __device__ static inline void placeWrite64(uint32_t* ring, uint64_t at, void* dst,
+                                             uint64_t value) {
+    const uint32_t data[2] = {static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32)};
+    ccoSdmaWriteImm(ring, at, dst, data);
+  }
+  __device__ static inline void placeFence(uint32_t* ring, uint64_t at, void* dst, uint32_t value) {
+    ccoSdmaWriteFence(ring, at, dst, value);
   }
 
   // quietQueue: drain one (peer, queueId). Cheaper than quiet() when you used a

@@ -1037,6 +1037,31 @@ class EpDispatchCombineOp:
                 pass
         return out
 
+    @classmethod
+    def per_rank_vmm(cls, cfg, n_ops=1, arch=None) -> int:
+        """Bytes of ``Communicator.init(per_rank_vmm=...)`` that ``n_ops`` ops built
+        from ``cfg`` need on one communicator (cco rounds it up to 4 GiB).
+
+        Resolved the way the op's constructor resolves it: the backend, the
+        "auto" receive layout and the environment switches that size the arena.
+        ``arch`` defaults to the current device's.
+        """
+        backend = cls
+        if cls is EpDispatchCombineOp:
+            backend = cls._resolve_backend(
+                getattr(cfg, "kernel_backend", None)
+                or os.environ.get("MORI_V2_KERNEL_BACKEND")
+                or _default_backend()
+            )
+        return backend._per_rank_vmm(cfg, n_ops, arch)
+
+    @classmethod
+    def _per_rank_vmm(cls, cfg, n_ops, arch) -> int:
+        raise NotImplementedError(
+            f"the {cls.backend_name} backend does not size its arena from the "
+            "config alone; size per_rank_vmm from a built op's arena instead"
+        )
+
     # -- hooks a subclass must supply --------------------------------------
     #
     # Arena layout, kernel construction, supported features and region names.
@@ -1791,7 +1816,8 @@ class EpDispatchCombineOp:
         """Enqueue the send half of a dispatch and return immediately.
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
-        only valid after :meth:`dispatch_recv`.
+        only valid after :meth:`dispatch_recv`. With MORI_ASYNCLL_DIRECT=1 the copy
+        engines read ``input`` until then, so do not write it in between.
         """
         with self._asyncll_call("dispatch_send"):
             return self._dispatch_impl(
@@ -1825,7 +1851,10 @@ class EpDispatchCombineOp:
             self._async_pending_dispatch_map = None
 
     def combine_send(self, input, weights=None, indices=None, *, routing):
-        """Enqueue the send half of a combine and return immediately."""
+        """Enqueue the send half of a combine and return immediately.
+
+        With MORI_ASYNCLL_DIRECT=1 the copy engines read ``input`` until
+        :meth:`combine_recv`, so do not write it in between."""
         self._asyncll_check_weight_fold(weights)
         with self._asyncll_call("combine_send"):
             return self._combine_impl(

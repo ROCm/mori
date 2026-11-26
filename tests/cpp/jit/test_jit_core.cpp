@@ -808,6 +808,40 @@ TEST(AsyncLLMode, ExistingPlanIsUnaffectedByEnvironmentChanges) {
   }
 }
 
+TEST(AsyncLLMode, FuseMetaNeedsDirectAndForksEntryAndSource) {
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = 1;
+  request.asyncLlFuseMeta = true;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlDirect = true;
+  const auto fuse = MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                       EpInterNodeFamily::AsyncLL);
+  request.asyncLlFuseMeta = false;
+  const auto plain = MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+  EXPECT_TRUE(fuse.asyncLlFuseMeta);
+  EXPECT_NE(Describe(fuse).find("asyncLlFuseMeta=true\n"), std::string::npos);
+  EXPECT_NE(EpInterNodeRequestSchema().find("asyncLlFuseMeta:b=0"), std::string::npos);
+  for (const auto kind :
+       {EpAsyncLLKernel::DispatchSlotAssign, EpAsyncLLKernel::DispatchSendTransferSeg}) {
+    EXPECT_NE(EpAsyncLLEntryName(fuse, kind).find("fusemeta_"), std::string::npos);
+    EXPECT_EQ(EpAsyncLLEntryName(plain, kind).find("fusemeta_"), std::string::npos);
+    EXPECT_NE(EpAsyncLLRenderSource(fuse, kind).find("#define MORI_ASYNCLL_FUSE_META 1\n"),
+              std::string::npos);
+    EXPECT_NE(EpAsyncLLRenderSource(plain, kind).find("#define MORI_ASYNCLL_FUSE_META 0\n"),
+              std::string::npos);
+  }
+  // A hand-built cfg goes through the same check in the render funnel.
+  auto hand = fuse;
+  hand.asyncLlDirect = false;
+  EXPECT_THROW(EpAsyncLLRenderSource(hand, EpAsyncLLKernel::DispatchSlotAssign),
+               std::runtime_error);
+}
+
 #if MORI_JIT_HAS_FIELD_COUNT
 TEST(AsyncLLMode, HostCfgAndRequestFieldCountsMatchTheirVisitors) {
   const EpInterNodeCfg cfg;

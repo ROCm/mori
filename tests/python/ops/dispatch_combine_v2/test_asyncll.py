@@ -66,8 +66,7 @@ Three scenarios target the protocol rather than the data path:
     recv's drain also waits for the other op's transfers.
 
 Segmented receive (async_ll_recv_layout; SEGMENTED=0 skips; on other transports
-and with the fused receive it only checks that "segmented" is refused and "auto"
-resolves to "compact") runs bf16 and fp8 with scales, the fp8 op built with
+it only checks that "segmented" is refused and "auto" resolves to "compact") runs bf16 and fp8 with scales, the fp8 op built with
 "auto": every segment holds exactly its source's tokens, every other row is
 invalidated (expert, weight, scales), total_recv is the row count and
 segment_counts() the per-source counts, through stride changes, shrinking counts
@@ -253,6 +252,17 @@ def _check_dispatch(
     return recv, failures
 
 
+def _check_arena(op, rank, tag):
+    """The arena follows the op's resolved MORI_ASYNCLL_DIRECT (asyncll_regions)."""
+    direct = getattr(op, "_asyncll_direct_on", False)
+    if rank == 0:
+        print(f"# {tag}: arena {op.arena.total_bytes} B, direct={direct}", flush=True)
+    if op.arena.has("inter_combine_staging") != direct:
+        return 0
+    print(f"[rank {rank}] {tag}: arena does not follow direct={direct}", flush=True)
+    return 1
+
+
 def run_shape(d, comm, hidden, topk, epr, m, loops):
     rank, world = d.rank, d.world
     dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
@@ -271,6 +281,7 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
     )
     failures = 0
     with EpDispatchCombineOp(cfg, comm) as op:
+        failures += _check_arena(op, rank, f"asyncll h={hidden} k={topk} m={m}")
         for it in range(loops):
             # A different token count per rank per iteration, including zero:
             # a rank with no tokens still has to publish its count or every peer
@@ -1091,6 +1102,12 @@ def _seg_flags(d, op, tag, want=0):
     return 0
 
 
+def _seg_shape():
+    """(hidden, topk, epr, m) of the segmented scenarios; SEG_SHAPE=h,k,e,m overrides."""
+    raw = os.environ.get("SEG_SHAPE")
+    return tuple(int(x) for x in raw.split(",")) if raw else (4096, 6, 16, 64)
+
+
 def run_segmented(d, comm, layout, fp8):
     """One op, rounds checked one at a time: strides that are exact, the full
     capacity, and change between rounds; a round whose counts shrink under the
@@ -1098,7 +1115,7 @@ def run_segmented(d, comm, layout, fp8):
     in between on the same op; both APIs; refused arguments; and a stride that one
     rank gets wrong and a round one rank runs compact, which every rank must
     flag."""
-    hidden, topk, epr, m = 4096, 6, 16, 64
+    hidden, topk, epr, m = _seg_shape()
     rank, world = d.rank, d.world
     dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
     # (per-rank counts, stride or None for a compact round, weighted, split API)
@@ -1125,6 +1142,7 @@ def run_segmented(d, comm, layout, fp8):
                 flush=True,
             )
             return 1
+        failures += _check_arena(op, rank, f"seg {layout!r} fp8={fp8}")
         level = layout
         for r, (counts, stride, weighted, split) in enumerate(rounds):
             n = counts[rank]
@@ -1206,17 +1224,22 @@ def run_segmented(d, comm, layout, fp8):
         dest = (idx.long() // epr).cpu()
         rows_per_dest = [int((dest == pe).any(dim=1).sum()) for pe in range(world)]
         want = 1 if max(rows_per_dest, default=0) > small else 0
+        # Exactly one overflow per overrun peer (self included), whichever pass counts it.
+        want_overflow = sum(r > small for r in rows_per_dest)
+        overflow0 = op.segment_error_counts()[0]
         *_, routing = op.dispatch(
             x, weights, scales, idx, return_routing=True, segment_stride=small
         )
         op.combine(op.combine_in_view(), routing=routing)
         torch.cuda.synchronize()
         dist.barrier()
+        overflow = op.segment_error_counts()[0] - overflow0
         flags = op.segment_error_flags(clear=True)
-        if flags != want:
+        if flags != want or overflow != want_overflow:
             print(
                 f"[rank {rank}] seg level={level}: stride {small} under rows "
-                f"{rows_per_dest}: flags {flags}, want {want}",
+                f"{rows_per_dest}: flags {flags}, want {want}; overflows "
+                f"{overflow}, want {want_overflow}",
                 flush=True,
             )
             failures += 1
@@ -1415,9 +1438,8 @@ def run_segmented_two_ops(d, comm_a, comm_b, layers, fp8):
 
 
 def run_segmented_refused(d, comm):
-    """The segmented layout is SDMA on one node without the fused receive;
-    anything else is refused when the op is built "segmented", and "auto"
-    resolves to "compact"."""
+    """The segmented layout needs the SDMA transport on one node; elsewhere
+    "segmented" is refused and "auto" resolves to "compact"."""
     failures = 0
     try:
         cfg = _seg_config(d, 2048, 8, 8, 32, "segmented", False)
@@ -1532,14 +1554,17 @@ def main():
     seg_runs = "off"
     if segmented:
         transport = os.environ.get("TRANSPORT", "sdma")
-        fused = os.environ.get("MORI_ASYNCLL_FUSED_RECV", "0") == "1"
-        if transport != "sdma" or fused:
+        if transport != "sdma":
             failures += own_comm(lambda c: run_segmented_refused(d, c), 2048, 32)
             seg_runs = "refused"
         else:
             for fp8 in (False, True):
                 mode = "auto" if fp8 else "segmented"
-                failures += own_comm(lambda c: run_segmented(d, c, mode, fp8), 4096, 64)
+                failures += own_comm(
+                    lambda c: run_segmented(d, c, mode, fp8),
+                    _seg_shape()[0],
+                    _seg_shape()[3],
+                )
                 if d.rank == 0:
                     print(
                         f"# asyncll segmented mode={mode!r} fp8={fp8}: done",

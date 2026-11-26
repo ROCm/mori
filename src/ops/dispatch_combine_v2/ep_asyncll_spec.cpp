@@ -95,19 +95,6 @@ const std::vector<std::string>& EpAsyncLLSourceDeps() {
 
 }  // namespace
 
-bool EpAsyncLLIsSegmented(EpAsyncLLKernel kind) {
-  switch (kind) {
-    case EpAsyncLLKernel::DispatchSendCopySeg:
-    case EpAsyncLLKernel::DispatchSendTransferSeg:
-    case EpAsyncLLKernel::DispatchRecvFinalizeSeg:
-    case EpAsyncLLKernel::CombineSendTransferSeg:
-    case EpAsyncLLKernel::CombineRecvCopySeg:
-      return true;
-    default:
-      return false;
-  }
-}
-
 bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
   switch (kind) {
     case EpAsyncLLKernel::DispatchSendTransfer:
@@ -126,6 +113,8 @@ bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
 
 std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind) {
   std::string name = "mori_ep_asyncll_";
+  if (cfg.asyncLlDirect) name += "direct_";
+  if (cfg.asyncLlFuseMeta) name += "fusemeta_";
   if (cfg.asyncLlMode == 2)
     name += "fused_";
   else if (cfg.asyncLlMode == 1)
@@ -165,21 +154,24 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   const bool fused = cfg.asyncLlMode == 2;
   if (early && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode)
     throw std::runtime_error("AsyncLL early notification requires a single node");
+  if (cfg.asyncLlDirect && !early)
+    throw std::runtime_error("AsyncLL direct sources require early notification");
+  if (cfg.asyncLlFuseMeta && !cfg.asyncLlDirect)
+    throw std::runtime_error("AsyncLL fused metadata requires direct sources");
   if (early && (kind == EpAsyncLLKernel::DispatchSendCopyLsa ||
                 kind == EpAsyncLLKernel::DispatchSendTransferLsa ||
                 kind == EpAsyncLLKernel::DispatchRecvTransferLsa ||
                 kind == EpAsyncLLKernel::CombineSendTransferLsa ||
                 kind == EpAsyncLLKernel::CombineRecvTransferLsa))
     throw std::runtime_error("AsyncLL early notification requires the SDMA transport");
-  // The segmented passes pair with the separate RecvTransfer the fused receive drops.
-  if (fused && EpAsyncLLIsSegmented(kind))
-    throw std::runtime_error("AsyncLL segmented receive does not support the fused receive");
   const AsyncLLDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpAsyncLLEntryName(cfg, kind);
 
   std::string source = "// mori jit — generated, do not edit.\n";
   source += "#define MORI_ASYNCLL_EARLY_NOTIFY " + std::to_string(early ? 1 : 0) + "\n";
   source += "#define MORI_ASYNCLL_FUSED_RECV " + std::to_string(fused ? 1 : 0) + "\n";
+  source += "#define MORI_ASYNCLL_DIRECT " + std::to_string(cfg.asyncLlDirect ? 1 : 0) + "\n";
+  source += "#define MORI_ASYNCLL_FUSE_META " + std::to_string(cfg.asyncLlFuseMeta ? 1 : 0) + "\n";
   source +=
       "#include \"src/ops/dispatch_combine_v2/ep_asyncll_kernel.hpp\"\n"
       "constexpr ::mori::ops::v2::EpInterNodeKernelCfg kConfig = ";
@@ -190,14 +182,28 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   // The entry macros come from ep_internode_kernel.hpp, which the AsyncLL header
   // includes; the _LOCAL form is the one whose body takes no communicator.
   const bool fusedCopy = fused && (kind == EpAsyncLLKernel::DispatchRecvCopy ||
-                                   kind == EpAsyncLLKernel::CombineRecvCopy);
+                                   kind == EpAsyncLLKernel::CombineRecvCopy ||
+                                   kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg ||
+                                   kind == EpAsyncLLKernel::CombineRecvCopySeg);
   source += (EpAsyncLLTakesComm(kind) || fusedCopy) ? "MORI_EP_INTERNODE_CCO_ENTRY("
                                                     : "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
   source += entry;
   source += ", ";
   if (fusedCopy) {
-    source += kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopyFused_body"
-                                                        : "EpCombineAsyncLLRecvCopyFused_body";
+    switch (kind) {
+      case EpAsyncLLKernel::DispatchRecvCopy:
+        source += "EpDispatchAsyncLLRecvCopyFused_body";
+        break;
+      case EpAsyncLLKernel::CombineRecvCopy:
+        source += "EpCombineAsyncLLRecvCopyFused_body";
+        break;
+      case EpAsyncLLKernel::DispatchRecvFinalizeSeg:
+        source += "EpDispatchAsyncLLRecvFinalizeSegFused_body";
+        break;
+      default:
+        source += "EpCombineAsyncLLRecvCopySegFused_body";
+        break;
+    }
   } else {
     source += descriptor.body;
   }
@@ -241,6 +247,10 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     case EpAsyncLLKernel::CombineSendTransferSeg:
       geometry.gridX = static_cast<unsigned>(worldSize);
       geometry.blockX = static_cast<unsigned>(cfg.waveSize);
+      // Direct dispatch posts a packet per run of rows: four waves fill the queue in turn.
+      if (cfg.asyncLlDirect && (kind == EpAsyncLLKernel::DispatchSendTransfer ||
+                                kind == EpAsyncLLKernel::DispatchSendTransferSeg))
+        geometry.blockX = static_cast<unsigned>(cfg.waveSize) * 4;
       geometry.sharedBytes = 0;
       break;
 
@@ -270,8 +280,26 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
   // A fused copy holds its whole grid resident while it waits for its peers
   // (see EpInterNodeCfg::asyncLlFusedRecvCtas). RecvCopy strides over its
   // tokens, so a narrower grid only does the same work in fewer CTAs.
-  const bool fusedCopy = cfg.asyncLlMode == 2 && (kind == EpAsyncLLKernel::DispatchRecvCopy ||
-                                                  kind == EpAsyncLLKernel::CombineRecvCopy);
+  const bool fusedCopy =
+      cfg.asyncLlMode == 2 &&
+      (kind == EpAsyncLLKernel::DispatchRecvCopy || kind == EpAsyncLLKernel::CombineRecvCopy ||
+       kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg ||
+       kind == EpAsyncLLKernel::CombineRecvCopySeg);
+  const bool sendCopy =
+      kind == EpAsyncLLKernel::DispatchSlotAssign || kind == EpAsyncLLKernel::DispatchSendCopy ||
+      kind == EpAsyncLLKernel::DispatchSendCopySeg || kind == EpAsyncLLKernel::CombineSendCopy;
+  if (sendCopy && cfg.asyncLlSendCtas > 0) {
+    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlSendCtas, worldSize));
+    if (cap < geometry.gridX) geometry.gridX = cap;
+  }
+  const bool recvCopy = kind == EpAsyncLLKernel::DispatchRecvCopy ||
+                        kind == EpAsyncLLKernel::CombineRecvCopy ||
+                        kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg ||
+                        kind == EpAsyncLLKernel::CombineRecvCopySeg;
+  if (recvCopy && cfg.asyncLlRecvCtas > 0) {
+    const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlRecvCtas, worldSize));
+    if (cap < geometry.gridX) geometry.gridX = cap;
+  }
   if (fusedCopy && cfg.asyncLlFusedRecvCtas > 0) {
     const auto cap = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.asyncLlFusedRecvCtas, worldSize));
     if (cap < geometry.gridX) geometry.gridX = cap;

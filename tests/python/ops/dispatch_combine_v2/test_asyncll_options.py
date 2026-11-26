@@ -26,7 +26,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
 from mori.ops.dispatch_combine_v2.internode_regions import (
     asyncll_regions,
@@ -110,6 +110,31 @@ class AsyncLLOptionsTest(unittest.TestCase):
             (1, True),
         )
 
+    def test_direct_sources_ride_on_early_notification(self):
+        resolve = EpDispatchCombineOpHip._asyncll_direct
+        for env, mode, expected in [
+            ({}, 1, False),
+            ({"MORI_ASYNCLL_DIRECT": "1"}, 1, True),
+            ({"MORI_ASYNCLL_DIRECT": "1"}, 2, True),
+            ({"MORI_ASYNCLL_DIRECT": "1"}, 0, False),
+            ({"MORI_ASYNCLL_DIRECT": "0"}, 1, False),
+        ]:
+            with (
+                self.subTest(env=env, mode=mode),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(mode), expected)
+        with patch.dict(os.environ, {"MORI_ASYNCLL_DIRECT": "yes"}, clear=True):
+            with self.assertRaises(ValueError):
+                resolve(1)
+        cfg = SimpleNamespace(async_ll_transport="sdma", nodes=1)
+        seq = EpDispatchCombineOpHip._asyncll_seq(cfg, 1, direct=True)
+        self.assertEqual(
+            seq["dispatch_send"],
+            ("dispatch_slotassign", "dispatch_sendcopy", "dispatch_sendtransfer"),
+        )
+        self.assertEqual(seq["combine_send"], ("combine_sendtransfer",))
+
     def test_fused_receive_grid_ceiling_reaches_only_the_fused_mode(self):
         resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
         for env, mode, expected in [
@@ -159,23 +184,107 @@ class AsyncLLOptionsTest(unittest.TestCase):
 
 
 class AsyncLLSegmentedTest(unittest.TestCase):
+    _SEND = (
+        "dispatch_slotassign",
+        "dispatch_sendcopy_seg",
+        "dispatch_sendtransfer_seg",
+    )
+    _SEND_FUSED_META = ("dispatch_slotassign", "dispatch_sendtransfer_seg")
+
+    def seg_seq(self, mode, fuse_meta, env=None):
+        # The sequence depends only on its arguments, never on the live env.
+        with patch.dict(os.environ, env or {}, clear=True):
+            return EpDispatchCombineOpHip._asyncll_seg_seq(mode, fuse_meta)
+
     def test_sequences(self):
-        seq = EpDispatchCombineOpHip._asyncll_seg_seq()
-        self.assertEqual(
-            seq["dispatch_send"],
-            (
-                "dispatch_slotassign",
-                "dispatch_sendcopy_seg",
-                "dispatch_sendtransfer_seg",
-            ),
-        )
-        self.assertEqual(
-            seq["dispatch_recv"], ("dispatch_recvtransfer", "dispatch_recvfinalize_seg")
-        )
+        for mode in (0, 1):
+            with self.subTest(mode=mode):
+                seq = self.seg_seq(mode, False)
+                self.assertEqual(seq["dispatch_send"], self._SEND)
+                self.assertEqual(
+                    seq["dispatch_recv"],
+                    ("dispatch_recvtransfer", "dispatch_recvfinalize_seg"),
+                )
+                self.assertEqual(seq["combine_send"], ("combine_sendtransfer_seg",))
+                self.assertEqual(
+                    seq["combine_recv"],
+                    ("combine_recvtransfer", "combine_recvcopy_seg"),
+                )
+
+    def test_fused_receive_sequence(self):
+        seq = self.seg_seq(2, False)
+        self.assertEqual(seq["dispatch_send"], self._SEND)
+        self.assertEqual(seq["dispatch_recv"], ("dispatch_recvfinalize_seg",))
         self.assertEqual(seq["combine_send"], ("combine_sendtransfer_seg",))
+        self.assertEqual(seq["combine_recv"], ("combine_recvcopy_seg",))
+
+    def test_fuse_meta_drops_only_sendcopy(self):
+        for mode in (1, 2):
+            with self.subTest(mode=mode):
+                fused = self.seg_seq(mode, True)
+                plain = self.seg_seq(mode, False)
+                self.assertEqual(fused["dispatch_send"], self._SEND_FUSED_META)
+                for group in ("dispatch_recv", "combine_send", "combine_recv"):
+                    self.assertEqual(fused[group], plain[group])
+        # The env alone does not drop the pass; only the resolved value does.
         self.assertEqual(
-            seq["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_seg")
+            self.seg_seq(1, False, {"MORI_ASYNCLL_FUSE_META": "1"})["dispatch_send"],
+            self._SEND,
         )
+
+    def test_fuse_meta_needs_direct_and_segmented(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fuse_meta
+        for env, direct, segmented, expected in [
+            ({}, True, True, True),
+            ({}, False, True, False),
+            ({"MORI_ASYNCLL_FUSE_META": "0"}, True, True, False),
+            ({"MORI_ASYNCLL_FUSE_META": "1"}, True, True, True),
+            ({"MORI_ASYNCLL_FUSE_META": "1"}, False, True, False),
+            ({"MORI_ASYNCLL_FUSE_META": "1"}, True, False, False),
+            ({"MORI_ASYNCLL_FUSE_META": "1"}, False, False, False),
+        ]:
+            with (
+                self.subTest(env=env, direct=direct, segmented=segmented),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertIs(resolve(direct, segmented), expected)
+        for value in ("yes", "2", ""):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"MORI_ASYNCLL_FUSE_META": value}, clear=True),
+                self.assertRaises(ValueError),
+            ):
+                resolve(False, False)
+
+    def test_fuse_meta_follows_direct_resolution(self):
+        # Direct off (mode 0, or MORI_ASYNCLL_DIRECT unset) keeps SendCopySeg.
+        for env, mode, want in [
+            ({"MORI_ASYNCLL_FUSE_META": "1"}, 1, self._SEND),
+            (
+                {"MORI_ASYNCLL_FUSE_META": "1", "MORI_ASYNCLL_DIRECT": "1"},
+                0,
+                self._SEND,
+            ),
+            (
+                {"MORI_ASYNCLL_FUSE_META": "1", "MORI_ASYNCLL_DIRECT": "1"},
+                1,
+                self._SEND_FUSED_META,
+            ),
+            ({"MORI_ASYNCLL_DIRECT": "1"}, 1, self._SEND_FUSED_META),
+            (
+                {"MORI_ASYNCLL_DIRECT": "1", "MORI_ASYNCLL_FUSE_META": "0"},
+                1,
+                self._SEND,
+            ),
+        ]:
+            with (
+                self.subTest(env=env, mode=mode),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                direct = EpDispatchCombineOpHip._asyncll_direct(mode)
+                fuse = EpDispatchCombineOpHip._asyncll_fuse_meta(direct, True)
+                seq = EpDispatchCombineOpHip._asyncll_seg_seq(mode, fuse)
+                self.assertEqual(seq["dispatch_send"], want)
 
     def test_config_values(self):
         def cfg(layout, async_ll=True):
@@ -251,6 +360,283 @@ class AsyncLLSegmentedTest(unittest.TestCase):
         cfg.max_total_recv_tokens = 8 * 50
         regions = dict(asyncll_regions(cfg))
         self.assertEqual(regions["inter_dispatch_staging"], 8 * 50 * 7168 * 2)
+
+    @staticmethod
+    def regions_cfg(scale_dim, token_nbytes, segmented, recv_cap=0):
+        return SimpleNamespace(
+            world_size=8,
+            gpu_per_node=8,
+            hidden_dim=7168,
+            max_num_inp_token_per_rank=100,
+            max_total_recv_tokens=recv_cap,
+            num_experts_per_rank=32,
+            num_experts_per_token=6,
+            max_token_type_size=2,
+            token_nbytes=token_nbytes,
+            scale_dim=scale_dim,
+            scale_type_size=1,
+            num_qp_per_pe=2,
+            async_ll_segmented=segmented,
+        )
+
+    def test_direct_off_keeps_the_regions(self):
+        # What every non-direct kernel addresses; direct=False must not move a byte.
+        common = [
+            ("inter_combine_inp", 11468800),
+            ("inter_dispatch_out", 11468800),
+            ("inter_combine_out", 1433600),
+            ("inter_dispatch_staging", 11468800),
+            ("inp_weights", 19200),
+            ("dispatch_out_weights", 19200),
+            ("combine_out_weights", 2400),
+            ("out_indices", 19200),
+            ("recv_token_num", 128),
+            ("node_recv_token_num", 8),
+            ("disp_tok_offset", 4),
+            ("disp_tok_id_to_src_tok_id", 102400),
+            ("cross_device_barrier", 512),
+            ("inter_node_chunk_flag", 800),
+        ]
+        golden = {
+            (0, 14336, 0): [("inter_dispatch_inp", 11510400)]
+            + common[:1]
+            + [("inter_staging", 11510400)]
+            + common[1:]
+            + [("send_count", 128), ("inter_combine_staging", 11468800)],
+            (224, 7168, 1): [("inter_dispatch_inp", 11689600)]
+            + common[:1]
+            + [("inter_staging", 11689600)]
+            + common[1:]
+            + [
+                ("out_scales", 179200),
+                ("send_count", 280),
+                ("inter_combine_staging", 11468800),
+            ],
+        }
+        for key, want in golden.items():
+            with self.subTest(key=key):
+                cfg = self.regions_cfg(*key)
+                self.assertEqual(asyncll_regions(cfg), want)
+                self.assertEqual(asyncll_regions(cfg, direct=False), want)
+
+    def test_direct_regions_cover_the_kernel_extents(self):
+        w, m, topk = 8, 100, 6
+        dropped = {
+            "inp_weights",
+            "combine_out_weights",
+            "node_recv_token_num",
+            "disp_tok_offset",
+            "inter_node_chunk_flag",
+            "inter_combine_staging",
+        }
+        for scale_dim, token_nbytes, segmented, cap in (
+            (0, 14336, 0, 0),
+            (0, 14336, 1, 0),
+            (224, 7168, 0, 0),
+            (224, 7168, 1, 0),
+            (224, 7168, 1, 8 * 50),
+        ):
+            with self.subTest(scales=scale_dim, segmented=segmented, cap=cap):
+                cfg = self.regions_cfg(scale_dim, token_nbytes, segmented, cap)
+                staged = asyncll_regions(cfg)
+                direct = asyncll_regions(cfg, direct=True)
+                full, regions = dict(staged), dict(direct)
+                # Same order, minus the regions no direct kernel reads; none grows.
+                self.assertEqual(
+                    [n for n, _ in direct], [n for n, _ in staged if n not in dropped]
+                )
+                for name, nbytes in direct:
+                    self.assertLessEqual(nbytes, full[name], name)
+                # Regions peers write keep the extent the non-direct kernels address.
+                meta = topk * 4 + topk * 4 + 4 + scale_dim
+                xd = token_nbytes + meta
+                seg_land = asyncll_seg_layout(cfg)["bytes"] if segmented else 0
+                self.assertEqual(
+                    regions["inter_dispatch_inp"], max(w * m * xd, seg_land)
+                )
+                for name in (
+                    "inter_combine_inp",
+                    "recv_token_num",
+                    "cross_device_barrier",
+                    "send_count",
+                ):
+                    self.assertEqual(regions[name], full[name], name)
+                # Compact: DirectStagingMetaOffset(W-1, M-1) + meta, and the landing's
+                # DirectMetaOffset(W-1, M-1) + meta (its hidden rows end before that).
+                self.assertGreaterEqual(regions["inter_staging"], w * m * meta)
+                self.assertGreaterEqual(
+                    regions["inter_dispatch_inp"],
+                    (w - 1) * m * xd + m * token_nbytes + m * meta,
+                )
+                if segmented:
+                    # Peers' field rows d < W*M in the hidden-less staging layout
+                    # (SegStagingLayoutOf); own rows in the landing layout.
+                    lay = asyncll_seg_layout(cfg, hidden_nbytes=0)
+                    self.assertEqual(lay["index"], 0)
+                    self.assertGreaterEqual(
+                        regions["inter_staging"], lay["src_tok"] + w * m * 4
+                    )
+                    self.assertGreaterEqual(regions["inter_dispatch_inp"], seg_land)
+                # RecvCopy rows < W*R at the dispatch width; reverse map rows < W*M.
+                per_rank = min(-(-cap // w), m) if cap else m
+                self.assertEqual(
+                    regions["inter_dispatch_out"], w * per_rank * token_nbytes
+                )
+                self.assertEqual(regions["disp_tok_id_to_src_tok_id"], w * m * 4)
+
+    def test_per_rank_vmm_follows_the_direct_flag(self):
+        cfg = EpDispatchCombineConfig(
+            rank=0,
+            world_size=8,
+            hidden_dim=7168,
+            max_num_inp_token_per_rank=16384,
+            num_experts_per_rank=32,
+            num_experts_per_token=8,
+            kernel_backend="hip",
+            async_ll=True,
+            async_ll_transport="sdma",
+            async_ll_recv_layout="auto",
+        )
+
+        def vmm(env, n_ops=1):
+            with patch.dict(os.environ, env, clear=True):
+                return EpDispatchCombineOp.per_rank_vmm(cfg, n_ops=n_ops, arch="gfx950")
+
+        gib = 1 << 30
+        staged, direct = vmm({}), vmm({"MORI_ASYNCLL_DIRECT": "1"})
+        # cco rounds the slot to 4 GiB: 12 GiB per op staged, 8 GiB direct at 16k.
+        self.assertTrue(8 * gib < staged <= 12 * gib, staged)
+        self.assertTrue(7 * gib < direct <= 8 * gib, direct)
+        self.assertEqual(vmm({"MORI_ASYNCLL_DIRECT": "1"}, n_ops=2), 2 * direct)
+        # Direct rides on early notification; without it the arena is the staged one.
+        off = {"MORI_ASYNCLL_DIRECT": "1", "MORI_ASYNCLL_EARLY_NOTIFY": "0"}
+        self.assertEqual(vmm(off), staged)
+
+
+def _fake_plan_type(name):
+    # Grid as EpAsyncLLGeometry derives it: capped copy passes, a per-peer transfer.
+    field = {
+        "dispatch_slotassign": "asyncLlSendCtas",
+        "combine_recvcopy_seg": "asyncLlRecvCtas",
+    }.get(name)
+
+    class Plan:
+        def __init__(self, **request):
+            self.request = request
+            self.bound = {}
+
+        @classmethod
+        def describe(cls, **request):
+            grid = 8
+            if field:
+                ceiling = 128 if field == "asyncLlRecvCtas" else 256
+                grid = min(request[field] or ceiling, ceiling)
+            return {"gridX": grid, "blockX": 256, "sharedBytes": 0, "cacheDir": ""}
+
+        @property
+        def info(self):
+            return dict(self.describe(**self.request), cacheDir="/cache/" + name)
+
+        def bind(self, **args):
+            self.bound.update(args)
+
+        def close(self):
+            pass
+
+    return Plan
+
+
+class AsyncLLCtasScheduleTest(unittest.TestCase):
+    def parse(self, side, value):
+        env = {f"MORI_ASYNCLL_{side}_CTAS_SCHEDULE": value}
+        with patch.dict(os.environ, env, clear=True):
+            return EpDispatchCombineOpHip._asyncll_ctas_schedule(side)
+
+    def test_parse(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(EpDispatchCombineOpHip._asyncll_ctas_schedule("RECV"))
+        self.assertIsNone(self.parse("RECV", " , "))
+        self.assertEqual(
+            self.parse("RECV", "128:64,1024:128,0:0"), ((128, 64), (1024, 128), (0, 0))
+        )
+        self.assertEqual(self.parse("SEND", " 0:32, 1024:8 "), ((1024, 8), (0, 32)))
+        for bad in ("128", "a:8", "-1:8", "8:-1", "1:2:3", "8:16,8:32", "128:"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.parse("SEND", bad)
+
+    def test_pick(self):
+        pick = EpDispatchCombineOpHip._asyncll_pick_bucket
+        buckets = ((128, "a"), (1024, "b"), (None, "c"))
+        for t, want in [(0, "a"), (128, "a"), (129, "b"), (1024, "b"), (1025, "c")]:
+            with self.subTest(t=t):
+                self.assertEqual(pick(buckets, t), want)
+
+    def build(self, env):
+        from mori.jit.v2 import plan_api
+        from mori.ops.dispatch_combine_v2 import hip_backend
+
+        types = {}
+
+        def plan_type(name):
+            return types.setdefault(name, _fake_plan_type(name))
+
+        seq = {
+            "dispatch_send": ("dispatch_slotassign", "dispatch_sendtransfer_seg"),
+            "combine_send": ("combine_sendtransfer_seg",),
+            "combine_recv": ("combine_recvcopy_seg",),
+        }
+        base = dict(asyncLlSendCtas=0, asyncLlRecvCtas=64, asyncLlFusedRecvCtas=0)
+        plans_by_pass = {
+            n: plan_type(n)(**base) for names in seq.values() for n in names
+        }
+        groups = {g: tuple(plans_by_pass[n] for n in names) for g, names in seq.items()}
+        op = object.__new__(EpDispatchCombineOpHip)
+        op._plans = list(plans_by_pass.values())
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(hip_backend.cb, "asyncll_plan", plan_type),
+            patch.object(plan_api, "make_launch_group", tuple),
+        ):
+            (buckets,) = op._build_asyncll_buckets(
+                SimpleNamespace(rank=1),
+                lambda g: dict(base),
+                plans_by_pass,
+                ((seq, groups),),
+            )
+        return op, plans_by_pass, groups, buckets
+
+    def test_unset_builds_nothing(self):
+        op, plans_by_pass, _, buckets = self.build({})
+        self.assertEqual(buckets, {})
+        self.assertEqual(len(op._plans), len(plans_by_pass))
+
+    def test_buckets_reuse_plans_the_cap_does_not_change(self):
+        op, plans_by_pass, groups, buckets = self.build(
+            {
+                "MORI_ASYNCLL_SEND_CTAS_SCHEDULE": "1024:8,0:32",
+                "MORI_ASYNCLL_RECV_CTAS_SCHEDULE": "128:64,1024:128",
+            }
+        )
+        send = buckets["dispatch_send"]
+        # The schedule's own catch-all ends it; no fallback to the single cap.
+        self.assertEqual([b for b, _ in send], [1024, None])
+        (slot8, xfer8), (slot32, xfer32) = (g for _, g in send)
+        self.assertEqual((slot8.info["gridX"], slot32.info["gridX"]), (8, 32))
+        self.assertIs(xfer8, plans_by_pass["dispatch_sendtransfer_seg"])
+        self.assertIs(xfer32, xfer8)
+        recv = buckets["combine_recv"]
+        self.assertEqual([b for b, _ in recv], [128, 1024, None])
+        # 64 is the single cap's grid, so the op's group is reused; past 1024 too.
+        self.assertIs(recv[0][1], groups["combine_recv"])
+        self.assertEqual(recv[1][1][0].info["gridX"], 128)
+        self.assertIs(recv[2][1], groups["combine_recv"])
+        new = op._plans[len(plans_by_pass) :]
+        self.assertEqual(len(new), 3)
+        for plan in new:
+            self.assertEqual(plan.bound, {"rdmaBlockNum": 0, "replayMode": 0})
+        self.assertNotIn("dispatch_recv", buckets)
+        # No pass of combine_send takes the cap, so it launches as without a schedule.
+        self.assertNotIn("combine_send", buckets)
 
 
 class AsyncLLSdmaQueuesTest(unittest.TestCase):

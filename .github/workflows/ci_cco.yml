@@ -717,7 +717,10 @@ jobs:
           #
           # sdma runs once per notification protocol: early notification is the
           # gfx950 default, so legacy and fused receive each need an explicit run.
-          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" "lsa"; do
+          # The direct-source run covers the copy engines reading the inputs in place
+          # (compact and segmented, fused receive) and the CTA ceilings.
+          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" \
+                     "sdma MORI_ASYNCLL_DIRECT=1 MORI_ASYNCLL_FUSED_RECV=1 MORI_ASYNCLL_SEND_CTAS=8 MORI_ASYNCLL_RECV_CTAS=16" "lsa"; do
             set -- $run
             transport=$1; shift
             envs="-e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport"
