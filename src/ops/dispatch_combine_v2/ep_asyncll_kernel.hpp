@@ -67,6 +67,7 @@
 // the generated TU expands. Including it rather than restating any of that is
 // what keeps the two families from drifting apart.
 #include "src/ops/dispatch_combine_v2/ep_internode_kernel.hpp"
+#include "src/ops/dispatch_combine_v2/ep_scatter_quant.hpp"
 
 #ifndef MORI_ASYNCLL_EARLY_NOTIFY
 #define MORI_ASYNCLL_EARLY_NOTIFY 0
@@ -197,6 +198,170 @@ __device__ __forceinline__ void LaneCopyWords(uint8_t* dst, const uint8_t* src, 
       *reinterpret_cast<uint32_t*>(dst + b) = *reinterpret_cast<const uint32_t*>(src + b);
   } else {
     for (size_t b = lane; b < bytes; b += warpSize) dst[b] = src[b];
+  }
+}
+
+// ---- Quantized combine (EpInterNodeKernelCfg.combineQGroup) ----
+// The combine wire row is the token's hiddenDim fp8 elements, then one scale per
+// group (an E8M0 byte per 32 elements, or an f32 per 128), padded to 16 B. Rows
+// sit at that stride in inter_combine_staging and inter_combine_inp, which are
+// sized for the bf16 row, so they fit. The codec is the scatter combine's
+// (ep_scatter_quant.hpp); a lane takes 16 elements, one 16 B fp8 access, and a
+// group's lanes share its amax.
+template <EpInterNodeKernelCfg kConfig>
+inline constexpr bool CombineQuant = kConfig.combineQGroup != 0;
+
+template <EpInterNodeKernelCfg kConfig, typename T>
+constexpr size_t CombineRowBytes() {
+  if constexpr (CombineQuant<kConfig>) {
+    constexpr size_t scale =
+        kConfig.combineQGroup == 32 ? kConfig.hiddenDim / 32 : kConfig.hiddenDim / 128 * 4;
+    return (static_cast<size_t>(kConfig.hiddenDim) + scale + 15) & ~static_cast<size_t>(15);
+  } else {
+    return static_cast<size_t>(kConfig.hiddenDim) * sizeof(T);
+  }
+}
+
+constexpr int kCombineQVec = 16;
+
+// Arena and input pointers are built from integers, so the compiler cannot see
+// that they are global: it emits flat accesses, which have no immediate offset
+// and keep a 64-bit address per access live. Rebuilding the pointer in address
+// space 1 gives global_load / global_store.
+template <typename V>
+__device__ __forceinline__ V LoadGlobal(const void* p) {
+  return *(const __attribute__((address_space(1))) V*)(reinterpret_cast<uintptr_t>(p));
+}
+template <typename V>
+__device__ __forceinline__ void StoreGlobal(void* p, V v) {
+  *(__attribute__((address_space(1))) V*)(reinterpret_cast<uintptr_t>(p)) = v;
+}
+
+// This warp's index in the grid, as a scalar: what a warp derives from it (its
+// token, the token's slots) then stays in SGPRs and loads as one.
+__device__ __forceinline__ int UniformWarpId() {
+  return __builtin_amdgcn_readfirstlane(blockIdx.x * (blockDim.x / warpSize) +
+                                        threadIdx.x / warpSize);
+}
+
+// CombineSendCopy, quantizing: one warp per (recv row, 16 * warpSize elements).
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ __forceinline__ void CombineQuantSendCopy(const EpDispatchCombineArgs& args,
+                                                     uint8_t* staging, int rows) {
+  static_assert(sizeof(T) == 2, "the quantized combine reads bf16 rows");
+  constexpr int kGroup = kConfig.combineQGroup;
+  constexpr int kHidden = kConfig.hiddenDim;
+  constexpr int kLanesPerGroup = kGroup / kCombineQVec;
+  constexpr size_t kRowB = CombineRowBytes<kConfig, T>();
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warps = gridDim.x * (blockDim.x / warpSize);
+  const int chunk = warpSize * kCombineQVec;
+  const int steps = (kHidden + chunk - 1) / chunk;
+  const T* inp = static_cast<const T*>(args.inpTokenBuf);
+
+  for (int u = UniformWarpId(); u < rows * steps; u += warps) {
+    const int tok = u / steps;
+    const int e = (u % steps) * chunk + lane * kCombineQVec;
+    const bool active = e < kHidden;
+    float f[2][8] = {};
+    if (active) {
+      const T* src = inp + static_cast<size_t>(tok) * kHidden + e;
+      EpBf16x8ToF32(LoadGlobal<uint4>(src), f[0]);
+      EpBf16x8ToF32(LoadGlobal<uint4>(src + 8), f[1]);
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(f[i / 8][i % 8]));
+#pragma unroll
+    for (int off = 1; off < kLanesPerGroup; off <<= 1) amax = fmaxf(amax, __shfl_xor(amax, off));
+    float scale, inv;
+    unsigned e8m0;
+    EpScatterScale<kGroup, kEpScatterFp8Max>(amax, scale, inv, e8m0);
+    if (!active) continue;
+    uint8_t* row = staging + static_cast<size_t>(args.dispReceiverIdxMap[tok]) * kRowB;
+    uint2 q[2];
+    EpScatterPack<false>(reinterpret_cast<char*>(&q[0]), f[0], inv);
+    EpScatterPack<false>(reinterpret_cast<char*>(&q[1]), f[1], inv);
+    StoreGlobal(row + e, make_uint4(q[0].x, q[0].y, q[1].x, q[1].y));
+    if (lane % kLanesPerGroup == 0) {
+      if constexpr (kGroup == 32)
+        StoreGlobal(row + kHidden + e / kGroup, static_cast<uint8_t>(e8m0));
+      else
+        StoreGlobal(row + kHidden + e / kGroup * 4, scale);
+    }
+  }
+}
+
+// CombineRecvCopy, dequantizing: one warp per (local token, 16 * warpSize
+// elements) sums the token's top-k rows in f32. The slots are resolved first and
+// every row's load is issued before the first is summed: resolving and loading
+// one row at a time serialises top-k round trips. A dropped slot loads a harmless
+// row and is skipped at the sum, not scaled by 0, since its bytes may be NaN.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ __forceinline__ void CombineQuantRecvCopy(const EpDispatchCombineArgs& args,
+                                                     const uint8_t* peerBase,
+                                                     const uint8_t* selfBase, T* out) {
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);
+  constexpr int kGroup = kConfig.combineQGroup;
+  constexpr int kHidden = kConfig.hiddenDim;
+  constexpr int kTopk = kConfig.numExpertPerToken;
+  constexpr size_t kRowB = CombineRowBytes<kConfig, T>();
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warps = gridDim.x * (blockDim.x / warpSize);
+  const int chunk = warpSize * kCombineQVec;
+  const int steps = (kHidden + chunk - 1) / chunk;
+
+  for (int u = UniformWarpId(); u < args.curRankNumToken * steps; u += warps) {
+    const int tok = u / steps;
+    const int e = (u % steps) * chunk + lane * kCombineQVec;
+    if (e >= kHidden) continue;
+    // All of the token's slots in flight at once, then warp-uniform: the row
+    // addresses are scalar arithmetic and the choice between them a select.
+    index_t slots[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) slots[j] = args.dispDestTokIdMap[tok * kTopk + j];
+    const uint8_t* rows[kTopk];
+    bool live[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      const index_t destTokId = __builtin_amdgcn_readfirstlane(slots[j]);
+      const int pe = PeFromSendBufSlotOffset(config, destTokId);
+      live[j] = pe < kConfig.worldSize;
+      // Own rows were never transferred: they are still in combine's staging.
+      rows[j] =
+          live[j] ? (pe != args.rank ? peerBase : selfBase) + static_cast<size_t>(destTokId) * kRowB
+                  : selfBase;
+    }
+    uint4 q[kTopk];
+    float scale[kTopk];
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      q[j] = LoadGlobal<uint4>(rows[j] + e);
+      if constexpr (kGroup == 32)
+        scale[j] = __uint_as_float(
+            static_cast<unsigned>(LoadGlobal<uint8_t>(rows[j] + kHidden + e / kGroup)) << 23);
+      else
+        scale[j] = LoadGlobal<float>(rows[j] + kHidden + e / kGroup * 4);
+    }
+    float acc[2][8] = {};
+#pragma unroll
+    for (int j = 0; j < kTopk; ++j) {
+      if (!live[j]) continue;
+      EpScatterAcc<false>(make_uint2(q[j].x, q[j].y), scale[j], acc[0]);
+      EpScatterAcc<false>(make_uint2(q[j].z, q[j].w), scale[j], acc[1]);
+    }
+    T* dst = out + static_cast<size_t>(tok) * kHidden + e;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      unsigned pk[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const unsigned lo = __builtin_bit_cast(unsigned short, T(acc[h][2 * i]));
+        const unsigned hi = __builtin_bit_cast(unsigned short, T(acc[h][2 * i + 1]));
+        pk[i] = lo | (hi << 16);
+      }
+      StoreGlobal(dst + 8 * h, make_uint4(pk[0], pk[1], pk[2], pk[3]));
+    }
   }
 }
 
@@ -1210,6 +1375,10 @@ __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
   // its transfer still reading it. See asyncll_regions.
   uint8_t* stagingPtr = args.reg(args.offCombineStaging)->template GetAs<uint8_t*>();
 
+  if constexpr (asyncll::CombineQuant<kConfig>) {
+    asyncll::CombineQuantSendCopy<kConfig, T>(args, stagingPtr, totalRecvTokenNum);
+    return;
+  }
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
     index_t stagingTokId = 0;
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
@@ -1226,12 +1395,14 @@ __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
 // The dispatch transfer with the endpoints swapped: what arrived in dispatchInp
 // goes back to combineInp, at the same slot arithmetic and the same stride. The
 // payload is hidden only -- no indices, no source id -- so the stride is
-// hiddenBytes rather than xferBytes.
+// hiddenBytes rather than xferBytes (CombineRowBytes when the combine quantizes).
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
                                                   const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   ::mori::cco::ccoSdma sdma{comm};
+  // One combine row on the wire: hiddenBytes, or the quantized row.
+  constexpr size_t rowBytes = asyncll::CombineRowBytes<kConfig, T>();
 
   uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
 
@@ -1253,16 +1424,16 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         }
       } else {
         const size_t remoteBase =
-            static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes;
+            static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * rowBytes;
         const size_t localBase =
-            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
+            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * rowBytes;
         asyncll::PostPayloadAndNotify(
             comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
             EpInterNodeWindow(args.reg(args.offCombineInp)),
             EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
             EpInterNodeWindow(args.reg(args.offCombineStaging)),
             EpInterNodeOffset(args.reg(args.offCombineStaging), localBase),
-            static_cast<size_t>(tokenNum) * hiddenBytes,
+            static_cast<size_t>(tokenNum) * rowBytes,
             EpInterNodeWindow(args.reg(args.offCrossDeviceBarrier)),
             EpInterNodeOffset(args.reg(args.offCrossDeviceBarrier), myPe * sizeof(uint64_t)),
             EpInterNodeWindow(args.reg(args.offSendCount)),
@@ -1298,9 +1469,8 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     if (destPe == myPe) continue;
     if (tokenNum == 0) continue;
 
-    const size_t remoteBase = static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes;
-    const size_t localBase =
-        static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
+    const size_t remoteBase = static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * rowBytes;
+    const size_t localBase = static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * rowBytes;
 
     if (destPe / config.gpuPerNode != myNode) {
       // Striped over the QPs, as the dispatch send leg is and for the same
@@ -1310,11 +1480,10 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         const int first = qpId * chunk;
         const int count = min(chunk, static_cast<int>(tokenNum) - first);
         if (count <= 0) break;
-        EpInterNodePut(comm, args.reg(args.offCombineInp),
-                       remoteBase + static_cast<size_t>(first) * hiddenBytes,
-                       args.reg(args.offCombineStaging),
-                       localBase + static_cast<size_t>(first) * hiddenBytes,
-                       static_cast<size_t>(count) * hiddenBytes, destPe, qpId);
+        EpInterNodePut(
+            comm, args.reg(args.offCombineInp), remoteBase + static_cast<size_t>(first) * rowBytes,
+            args.reg(args.offCombineStaging), localBase + static_cast<size_t>(first) * rowBytes,
+            static_cast<size_t>(count) * rowBytes, destPe, qpId);
       }
       continue;
     }
@@ -1324,7 +1493,7 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offCombineInp)),
         EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
         EpInterNodeWindow(args.reg(args.offCombineStaging)),
-        EpInterNodeOffset(args.reg(args.offCombineStaging), localBase), tokenNum * hiddenBytes, q);
+        EpInterNodeOffset(args.reg(args.offCombineStaging), localBase), tokenNum * rowBytes, q);
   }
 }
 
@@ -1414,6 +1583,13 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 
   if (args.curRankNumToken == 0) return;
 
+  if constexpr (asyncll::CombineQuant<kConfig>) {
+    asyncll::CombineQuantRecvCopy<kConfig, T>(
+        args, args.reg(args.offCombineInp)->template GetAs<const uint8_t*>(),
+        args.reg(args.offCombineStaging)->template GetAs<const uint8_t*>(),
+        args.reg(args.offCombineOut)->template GetAs<T*>());
+    return;
+  }
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
   for (int i = globalWarpId; i < args.curRankNumToken * mwIter.warpsPerItem; i += globalWarpNum) {

@@ -63,6 +63,8 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/distributed/tier_proto.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
+#include "umbp/l1/l1_service.h"
 #include "umbp/sim/sim.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
@@ -461,6 +463,101 @@ class KeyHandleStats {
   uint64_t events_ = 0;
 };
 
+// The L1 pools' memory operations, with a fetch's copies issued through the
+// HBM copy engine: the fragments one source device supplies go out as one
+// plan, so the engine's gather kernel carries them in a single launch instead
+// of one hipMemcpyAsync per fragment. On unless UMBP_L1_GATHER_COPY=0: the
+// other path (`HipMemoryApi::CopyBatch`) keeps the copies off the GPUs'
+// compute units, which the engine that owns the pools is running its model
+// on, but takes far longer per fetch. Kept as a switch so the two can be
+// measured against each other end to end.
+class EngineL1MemoryApi final : public l1::MemoryApi {
+ public:
+  explicit EngineL1MemoryApi(std::shared_ptr<l1::MemoryApi> inner) : inner_(std::move(inner)) {}
+
+  bool Allocate(int device, uint64_t bytes, void** base, l1::ExportedMemory* exported,
+                std::string* error) override {
+    return inner_->Allocate(device, bytes, base, exported, error);
+  }
+  void Free(int device, void* base, uint64_t bytes) override { inner_->Free(device, base, bytes); }
+  bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
+              std::string* error) override {
+    return inner_->Import(device, handle, offset, base, mapped, error);
+  }
+  void Unimport(int device, void* mapped) override { inner_->Unimport(device, mapped); }
+  bool Copy(int dst_device, void* dst, int src_device, const void* src, uint64_t bytes,
+            std::string* error) override {
+    return inner_->Copy(dst_device, dst, src_device, src, bytes, error);
+  }
+  bool Synchronize(int device, std::string* error) override {
+    return inner_->Synchronize(device, error);
+  }
+
+  bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
+                 std::string* error) override {
+    if (fragments.size() < 2) return inner_->CopyBatch(dst_device, fragments, error);
+    // One plan per source device, over the span its fragments cover at each end.
+    std::map<int, std::vector<size_t>> by_source;
+    for (size_t i = 0; i < fragments.size(); ++i) by_source[fragments[i].src_device].push_back(i);
+    std::vector<TransferPlan> plans;
+    for (const auto& [src_device, indices] : by_source) {
+      uintptr_t src_lo = UINTPTR_MAX, src_hi = 0, dst_lo = UINTPTR_MAX, dst_hi = 0;
+      for (size_t i : indices) {
+        const uintptr_t src = reinterpret_cast<uintptr_t>(fragments[i].src);
+        const uintptr_t dst = reinterpret_cast<uintptr_t>(fragments[i].dst);
+        src_lo = std::min(src_lo, src);
+        src_hi = std::max(src_hi, src + fragments[i].bytes);
+        dst_lo = std::min(dst_lo, dst);
+        dst_hi = std::max(dst_hi, dst + fragments[i].bytes);
+      }
+      TransferPlan plan;
+      plan.src = TransferRef::HostBytes(reinterpret_cast<void*>(src_lo), src_hi - src_lo,
+                                        mori::io::MemoryLocationType::GPU, src_device);
+      plan.dst = TransferRef::HostBytes(reinterpret_cast<void*>(dst_lo), dst_hi - dst_lo,
+                                        mori::io::MemoryLocationType::GPU, dst_device);
+      plan.dir = TransferDirection::kLocal;
+      for (size_t i : indices) {
+        plan.src_offsets.push_back(reinterpret_cast<uintptr_t>(fragments[i].src) - src_lo);
+        plan.dst_offsets.push_back(reinterpret_cast<uintptr_t>(fragments[i].dst) - dst_lo);
+        plan.sizes.push_back(fragments[i].bytes);
+        plan.tags.push_back(i);
+      }
+      plans.push_back(std::move(plan));
+    }
+    std::vector<TransferFailure> failures;
+    if (auto handle = engine_.Submit(std::move(plans))) handle->Wait(&failures);
+    // A plan the gather kernel declines (128 KiB a fragment or more) is copied
+    // with hipMemcpy. Between two devices that returns once the bytes have
+    // landed; within one device it returns as soon as the copy is queued, so
+    // those need the device synchronized before anything is handed on -- also
+    // when another plan failed, since the caller then gives the slots up.
+    std::string sync_error;
+    const bool landed =
+        by_source.count(dst_device) == 0 || inner_->Synchronize(dst_device, &sync_error);
+    if (!failures.empty()) {
+      *error = failures.front().message;
+      return false;
+    }
+    if (!landed) {
+      *error = sync_error;
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  std::shared_ptr<l1::MemoryApi> inner_;
+  HbmCopyEngine engine_;
+};
+
+std::shared_ptr<l1::MemoryApi> MakeL1MemoryApi() {
+  std::shared_ptr<l1::MemoryApi> api = l1::MakeHipMemoryApi();
+  const char* raw = std::getenv("UMBP_L1_GATHER_COPY");
+  if (raw != nullptr && std::strcmp(raw, "0") == 0) return api;
+  MORI_UMBP_INFO("[StandaloneServer] L1 fetch copies go through the HBM copy engine (gather)");
+  return std::make_shared<EngineL1MemoryApi>(std::move(api));
+}
+
 }  // namespace
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
@@ -552,6 +649,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     int selected_port = 0;
     builder.AddListeningPort(address_, grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(this);
+    // L1 block pools ride the same socket. Registering costs nothing: no GPU
+    // context or memory exists until an engine attaches a pool.
+    l1_manager_ = std::make_shared<l1::PoolManager>(MakeL1MemoryApi());
+    l1_service_ = l1::MakeL1PoolService(l1_manager_);
+    builder.RegisterService(l1_service_.get());
     mode_t old_umask = umask(0077);
     server_ = builder.BuildAndStart();
     umask(old_umask);
@@ -1776,6 +1878,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   const bool concurrent_backend_;
   std::string address_;
   std::string fd_socket_path_;
+  // Declared before server_ so they outlive it: handlers may still be running
+  // until the server is destroyed.
+  std::shared_ptr<l1::PoolManager> l1_manager_;
+  std::unique_ptr<grpc::Service> l1_service_;
   std::unique_ptr<grpc::Server> server_;
   std::atomic<bool> shutdown_{false};
 

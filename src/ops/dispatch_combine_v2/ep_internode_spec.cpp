@@ -107,6 +107,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.windowUncached = request.windowUncached && (kind == EpInterNodeKernel::Combine ||
                                                             kind == EpInterNodeKernel::CombineLL);
   cfg.asyncLlMode = request.asyncLlMode;
+  cfg.kernelCfg.combineQGroup = request.combineQGroup;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -148,6 +149,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   }
   if (cfg.asyncLlMode != 0 && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode) {
     throw std::runtime_error("mori ep v2: asyncLlMode > 0 requires a single-node SDMA plan");
+  }
+  if (cfg.kernelCfg.combineQGroup != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: combineQGroup is only supported by AsyncLL plans");
   }
   if (request.asyncLlFusedRecvCtas < 0) {
     throw std::runtime_error("mori ep v2: asyncLlFusedRecvCtas must be >= 0");

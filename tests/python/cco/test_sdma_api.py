@@ -203,6 +203,97 @@ def _worker_put(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
+def _kfd_sdma_queues():
+    """The SDMA queues KFD holds on this GPU across all processes, as a set of
+    (proc dir, queue id), or None if sysfs cannot tell. Callers diff it around
+    their own queue creation (the pid in sysfs is not this process's pid inside
+    a container); only new entries count, so another process releasing queues
+    meanwhile cannot fail the check."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    loc = (props.pci_bus_id << 8) | (props.pci_device_id << 3)
+    nodes = "/sys/class/kfd/kfd/topology/nodes"
+    gpu_id = None
+    for n in os.listdir(nodes):
+        try:
+            kv = dict(
+                line.split()
+                for line in open(f"{nodes}/{n}/properties")
+                if len(line.split()) == 2
+            )
+            if (
+                int(kv.get("location_id", -1)) == loc
+                and int(kv.get("domain", 0)) == props.pci_domain_id
+            ):
+                gpu_id = open(f"{nodes}/{n}/gpu_id").read().strip()
+        except OSError:
+            pass
+    procs = "/sys/class/kfd/kfd/proc"
+    if gpu_id is None or not os.path.isdir(procs):
+        return None
+    found = set()
+    for p in os.listdir(procs):
+        qdir = f"{procs}/{p}/queues"
+        try:
+            for q in os.listdir(qdir):
+                if open(f"{qdir}/{q}/gpuid").read().strip() != gpu_id:
+                    continue
+                # KFD_QUEUE_TYPE_SDMA = 1, KFD_QUEUE_TYPE_SDMA_XGMI = 4
+                if open(f"{qdir}/{q}/type").read().strip() in ("1", "4"):
+                    found.add((p, q))
+        except OSError:
+            continue
+    return found
+
+
+def _worker_queue_count(rank, world_size, uid_path, coop_name, results_path):
+    """sdma_queue_count 0 builds no SDMA queue even with MORI_ENABLE_SDMA=1; a
+    later DevComm on the same comm that asks for queues still gets them."""
+    err = None
+    try:
+        mods = _worker_imports()
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+        comm = _init_comm(rank, world_size, uid_path)
+        mem = comm.alloc_mem(4096)
+        comm.register_window(mem.ptr, mem.size)
+
+        def reqs(n):
+            r = CCODevCommRequirements()
+            r.gda_connection_type = GDA_CONNECTION_NONE
+            r.gda_signal_count = 0
+            r.gda_counter_count = 0
+            r.sdma_queue_count = n
+            return r
+
+        before = _kfd_sdma_queues()
+        dc0 = comm.create_dev_comm(reqs(0))
+        after0 = _kfd_sdma_queues()
+        dc2 = comm.create_dev_comm(reqs(2))
+        after2 = _kfd_sdma_queues()
+        new0 = None if before is None else len(after0 - before)
+        new2 = None if before is None else len(after2 - after0)
+        print(
+            f"[rank {rank}] sdma_num_queue {dc0.sdma_num_queue} / {dc2.sdma_num_queue},"
+            f" new KFD SDMA queues on this GPU: {new0} with count 0, {new2} with count 2",
+            flush=True,
+        )
+        if dc0.sdma_num_queue != 0:
+            raise AssertionError(f"count 0 gave {dc0.sdma_num_queue} queues per peer")
+        if dc2.sdma_num_queue != 2:
+            raise AssertionError(f"count 2 gave {dc2.sdma_num_queue} queues per peer")
+        if before is not None:
+            if new0:
+                raise AssertionError(f"count 0 created {new0} KFD SDMA queues")
+            if new2 < 2 * (world_size - 1):
+                raise AssertionError(f"count 2 created only {new2} KFD SDMA queues")
+        comm.barrier()
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 def _worker_put_quiet_queue(rank, world_size, uid_path, coop_name, results_path):
     """Same all-to-all put, but drained per queue with quiet_queue(peer, 0).
 
@@ -1724,6 +1815,12 @@ def test_sdma_put_alltoall(coop_name, world_size):
 
     Scales across 2/4/8 GPUs; cases needing more GPUs than present are skipped."""
     _run(_worker_put, world_size=world_size, coop_name=coop_name)
+
+
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_sdma_queue_count_zero_builds_none(world_size):
+    """Queues come only from an explicit sdma_queue_count, not from MORI_ENABLE_SDMA."""
+    _run(_worker_queue_count, world_size=world_size, coop_name="THREAD")
 
 
 def test_sdma_quiet_queue():

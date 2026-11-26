@@ -113,7 +113,8 @@ local caps = ARGV[6]
 local lcaps = ARGV[7]
 local nev = tonumber(ARGV[8])
 
-if redis.call('EXISTS', nodeKey) == 0 then
+if redis.call('EXISTS', nodeKey) == 0 or (full == 0
+    and tonumber(redis.call('HGET', nodeKey, 'status') or '0') == 2) then
   return { 'UNKNOWN', '0' }
 end
 local last = tonumber(redis.call('HGET', nodeKey, 'seq') or '0')
@@ -441,7 +442,8 @@ local now = tonumber(ARGV[4])
 local full = tonumber(ARGV[5])
 local caps = ARGV[6]
 local lcaps = ARGV[7]
-if redis.call('EXISTS', nodeKey) == 0 then
+if redis.call('EXISTS', nodeKey) == 0 or (full == 0
+    and tonumber(redis.call('HGET', nodeKey, 'status') or '0') == 2) then
   return { 'UNKNOWN', '0' }
 end
 local last = tonumber(redis.call('HGET', nodeKey, 'seq') or '0')

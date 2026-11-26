@@ -146,7 +146,7 @@ can share one instance.
 | `m_max` | `int` | *(required)* | The largest per-rank M any call passes, at least 1. Rounded up to the M granule (128, or 256 for mxfp8). Sizes the window, which cannot grow. |
 | `quant` | `str` | `"ptpc"` | `"ptpc"`: fp32 per-token A scale and per-channel B scale. `"mxfp8"`: ue8m0 scales, 1x32 blocks for A and 32x32 for B; raises the M granule to 256. |
 | `mode` | `str` | `"fused"` | `"fused"`: puts posted from the GEMM epilogue, chunk by chunk. `"split"`: the GEMM, then one put per destination. Same window, same result. |
-| `sdma_queues` | `int` | `1` | SDMA queues per peer, at least 1. The communicator's first dev-comm fixes the count, and the constructor raises if it has fewer. Leave it at 1 (section 8). |
+| `sdma_queues` | `int` | `1` | SDMA queues per peer, at least 1. The first dev-comm on the communicator that asks for SDMA queues fixes the count, and the constructor raises if it has fewer. Leave it at 1 (section 8). |
 | `max_shapes` | `int` | `8` | How many distinct padded M values the instance serves, at least 1. Each takes a counter set in the window; `self_test()` takes one for `m_max`. Pass the same value to `window_bytes_for`. |
 | `chunks` | `int` or `None` | `None` | Puts per destination per call, at least 1. `None` picks per M (section 8). A number is rounded down per M to a divisor of the row tiles. No effect with `mode="split"`. Above 8 it enlarges the control region: pass the same value to `window_bytes_for`. |
 | `war_credit` | `bool` | `True` | The receive-reuse credit. `False` exists only as the race test's negative control: a peer can then overwrite a result this rank has not read. |
@@ -465,7 +465,7 @@ on a pure GEMM and changed which chunk count won.
 | Symptom | Cause and fix |
 |---|---|
 | `ModuleNotFoundError` for `flydsl` when importing `GemmA2AOp` | FlyDSL is not installed: `pip install 'amd_mori[flydsl]'`. |
-| `RuntimeError: GemmA2AOp needs 1 SDMA queue(s) per peer but the communicator has 0` | MORI built without `BUILD_CCO_SDMA=ON`; or `MORI_ENABLE_SDMA=1` not set before the communicator was created; or the communicator's first dev-comm asked for fewer queues than `sdma_queues`. |
+| `RuntimeError: GemmA2AOp needs 1 SDMA queue(s) per peer but the communicator has 0` | MORI built without `BUILD_CCO_SDMA=ON`; or `MORI_ENABLE_SDMA=1` not set before the communicator was created; or the first dev-comm on the communicator that asked for SDMA queues asked for fewer than `sdma_queues`. |
 | `RuntimeError: gemm_a2a self-test failed: recv block from rank ... holds ..., expected ...` | The puts move nothing; same causes. Without this check the operator would return this rank's block plus stale data. |
 | `RuntimeError: GemmA2AOp needs every rank in one LSA domain (one node)` | The ranks span nodes. The operator is single-node. |
 | `RuntimeError: ccoMemAlloc failed` at construction, `slot exhausted` in the log | `per_rank_vmm` is too small. Size it from `window_bytes_for` with the constructor's settings, plus other operators' windows. |

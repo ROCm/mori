@@ -380,7 +380,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         // reaper doesn't expire an idle-but-alive node.  seq=0 deterministically
         // hits the SEQ_GAP branch, which bumps last_heartbeat + status←ALIVE
         // without advancing last_applied_seq; the gap is ignored (no full-sync
-        // request) because there is nothing to recover.
+        // request) because there is nothing to recover.  An EXPIRED node gets
+        // UNKNOWN instead and re-registers.
         auto result = store_.ApplyHeartbeat(request->node_id(), /*seq=*/0, now, caps,
                                             /*events=*/{}, /*is_full_sync=*/false, logical_caps);
         if (result.status == HeartbeatResult::UNKNOWN) {

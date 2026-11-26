@@ -27,8 +27,11 @@ evaluating a migration.
    * - EPv2, HIP
      - Same EPv2 import; ``kernel_backend="hip"``
      - Intra-node
-     - Gather combine in BF16/FP32. Dispatch can carry already-quantized FP8/FP4
-       payloads. Does not require FlyDSL.
+     - Gather combine in BF16/FP32, and a quantized combine (see the EPv2 package
+       README for the formats per arch). On gfx942/gfx950 also the unquantized
+       scatter combine, the ``max_total_recv_tokens`` cap, routing replay,
+       ``local_expert_count()`` and BF16 standard-MoE conversion. Dispatch can carry
+       already-quantized FP8/FP4 payloads. Does not require FlyDSL.
    * - EPv2, HIP internode preview
      - HIP backend with ``gpu_per_node < world_size``
      - Multiple physical nodes over CCO/GDA

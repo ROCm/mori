@@ -303,9 +303,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 for (b, w) in combine_specs
             }
 
-        self._local_expert_count_buf = torch.zeros(
-            cfg.num_experts_per_rank, dtype=torch.int32, device=device
-        )
+        if cfg.enable_std_moe:
+            # before the packed buffers are sized in the configured dtype
+            assert elem_size == 2, "StdMoE convert path is bf16-only"
+        self._alloc_local_buffers(cfg)
         self._local_expert_count = make_local_expert_count(
             rank=cfg.rank,
             experts_per_rank=cfg.num_experts_per_rank,
@@ -315,24 +316,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         )
 
         if cfg.enable_std_moe:
-            assert elem_size == 2, "StdMoE convert path is bf16-only"
             experts_per_rank = cfg.num_experts_per_rank
-            max_tok_per_expert = cfg.world_size * max_tok_per_rank
-            self._max_tok_per_expert = max_tok_per_expert
-            self.packed_x = torch.zeros(
-                experts_per_rank * max_tok_per_expert * hidden_dim,
-                dtype=torch.int16,
-                device=device,
-            )
-            self.packed_count = torch.zeros(
-                experts_per_rank, dtype=torch.int32, device=device
-            )
-            self.packed_src = torch.zeros(
-                experts_per_rank * max_tok_per_expert, dtype=torch.int32, device=device
-            )
-            self.slot_map = torch.full(
-                (recv_cap * topk,), -1, dtype=torch.int64, device=device
-            )
+            max_tok_per_expert = self._max_tok_per_expert
             self._convert_dispatch = make_convert_dispatch_output(
                 rank=cfg.rank,
                 experts_per_rank=experts_per_rank,
@@ -363,6 +348,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
+            local_expert_count=self._run_local_expert_count,
+            convert_dispatch=self._run_convert_dispatch if cfg.enable_std_moe else None,
+            convert_combine=self._run_convert_combine if cfg.enable_std_moe else None,
             # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
             capabilities=frozenset(
@@ -370,10 +358,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     "gather",
                     "scatter",
                     "quant",
-                    "std_moe",
                     "scales",
                     "replay",
-                    "local_expert_count",
                     "asymmetric_dtype",
                     "recv_cap",
                 }
@@ -413,49 +399,29 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
         )
 
-    def convert_dispatch_output(self):
-        """mori ConvertDispatchOutput: repack recv tokens into per-local-expert
-        buckets. Returns (packed_x, packed_count, packed_src); GEMM overwrites
-        packed_x in place."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
-        self.packed_count.zero_()
-        self.slot_map.fill_(-1)
+    def _run_convert_dispatch(self, *, total_recv):
         arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
         self._convert_dispatch(
             arena.local_ptr("disp_out"),
             arena.local_ptr("out_idx"),
             arena.local_ptr("recv_to_src_token"),
-            self.total_recv.data_ptr(),
+            total_recv.data_ptr(),
             self.packed_x.data_ptr(),
             self.packed_count.data_ptr(),
             self.packed_src.data_ptr(),
             self.slot_map.data_ptr(),
-            stream,
+            fx.Stream(torch.cuda.current_stream()),
         )
-        experts_per_rank = self.cfg.num_experts_per_rank
-        max_tok_per_expert = self._max_tok_per_expert
-        hidden_dim = self.cfg.hidden_dim
-        packed_x_view = from_gpu_ptr(
-            self.packed_x.data_ptr(),
-            (experts_per_rank, max_tok_per_expert, hidden_dim),
-            self.cfg.dispatch_dtype,
-        )
-        return packed_x_view, self.packed_count, self.packed_src
 
-    def convert_combine_input(self, routing):
-        """mori ConvertCombineInput: weighted-reduce each recv token's local-expert
-        outputs from packed_x back into out_tok. Run after GEMM, before combine."""
-        assert self.cfg.enable_std_moe, "op built without enable_std_moe"
+    def _run_convert_combine(self, *, total_recv):
         arena = self.arena
-        stream = fx.Stream(torch.cuda.current_stream())
         self._convert_combine(
             arena.local_ptr("out_tok"),
             arena.local_ptr("out_wts"),
-            routing.total_recv_token_num.data_ptr(),
+            total_recv.data_ptr(),
             self.packed_x.data_ptr(),
             self.slot_map.data_ptr(),
-            stream,
+            fx.Stream(torch.cuda.current_stream()),
         )
 
     def recv_weights(self):
@@ -547,15 +513,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         return run
 
-    def local_expert_count(self):
-        """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch."""
-        self._local_expert_count_buf.zero_()
-        stream = fx.Stream(torch.cuda.current_stream())
+    def _run_local_expert_count(self, *, total_recv, out):
         self._local_expert_count(
             self.arena.local_ptr("out_idx"),
-            self.total_recv.data_ptr(),
-            self._local_expert_count_buf.data_ptr(),
-            stream,
+            total_recv.data_ptr(),
+            out.data_ptr(),
+            fx.Stream(torch.cuda.current_stream()),
         )
-        return self._local_expert_count_buf
