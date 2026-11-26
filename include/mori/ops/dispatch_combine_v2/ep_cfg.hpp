@@ -389,6 +389,56 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
+// ---------------------------------------------------------------------------
+// Intranode dispatch geometry. A block owns one token at a time and its
+// warps take fixed roles: warp 0 routes, warp 1 forwards the scale row when there
+// is one, and every other warp copies a share of the payload. All of it is a
+// function of the Cfg, so the split is exact at compile time: the payload is a
+// whole number of rows of one 16 B vector per lane, the rows are dealt out to the
+// copy warps with the remainder spread one a warp, and no warp's trip count or
+// offset is computed on the device.
+// ---------------------------------------------------------------------------
+constexpr int EpCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
+constexpr int EpCopyWarps(const EpCfg& c) { return c.warpPerBlock - EpCtrlWarps(c); }
+constexpr int EpRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
+constexpr int EpRowsPerToken(const EpCfg& c) {
+  return (EpTokenBytes(c) + EpRowBytes(c) - 1) / EpRowBytes(c);
+}
+// 16 B vectors in the last row; the lanes past it sit that row out.
+constexpr int EpLastRowVecs(const EpCfg& c) {
+  return (EpTokenBytes(c) - (EpRowsPerToken(c) - 1) * EpRowBytes(c)) / 16;
+}
+// Copy warp w takes rows [EpRowBegin, EpRowBegin + EpRowCount): the first
+// `rows % copyWarps` warps take one more than the rest.
+constexpr int EpRowCount(const EpCfg& c, int w) {
+  return EpRowsPerToken(c) / EpCopyWarps(c) + (w < EpRowsPerToken(c) % EpCopyWarps(c) ? 1 : 0);
+}
+constexpr int EpRowBegin(const EpCfg& c, int w) {
+  const int r = EpRowsPerToken(c) % EpCopyWarps(c);
+  return w * (EpRowsPerToken(c) / EpCopyWarps(c)) + (w < r ? w : r);
+}
+constexpr int EpMaxRowCount(const EpCfg& c) { return EpRowCount(c, 0); }
+// Destinations a token can fan out to: one per distinct rank, so at most topk.
+constexpr int EpMaxDests(const EpCfg& c) {
+  return c.worldSize < c.numExpertPerToken ? c.worldSize : c.numExpertPerToken;
+}
+// The warp count a request without one gets: a row a copy warp wherever the block can
+// hold that many warps, the widest split the payload has. Measured against two rows a
+// warp (what v1 used) on gfx950, EP8, hidden 7168 bf16, rocprof kernel time, fastest
+// of the run: 32 tokens a rank 11.8us against 13.4, 2048 tokens 397us against 401. The
+// small count is where it matters -- there every block holds one token, so the row
+// count IS the block's parallelism.
+//
+// Past that many rows the split is the widest the block allows, and EpRowCount
+// spreads the remainder; one row a warp is exactly even, so the common shapes also get
+// the single-constant row count.
+constexpr int EpDefaultDispatchWarps(const EpCfg& c) {
+  const int cap = 1024 / c.waveSize - EpCtrlWarps(c);  // EpBlockThreads(c) <= 1024
+  const int rows = EpRowsPerToken(c);
+  const int copy = rows < cap ? rows : cap;
+  return EpCtrlWarps(c) + (copy > 0 ? copy : 1);
+}
+
 constexpr int EpCombinePushSlotAlign = 128;
 
 // The push combine: each sender quantizes its rows into the peer's landing zone,

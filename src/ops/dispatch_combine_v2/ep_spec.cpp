@@ -137,6 +137,24 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
+  // The intranode dispatch is a block-per-token pipeline on every arch but gfx125x,
+  // which has its own TDM body. Its warps are a role split rather than a geometry, so
+  // an unpinned count is derived from the payload instead of the generic default, and
+  // its constraints are checked here -- EpCfgIsValid cannot tell a dispatch from a
+  // combine, and worldSize <= waveSize is true of the first and not of the second.
+  if (isDispatch && arch.rfind("gfx125", 0) != 0) {
+    if (req.warpPerBlock <= 0) c.warpPerBlock = EpDefaultDispatchWarps(c);
+    if (c.worldSize > c.waveSize || EpCopyWarps(c) < 1) {
+      throw std::runtime_error(
+          "mori v2 ep: the intranode dispatch routes with lane p owning destination p, so "
+          "worldSize (" +
+          std::to_string(c.worldSize) + ") must fit in a wavefront (" + std::to_string(c.waveSize) +
+          "), and the block needs a warp each for routing (and scales) and for copying "
+          "(warps=" +
+          std::to_string(c.warpPerBlock) + ")");
+    }
+  }
+
   if (req.ll128) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
     const bool bf16 = !req.combineFp4 && !req.combineFp8 &&
@@ -227,8 +245,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
         " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
-        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
-        "aggReserve needs worldSize <= waveSize and blocks < 4096");
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), "
+        "and aggReserve needs worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
