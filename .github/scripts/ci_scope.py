@@ -592,7 +592,7 @@ HINT = (
     "Lanes follow the changed files. Adding `ci:full` re-runs CI with every lane, "
     "the full internode sweeps and every fused GEMM case; adding `ci:mi300x` re-runs "
     "it with the MI300X lanes "
-    "added. `/ci-rerun` re-runs CI against the current main."
+    "added. `/ci-rerun` merges the current main into the branch and runs CI on it."
 )
 
 
