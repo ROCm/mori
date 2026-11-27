@@ -191,6 +191,50 @@ operators can find them in one place.
 
 ---
 
+## L1 pools over the store
+
+Read by `umbp_standalone_server`. The L1 pool manager manages HBM only. With
+`UMBP_L1_DRAM_STORE=1` what the pools evict goes to **this server's store**
+and is read back from it when no pool holds the key: one store object per
+slot, placed, moved and evicted by the store as any other object is. The
+pools have no DRAM of their own: how much is kept, and on which node, is the
+store's configuration (`UMBP_DRAM_CAPACITY`, the master's routing), and what
+the store evicts is gone for the pools too.
+
+A block is written to the store at one of three moments: **at its eviction**
+(the eviction waits for the write), **ahead of its eviction** by a background
+writer, or, with write-through, **once its publish has landed**. The first
+two write only a key's last L1 copy -- a copy another pool also holds is
+dropped, not written.
+
+| Env var | Default | Description |
+|---|---|---|
+| `UMBP_L1_DRAM_STORE` | `0` | `1`: put the store under the L1 pools. Needs the server's store on the DRAM medium. With a master, also needs the ranged scratch arenas (`UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES`, a shard at least one slot large): a slot the master routes to another node is assembled there before it is sent, and one read from another node is staged there or in this node's DRAM. |
+| `UMBP_L1_DRAM_WRITE` | `ahead` | `publish`: write-through. Every published block is offered to the store as soon as its owner's writes have landed, the newest first, whether or not it is cold, held or a last copy; the first holder whose copy has landed writes it, once. For a store other ranks and nodes read what a rank has just computed from, and one that must already hold a block when an eviction that does not wait takes it. `UMBP_L1_DRAM_AHEAD` and the write at eviction stay as the fallback for a block the store refused. |
+| `UMBP_L1_DRAM_AHEAD` | `0` | Fraction of each pool's slots (`0`..`1`) whose content -- the cached last copies an eviction takes next -- a background thread keeps already written, so the eviction does not wait for the write. |
+| `UMBP_L1_DRAM_WRITE_AT_EVICTION` | `1` | `0`: an eviction never waits for the store; a last copy the store was not given beforehand is lost and counted (`lost_slots`). |
+| `UMBP_L1_DRAM_THREADS` | `4` | Store calls one burst of evictions, or one load, is split over. |
+| `UMBP_L1_KEEP_COPIES` | `1` | Copies of a key eviction keeps in L1: a pool gives up a copy that this many other pools hold a newer copy of before it gives up its coldest slot. `0`: least recently released. |
+
+The L1 stats (`Stats` RPC, `L1Client.stats()`) say what the store was given:
+`written_back_slots` (at eviction), `written_ahead_slots` (before it,
+write-through included), `loaded_slots`, `lost_slots`, and `published_slots`,
+`offered_slots` and `unstored_slots` -- the last is the number of a pool's
+slots whose key the store has not been given by any pool, which under
+write-through is the writer's backlog.
+
+A store call or a copy between pools that takes more than a second is logged
+at WARN when it returns, and one still out after ten seconds is logged once
+with what else is in flight.
+
+### A diagnostic switch
+
+| Env var | Default | Description |
+|---|---|---|
+| `UMBP_L1_PEER_SOURCE` | `1` | `0`: the pools of a group are not each other's fetch sources and share only the store. A fetch or a probe finds a key its pool does not hold in the store or not at all; every copy is written to the store as a last copy is, once; eviction is least recently released whatever `UMBP_L1_KEEP_COPIES` says. For measuring, on one binary and one server, what the HBM-to-HBM exchange adds over the shared store: run it with `UMBP_L1_DRAM_WRITE=publish`, since a key another pool computed is reachable only once it is in the store. Not a mode to serve in. |
+
+---
+
 ## Pre-existing / unrelated knobs
 
 | Env var | Default | Description |

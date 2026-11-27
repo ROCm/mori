@@ -482,6 +482,18 @@ target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
 target_compile_features(test_l1_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_l1_pool COMMAND test_l1_pool)
 
+# The L1 pools over the UMBP store: what they evict becomes objects of an
+# embedded client's DRAM medium and is read back out of it. Host memory
+# throughout, so it needs no GPU and no fabric.
+add_executable(test_l1_backing_store test_l1_backing_store.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_l1_backing_store PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_l1_backing_store PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                                ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_l1_backing_store COMMAND test_l1_backing_store)
+
 # HipMemoryApi::CopyBatch when the runtime fails under it, on real devices
 # (skipped with fewer than two GPUs). The two HIP calls are wrapped at link
 # time so the test can make one of them fail.

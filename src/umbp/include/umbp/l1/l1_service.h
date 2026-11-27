@@ -66,12 +66,13 @@ class L1Client {
   L1Client& operator=(const L1Client&) = delete;
 
   AttachResult Attach(const std::string& pool_id, const std::string& group, int device,
-                      uint64_t bytes, const ExternalMemory& external = {});
-  Status BindLayout(const std::string& pool_id, const Layout& layout);
+                      uint64_t bytes, const ExternalMemory& external = {},
+                      const PartSpec& part = {});
+  Status BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part = 0);
   OpenResult Open(const std::string& pool_id);
   AllocateResult Allocate(const std::string& pool_id, uint32_t count, uint32_t min_count);
   Status Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp = 0);
-  Status Commit(const std::string& pool_id, uint64_t committed);
+  Status Commit(const std::string& pool_id, uint64_t committed, uint32_t part = 0);
   FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
                     const FetchOptions& options = {});
   Status Clear(const std::string& pool_id);
