@@ -1,21 +1,31 @@
 name: ci-rerun
 
-# Re-run CI on a PR against the current main, without pushing to the PR
-# branch: comment "/ci-rerun" on the PR, or add the "ci-rerun" label.
+# Re-run CI on a PR with the current main: comment "/ci-rerun" on the PR, or add
+# the "ci-rerun" label.
 #
-# This re-runs the PR's latest ci.yml run (which calls ci_cco.yml), the same as
-# its "Re-run all jobs" button, so the results stay in the PR checks. On a re-run
-# the jobs check out refs/pull/N/merge, i.e. the PR merged with the current main;
-# the workflow definition stays that of the original run. GITHUB_TOKEN can re-run
-# workflows, so no personal token is involved.
+# When main has commits the PR branch lacks, this merges main into the branch
+# (the "Update branch" button, as GITHUB_TOKEN). The push starts a new
+# pull_request run, so it tests the PR merged with the current main using the
+# current main's workflows, and its results land in the PR checks. A plain re-run
+# would not do: it keeps the workflow files of the original run.
 #
-# Adding the ci:full or ci:mi300x label re-runs it the same way; the re-run's scope
-# job reads the PR's labels live, so it runs every lane, or adds the MI300X lanes.
+# GitHub holds every run a GITHUB_TOKEN push starts until someone approves it.
+# On a PR from this repository this workflow approves them: only people with
+# write access can push there. On a fork PR it does not, since commit metadata
+# proves nothing about what a fork pushed; it links the held runs for a
+# maintainer to approve.
+#
+# When the branch already contains main, nothing needs merging, and this re-runs
+# the PR's latest ci.yml run (which calls ci_cco.yml) instead.
+#
+# Adding the ci:full or ci:mi300x label does the same; the scope job reads the
+# PR's labels live, so the run covers every lane, or adds the MI300X lanes.
 #
 # Fork PRs: use the comment, after adding ci:full or ci:mi300x if wanted. A label
 # event on a fork PR gets a read-only GITHUB_TOKEN, so the label path is skipped
-# there. (pull_request_target would have a write token, but GitHub blocks it by
-# default in public repositories from 2026-11-02.)
+# there. Merging main into a fork's branch needs "Allow edits by maintainers".
+# (pull_request_target would have a write token, but GitHub blocks it by default
+# in public repositories from 2026-11-02.)
 on:
   issue_comment:
     types: [created]
@@ -24,7 +34,7 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
   issues: write
   pull-requests: write
 
@@ -36,6 +46,12 @@ jobs:
       (github.event_name == 'pull_request' &&
        contains(fromJSON('["ci-rerun", "ci:full", "ci:mi300x"]'), github.event.label.name) &&
        github.event.pull_request.head.repo.full_name == github.repository)
+    # One at a time per PR, so a comment and a label added together do not merge
+    # and approve at once. Job level: every comment starts this workflow, and a
+    # workflow-level group would let a skipped one replace a pending real one.
+    concurrency:
+      group: ci-rerun-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
@@ -46,6 +62,8 @@ jobs:
             const reply = (body) =>
               github.rest.issues.createComment({ owner, repo, issue_number: number, body })
                 .catch((e) => core.warning(`could not comment: ${e.message}`));
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const short = (sha) => sha.slice(0, 8);
 
             // Remove the label so it can be added again next time. The comment
             // path also clears one left on a fork PR, where the label path is
@@ -73,24 +91,203 @@ jobs:
               await reply('`/ci-rerun`: this PR is not open.');
               return;
             }
+            // ci.yml runs only on PRs into main (its pull_request branches filter).
+            if (pr.base.ref !== 'main') {
+              await reply(`\`/ci-rerun\`: CI runs only on PRs into main, and this one targets ${pr.base.ref}. ` +
+                'Retarget it to main, or wait for its base PR to merge.');
+              return;
+            }
+            // The scope job runs nothing for a draft without ci:full (ci_scope.py).
+            if (pr.draft && !(pr.labels || []).some((l) => l.name === 'ci:full')) {
+              await reply('`/ci-rerun`: a draft PR runs no GPU CI. Mark it ready for review, or add `ci:full`.');
+              return;
+            }
             if (context.eventName === 'issue_comment') {
               await github.rest.reactions.createForIssueComment({
                 owner, repo, comment_id: context.payload.comment.id, content: 'rocket',
               }).catch(() => {});
             }
 
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            const latest = async (workflow_id) => (await github.rest.actions.listWorkflowRuns({
-              owner, repo, workflow_id, event: 'pull_request', head_sha: pr.head.sha, per_page: 1,
+            const label = context.eventName === 'pull_request' ? context.payload.label.name : 'ci-rerun';
+            const why = label === 'ci-rerun' ? '' : ` (for \`${label}\`)`;
+            const base = pr.base.ref;
+            const fork = !pr.head.repo || pr.head.repo.full_name !== `${owner}/${repo}`;
+            const latest = async (workflow_id, head_sha) => (await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id, event: 'pull_request', head_sha, per_page: 1,
             })).data.workflow_runs[0];
+            const held = (run) => run.status === 'action_required' || run.conclusion === 'action_required';
+            const links = (runs) => runs.map((r) => `[${r.name}](${r.html_url})`).join(', ');
+            // A merge "Update branch" made as GITHUB_TOKEN. Metadata only: good
+            // enough to word a reply, never a reason to approve fork code.
+            const ourMerge = (commit, parent) => commit.parents.length === 2 &&
+              (!parent || commit.parents[0].sha === parent) &&
+              (commit.author || {}).login === 'github-actions[bot]';
+
+            // The held runs on head (ci.yml, pre-commit, docs, ...), approved on a PR
+            // from this repo and only listed on a fork PR. Keeps looking for two more
+            // passes after ci.yml's appears: the others can be listed a little later.
+            const handleHeld = async (head) => {
+              const approved = new Set(), left = new Map();
+              let ci, seen = -1;
+              for (let i = 0; i < 40; i++) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, event: 'pull_request', head_sha: head, per_page: 100 });
+                for (const run of data.workflow_runs) {
+                  if ((run.path || '').startsWith('.github/workflows/ci.yml')) ci = run;
+                  if (!held(run) || approved.has(run.id) || left.has(run.id)) continue;
+                  if (fork) {
+                    left.set(run.id, run);
+                    continue;
+                  }
+                  try {
+                    await github.request('POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve',
+                      { owner, repo, run_id: run.id });
+                    approved.add(run.id);
+                  } catch (e) {
+                    core.warning(`could not approve run ${run.id}: ${e.message}`);
+                    left.set(run.id, run);
+                  }
+                }
+                if (ci && seen < 0) seen = i;
+                if (ci && i - seen >= 2) break;
+                await sleep(5000);
+              }
+              // A run another job approved meanwhile is no longer held.
+              const still = [];
+              for (const run of left.values()) {
+                const { data: now } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id });
+                if (held(now)) still.push(now);
+              }
+              const lines = [];
+              if (still.length) {
+                lines.push(`CI on ${short(head)} uses ${base}'s workflows and is waiting for approval` +
+                  (fork ? ' (a fork PR: a maintainer approves it)' : '') +
+                  `: approve ${links(still)} on the PR page ("Approve workflows to run").`);
+              } else if (ci) {
+                lines.push(`CI runs on it with ${base}'s workflows: ${links([ci])}.`);
+              } else {
+                lines.push(`ci.yml has not started for ${short(head)} yet. When it does it may wait for approval; ` +
+                  'comment `/ci-rerun` again then.');
+              }
+              return lines;
+            };
+
+            // Merges the base into the branch and handles the runs that starts.
+            // Returns false when the branch turned out to contain the base already.
+            const mergeBase = async (baseSha) => {
+              if (fork && !pr.maintainer_can_modify) {
+                await reply(`\`/ci-rerun\` cannot merge ${base} into a fork branch without "Allow edits by maintainers". ` +
+                  `Enable it, or merge ${base} into the branch and push.`);
+                return true;
+              }
+              try {
+                await github.rest.pulls.updateBranch({ owner, repo, pull_number: number, expected_head_sha: pr.head.sha });
+              } catch (e) {
+                const msg = String(e.message || e);
+                if (/no new commits/i.test(msg)) return false;
+                if (/conflict/i.test(msg)) {
+                  await reply(`\`/ci-rerun\`: this branch conflicts with ${base}. ` +
+                    `Merge ${base} into it, resolve the conflicts and push.`);
+                } else if (/expected head sha/i.test(msg)) {
+                  // Usually another /ci-rerun merged the base a moment earlier.
+                  const { data: now } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+                  const { data: moved } = await github.rest.repos.getCommit({ owner, repo, ref: now.head.sha });
+                  if (ourMerge(moved, pr.head.sha)) {
+                    const lines = [`${base} was just merged into this branch as ${short(now.head.sha)} by another \`/ci-rerun\`.`];
+                    lines.push(...await handleHeld(now.head.sha));
+                    await reply(lines.join('\n\n'));
+                  } else {
+                    await reply('`/ci-rerun`: the branch moved while this ran; comment again.');
+                  }
+                } else {
+                  await reply(`\`/ci-rerun\` could not merge ${base} into the branch (${e.status}: ${msg}). ` +
+                    `Merge ${base} into the branch and push.`);
+                }
+                return true;
+              }
+
+              // GitHub makes the merge commit asynchronously.
+              let head = pr.head.sha;
+              try {
+                for (let i = 0; i < 24 && head === pr.head.sha; i++) {
+                  await sleep(5000);
+                  head = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data.head.sha;
+                }
+                if (head === pr.head.sha) {
+                  await reply(`\`/ci-rerun\`: GitHub has not merged ${base} into the branch after two minutes; comment again later.`);
+                  return true;
+                }
+                const { data: merge } = await github.rest.repos.getCommit({ owner, repo, ref: head });
+                if (!ourMerge(merge, pr.head.sha)) {
+                  await reply(`\`/ci-rerun\`: the branch moved to ${short(head)}, which is not the merge this made; ` +
+                    'nothing was approved. Comment again if CI should run on it.');
+                  return true;
+                }
+                const lines = [`Merged the current ${base} (${short(baseSha)}) into this branch as ${short(head)}${why}.`];
+                lines.push(...await handleHeld(head));
+                lines.push('Pull before pushing to this branch again.');
+                await reply(lines.join('\n\n'));
+              } catch (e) {
+                await reply(`\`/ci-rerun\` merged ${base} into the branch` +
+                  (head !== pr.head.sha ? ` as ${short(head)}` : '') + `, then failed (${e.status || ''} ${e.message}). ` +
+                  'Comment `/ci-rerun` again to pick up its CI runs.');
+              }
+              return true;
+            };
+
+            const { data: { commit: { sha: baseSha } } } = await github.rest.repos.getBranch({ owner, repo, branch: base });
+            // A fork's head commit may only be reachable as owner:branch.
+            let cmp;
+            for (const head of [pr.head.sha, pr.head.label]) {
+              try {
+                ({ data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner, repo, basehead: `${baseSha}...${head}`, per_page: 1 }));
+                break;
+              } catch (e) {
+                core.warning(`compare ${short(baseSha)}...${head}: ${e.message}`);
+              }
+            }
+            if (!cmp) {
+              await reply(`\`/ci-rerun\`: could not compare the branch with ${base}; comment again later.`);
+              return;
+            }
+            if (cmp.behind_by > 0 && await mergeBase(baseSha)) return;
+
+            // The branch already contains the current base: re-run its latest run.
+            let ci = await latest('ci.yml', pr.head.sha);
+            // GitHub may still be creating the run for a just-pushed head.
+            for (let i = 0; i < 6 && !ci; i++) {
+              await sleep(10000);
+              ci = await latest('ci.yml', pr.head.sha);
+            }
+            if (!ci) {
+              await reply(`\`/ci-rerun\`: no \`pull_request\` run of ci.yml exists for the head commit ` +
+                `${short(pr.head.sha)}; push a commit to start one.`);
+              return;
+            }
+            if (held(ci)) {
+              // On a PR from this repo only a bot push is held (e.g. another
+              // /ci-rerun's merge), and approving it is safe; a fork waits for a person.
+              await reply([`The branch already has the current ${base}.`, ...await handleHeld(pr.head.sha)].join('\n\n'));
+              return;
+            }
+            // A run already going on a merge /ci-rerun made has the current base; a
+            // second comment should not restart it. A label that widens the lanes does.
+            if (ci.status !== 'completed' && label === 'ci-rerun') {
+              const { data: headCommit } = await github.rest.repos.getCommit({ owner, repo, ref: pr.head.sha });
+              if (ourMerge(headCommit)) {
+                await reply(`\`/ci-rerun\`: CI is already running on ${short(pr.head.sha)}, which has the current ${base}: ` +
+                  `${links([ci])}.`);
+                return;
+              }
+            }
+
             // Before CI routing every PR event also started a ci_cco.yml run of its
             // own; re-run one only next to the ci.yml run it was started with.
-            const ci = await latest('ci.yml'), cco = await latest('ci_cco.yml');
-            const paired = Boolean(ci && cco &&
-              Math.abs(Date.parse(ci.created_at) - Date.parse(cco.created_at)) < 120000);
+            const cco = await latest('ci_cco.yml', pr.head.sha);
+            const paired = Boolean(cco && Math.abs(Date.parse(ci.created_at) - Date.parse(cco.created_at)) < 120000);
             const rerun = [];
             for (let run of paired ? [ci, cco] : [ci]) {
-              if (!run) continue;
               // A run can only be re-run once it has finished.
               if (run.status !== 'completed') {
                 await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id }).catch(() => {});
@@ -100,20 +297,12 @@ jobs:
                 }
               }
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
-              rerun.push(`[${run.name}](${run.html_url})`);
+              rerun.push(links([run]));
             }
 
-            const lines = [];
-            const label = context.eventName === 'pull_request' ? context.payload.label.name : 'ci-rerun';
-            const why = label === 'ci-rerun' ? '' : ` with \`${label}\``;
-            if (rerun.length) lines.push(`Re-running ${rerun.join(' and ')} against the current main${why}.`);
+            const lines = [`The branch already has the current ${base}; re-running ${rerun.join(' and ')}${why}.`];
             if (paired) {
               lines.push('These runs predate CI routing, so the re-run runs every lane; ' +
                 'push a commit to get a run that picks lanes from the changed files.');
-            }
-            if (!ci) {
-              lines.push(`No \`pull_request\` run of ci.yml exists for the head commit ` +
-                `${pr.head.sha.slice(0, 8)} (e.g. it was pushed by a bot, whose pushes start no CI); ` +
-                'push a commit to start one.');
             }
             await reply(lines.join('\n\n'));
