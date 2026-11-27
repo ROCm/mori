@@ -892,7 +892,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             n_nodes * max_tokens_per_rank * 2, **i32
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
-        self.block_flag_counter = torch.zeros(n_nodes, **i32)
+        # Per node for the internode kernels; per peer for AsyncLL's shared send transfer.
+        self.block_flag_counter = torch.zeros(max(n_nodes, world_size), **i32)
         # AsyncLL only: recv slot -> the send-buffer slot it arrived in, written by
         # dispatch's RecvCopy and read by combine's SendCopy. One entry per slot
         # this rank can receive into.

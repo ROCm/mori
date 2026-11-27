@@ -90,7 +90,9 @@ struct EpInterNodeCfg {
   // run before any peer's wait can end -- a cross-rank deadlock.
   int asyncLlFusedRecvBlocks{0};
   // Grid ceiling for the AsyncLL send-side copy passes (SlotAssign, SendCopy,
-  // CombineSendCopy); 0 = the whole device.
+  // CombineSendCopy); 0 = the whole device. With direct sources and fused metadata
+  // it also sets DispatchSendTransferSeg's grid: asyncLlSendBlocks / worldSize blocks
+  // per peer (one when 0), up to the device.
   int asyncLlSendBlocks{0};
   // Same for the receive-side copy passes (RecvCopy, CombineRecvCopy, their segmented forms).
   int asyncLlRecvBlocks{0};

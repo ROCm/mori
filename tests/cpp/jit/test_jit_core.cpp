@@ -770,6 +770,28 @@ TEST(AsyncLLMode, SegmentedDispatchReceiveGridCoversTwoRowsPerThread) {
             256u);
 }
 
+TEST(AsyncLLMode, DirectSendTransferSplitsPeersByTheSendCeiling) {
+  EpInterNodeRequest request;
+  request.worldSize = 8;
+  request.gpuPerNode = 8;
+  request.mpCount = 256;
+  request.asyncLlMode = 1;
+  request.asyncLlDirect = true;
+  const auto grid = [&](bool fuseMeta, int sendBlocks) {
+    request.asyncLlFuseMeta = fuseMeta;
+    request.asyncLlSendBlocks = sendBlocks;
+    return EpAsyncLLGeometry(MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                                EpInterNodeFamily::AsyncLL),
+                             EpAsyncLLKernel::DispatchSendTransferSeg)
+        .gridX;
+  };
+  EXPECT_EQ(grid(true, 0), 8u);    // no ceiling: one block per peer
+  EXPECT_EQ(grid(true, 8), 8u);
+  EXPECT_EQ(grid(true, 32), 32u);  // four per peer
+  EXPECT_EQ(grid(true, 36), 32u);  // rounded down to the world size
+  EXPECT_EQ(grid(false, 32), 8u);  // only the fused-metadata transfer shares its peers
+}
+
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
   for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
     const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"

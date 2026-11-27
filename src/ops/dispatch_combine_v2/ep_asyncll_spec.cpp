@@ -25,6 +25,7 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_asyncll_spec.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -252,6 +253,12 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
       if (cfg.asyncLlDirect && (kind == EpAsyncLLKernel::DispatchSendTransfer ||
                                 kind == EpAsyncLLKernel::DispatchSendTransferSeg))
         geometry.blockX = static_cast<unsigned>(cfg.waveSize) * 16;
+      // With fused metadata the send ceiling also splits each peer's rows over ceiling /
+      // worldSize blocks (the kernel posts their shared tail once all have reserved).
+      if (cfg.asyncLlDirect && cfg.asyncLlFuseMeta &&
+          kind == EpAsyncLLKernel::DispatchSendTransferSeg && cfg.asyncLlSendBlocks > 0)
+        geometry.gridX = static_cast<unsigned>(
+            EpAsyncLLAlignGrid(std::min(cfg.asyncLlSendBlocks, cfg.mpCount), worldSize));
       geometry.sharedBytes = 0;
       break;
 

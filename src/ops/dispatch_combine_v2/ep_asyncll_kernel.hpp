@@ -519,17 +519,15 @@ __device__ __forceinline__ void DirectWriteMetaGroup(const EpDispatchCombineArgs
                                                      const EpInterNodeDeviceCfg& config,
                                                      size_t hiddenBytes, int stride, bool active,
                                                      int tok, int j, int baseLane, index_t dst,
-                                                     index_t index) {
+                                                     index_t index, float weight, uint8_t* staging,
+                                                     uint8_t* landing) {
   constexpr int numEpt = kConfig.numExpertPerToken;
   constexpr size_t kIndexBytes = numEpt * sizeof(index_t);
   constexpr size_t kWeightBytes = numEpt * sizeof(float);
   const int myPe = args.rank;
   const index_t null = NullSendBufSlotOffset(config);
-  uint8_t* staging = args.reg(args.offStaging)->template GetAs<uint8_t*>();
-  uint8_t* landing = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
   const SegLayout layout = SegLayoutOf(config, hiddenBytes);
   const SegLayout stagingLayout = SegStagingLayoutOf<kConfig>(config, hiddenBytes);
-  const float weight = (active && args.weightsBuf) ? args.weightsBuf[tok * numEpt + j] : 0.0f;
   for (int k = 0; k < numEpt; ++k) {
     const index_t d = __shfl(dst, (baseLane + k) & (warpSize - 1));
     if (!active || d >= null) continue;
@@ -671,6 +669,29 @@ __device__ __forceinline__ P* WaveUniform(P* p) {
   return reinterpret_cast<P*>(WaveUniformU64(reinterpret_cast<uint64_t>(p)));
 }
 
+// E floats to E T's in a 16-byte vector. bf16 on gfx950 uses the packed hardware convert (same
+// round-to-nearest-even as hip_bfloat16's, without its branchy software path).
+template <typename T, int E>
+__device__ __forceinline__ uint4 PackAccum(const float (&acc)[E]) {
+  uint4 r;
+#if defined(__gfx950__)
+  if constexpr (std::is_same_v<T, hip_bfloat16> || std::is_same_v<T, __hip_bfloat16>) {
+    typedef float F2 __attribute__((ext_vector_type(2)));
+    typedef __bf16 B2 __attribute__((ext_vector_type(2)));
+    uint32_t* w = reinterpret_cast<uint32_t*>(&r);
+#pragma unroll
+    for (int p = 0; p < E / 2; ++p)
+      w[p] =
+          __builtin_bit_cast(uint32_t, __builtin_convertvector(F2{acc[2 * p], acc[2 * p + 1]}, B2));
+    return r;
+  }
+#endif
+  T* y = reinterpret_cast<T*>(&r);
+#pragma unroll
+  for (int e = 0; e < E; ++e) y[e] = T(acc[e]);
+  return r;
+}
+
 template <typename T, int kTopk>
 __device__ __forceinline__ void CombineReduceRegs(T* out_, const T* const (&src_)[kTopk],
                                                   size_t nelems) {
@@ -713,10 +734,7 @@ __device__ __forceinline__ void CombineReduceRegs(T* out_, const T* const (&src_
 #pragma unroll
         for (int e = 0; e < E; ++e) acc[e] += float(x[e]);
       }
-    uint4 r;
-    T* y = reinterpret_cast<T*>(&r);
-#pragma unroll
-    for (int e = 0; e < E; ++e) y[e] = T(acc[e]);
+    uint4 r = PackAccum<T, E>(acc);
     __builtin_amdgcn_raw_buffer_store_b128(
         *reinterpret_cast<decltype(__builtin_amdgcn_raw_buffer_load_b128(ro, 0, 0, 0))*>(&r), ro,
         voff, 0, 0);
@@ -1064,16 +1082,17 @@ __device__ __forceinline__ void DirectPostRowsPerWarp(
 // Rows straight from the input, by every warp of the block: slot s goes to dst + s * hiddenBytes
 // from the source token whose SrcTokenIndex sits at srcTokAt + s * srcTokStride. Warp w posts
 // batches w, w + W, ...; a run of adjacent source tokens is one packet, and with scaleBytes a
-// second one carries the run's scale rows from args.scalesBuf to scaleDst. The caller follows
+// second one carries the run's scale rows from args.scalesBuf to scaleDst. With `parts` > 1 the
+// peer's batches are split over that many blocks (this one is `part`), each reserving its own;
+// returns true in the one block that reserved last (counted at `arrival`), so what that block
+// reserves next lands behind every block's rows. Always true with one part. The caller follows
 // with a block barrier before anything that must land behind the rows.
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args,
-                                               const ::mori::cco::ccoDevComm& comm,
-                                               const EpInterNodeDeviceCfg& config, int peer, int q,
-                                               uint8_t* dst, const uint8_t* srcTokAt,
-                                               size_t srcTokStride, int tokenNum,
-                                               size_t hiddenBytes, uint8_t* scaleDst = nullptr,
-                                               size_t scaleBytes = 0) {
+template <EpInterNodeKernelCfg kConfig, bool kSplit = false>
+__device__ __forceinline__ bool DirectPostRows(
+    const EpDispatchCombineArgs& args, const ::mori::cco::ccoDevComm& comm,
+    const EpInterNodeDeviceCfg& config, int peer, int q, uint8_t* dst, const uint8_t* srcTokAt,
+    size_t srcTokStride, int tokenNum, size_t hiddenBytes, uint8_t* scaleDst = nullptr,
+    size_t scaleBytes = 0, int part = 0, int parts = 1, int* arrival = nullptr) {
 #if MORI_ASYNCLL_BATCH_POST
   // All waves place the peer's runs at their run index; one reservation and doorbell per half ring.
   constexpr int kMaxBatches = (kConfig.maxNumInpTokenPerRank + 31) / 32;
@@ -1095,20 +1114,34 @@ __device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args
   const int groupStride = kReg * warpNum;
   const uint8_t* input = static_cast<const uint8_t*>(args.inpTokenBuf);
   const index_t firstSrcTok = SrcTokenIndex(config, args.rank, 0);
-  const int nb = (tokenNum + warpSize - 1) / warpSize;
+  // `parts` blocks share the peer, block `part` taking an even share of its 64-slot batches (a
+  // run never spans batches, so the split adds no packets). Each reserves and submits its own;
+  // the last to finish reserving, counted at `arrival`, returns true: anything the caller then
+  // reserves lands behind every block's rows.
+  const int nbAll = (tokenNum + warpSize - 1) / warpSize;
+  // kSplit is the caller's parts > 1: one part (the common case) compiles none of this.
+  const int bLo = kSplit ? nbAll * part / parts : 0;
+  const int nb = kSplit ? nbAll * (part + 1) / parts - bLo : nbAll;
   const unsigned long long below = (1ull << laneId) - 1ull;
   // Packets per run, and the runs a half-ring reservation holds.
   const int perRun = scaleBytes ? 2 : 1;
   const int chunkRuns = max(kChunkRuns / perRun, 1);
+  // Thread 0, after this block's last row reservation.
+  auto arrive = [&]() {
+    if constexpr (!kSplit) return true;
+    const bool last = atomicAdd(arrival, 1) == parts - 1;
+    if (last) *arrival = 0;  // every block has counted; the next round starts from zero
+    return last;
+  };
   // This lane's source token in batch b; the row is clamped into the slice so loads never branch.
   using GIndex = const __attribute__((address_space(1))) index_t*;
   auto srcTokOf = [&](int b) -> index_t {
-    const int row = max(min(b * static_cast<int>(warpSize) + laneId, tokenNum - 1), 0);
+    const int row = max(min((bLo + b) * static_cast<int>(warpSize) + laneId, tokenNum - 1), 0);
     return *(GIndex)(srcTokAt + static_cast<size_t>(row) * srcTokStride) - firstSrcTok;
   };
   // Lanes of batch b that start a run of adjacent source tokens.
   auto headsOf = [&](int b, index_t srcTok) -> unsigned long long {
-    const int slot = b * warpSize + laneId;
+    const int slot = (bLo + b) * warpSize + laneId;
     const index_t prev = __shfl_up(srcTok, 1);
     return __ballot((slot < tokenNum) && (laneId == 0 || prev + 1 != srcTok));
   };
@@ -1123,6 +1156,7 @@ __device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args
   ::mori::cco::ccoSdmaQueueDeviceHandle* const qh = WaveUniform(qhLoaded);
   uint32_t* const ring = WaveUniform(::mori::cco::ccoSdma::ring(qh));
   ::mori::cco::ccoSdmaQueueDeviceHandle h{};  // thread 0's copy for every reserve and publish
+  __shared__ bool lastBlock;                  // this block reserved the peer's last rows
   if (threadIdx.x == 0 && tokenNum > 0) h = *::mori::cco::impl::global(qh);
 #pragma unroll
   for (int i = 0; i < kReg; ++i) {
@@ -1159,6 +1193,7 @@ __device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args
       runBase =
           carry ? h.ReserveSlot(static_cast<uint64_t>(min(carry, chunkRuns)) * perRun * kPkt, qh)
                 : 0;
+      if (carry <= chunkRuns) lastBlock = arrive();
     }
   }
   __syncthreads();
@@ -1168,11 +1203,12 @@ __device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args
     auto place = [&](int b, index_t srcTok, unsigned long long heads) {
       const int g = runStart[b] + __popcll(heads & below);
       if (!((heads >> laneId) & 1ull) || g < lo || g >= hi) return;
-      const int active = min(tokenNum - b * static_cast<int>(warpSize), static_cast<int>(warpSize));
+      const int active =
+          min(tokenNum - (bLo + b) * static_cast<int>(warpSize), static_cast<int>(warpSize));
       const unsigned long long later =
           heads & ~((laneId + 1 >= 64) ? ~0ull : ((1ull << (laneId + 1)) - 1));
       const int end = later ? (__ffsll(static_cast<long long>(later)) - 1) : active;
-      const int slot = b * warpSize + laneId;
+      const int slot = (bLo + b) * warpSize + laneId;
       const uint64_t at = base + static_cast<uint64_t>(g - lo) * perRun * kPkt;
       ::mori::cco::ccoSdma::placeCopy(
           ring, at, dst + static_cast<size_t>(slot) * hiddenBytes,
@@ -1220,16 +1256,22 @@ __device__ __forceinline__ void DirectPostRows(const EpDispatchCombineArgs& args
       const int hi = min(lo + chunkRuns, total);
       placeRange(lo, hi, runBase, false);
       if (hi < total) {
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0) {
           runBase =
               h.ReserveSlot(static_cast<uint64_t>(min(chunkRuns, total - hi)) * perRun * kPkt, qh);
+          if (total - hi <= chunkRuns) lastBlock = arrive();
+        }
         __syncthreads();
       }
     }
   }
+  if constexpr (!kSplit) return true;
+  __syncthreads();
+  return lastBlock;
 #else
   DirectPostRowsPerWarp<kConfig>(args, comm, config, peer, q, dst, srcTokAt, srcTokStride, tokenNum,
                                  hiddenBytes, scaleDst, scaleBytes);
+  return true;
 #endif
 }
 
@@ -1326,6 +1368,11 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
 
   constexpr bool kFuseMeta = asyncll::Direct<kConfig> && MORI_ASYNCLL_FUSE_META;
   const int segStride = kFuseMeta ? asyncll::SegStrideOf(args, config) : 0;
+  // The fused field writes' bases, loaded ahead of the barriers they would otherwise follow.
+  uint8_t* const metaStaging =
+      kFuseMeta ? args.reg(args.offStaging)->template GetAs<uint8_t*>() : nullptr;
+  uint8_t* const metaLanding =
+      kFuseMeta ? args.reg(args.offDispatchInp)->template GetAs<uint8_t*>() : nullptr;
   // Fused field writes: spread the tokens over every block (whole warps' worth each), so a
   // few tokens still use the whole grid for the writes.
   int chunk = tokensPerBlock;
@@ -1355,6 +1402,7 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
     const int i = tokenId * numEpt + expertIdx;
     // A negative expert id is the caller's "drop this slot" sentinel.
     const index_t destExpert = active ? args.tokenIndices[i] : static_cast<index_t>(-1);
+    const float metaWeight = (kFuseMeta && active && args.weightsBuf) ? args.weightsBuf[i] : 0.0f;
     const bool dropped = (destExpert < 0);
     const index_t destPe = dropped ? 0 : (destExpert / config.numExpertPerRank);
 
@@ -1429,7 +1477,8 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
                                 ? SendBufSlotOffset(config, destPe, destTokId)
                                 : NullSendBufSlotOffset(config);
         asyncll::DirectWriteMetaGroup<kConfig>(args, config, hiddenBytes, segStride, active,
-                                               tokenId, expertIdx, baseLane, dst, destExpert);
+                                               tokenId, expertIdx, baseLane, dst, destExpert,
+                                               metaWeight, metaStaging, metaLanding);
       }
     }
     // blockClaims is reset at the top of the next round.
@@ -2848,13 +2897,21 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
   constexpr bool kInline =
       asyncll::Direct<kConfig> && MORI_ASYNCLL_FUSE_META && asyncll::InlineCount<kConfig>;
 
-  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+  // Direct sources: blockNum / npes blocks share each peer's rows (the send ceiling sets the
+  // grid); the one that reserves last posts the peer's tail. Otherwise one block per peer.
+  constexpr bool kShared = asyncll::Direct<kConfig> && MORI_ASYNCLL_BATCH_POST;
+  const int parts = kShared ? max(1, blockNum / npes) : 1;
+  for (int unit = blockId; unit < npes * parts; unit += blockNum) {
+    const int destPe = unit % npes;
+    const int part = unit / npes;
     const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
     const size_t tokenNum = static_cast<size_t>(min(raw, stride));
+    // This block reserved the peer's last rows, so it posts what follows them.
+    bool postTail = true;
     if constexpr (asyncll::Direct<kConfig> && MORI_ASYNCLL_FUSE_META) {
       // No SendCopySeg: stage this peer's count and the mode word here, written back to memory
       // before any packet that carries them.
-      if (warpId == 0 && laneId == 0) {
+      if (part == 0 && warpId == 0 && laneId == 0) {
         if (raw > stride) asyncll::SegCountError(args, config, asyncll::SegErrOverflow);
         if constexpr (!kInline) {
           *reinterpret_cast<uint64_t*>(words + asyncll::SendCountSlot(destPe)) =
@@ -2881,23 +2938,27 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
                           srcTokenIdBytes;
         // With fused metadata the scale rows ride the same runs instead of the staging.
         const bool scaleRuns = MORI_ASYNCLL_FUSE_META && args.scalesBuf && scaleBytes > 0;
-        asyncll::DirectPostRows<kConfig>(
-            args, comm, config, destPe - args.lsaBase,
-            asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
-            static_cast<uint8_t*>(asyncll::RegionPeerPtr(
-                landing, destPe - args.lsaBase,
-                layout.hidden + static_cast<size_t>(myPe) * stride * hiddenBytes)),
-            srcTokAt, srcTokenIdBytes, static_cast<int>(tokenNum), hiddenBytes,
-            scaleRuns ? static_cast<uint8_t*>(asyncll::RegionPeerPtr(
-                            landing, destPe - args.lsaBase,
-                            layout.scale + static_cast<size_t>(myPe) * stride * scaleBytes))
-                      : nullptr,
-            scaleRuns ? scaleBytes : 0);
+        auto post = [&](auto split) {
+          return asyncll::DirectPostRows<kConfig, decltype(split)::value>(
+              args, comm, config, destPe - args.lsaBase,
+              asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
+              static_cast<uint8_t*>(asyncll::RegionPeerPtr(
+                  landing, destPe - args.lsaBase,
+                  layout.hidden + static_cast<size_t>(myPe) * stride * hiddenBytes)),
+              srcTokAt, srcTokenIdBytes, static_cast<int>(tokenNum), hiddenBytes,
+              scaleRuns ? static_cast<uint8_t*>(asyncll::RegionPeerPtr(
+                              landing, destPe - args.lsaBase,
+                              layout.scale + static_cast<size_t>(myPe) * stride * scaleBytes))
+                        : nullptr,
+              scaleRuns ? scaleBytes : 0, part, parts, args.blockFlagCounter + destPe);
+        };
+        postTail = parts > 1 ? post(std::true_type{}) : post(std::false_type{});
       }
       __syncthreads();
     }
     if (warpId != 0) continue;
 
+    if (!postTail) continue;
     if (destPe == myPe) {
       if (laneId == 0) {
         if constexpr (kInline) {

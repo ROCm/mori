@@ -143,7 +143,10 @@ These options are read once when an op is constructed:
        passes: slot assignment and the dispatch and combine gathers (not the
        LSA transport's fused dispatch gather). A positive value is rounded down
        to a multiple of the world size, and up to the world size if smaller; it
-       never widens a pass's default grid.
+       never widens a pass's default grid. With ``MORI_ASYNCLL_DIRECT=1`` and
+       fused metadata (``MORI_ASYNCLL_FUSE_META``, on by default) in the
+       segmented layout it also sets the send transfer's blocks per peer,
+       ceiling / world size (one when 0), up to the device.
    * - ``MORI_ASYNCLL_RECV_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
        passes: the dispatch and combine receive copies, in either receive
