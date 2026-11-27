@@ -127,6 +127,31 @@ class AsyncLLOptionsTest(unittest.TestCase):
         with patch.dict(os.environ, {"MORI_ASYNCLL_DIRECT": "yes"}, clear=True):
             with self.assertRaises(ValueError):
                 resolve(1)
+
+    def test_direct_sources_default_on_for_segmented_gfx950(self):
+        resolve = EpDispatchCombineOpHip._asyncll_direct
+        seg = SimpleNamespace(async_ll_segmented=True, quant_type="none")
+        compact = SimpleNamespace(async_ll_segmented=False, quant_type="none")
+        quant = SimpleNamespace(
+            async_ll_segmented=False, quant_type="fp8_blockwise_1x128"
+        )
+        for env, mode, cfg, arch, expected in [
+            ({}, 1, seg, "gfx950", True),
+            ({}, 2, seg, "gfx950", True),
+            ({}, 0, seg, "gfx950", False),  # no early notification
+            ({}, 1, compact, "gfx950", False),
+            ({}, 1, quant, "gfx950", False),
+            ({}, 1, seg, "gfx942", False),
+            ({}, 1, seg, "gfx1250", False),
+            ({"MORI_ASYNCLL_DIRECT": ""}, 1, seg, "gfx950", True),
+            ({"MORI_ASYNCLL_DIRECT": "0"}, 1, seg, "gfx950", False),
+            ({"MORI_ASYNCLL_DIRECT": "1"}, 1, compact, "gfx942", True),
+        ]:
+            with (
+                self.subTest(env=env, mode=mode, cfg=cfg, arch=arch),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(mode, cfg, arch), expected)
         cfg = SimpleNamespace(async_ll_transport="sdma", nodes=1)
         seq = EpDispatchCombineOpHip._asyncll_seq(cfg, 1, direct=True)
         self.assertEqual(
@@ -516,7 +541,11 @@ class AsyncLLSegmentedTest(unittest.TestCase):
                 return EpDispatchCombineOp.per_rank_vmm(cfg, n_ops=n_ops, arch="gfx950")
 
         gib = 1 << 30
-        staged, direct = vmm({}), vmm({"MORI_ASYNCLL_DIRECT": "1"})
+        staged, direct = vmm({"MORI_ASYNCLL_DIRECT": "0"}), vmm(
+            {"MORI_ASYNCLL_DIRECT": "1"}
+        )
+        # "auto" resolves to segmented here, where direct sources are the default on gfx950.
+        self.assertEqual(vmm({}), direct)
         # cco rounds the slot to 4 GiB: 12 GiB per op staged, 8 GiB direct at 16k.
         self.assertTrue(8 * gib < staged <= 12 * gib, staged)
         self.assertTrue(7 * gib < direct <= 8 * gib, direct)

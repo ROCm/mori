@@ -575,7 +575,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The second value (MORI_ASYNCLL_SKIP_RESET) selects nothing; it is
             # parsed only so existing settings validate.
             self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
-            self._asyncll_direct_on = self._asyncll_direct(self._asyncll_mode)
+            self._asyncll_direct_on = self._asyncll_direct(
+                self._asyncll_mode, cfg, self._arch
+            )
             if self._asyncll_direct_on and not self._arch.startswith(
                 ("gfx942", "gfx950")
             ):
@@ -1165,7 +1167,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     cfg, async_ll_recv_layout="segmented" if supported else "compact"
                 )
             mode, _ = cls._asyncll_options(cfg, arch)
-            regions = asyncll_regions(cfg, direct=cls._asyncll_direct(mode))
+            regions = asyncll_regions(cfg, direct=cls._asyncll_direct(mode, cfg, arch))
         else:
             regions = internode_regions(cfg)
         # SymmArena's packing.
@@ -1335,7 +1337,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"quant_type={q!r} needs hidden_dim % 128 == 0, got {cfg.hidden_dim}"
             )
         try:
-            direct = self._asyncll_direct(self._asyncll_options(cfg, self._arch)[0])
+            direct = self._asyncll_direct(
+                self._asyncll_options(cfg, self._arch)[0], cfg, self._arch
+            )
         except ValueError:
             direct = False  # reported when the kernels are built
         if direct:
@@ -1677,15 +1681,26 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return (2 if fused else int(early)), skip_reset
 
     @staticmethod
-    def _asyncll_direct(mode):
-        # MORI_ASYNCLL_DIRECT=1: the copy engines read the caller's tokens in place (dispatch
-        # input, combine input) instead of a gathered staging copy, so neither may be written
+    def _asyncll_direct(mode, cfg=None, arch=""):
+        # Direct sources: the copy engines read the caller's tokens in place (dispatch input
+        # and scales, combine input) instead of a gathered staging copy, so none may be written
         # until the matching recv. Rides on early notification; mode 0 means this op has none
-        # (another transport, several nodes, or MORI_ASYNCLL_EARLY_NOTIFY=0).
-        value = os.environ.get("MORI_ASYNCLL_DIRECT", "0")
-        if value not in ("0", "1"):
+        # (another transport, several nodes, or MORI_ASYNCLL_EARLY_NOTIFY=0). Unset, it is on
+        # for the segmented layout on gfx950 without a quantized combine (`cfg` resolved, so
+        # every rank and per_rank_vmm agree); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
+        value = os.environ.get("MORI_ASYNCLL_DIRECT", "")
+        if value not in ("", "0", "1"):
             raise ValueError(f"MORI_ASYNCLL_DIRECT must be '0' or '1', got {value!r}")
-        return value == "1" and mode != 0
+        if mode == 0:
+            return False
+        if value:
+            return value == "1"
+        return bool(
+            cfg is not None
+            and cfg.async_ll_segmented
+            and cfg.quant_type == "none"
+            and arch.startswith("gfx950")
+        )
 
     @staticmethod
     def _asyncll_fuse_meta(direct, segmented):

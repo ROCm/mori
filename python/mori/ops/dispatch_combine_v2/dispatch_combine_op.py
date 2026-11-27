@@ -1585,7 +1585,7 @@ class EpDispatchCombineOp:
         if kernels is not self._kernels.dispatch:
             self._async_pending_dispatch_tokens = n
             self._async_pending_dispatch_input = input
-            # With MORI_ASYNCLL_DIRECT=1 the copy engines read the scale rows in place too,
+            # With direct sources the copy engines read the scale rows in place too,
             # until dispatch_recv drains them: keep the caller's tensor from being reused.
             self._async_pending_dispatch_scales = scales
             self._async_pending_dispatch_map = dest_map
@@ -1820,7 +1820,8 @@ class EpDispatchCombineOp:
         """Enqueue the send half of a dispatch and return immediately.
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
-        only valid after :meth:`dispatch_recv`. With MORI_ASYNCLL_DIRECT=1 the copy
+        only valid after :meth:`dispatch_recv`. With direct sources (MORI_ASYNCLL_DIRECT;
+        on by default for the segmented layout on gfx950) the copy
         engines read ``input`` and ``scales`` until then, so do not write either in
         between.
         """
@@ -1859,7 +1860,7 @@ class EpDispatchCombineOp:
     def combine_send(self, input, weights=None, indices=None, *, routing):
         """Enqueue the send half of a combine and return immediately.
 
-        With MORI_ASYNCLL_DIRECT=1 the copy engines read ``input`` until
+        With direct sources the copy engines read ``input`` until
         :meth:`combine_recv`, so do not write it in between."""
         self._asyncll_check_weight_fold(weights)
         with self._asyncll_call("combine_send"):
