@@ -285,8 +285,10 @@ class IMasterMetadataStore {
   virtual void UnregisterClient(const std::string& node_id) = 0;
 
   // Heartbeat ingestion. Atomically:
-  //   1. Looks up the client record; returns UNKNOWN if absent (no
-  //      other state touched).
+  //   1. Looks up the client record; returns UNKNOWN if absent, or if
+  //      EXPIRED and !is_full_sync (no other state touched). The reaper
+  //      already dropped an EXPIRED node's block locations, so a keepalive
+  //      or delta must not revive it; a full sync carries them all.
   //   2. If !is_full_sync and seq != last_applied_seq + 1, returns
   //      SEQ_GAP with acked_seq = last_applied_seq. SEQ_GAP still
   //      bumps last_heartbeat and sets status←ALIVE so the reaper

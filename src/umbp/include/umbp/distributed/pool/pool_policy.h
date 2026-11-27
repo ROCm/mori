@@ -48,6 +48,10 @@ struct PoolPlacementRequest {
   std::string backend_name;
   std::string logical_tier;
   int preferred_numa_node = -1;
+  // The GPU the writer's source lives on. Among HBM backends that are equal
+  // choices otherwise, the one on this GPU is tried first: the write is then a
+  // copy inside one GPU. Absent: no preference.
+  int preferred_device = -1;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot

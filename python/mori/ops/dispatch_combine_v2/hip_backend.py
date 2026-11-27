@@ -30,9 +30,11 @@ at launch.
 Two paths live here, selected by ``cfg.is_internode`` (world_size larger than
 gpu_per_node; there is no kernel_type enum on the v2 side):
 
-* intranode -- one dispatch kernel and one combine kernel, gather only, a
-  bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
-  (block, warp) the tuning schedule can select.
+* intranode -- one dispatch kernel and one combine kernel (a gather; on
+  gfx942/gfx950 also the quantized and unquantized scatters, on gfx125x the push),
+  a bf16/fp32/fp8/fp4 dispatch and a bf16/fp32 combine, one plan compiled per
+  (block, warp) the tuning schedule can select. On gfx942/gfx950 it also serves
+  local_expert_count and bf16 StdMoE.
 * internode -- a sequence of separately compiled passes over the
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
@@ -67,6 +69,7 @@ from mori.tensor_utils import from_gpu_ptr
 from . import ep_plans as cb
 from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
+from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
     asyncll_regions,
     asyncll_seg_layout,
@@ -212,17 +215,22 @@ def _hsa_cu_mask_cus(device_index: int, mp_count: int):
 
 
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
-    """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
+    """How many SDMA queues per pair to ask cco for (at least 1).
 
     `model` is detect_model()'s answer, None when the part is not one it knows.
 
     An explicit MORI_SDMA_NUM_CHANNELS is the operator saying what this machine
-    can take, so it wins: returning 0 lets cco fall through to it. Without that
-    deference this request silently beat the env knob, and the only way out of
-    the MI308X abort was to edit the source.
+    can take, so it wins. It is read here, clamped to 1..8 as anvil does: cco
+    creates queues only for an explicit count, so a 0 here would mean none.
+    Without that deference this request silently beat the env knob, and the
+    only way out of the MI308X abort was to edit the source.
     """
-    if os.environ.get("MORI_SDMA_NUM_CHANNELS"):
-        return 0
+    try:
+        env = int(os.environ.get("MORI_SDMA_NUM_CHANNELS", "0"))
+    except ValueError:
+        env = 0
+    if env >= 1:
+        return min(env, 8)
     want = min(8, max(1, gpu_per_node))
     cap = _ASYNCLL_SDMA_QUEUE_CAP.get(model)
     return min(want, cap) if cap else want
@@ -305,20 +313,32 @@ def _combine_info_cached(fields: tuple) -> dict:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
+PUSH_QGROUP = {
+    "fp4_blockwise_1x32": 32,
+    "fp4_blockwise_1x128": 128,
+    "fp8_blockwise_1x32": 32,
+}
 # The combine request fields each push quant type turns on.
 _PUSH_REQUEST = {
-    "fp4_blockwise": (("combine_fp4", 1),),
-    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
-    "fp8_blockwise": (("combine_fp8", 1),),
+    "fp4_blockwise_1x32": (("combine_fp4", 1),),
+    "fp4_blockwise_1x128": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise_1x32": (("combine_fp8", 1),),
 }
+
+
+def _push_quant(name):
+    """The explicit push quant type `name` means; the push combine is gfx125x."""
+    return resolve_quant_type(name, gfx125x=True)
 
 
 def push_wire_nbytes(cfg) -> int:
     """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
     plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
     cfg.quant_type; the push combine, and so this, is gfx125x only."""
-    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    fields = (
+        ("hidden_dim", int(cfg.hidden_dim)),
+        *_PUSH_REQUEST[_push_quant(cfg.quant_type)],
+    )
     return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
@@ -331,7 +351,7 @@ def push_land_rows(cfg) -> int:
         ("world_size", int(cfg.world_size)),
         ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
         ("num_expert_per_token", int(cfg.num_experts_per_token)),
-        *_PUSH_REQUEST["fp4_blockwise"],
+        *_PUSH_REQUEST["fp4_blockwise_1x32"],
     )
     return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
 
@@ -339,7 +359,12 @@ def push_land_rows(cfg) -> int:
 _CARD_COMBINE_ROWS_MAX = 2048
 
 
-_CARD_QUANT_TYPES = ("fp8_blockwise", "fp4_blockwise")
+_CARD_QUANT_TYPES = ("fp8_blockwise_1x32", "fp4_blockwise_1x32")
+# The gfx942/gfx950 scatter combine's wires (combine_scatter_q_group); e2m1 needs gfx950.
+_SCATTER_QUANT_TYPES = ("fp8_blockwise_1x32", "fp8_blockwise_1x128")
+_SCATTER_FP4_QUANT_TYPES = ("fp4_blockwise_1x32", "fp4_blockwise_1x128")
+# The AsyncLL combine's fp8 wires: elements per scale (EpInterNodeKernelCfg.combineQGroup).
+_ASYNCLL_QUANT_GROUPS = {"fp8_blockwise_1x32": 32, "fp8_blockwise_1x128": 128}
 
 
 def _card_layout(cfg):
@@ -428,7 +453,9 @@ class TokOffExt:
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
-    """C++/JIT-kernel EP op: gather combine, no quant, no replay.
+    """C++/JIT-kernel EP op: gather combine, the quantized combine, and on
+    gfx942/gfx950 the unquantized scatter combine, the recv cap, routing replay,
+    local_expert_count and StdMoE.
 
     Dispatch transports bf16/fp32/fp8/fp4, combine reduces in bf16/fp32, and the
     two need not match -- an fp8-in/bf16-out op is just two plans with different
@@ -454,7 +481,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
-        self._is1250 = _arch.split(":")[0].startswith("gfx125")
+        self._is1250 = is_gfx125x_arch(_arch)
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
@@ -965,6 +992,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._scale_row_bytes()
         return self._disp_infos[0]["scaleStride"]
 
+    def _dispatch_warps(self, cfg, spec):
+        """The warp count a dispatch plan of this schedule row is built with. The
+        dispatch's warps are its role split, so unless the caller pinned one the Cfg
+        derives it from the payload (0 asks for that) instead of taking the table's.
+
+        Pinned means the CALLER set it: _resolve_geometry has already filled the field
+        from the tuning table by the time a backend sees the config, so the field being
+        non-None says nothing. _pinned_geometry is the record of what was passed in."""
+        if not self._is1250 and "warp_num_per_block" not in cfg._pinned_geometry:
+            return 0
+        return spec.warp_per_block
+
     def _describe(self, cfg):
         """(dispatch infos, combine infos): every intranode variant, asked of
         describe(), which compiles nothing. Empty on the internode and AsyncLL
@@ -977,7 +1016,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 cb.EpDispatchPlan.describe(
                     **self._variant_request(disp, blocks),
                     block_num=spec.block_num,
-                    warp_per_block=spec.warp_per_block,
+                    warp_per_block=self._dispatch_warps(cfg, spec),
                     call_tok_max=cap,
                 )
                 for spec in self._dispatch_specs
@@ -1101,9 +1140,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.enable_std_moe:
             bad.append("enable_std_moe (not implemented on the AsyncLL path)")
         if cfg.quant_type != "none":
-            bad.append(
-                f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
-            )
+            bad.extend(self._asyncll_quant_unsupported(cfg))
         if cfg.async_ll_transport not in ("sdma", "lsa"):
             bad.append(
                 f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
@@ -1159,12 +1196,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if self._card["pull_blocks"]:
                 disp["card_pull_blocks"] = self._card["pull_blocks"]
         comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb["combine_fp8"] = True
+        if self._is1250:
+            for field, on in _PUSH_REQUEST.get(cfg.quant_type, ()):
+                comb[field] = bool(on)
+        elif cfg.quant_type != "none":
+            comb["combine_scatter_q_group"] = cfg.quant_group
+            if cfg.quant_element == "fp4":
+                comb["combine_scatter_fp4"] = True
+        elif cfg.is_scatter:
+            comb["combine_scatter_plain"] = True
         if self._card is not None and cfg.quant_type in _CARD_QUANT_TYPES:
             comb["card_combine"] = True
         geom = self._ll128_geom
@@ -1210,8 +1250,40 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    def _asyncll_quant_unsupported(self, cfg) -> list[str]:
+        """The quantized AsyncLL combine: the scatter's fp8 wire codec in the
+        compact SDMA combine's SendCopy / RecvCopy, on one wave64 node."""
+        q = cfg.quant_type
+        if q not in _ASYNCLL_QUANT_GROUPS or not self._arch.startswith(
+            ("gfx942", "gfx950")
+        ):
+            return [
+                f"quant_type={q!r} on {self._arch} (AsyncLL serves "
+                f"{', '.join(_ASYNCLL_QUANT_GROUPS)} on gfx942/gfx950)"
+            ]
+        bad = []
+        if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
+            bad.append(
+                f"quant_type={q!r} needs async_ll_transport='sdma' on one node: only "
+                "that combine quantizes"
+            )
+        if cfg.combine_dtype != torch.bfloat16:
+            bad.append(
+                f"quant_type={q!r} with combine dtype {cfg.combine_dtype} (bf16 only)"
+            )
+        if cfg.hidden_dim % 128:
+            bad.append(
+                f"quant_type={q!r} needs hidden_dim % 128 == 0, got {cfg.hidden_dim}"
+            )
+        return bad
+
     def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
         bad = []
+        if cfg.quant_type != "none":
+            bad.append(
+                "async_ll_recv_layout='segmented' with a quant_type: the segmented "
+                "combine sends the expert output in place, with no pass to quantize it"
+            )
         if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
             bad.append(
                 "async_ll_recv_layout='segmented' needs async_ll_transport='sdma' on one node: its "
@@ -1242,6 +1314,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         return bad
 
+    @classmethod
+    def _quant_formats(cls, arch):
+        # gfx125x pushes; gfx942/gfx950 scatter an fp8 wire, and gfx950 an e2m1 one too.
+        if is_gfx125x_arch(arch):
+            return _PUSH_QUANT_TYPES
+        if arch.startswith("gfx950"):
+            return _SCATTER_QUANT_TYPES + _SCATTER_FP4_QUANT_TYPES
+        return _SCATTER_QUANT_TYPES
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
         if cfg.async_ll:
@@ -1256,29 +1337,45 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         q = cfg.quant_type
-        push = q in _PUSH_QUANT_TYPES
-        if cfg.is_scatter and not push:
+        refused = self._quant_refusal(cfg, self._arch)
+        bad.extend(refused)
+        if cfg.is_scatter and q == "none" and self._is1250:
             bad.append(
-                "combine_mode='scatter' (gather only, except the push quant types "
-                f"{_PUSH_QUANT_TYPES})"
+                f"combine_mode='scatter' without a quant type on {self._arch} (gather "
+                f"only, or the push quant types {self._quant_formats(self._arch)})"
             )
-        if q != "none" and not push:
-            bad.append(f"quant_type={q!r}")
-        if push:
-            if not self._is1250:
-                bad.append(f"quant_type={q!r} (the push combine is gfx125x only)")
+        if q != "none" and not refused:
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
                     "(bf16 only)"
                 )
-            elif cfg.hidden_dim % 1024:
+            elif cfg.hidden_dim % (1024 if self._is1250 else 128):
                 bad.append(
                     f"quant_type={q!r} with hidden_dim={cfg.hidden_dim} "
-                    "(needs a multiple of 1024)"
+                    f"(needs a multiple of {1024 if self._is1250 else 128})"
                 )
         if cfg.enable_std_moe:
-            bad.append("enable_std_moe")
+            if self._is1250:
+                bad.append("enable_std_moe (gfx942/gfx950 only)")
+            elif (
+                cfg.dispatch_dtype is not torch.bfloat16
+                or cfg.combine_dtype is not torch.bfloat16
+            ):
+                bad.append(
+                    f"enable_std_moe with dtype {cfg.dispatch_dtype} (bf16 only)"
+                )
+            elif cfg.is_scatter:
+                bad.append("enable_std_moe with combine_mode='scatter' (gather only)")
+            elif cb.local_plan("ep_convert_dispatch") is None:
+                bad.append(
+                    "enable_std_moe (libmori_ops_v2.so predates the StdMoE kernels; "
+                    "rebuild it)"
+                )
+            elif why := self._local_refusal(
+                cfg, "ep_convert_dispatch", "ep_convert_combine"
+            ):
+                bad.append(f"enable_std_moe: {why}")
         # The kernel walks the source scale rows with the PADDED dword stride, so
         # a caller row that is not itself a whole number of dwords would be read
         # at the wrong pitch. _scale_i32 rounds up, which hides that from the Cfg
@@ -1290,14 +1387,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"(scale_dim={cfg.scale_dim} x {cfg.scale_type_size}); "
                 "the row must be a whole number of dwords"
             )
-        # The C++ validator rejects a shrunk cap: the recv capacity is also the
-        # flat-index stride, so an overflow re-encodes to the next peer instead
-        # of merely overrunning the region.
+        # Only the portable body drops the slots past a shrunk cap; the gfx125x
+        # body would encode them onto the next peer.
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
-        if cfg.effective_max_recv < worst:
+        if self._is1250 and cfg.effective_max_recv < worst:
             bad.append(
                 f"max_total_recv_tokens below the worst case "
-                f"({cfg.effective_max_recv} < {worst}); token dropping is not implemented"
+                f"({cfg.effective_max_recv} < {worst}); token dropping is not "
+                "implemented on gfx125x"
             )
         return tuple(bad)
 
@@ -1610,9 +1707,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             for name in names:
                 if name in plans_by_pass:
                     continue
+                leg = self._asyncll_leg(group)
                 request = self._asyncll_request(
-                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
+                    cfg, leg_dtype[leg], block_num, warp_per_block
                 )
+                # AsyncLL's kernels never read quantType; a quantized op tells
+                # only its combine passes the wire's group size, so the dispatch
+                # passes keep their modules.
+                request["quantType"] = "none"
+                if leg == "combine":
+                    request["combineQGroup"] = _ASYNCLL_QUANT_GROUPS.get(
+                        cfg.quant_type, 0
+                    )
                 plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the
@@ -2091,15 +2197,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         bound = dict(arena=arena, region_names=_REGIONS)
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
-        dispatch, combine = {}, {}
+        dispatch, combine, replay = {}, {}, {}
         for spec in self._dispatch_specs:
-            sized = []
+            sized, replayed = [], []
             for cap, blocks in self._dispatch_variants(cfg, spec):
                 plan = cb.EpDispatchPlan(
                     **self._variant_request(disp_req, blocks),
                     **bound,
                     block_num=spec.block_num,
-                    warp_per_block=spec.warp_per_block,
+                    warp_per_block=self._dispatch_warps(cfg, spec),
                     call_tok_max=cap,
                 )
                 plan.bind(rank=cfg.rank)
@@ -2107,7 +2213,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     plan.bind(staging_base=self.dispatch_staging)
                 self._plans.append(plan)
                 sized.append((cap, plan, self._card is not None and not blocks))
+                # Built eagerly, so a first replay inside a graph capture compiles nothing.
+                if not self._is1250:
+                    plan = cb.EpDispatchPlan(
+                        **disp_req,
+                        **bound,
+                        block_num=spec.block_num,
+                        warp_per_block=self._dispatch_warps(cfg, spec),
+                        call_tok_max=cap,
+                        replay=True,
+                    )
+                    plan.bind(rank=cfg.rank)
+                    self._plans.append(plan)
+                    replayed.append((cap, plan, False))
             dispatch[spec] = self._wrap_dispatch(sized)
+            if replayed:
+                replay[spec] = self._wrap_dispatch(replayed)
         for spec in self._combine_specs:
             plan = cb.EpCombinePlan(
                 **comb_req,
@@ -2153,14 +2274,118 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return KernelSet(
             dispatch=dispatch,
             combine=combine,
-            dispatch_replay=None,  # no replay path in this backend
+            dispatch_replay=replay or None,  # gfx125x has no replay body
+            **self._local_kernels(cfg),
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
             capabilities=frozenset(
-                {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
+                {"gather", "scales"}
+                | ({"scatter"} if cfg.is_scatter else set())
+                | ({"quant"} if cfg.quant_type != "none" else set())
+                | (set() if self._is1250 else {"recv_cap"})
+                | ({"replay"} if replay else set())
             ),
         )
+
+    @staticmethod
+    def _local_refusal(cfg, *names):
+        """Why the local plans `names` cannot be built for cfg, or None. Asks the
+        plans themselves (describe() runs EpLocalCfgIsValid and compiles nothing),
+        so the limits live in C++ only. The shape is what _local_kernels builds;
+        the grid and recv size do not bear on validity here."""
+        shape = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=0,
+            block_num=1,
+            warp_per_block=8,
+        )
+        for name in names:
+            rows = {}
+            if name != "ep_local_expert_count":
+                rows = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.dispatch_dtype)
+            try:
+                cb.local_plan(name).describe(**shape, **rows)
+            except RuntimeError as e:
+                return str(e)
+        return None
+
+    def _local_kernels(self, cfg):
+        """local_expert_count and the StdMoE converts: gfx942/gfx950 intranode."""
+        if self._is1250 or cb.local_plan("ep_local_expert_count") is None:
+            return {}
+        # Past the local kernels' limits the op serves dispatch and combine only.
+        if self._local_refusal(cfg, "ep_local_expert_count"):
+            return {}
+        self._alloc_local_buffers(cfg)
+        arena = self.arena
+        shape = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=self._recv_cap,
+        )
+
+        def plan(name, block_num, warp_per_block, **kw):
+            p = cb.local_plan(name)(
+                **shape, **kw, block_num=block_num, warp_per_block=warp_per_block
+            )
+            p.bind(rank=cfg.rank, out_idx=arena.local_ptr("out_idx"))
+            self._plans.append(p)
+            return p
+
+        def stream():
+            return torch.cuda.current_stream().cuda_stream
+
+        count = plan(
+            "ep_local_expert_count", cfg.dispatch_block_num, cfg.warp_num_per_block
+        )
+
+        def local_expert_count(*, total_recv, out):
+            count.launch(
+                stream=stream(),
+                total_recv=total_recv.data_ptr(),
+                expert_count=out.data_ptr(),
+            )
+
+        kernels = dict(local_expert_count=local_expert_count)
+        if not cfg.enable_std_moe:
+            return kernels
+        # Latency-bound local row copies: two 8-warp blocks a CU, not the comm grids.
+        conv = (2 * self._multi_processor_count, 8)
+        tok = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.dispatch_dtype)
+        packed = dict(
+            packed_x=self.packed_x.data_ptr(), slot_map=self.slot_map.data_ptr()
+        )
+        disp = plan("ep_convert_dispatch", *conv, **tok)
+        disp.bind(
+            expert_count=self.packed_count.data_ptr(),
+            disp_out=arena.local_ptr("disp_out"),
+            recv_to_src=arena.local_ptr("recv_to_src_token"),
+            packed_src=self.packed_src.data_ptr(),
+            **packed,
+        )
+        comb = plan("ep_convert_combine", *conv, **tok)
+        comb.bind(
+            out_wts=arena.local_ptr("out_wts"),
+            out_tok=arena.local_ptr("out_tok"),
+            **packed,
+        )
+
+        def convert_dispatch(*, total_recv):
+            disp.launch(stream=stream(), total_recv=total_recv.data_ptr())
+
+        def convert_combine(*, total_recv):
+            comb.launch(stream=stream(), total_recv=total_recv.data_ptr())
+
+        kernels.update(
+            convert_dispatch=convert_dispatch, convert_combine=convert_combine
+        )
+        return kernels
 
     def reset(self):
         super().reset()
@@ -2341,17 +2566,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._views[key] = view
         return view
 
-    def local_expert_count(self):
-        raise NotImplementedError(
-            "local_expert_count is flydsl-only; use backend='flydsl'"
-        )
-
-    def convert_dispatch_output(self):
-        raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
-
-    def convert_combine_input(self, routing):
-        raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
-
     # -- ops ---------------------------------------------------------------
 
     def set_active_qps(self, active_qps):
@@ -2460,7 +2674,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan, ll=False):
-        push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        push = self._is1250 and self.cfg.quant_type in _PUSH_QUANT_TYPES
         src_ptr = self.arena.local_ptr(
             "ll_recv_to_src_token" if ll else "recv_to_src_token"
         )
@@ -2564,7 +2778,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs:
+        if not self._is1250 or (
+            self.cfg.quant_type not in _PUSH_QUANT_TYPES and not self._push_specs
+        ):
             raise ValueError(
                 f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )

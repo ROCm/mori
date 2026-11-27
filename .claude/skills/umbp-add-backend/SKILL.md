@@ -201,7 +201,10 @@ between it and your device **inside** the backend:
 - `BatchCommit` spills that page to your device and **returns the page to the
   arena**. The page is borrowed for the write, not the key's home.
 - `BatchResolve` fills a staging page from your device and publishes it under a
-  **read lease**; a reaper reclaims the page when the lease expires.
+  **read lease**; a reaper reclaims the page when the lease expires. Override
+  `BatchFinishReads` to end the lease as soon as the remote readers that were
+  given the page report back, the way `SsdBackend` does; without it every read
+  holds its page for the full lease.
 
 The cost is one host copy per side. The benefit is that your medium reaches the
 data plane with **zero new transfer-layer concepts** — no new `TransferRef`

@@ -35,7 +35,6 @@ verified is that REPLAY keeps reproducing it, not just the first launch.
 import os
 import sys
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -54,6 +53,10 @@ K = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 16))
 CT = int(os.environ.get("CT", 512))  # one token count: a graph is a fixed shape
 REPLAYS = int(os.environ.get("REPLAYS", 5))
+# LEC=1: local_expert_count() between dispatch and combine, as SGLang's recorder.
+LEC = int(os.environ.get("LEC", 0))
+# STDMOE=1: convert_dispatch_output -> identity -> convert_combine_input in the step.
+STDMOE = int(os.environ.get("STDMOE", 0))
 
 
 class Dist:
@@ -108,6 +111,7 @@ def main():
             num_experts_per_rank=EPR,
             num_experts_per_token=K,
             data_type=torch.bfloat16,
+            enable_std_moe=bool(STDMOE),
         )
         op = EpDispatchCombineOp(cfg, comm)
         comm.barrier()
@@ -120,23 +124,37 @@ def main():
             recv_x, _w, _s, _i, _total, routing = op.dispatch(
                 inp, wts, None, idx, return_routing=True
             )
+            lec = op.local_expert_count() if LEC else None
+            if STDMOE:
+                op.convert_dispatch_output()
+                op.convert_combine_input(routing)
             out, _ow = op.combine(recv_x, routing=routing)
-            return out
+            return out, lec
 
         # Reference, eager.
-        out_eager = step().clone()
+        out_eager, lec_eager = step()
+        out_eager = out_eager.clone()
+        lec_eager = lec_eager.clone() if LEC else None
         sync()
         comm.barrier()
 
-        U = np.array(
-            [len({int(i) // EPR for i in idx[t].cpu().tolist()}) for t in range(CT)]
-        )
-        exp = (torch.from_numpy(U).view(CT, 1).float() * inp.float().cpu()).to(
-            torch.bfloat16
-        )
-        ok_eager = torch.allclose(
-            out_eager.float().cpu(), exp.float(), atol=1e-2, rtol=1e-2
-        )
+        if STDMOE:
+            # The identity expert telescopes to (sum_k w) * x.
+            scale = wts.float().cpu().sum(dim=1, keepdim=True)
+        else:
+            U = [len({int(i) // EPR for i in idx[t].cpu().tolist()}) for t in range(CT)]
+            scale = torch.tensor(U, dtype=torch.float32).view(CT, 1)
+        exp = (scale * inp.float().cpu()).to(torch.bfloat16)
+        tol = dict(atol=5e-2, rtol=5e-2) if STDMOE else dict(atol=1e-2, rtol=1e-2)
+        ok_eager = torch.allclose(out_eager.float().cpu(), exp.float(), **tol)
+        lec_exp = None
+        if LEC:
+            all_i = [torch.empty_like(idx.cpu()) for _ in range(npes)]
+            dist.all_gather(all_i, idx.cpu())
+            ids = torch.cat(all_i).flatten().long() - rank * EPR
+            ids = ids[(ids >= 0) & (ids < EPR)]
+            lec_exp = torch.bincount(ids, minlength=EPR).to(torch.int32)
+            ok_eager = ok_eager and torch.equal(lec_eager.cpu(), lec_exp)
 
         # Warm up on a side stream, the torch-documented prerequisite for capture.
         s = torch.cuda.Stream()
@@ -151,11 +169,11 @@ def main():
         # Capture. Nothing here executes on the GPU: a failed capture raises, and a
         # host sync inside the op would be the thing that raises.
         graph = torch.cuda.CUDAGraph()
-        captured = None
+        captured = captured_lec = None
         err = ""
         try:
             with torch.cuda.graph(graph):
-                captured = step()
+                captured, captured_lec = step()
         except Exception as e:  # noqa: BLE001 - reported, not swallowed
             err = f"{type(e).__name__}: {e}"
         ok_capture = err == ""
@@ -174,9 +192,9 @@ def main():
             graph.replay()
             sync()
             comm.barrier()
-            if not torch.allclose(
-                captured.float().cpu(), exp.float(), atol=1e-2, rtol=1e-2
-            ):
+            if not torch.allclose(captured.float().cpu(), exp.float(), **tol):
+                bad += 1
+            elif LEC and not torch.equal(captured_lec.cpu(), lec_exp):
                 bad += 1
         errs = d.allreduce_sum(bad) + d.allreduce_sum(0 if ok_eager else 1)
 
@@ -184,7 +202,8 @@ def main():
             print(
                 f"# GRAPH-CAPTURE: {'PASS' if errs == 0 else 'FAIL'} "
                 f"(capture ok, {REPLAYS} replays, ct={CT} hidden={HIDDEN} "
-                f"backend={op.backend_name}; eager={'ok' if ok_eager else 'BAD'})",
+                f"backend={op.backend_name} lec={LEC} stdmoe={STDMOE}; "
+                f"eager={'ok' if ok_eager else 'BAD'})",
                 flush=True,
             )
     d.shutdown()

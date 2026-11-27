@@ -32,6 +32,7 @@
 
 #include "mori/jit/v2/spec.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_local_cfg.hpp"
 
 namespace mori {
 namespace ops {
@@ -57,6 +58,10 @@ struct EpRequest {
   bool combineFp8 = false;
   bool tokOffExt = false;
   bool combineBf16Push = false;
+  int combineScatterQGroup = 0;      // gfx942/gfx950 fp8 scatter combine: 32 or 128; 0 = off
+  bool combineScatterFp4 = false;    // e2m1 on that wire instead (gfx950)
+  bool replay = false;               // dispatch: reuse a handle's slots (portable body)
+  bool combineScatterPlain = false;  // combine: unquantized scatter (gfx942/gfx950)
   int callTokMax = 0;
   bool ll128 = false;
   bool ll128CombineOnly = false;
@@ -86,6 +91,10 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineFp8);
   MORI_FIELD(tokOffExt);
   MORI_FIELD(combineBf16Push);
+  MORI_FIELD(combineScatterQGroup);
+  MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(replay);
+  MORI_FIELD(combineScatterPlain);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
   MORI_FIELD(ll128CombineOnly);
@@ -97,7 +106,7 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 24,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 28,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();
@@ -159,6 +168,31 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();
 };
+
+// ---------------------------------------------------------------------------
+// The local kernels (ep_local_cfg.hpp): one Cfg, three bodies, no arena.
+// ---------------------------------------------------------------------------
+enum class EpLocalKind { ExpertCount, ConvertDispatch, ConvertCombine };
+
+EpLocalCfg MakeEpLocalCfg(const std::string& arch, const EpLocalRequest& req, EpLocalKind kind);
+std::string EpLocalRequestSchema();
+std::string EpLocalInfo(const EpLocalCfg& cfg);
+
+#define MORI_EP_LOCAL_SPEC(CLASS, NAME)                               \
+  class CLASS : public mori::jit::v2::KernelSpec<CLASS, EpLocalCfg> { \
+   public:                                                            \
+    using Args = EpLocalArgs;                                         \
+    static constexpr const char* kName = NAME;                        \
+    static std::string EntryName(const Cfg& cfg);                     \
+    static std::string RenderSource(const Cfg& cfg);                  \
+    static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);    \
+    static const std::vector<std::string>& SourceDeps();              \
+  };
+
+MORI_EP_LOCAL_SPEC(EpLocalExpertCountSpec, "ep_local_expert_count")
+MORI_EP_LOCAL_SPEC(EpConvertDispatchSpec, "ep_convert_dispatch")
+MORI_EP_LOCAL_SPEC(EpConvertCombineSpec, "ep_convert_combine")
+#undef MORI_EP_LOCAL_SPEC
 
 }  // namespace v2
 }  // namespace ops

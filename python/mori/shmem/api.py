@@ -109,13 +109,16 @@ def shmem_torch_process_group_init(group_name: str):
     group = dist.distributed_c10d._resolve_process_group(group_name)
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
+    # PyTorch treats broadcast src as a *global* rank. Singleton EP groups
+    # (e.g. PP8 EP1: one rank per group) do not contain global rank 0.
+    src_global = dist.get_global_rank(group, 0)
 
     if rank == 0:
         uid = shmem_get_unique_id()
-        dist.broadcast_object_list([uid], src=0, group=group)
+        dist.broadcast_object_list([uid], src=src_global, group=group)
     else:
         uid_list = [None]
-        dist.broadcast_object_list(uid_list, src=0, group=group)
+        dist.broadcast_object_list(uid_list, src=src_global, group=group)
         uid = uid_list[0]
 
     return shmem_init_attr(MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, uid)

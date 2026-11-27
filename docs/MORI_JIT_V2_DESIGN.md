@@ -137,7 +137,7 @@ mori_ep_dispatch_bf16_ws8_h2048_k8_64x16(EpArgs args) { EpDispatchBody<kCfg, Tok
 - **文本即 key** → 配置不可能不进 key。
 - **`__launch_bounds__` 是表达式不是数字** → 由 host/device 共用的同一个 constexpr 算出。
 - **arch 路由在 host 侧**：include 哪个 body、调哪个函数，由 `RenderSource` 按
-  `GetToolchain().arch` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
+  `ActiveArch()` 决定——gfx125x 渲染 `ep_intranode_1250x.hpp` 的 TDM 版本，其余渲染 portable
   版。不是 device `#if`：渲染时看到的 arch 就是 `--offload-arch` 的 arch，两侧不可能不一致；而这个
   选择写在源码文本里，所以自动进 key，两种 body 各有自己的缓存条目。
   host 按前缀判断（`gfx125` 选 TDM body，`gfx12` 定 wave32），所以 `gfx1250-strict` 走的是与
@@ -220,8 +220,8 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 ```
 
 `MakeEpCfg` 也是拒绝非法组合的地方：`EpCfgIsValid` 不过就抛（token 字节数必须 16B 对齐、
-topk 和 worldSize 必须装进一个 wavefront、recv 容量必须覆盖最坏情况），combine 那条腿上的字节类型
-单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
+topk 和 worldSize 必须装进一个 wavefront），低于最坏情况的 recv 容量只在 gfx125x 上拒绝（那里的 body
+不丢 token），combine 那条腿上的字节类型单独拒绝（§3.7）。一个编不出来或跑错的 Cfg 是构造期错误，不是运行期的错误数字。
 
 ### 3.6 环境变量
 
@@ -319,9 +319,10 @@ kernel 内还是 host 侧）、`self_resets_counters`、`capabilities` / `unsupp
 ctypes plan 的关键字参数各自在 `_wrap_*` 里适配。
 
 **特性面是真包含不是交集**：HIP 后端做 gather combine，dispatch 收 bf16/fp32/fp8/fp4、combine 出
-bf16/fp32（§3.7），其余一概不接：scatter、量化（`quant_type`，与直接传已量化载荷是两回事）、
-StdMoE、per-token scales、routing replay、`local_expert_count`。能力门在**构造期**跑、且在分配 arena
-之前——问它要 scatter 会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
+bf16/fp32（§3.7）；带 `quant_type` 时做量化 scatter combine（gfx942/gfx950 是逐源 token 落地一行、
+本地反量化累加，gfx125x 是 push）。gfx942/gfx950 上另有非量化 scatter、`max_total_recv_tokens` 截断、routing
+replay、`local_expert_count` 和 bf16 StdMoE。能力门在**构造期**跑、且在分配 arena
+之前——问它要不支持的功能（如 gfx125x 上的非量化 scatter）会当场报错并列出缺什么，而不是发射时给出错误数字，也不会先占住一个对称 window
 再失败。
 
 `_regions` 归子类还消掉一个陷阱：FlyDSL 的 `off_out_tok` 对 dispatch 指 `disp_out`、对 combine 指
@@ -357,8 +358,8 @@ HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 b
 `KernelConfig`。
 单机的查表在构造 `EpDispatchCombineConfig` 时完成，`resolve_schedule()` 只把得到的 `cfg.schedule`
 转成 `ScheduleEntry`。只有 `cfg.kernel_backend`、`MORI_V2_KERNEL_BACKEND` 或架构默认值解析为 `hip`
-时才查 HIP 的表：`quant_type="none"` 时先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，再没有
-就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
+时才查 HIP 的表：先查 `IntraNodeV2` 表（量化时不用它的 combine 行，gfx125x 上量化时 dispatch 行也不用），
+某相没有规则时回退到 Python 表，再没有就用单档默认值；只给 dtype 字符串的调用方（如 aiter）也按它对应的 dtype 查表。否则 cfg 按 FlyDSL 的表
 解析：在 gfx942/gfx950 上既不设 `kernel_backend` 也不设 `MORI_V2_KERNEL_BACKEND` 就直接实例化
 `EpDispatchCombineOpHip`，HIP 沿用的是 FlyDSL 的几何。单机时只要显式给出 `cfg.schedule` 或任一
 block/warp 字段，整个 op 就不查表，未给的字段取单档默认值（dispatch 64×16、combine 80×4）；跨机忽略
@@ -447,9 +448,12 @@ dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` �
 **为什么是 ctypes**：边界只传指针和标量，没有类型转换可做。pybind11 的代价是编译期（aiter 实测
 libtorch+pybind11 的设备 pass 解析 ~15s）。绑定层里**没有 `import torch`**，靠鸭子类型取 `.data_ptr()`。
 
-**交叉编译是进程级模式**：工具链只解析一次 arch，`arch=` 在那之前经 `SetArchOverride()` 落到一个
-带锁的进程变量（不是 `setenv`——解析侧用 `getenv` 读，两线程并发建 plan 就是 POSIX 数据竞争）；
-`MORI_JIT_ARCH` 仍作为静态覆盖有效。与已解析的不一致会**报错**，不是静默地"按 A 渲染、按 B 编译"。
+**`arch=` 只作用于本次调用**：create / describe / precompile 的 `arch=` 经 `ScopedArch` 落到一个
+thread-local 变量，调用返回即撤销，所以不会带到之后的 plan。不是 `setenv`：解析侧用 `getenv` 读，两线程
+并发建 plan 就是 POSIX 数据竞争。渲染（`ActiveArch()`）和编译（`--offload-arch`、缓存 key）在同一次
+调用里读同一个值，不会"按 A 渲染、按 B 编译"。不传时用工具链的 arch：`MORI_JIT_ARCH`，否则 0 号设备。
+code object 只能在自己的目标上加载，所以编译前若目标与当前设备不同就直接**报错**，并指出 arch 来自
+`arch=` 还是 `MORI_JIT_ARCH`；这两者只对 describe 和 precompile 有意义。
 
 ## 7. 几个有证据的决定
 
@@ -514,8 +518,18 @@ gfx125x 的 TDM body（`ep_intranode_1250x.hpp`）同样是从 v1 机械移植�
 `_cusplit_*` 设备全局暂存池）原样保留。范围收到 hip 后端能服务的部分：非量化的 TDM dispatch +
 PULL/QUAD gather combine。
 
-**HIP 后端未实现**（由能力门在构造期拒绝）：scatter combine、`quant_type` 量化、StdMoE、per-token
-scales 转发、routing replay、`local_expert_count`。这些在 FlyDSL 后端都有。注意 fp8/fp4 **dispatch**
+**HIP 后端未实现**（由能力门在构造期拒绝）：gfx125x 上的非量化 scatter combine、
+`max_total_recv_tokens` 截断和 StdMoE（gfx125x 上的 routing replay 与 `local_expert_count` 不在门里拒绝，
+op 不声明这两个能力，调用时报 `NotImplementedError`）；这些在 FlyDSL 后端都有。
+
+gfx942/gfx950 的 dispatch 在 grid barrier 前让每个 block 用一次 `s_waitcnt` 排空自己的对端写（HIP 与
+FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_WINDOW=0`，或 ROCm 7.2.x 的 VMM
+路径忽略 uncached）按内存模型应改为每 block 一次 system release；但这些对端写不经 release 也已可见
+（`FRESH=1` 在 cached 窗口下同样通过），而 release 会让 dispatch 慢 6–40%，所以只做排空。
+`local_expert_count` 与 StdMoE 的两个 convert 是三个只读写本 rank 行的本地 kernel
+（`ep_local_kernels.hpp`，`ep_local_expert_count` / `ep_convert_dispatch` / `ep_convert_combine`
+三个 plan，自有的 `EpLocalCfg` / `EpLocalArgs`）；方法和输出 buffer 归父类，后端只在 `KernelSet`
+里交回 callable，能力由 callable 是否存在决定。注意 fp8/fp4 **dispatch**
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
 
 **cross-node 也有了**：`src/ops/dispatch_combine_v2/` 现在是三个 body 头文件——两个 intranode

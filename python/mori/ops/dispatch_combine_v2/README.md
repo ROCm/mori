@@ -9,11 +9,16 @@ backends:
   feature set (gather + scatter combine, fp8/fp4, quant, StdMoE, per-token
   scales, routing replay). Intranode only.
 - **hip** (the default on gfx125x): C++/HIP kernels JIT-compiled by the v2 JIT
-  framework. Gather combine in bf16/fp32; on gfx125x also the push (scatter)
-  combine with `fp8_blockwise` or fp4 quantization, and on gfx1250 a bf16 push
-  combine (see "HIP V2 configuration interface" below). The dispatch leg also
+  framework. Gather combine in bf16/fp32. With a `quant_type`, a quantized
+  combine: a scatter combine on gfx942/gfx950 and the push combine on gfx125x
+  (see "Combine quant types"). On gfx942/gfx950 a `max_total_recv_tokens` below
+  the worst case drops the slots past it, as FlyDSL does, `dispatch(...,
+  routing=handle)` replays a handle's slots, and `combine_mode="scatter"` without
+  a quant type runs an unquantized bf16/fp32 scatter combine. On gfx1250 also a bf16
+  push combine (see "HIP V2 configuration interface" below). The dispatch leg also
   carries fp8 and fp4 (transport only — it moves an already-quantized payload).
-  A dedicated gfx125x TDM body is selected by arch. **The only backend with an
+  A dedicated gfx125x TDM body is selected by arch. On gfx942/gfx950 it also
+  serves `local_expert_count()` and bf16 StdMoE (gather combine). **The only backend with an
   internode path** (bf16/f32/fp8, plus packed fp4 dispatch with bf16/fp32
   combine; no quant/StdMoE/scatter). Works on a machine with no FlyDSL. See
   `docs/MORI_JIT_V2_DESIGN.md`.
@@ -50,8 +55,9 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding (gather; scatter and push combines per arch); rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
+| `quant_types.py` | the combine quant type names, what each resolves to on this arch, and the format each names (see "Combine quant types") |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `internode_regions.py` | `internode_regions(cfg)`: the internode op's `SymmArena` region list — 17 named `(name, nbytes)` regions (16 plus `out_scales` when scales are on), in v1's allocation order and transcribed from what `EpDispatchCombineHandle` allocated |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
@@ -59,6 +65,62 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
 | `hip_tuning_configs.py` | **hip** configuration selection: `resolve_schedule(cfg)` returns `ScheduleEntry` rows for both intra and inter. Each phase has a `KernelConfig(family, block_num, warp_per_block, rdma_block_num, load_first, active_qps)`. Inter reads its CSV table; intra reads the `IntraNodeV2` table first and falls back to Python tables per phase, whose dispatch half is keyed by `dispatch_dtype_str` (bf16/fp8/fp4) and combine half by `quant_type`. File names come from `v2_table_filename()`; `read_v2_table()` / `write_v2_table()` parse, check and write the tables, and `save_internode_result()` merges a tuning result by selector |
 | `tuning_configs/*.csv` | V2 rules, one CSV per GPU model, kernel and EP size holding both phases: `{arch}_{model}_{kernel}_ep{n}.csv`, e.g. `gfx950_mi355x_InterNodeV2_ep16.csv`. Kernels are `InterNodeV2`, `InterNodeV2LL` and `IntraNodeV2`; `--cmd tuning --tuning-save` merges a rule into them. Columns and how the shipped rows were measured: [tuning_configs/README.md](tuning_configs/README.md) |
+
+## Combine quant types
+
+A quantized combine sends each expert row as fp8 or e2m1 elements plus
+per-group scales. `quant_type` names the format:
+
+| `quant_type` | elements | scale |
+|---|---|---|
+| `fp8_blockwise_1x32` | fp8 | one E8M0 per 32 elements (MXFP8) |
+| `fp4_blockwise_1x32` | e2m1 | one E8M0 per 32 elements (MXFP4) |
+| `fp8_blockwise_1x128` | fp8 | one f32 per 128 elements |
+| `fp4_blockwise_1x128` | e2m1 | one f32 per 128 elements |
+| `fp8_blockwise` / `fp4_blockwise` | as above | the arch's default group: 1x32 on gfx125x, 1x128 elsewhere |
+| `fp4_blockwise_fp32` | | the old name of `fp4_blockwise_1x128` |
+
+fp8 is the arch's own: e4m3fnuz on gfx942 (largest value 240), e4m3fn on gfx950
+and gfx125x (448); e2m1's largest value is 6. A 1x128 scale is the block's amax
+over the element's largest value, so every block spans the whole element range
+(a block whose amax is below that value times 2^-126 keeps scale 1); a 1x32 E8M0
+scale is the smallest power of two that brings the group's amax within it
+(`quant_types.e8m0_round_up`). The config stores the explicit name: after
+construction `cfg.quant_type` reads `fp8_blockwise_1x128` on a gfx942 config built
+with `fp8_blockwise`. `fp8_blockwise` and `fp4_blockwise` need the GPU arch; when it
+cannot be read, the config refuses them and asks for the explicit name.
+
+A backend that does not serve the resolved format refuses the config when the
+op is built, naming the arch and what it serves; nothing falls back to another
+format. `supported_quant_types(backend=None, arch=None)` returns the names a
+backend accepts on an arch, each mapped to its explicit format, without building
+an op. What each backend serves:
+
+| backend | gfx942 | gfx950 | gfx125x |
+|---|---|---|---|
+| flydsl | `fp8_blockwise_1x32`, `fp8_blockwise_1x128` (scatter) | as gfx942 | none |
+| hip | `fp8_blockwise_1x32`, `fp8_blockwise_1x128` (scatter) | as gfx942, plus `fp4_blockwise_1x32`, `fp4_blockwise_1x128` | `fp8_blockwise_1x32`, `fp4_blockwise_1x32`, `fp4_blockwise_1x128` (push) |
+
+The scatter combines quantize each expert row on the rank that computed it and
+write it into a landing row on the token's own rank; after one barrier that rank
+dequantizes and sums its rows. Both need a bf16 combine and a `hidden_dim` that
+is a multiple of 128.
+
+AsyncLL (`async_ll=True`, hip) also serves `fp8_blockwise_1x32` and
+`fp8_blockwise_1x128` on gfx942/gfx950, with its own gather combine rather than a
+scatter: combine SendCopy quantizes each expert row into its staging slot, the SDMA
+transfer moves the fp8 row and its scales, and combine RecvCopy dequantizes and
+sums. Same codec, same bf16 combine and `hidden_dim % 128` rules; SDMA transport
+on one node only, and not with the segmented receive layout (which sends the
+expert output in place). `supported_quant_types()` reports the intranode
+combines only. Plan field: `combineQGroup` (32 or 128) on the AsyncLL combine
+passes.
+
+Plan requests name the format with fields, not these strings: `combine_fp8` and
+`combine_fp4` select the 1x32 push combine, and `combine_fp4_f32_scale` turns
+the fp4 one into 1x128. `combine_scatter_q_group` (32 or 128) selects the
+gfx942/gfx950 scatter combine, and `combine_scatter_fp4` makes its elements e2m1;
+`combine_scatter_plain` selects the unquantized one.
 
 ## gfx125x dispatch: slot reservation
 
@@ -341,7 +403,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (QPs allocated, default 1), `--active-qps`, `--active-qp-counts` (under `--cmd test`/`stress` the ranks switch among them, deliberately out of step), `--tuning-qps` (active counts crossed with the geometry sweep), `--kernel-type auto\|v2\|v2_ll\|asyncll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase dispatch\|combine`) against the other's shipped value, or with `--tuning-phase pair` the dispatch/combine active QP pairs at the shipped geometry, and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`). **`bench` and `stress` need two nodes**: the script runs them only on the internode op and refuses them on one node. One host cannot emulate that op either, because it refuses a config whose node grouping disagrees with the communicator's LSA team. On one node, `test` and `tuning` build the intranode op instead, which is how the `IntraNodeV2` tables are tuned |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
-| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
+| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank; `MAXRECV=N` caps the recv pool; `REPLAY=1` replays each point's handle; `FRESH=1` reads the received rows straight behind dispatch; `REROUTE=N` adds N rounds of new routing with `local_expert_count` (and the StdMoE counts) read right after each; `STDMOE=1` runs the StdMoE converts |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs calls whose `max_num_inp_token_across_ranks` is at most `max_tok` on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, as snapshot handles, and through a handle rebuilt with `from_tensors`, each combine equal to the synced one bit for bit (a rebuilt handle without `max_num_inp_token_across_ranks` is refused); then calls whose ranks fall on both sides of `max_tok`, under each `low_latency`, `True` without the value raising at dispatch. Where the bf16 card fold is on (EP8 on 96-CU gfx1250 partitions), a snapshot of a schedule call must be refused before it launches and leave the next call's result as it was. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
@@ -350,7 +412,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_tuning_profile.py` | peak and capped profiles: capped keeps every gfx125x lookup within 64 blocks, reuses the peak rows that fit and falls back to the default (with a warning) elsewhere; peak is `lookup()`'s default; precedence of the config field, `MORI_EP_TUNING_PROFILE` and the device default. CPU only |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
-| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull` (default `push`, the fp4 combine: hip backend on gfx125x only), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure (except the scatter combines on gfx942/gfx950, which `test_op.py` checks). Every rank sends the point's token count and passes it as `max_num_inp_token_across_ranks`. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMB_MODE=push\|pull\|scatter` (default `push`: the quantized combine `PUSH_QUANT`, the push on gfx125x and the scatter on gfx942/gfx950; `scatter`: the unquantized scatter), `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 
@@ -557,6 +619,29 @@ because eager passed.
 
 `v1_asyncll` has no row either -- v1 is the shmem path and does not run on this
 arch.
+
+### Single-node, EP8 (MI355X gfx950): quantized combine
+
+hidden 7168, top-k 8, fp8 dispatch, SDMA transport, early notification (the
+gfx950 default), CUDA graph. Rank 0 rocprofv3 kernel trace, median round span
+(dispatch + combine) in us; arms run alternately, two or three clean runs each.
+
+| tok/rank | bf16 combine | `fp8_blockwise_1x128` | `fp8_blockwise_1x32` |
+|---:|---:|---:|---:|
+| 64   |  79.6 |  66.3 (-16.7%) |  66.2 (-16.8%) |
+| 2048 | 695.7 | 517.0 (-25.7%) | 516.4 (-25.8%) |
+
+The gain is mostly the wire: a 7168-element row goes from 14336 B to 7392 B, and
+the combine RecvTransfer at 2048 tokens from 337.6 to 178.2 us -- the SDMA link
+was already at its ceiling, so time tracks bytes. The two copy passes get cheaper
+as well, 58.6 to 36.4 us (SendCopy) and 38.5 to 31.1 us (RecvCopy), because of
+how they are written: a lane takes 16 elements (one 16 B fp8 access), the arena
+pointers are rebuilt in address space 1 so the accesses are global rather than
+flat, and RecvCopy reads a token's top-k slots in one go and issues every row's
+load before summing. Loading slot and row one at a time first cost 42.0 us
+(1x128) and 50.9 us (1x32): top-k serial round trips, slower than the bf16
+gather despite half the bytes. Round-trip error of an identity expert: worst row
+2.7% (1x128) and 2.8% (1x32) relative L2.
 
 ### Tried and rejected
 

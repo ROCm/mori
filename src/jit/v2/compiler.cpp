@@ -49,25 +49,21 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Why a load failed, when it is because the code object targets another arch.
-std::string ArchMismatchNote() {
-  int dev = 0;
-  hipDeviceProp_t props{};
-  if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&props, dev) != hipSuccess)
-    return "";
-  std::string devArch(props.gcnArchName);
-  devArch = devArch.substr(0, devArch.find(':'));
-  const std::string& built = GetToolchain().arch;
-  if (devArch == built) return "";
-  std::string note = ". The code object targets " + built + " but device " + std::to_string(dev) +
-                     " is " + devArch;
-  const bool gfx1250Pair = (built == "gfx1250" && devArch == "gfx1250-strict") ||
-                           (built == "gfx1250-strict" && devArch == "gfx1250");
-  if (gfx1250Pair)
-    note +=
-        ": gfx1250 and gfx1250-strict code objects each load only where the runtime "
-        "reports that target";
-  return note + " (MORI_JIT_ARCH or a plan's arch= overrides the device; unset it)";
+// A code object loads only on the arch it targets: refuse another before compiling it.
+void CheckLoadableArch(int dev, const std::string& target) {
+  const std::string devArch = DeviceArch(dev);
+  if (devArch.empty() || devArch == target.substr(0, target.find(':'))) return;
+  const std::string source = ActiveArchSource();
+  std::string msg = "mori jit: building for " + target + " (set by " + source + "), but device " +
+                    std::to_string(dev) + " is " + devArch +
+                    " and a code object loads only on the arch it targets";
+  if (target.rfind("gfx1250", 0) == 0 && devArch.rfind("gfx1250", 0) == 0)
+    msg += " (gfx1250 and gfx1250-strict are separate targets)";
+  if (source != "device 0")
+    msg +=
+        ". Leave arch= and MORI_JIT_ARCH unset to build for the device; they are for "
+        "describe() and precompile()";
+  throw std::runtime_error(msg);
 }
 
 }  // namespace
@@ -77,7 +73,7 @@ Module::Module(const std::string& hsacoPath, std::string entry)
   hipError_t err = hipModuleLoad(&module_, hsacoPath.c_str());
   if (err != hipSuccess) {
     throw std::runtime_error("mori jit: hipModuleLoad(" + hsacoPath +
-                             ") failed: " + hipGetErrorString(err) + ArchMismatchNote());
+                             ") failed: " + hipGetErrorString(err));
   }
   err = hipModuleGetFunction(&entry_, module_, entryName_.c_str());
   if (err != hipSuccess) {
@@ -199,7 +195,7 @@ Compiler& Compiler::Instance() {
 
 std::string Compiler::CacheDirFor(const std::string& name, const std::string& code,
                                   const std::vector<std::string>& sourceDeps) const {
-  const Toolchain& tc = GetToolchain();
+  const Toolchain tc = ActiveToolchain();
 
   Sha256 h;
   h.Update(name);
@@ -227,7 +223,7 @@ std::string Compiler::CacheDirFor(const std::string& name, const std::string& co
 
 std::string Compiler::EnsureCompiled(const std::string& name, const std::string& code,
                                      const std::vector<std::string>& sourceDeps) {
-  const Toolchain& tc = GetToolchain();
+  const Toolchain tc = ActiveToolchain();
   const std::string dir = CacheDirFor(name, code, sourceDeps);
 
   if (!CacheEntryValid(dir)) {
@@ -309,6 +305,7 @@ std::shared_ptr<Module> Compiler::Build(const std::string& name, const std::stri
     if (it != impl.modules.end()) return it->second;
   }
 
+  CheckLoadableArch(dev, ActiveArch());
   const std::string dir = EnsureCompiled(name, code, sourceDeps);
 
   auto mod = std::make_shared<Module>(dir + "/" + kObjectFile, entry);

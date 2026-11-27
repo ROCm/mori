@@ -76,10 +76,8 @@ struct vmmProcessLock {
 // one that most needs to say so. ERROR, not WARN -- the default global level is
 // ERROR. Not fatal: a comm without SDMA is legal and every other path works.
 //
-// `asked` covers both ways of asking -- an explicit sdmaQueueCount and
-// MORI_ENABLE_SDMA -- because the count defaults to 0 and almost every caller
-// leaves it there. Nobody asking is the default configuration, and not wanting
-// SDMA is not an error, so that case stays silent.
+// `asked` is an explicit sdmaQueueCount > 0. A count of 0 does not want SDMA,
+// which is not an error, so that case stays silent.
 void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
   if (!asked) return;
   MORI_SHMEM_ERROR(
@@ -90,13 +88,21 @@ void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
 
 void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
-  // Idempotent: first DevComm fixes the channel count; later ones reuse it.
+  // Idempotent: the first DevComm that asks fixes the channel count; later ones,
+  // including those that ask for 0, reuse it.
   if (comm->sdmaDevHandles != nullptr) {
     int want = std::min(requestedChannels, anvil::kMaxSdmaChannelsPerPair);
     if (want > 0 && want != comm->sdmaNumQueue) {
       MORI_SHMEM_WARN("sdmaQueueCount {} ignored; comm already has {}", requestedChannels,
                       comm->sdmaNumQueue);
     }
+    return;
+  }
+
+  // Only an explicit count creates queues; MORI_ENABLE_SDMA just permits them.
+  // Idle queues still cost: each KFD sdma_<gpu_id> read scans their registers.
+  if (requestedChannels <= 0) {
+    comm->sdmaNumQueue = 0;
     return;
   }
 
@@ -110,14 +116,13 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
   if (!(comm->ctx->IsSdmaEnabled() && anySdmaCapable)) {
     bool envOn = comm->ctx->IsSdmaEnabled();
     ccoSdmaReportNoQueues(
-        requestedChannels > 0 || envOn, requestedChannels,
+        true, requestedChannels,
         !envOn ? "MORI_ENABLE_SDMA is not enabled" : "no peer reports SDMA capability");
     comm->sdmaNumQueue = 0;
     return;
   }
 
-  // requestedChannels: reqs.sdmaQueueCount, 0 = env default. Adopt the count
-  // actually connected so device-side indexing stays in bounds.
+  // Adopt the count actually connected so device-side indexing stays in bounds.
   comm->ctx->EnsureSdmaTransport(requestedChannels);
   comm->sdmaNumQueue = comm->ctx->SdmaChannels();
 
@@ -152,7 +157,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     }
   }
 #else
-  ccoSdmaReportNoQueues(requestedChannels > 0 || comm->ctx->IsSdmaEnabled(), requestedChannels,
+  ccoSdmaReportNoQueues(requestedChannels > 0, requestedChannels,
                         "this mori was built BUILD_CCO_SDMA=OFF");
   comm->sdmaNumQueue = 0;
 #endif  // BUILD_CCO_SDMA
@@ -513,8 +518,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
 
-  // Step 2: context (RDMA endpoints + transport-type negotiation).
-  comm->ctx = new application::Context(*comm->bootNet);
+  // Step 2: context (peer capabilities). NICs stay closed until a peer needs RDMA (below).
+  comm->ctx = new application::Context(*comm->bootNet, /*deferRdma=*/true);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
   // Cache the bound device once (used by topology detection below and later by
@@ -757,6 +762,8 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
 
   // Every peer is LSA-mapped on a single node, so windows need no MR until a FULL DevComm.
   comm->windowMrsEnabled = comm->lsaSize < comm->worldSize;
+  // Peers outside the LSA team are reached over RDMA; otherwise only a FULL DevComm opens the NIC.
+  if (comm->lsaSize < comm->worldSize) comm->ctx->EnsureRdmaTransport();
 
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
@@ -1763,6 +1770,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                     reqs->version, CCO_API_VERSION);
   }
 
+  // FULL reaches LSA peers by NIC loopback; keyed on the requested type so all ranks open theirs.
+  if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL) comm->ctx->EnsureRdmaTransport();
   // GDA QPs go to gdaPeerMask, proxy QPs to proxyPeerMask (ccoProxy queues only).
   std::vector<bool> gdaPeerMask;
   ccoGdaConnectionType connType = CcoResolveConnection(comm, reqs->gdaConnectionType, &gdaPeerMask);
@@ -1804,6 +1813,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   }
   const bool proxyConnValid =
       proxyConnReq >= CCO_GDA_CONNECTION_NONE && proxyConnReq <= CCO_GDA_CONNECTION_RAIL;
+  // As for GDA: a FULL proxy connection reaches LSA peers by NIC loopback.
+  if (proxyConnReq == CCO_GDA_CONNECTION_FULL) comm->ctx->EnsureRdmaTransport();
   std::vector<bool> proxyPeerMask;
   const ccoGdaConnectionType proxyConnType =
       CcoResolveConnection(comm, proxyConnValid ? proxyConnReq : 0, &proxyPeerMask);
@@ -2182,7 +2193,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // handle was exported by the same process, so for SPMT we Allgather raw
   // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
   // (See shmem's SymmMemManager::Register for the same pattern.)
-  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = env default).
+  // Set up comm SDMA queues from reqs.sdmaQueueCount (0 = none).
   ccoSdmaSetupCommQueues(comm, reqs != nullptr ? reqs->sdmaQueueCount : 0);
 
   ccoSdmaContext& sdma = hostShadow.sdma;
@@ -2260,9 +2271,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                   comm->rank, numWindows, signalCount, counterCount, (void*)resourceWindow);
 
   // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
-  // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
-  // this DevComm has materialized resources for that transport — useful for
-  // verifying gdaConnectionType behavior end-to-end.
+  // peer's capability (canP2P/canSDMA/canRDMA; RDMA only once this comm has
+  // opened its NIC) alongside whether this DevComm has materialized resources
+  // for that transport — useful for verifying gdaConnectionType behavior end-to-end.
   if (const char* env = std::getenv("MORI_CCO_LOG_TRANSPORT")) {
     if (env[0] != '0') {
       const bool sdmaPoolActive =
@@ -2272,12 +2283,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       // interleaving when ranks fork-write to the same stderr concurrently.
       std::string buf;
       buf.reserve(256 + 64 * comm->worldSize);
-      char line[160];
+      char line[192];
       snprintf(line, sizeof(line),
                "[cco] DevComm rank=%d/%d connType=%s proxyConnType=%s — transport map "
-               "(CAP=hardware capability, ACT=materialized by this DevComm):\n",
+               "(CAP=capability, ACT=materialized by this DevComm%s):\n",
                comm->rank, comm->worldSize, CcoConnectionName(connType),
-               CcoConnectionName(proxyConnType));
+               CcoConnectionName(proxyConnType),
+               comm->ctx->GetRdmaContext() ? "" : "; NIC not opened, no peer needs RDMA");
       buf += line;
       buf += "  peer  | cap                | active\n";
       buf += "  ------+--------------------+--------------------\n";

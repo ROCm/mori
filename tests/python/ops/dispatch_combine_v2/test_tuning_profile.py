@@ -22,8 +22,10 @@
 """Tuning profiles: "peak" is the tuned tables, "capped" keeps every grid within 64 blocks."""
 
 import pytest
+import torch
 
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+from mori.ops.dispatch_combine_v2 import dispatch_combine_op as op
 from mori.ops.dispatch_combine_v2 import hip_tuning_configs as tc
 
 DTYPES = ("bf16", "fp8", "fp4")
@@ -149,7 +151,7 @@ def test_capped_push_row_without_a_peak_push_row(gfx1250, monkeypatch):
     shape = (4, 4096, 8, None)
     rows = ((None, 64, 24),)
     monkeypatch.setitem(
-        tc._CAPPED_COMBINE_PUSH_TABLE, "fp8_blockwise", {"gfx1250": {shape: rows}}
+        tc._CAPPED_COMBINE_PUSH_TABLE, "fp8_blockwise_1x32", {"gfx1250": {shape: rows}}
     )
     t = tc.lookup(4, 4096, 8, quant_type="fp8_blockwise", profile="capped")
     assert {row[3:] for row in t["schedule"]} == {(64, 24)}
@@ -219,3 +221,40 @@ def test_asyncll_stays_outside_the_profiles(gfx1250, caplog):
 def test_a_bad_profile_is_refused_even_with_pinned_geometry(gfx1250):
     with pytest.raises(ValueError, match="tuning_profile"):
         config(tuning_profile="lean", dispatch_block_num=64)
+
+
+@pytest.mark.parametrize(
+    "hidden, dtype, want",
+    [
+        (7168, torch.bfloat16, 16),
+        (7168, torch.float32, 8),
+        (10240, torch.bfloat16, 8),
+        (10240, torch.float32, 4),
+    ],
+)
+def test_gfx125x_dispatch_warps_fit_the_slabs(
+    gfx1250, monkeypatch, hidden, dtype, want
+):
+    # The bound is the row's slab, not the dtype (ROCm/mori#951): bf16 hits it too.
+    monkeypatch.setattr(op, "_gfx125x", lambda: True)
+    assert op._dispatch_warp_cap(hidden * dtype.itemsize) == want
+    # The single-shot default, and a tuned row: neither goes past the bound.
+    assert config(
+        hidden_dim=hidden, data_type=dtype, dispatch_block_num=64
+    ).warp_num_per_block == min(16, want)
+    cfg = config(hidden_dim=hidden, data_type=dtype)
+    assert cfg.warp_num_per_block <= want
+    assert all(bucket[2] <= want for bucket in cfg.schedule or ())
+
+
+def test_gfx125x_dispatch_warps_pinned_by_the_caller_are_left_alone(
+    gfx1250, monkeypatch
+):
+    monkeypatch.setattr(op, "_gfx125x", lambda: True)
+    cfg = config(
+        hidden_dim=10240,
+        data_type=torch.float32,
+        dispatch_block_num=64,
+        warp_num_per_block=16,
+    )
+    assert cfg.warp_num_per_block == 16

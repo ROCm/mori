@@ -41,6 +41,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
 #include "umbp/distributed/transfer/plan_builder.h"
+#include "umbp/distributed/transfer/restore_scheduler.h"
 
 namespace mori::umbp {
 
@@ -153,6 +154,22 @@ size_t DebugMaxSegments() {
 size_t DebugSummarySeconds() {
   static const size_t n = DebugEnvSize("UMBP_HBM_COPY_DEBUG_SUMMARY_SEC", 10);
   return n;
+}
+
+bool StripedRestoreEnabled() {
+  static const bool enabled = [] {
+    const char* policy = std::getenv("UMBP_HBM_RESTORE_SCHEDULER");
+    if (policy == nullptr || std::string(policy) == "off") return false;
+    if (std::string(policy) == "round_robin") return true;
+    MORI_UMBP_WARN("Unsupported UMBP_HBM_RESTORE_SCHEDULER '{}'; using native restores", policy);
+    return false;
+  }();
+  return enabled;
+}
+
+size_t RestoreChunkBytes() {
+  static const size_t bytes = DebugEnvSize("UMBP_HBM_RESTORE_CHUNK_BYTES", 128ULL << 20);
+  return bytes;
 }
 
 // One counter for the whole engine, so sampling thins the combined stream
@@ -355,6 +372,36 @@ std::atomic<bool>& GatherDisabled() {
   return disabled;
 }
 
+// Whether a kernel on `kernel_device` may dereference memory that lives on
+// `other`. Peer access makes it so, for ordinary and VMM allocations alike and
+// for a buffer another process shared over IPC. It is enabled once per ordered
+// pair, the first time a copy between the two GPUs comes up, and the answer is
+// kept; a pair without it keeps hipMemcpy.
+bool PeerAccessReady(int kernel_device, int other) {
+  static std::mutex* mutex = new std::mutex();
+  static auto* ready = new std::map<std::pair<int, int>, bool>();
+  std::lock_guard<std::mutex> lock(*mutex);
+  const auto key = std::make_pair(kernel_device, other);
+  auto found = ready->find(key);
+  if (found != ready->end()) return found->second;
+  bool ok = false;
+  int previous = -1;
+  (void)hipGetDevice(&previous);
+  if (hipSetDevice(kernel_device) == hipSuccess) {
+    int can = 0;
+    if (hipDeviceCanAccessPeer(&can, kernel_device, other) == hipSuccess && can != 0) {
+      const hipError_t status = hipDeviceEnablePeerAccess(other, 0);
+      ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
+    }
+  }
+  (void)hipGetLastError();
+  if (previous >= 0) (void)hipSetDevice(previous);
+  MORI_UMBP_INFO("[HbmCopyEngine] gather across GPUs {} -> {}: {}", other, kernel_device,
+                 ok ? "enabled" : "unavailable, keeping hipMemcpy");
+  (*ready)[key] = ok;
+  return ok;
+}
+
 // Which device a plan's copies should run on.  A D2D pair between two devices
 // needs a current device with peer access to both; we pick the destination's,
 // which is the one hipMemcpy attributes the copy to.
@@ -399,6 +446,21 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   // NT-AVX2 path, and overlapping the two engines would make composite
   // selection order load-bearing for performance.
   return IsGpu(src) || IsGpu(dst);
+}
+
+bool HbmCopyEngine::CanHandleSized(const TransferRef& src, const TransferRef& dst,
+                                   uint64_t item_bytes) const {
+  if (!CanHandle(src, dst)) return false;
+  // Opt-in: a large item between a registered host buffer and a registered GPU
+  // buffer belongs to MoriIoEngine's local loopback, which sits behind this
+  // engine in the composite.  An empty item is never yielded: the RDMA planner
+  // drops a zero-size item instead of carrying it, and with a floor of 0 that
+  // would turn today's no-op copy into a tag that never completes.
+  if (yield_registered_host_gpu_pairs_ && item_bytes > 0 && item_bytes >= yield_min_item_bytes_ &&
+      IsGpu(src) != IsGpu(dst) && src.HasMemoryDesc() && dst.HasMemoryDesc()) {
+    return false;
+  }
+  return true;
 }
 
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
@@ -496,8 +558,9 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
 // small-fragment batch the kernel wins on.  Direction does not partition the
 // buckets either: once the host side is registered both endpoints are
 // dereferenceable from the device, so one kernel can carry H2D and D2H
-// fragments at once.  D2D within one GPU joins the same bucket with nothing to
-// register: both of its endpoints are device addresses already.
+// fragments at once.  D2D joins the same bucket with nothing to register: both
+// of its endpoints are device addresses already, and between two GPUs peer
+// access lets the destination's kernel read the source's.
 //
 // Never reports a plan it did not fully complete.  Anything declined or failed
 // is left for the hipMemcpy loop, which reaches the same result whether or not
@@ -577,10 +640,12 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     const bool device_to_device = kind == hipMemcpyDeviceToDevice;
     if (device_to_device) {
       // Within one GPU both endpoints are addresses its kernel can use as they
-      // are.  Between two GPUs the kernel on one would have to dereference the
-      // other's memory, which nothing here arranges, so those copies stay with
-      // hipMemcpy.
-      if (plan.src.device < 0 || plan.src.device != plan.dst.device) {
+      // are.  Between two GPUs the kernel runs on the destination's and reads
+      // the source's memory, which peer access allows; without it those copies
+      // stay with hipMemcpy.
+      if (plan.src.device < 0 || plan.dst.device < 0 ||
+          (plan.src.device != plan.dst.device &&
+           !PeerAccessReady(plan.dst.device, plan.src.device))) {
         note(p, GatherSkip::kAcrossDevices);
         continue;
       }
@@ -746,6 +811,14 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
   } else {
     device_touched = true;
   }
+  auto map_host = [this](const void* ptr, size_t bytes, int device) {
+    return HostRegionDeviceAddress(ptr, bytes, device);
+  };
+  if (StripedRestoreEnabled() && TryStripedRestore(plans, map_host, RestoreChunkBytes())) {
+    if (device_touched && entry_device >= 0) (void)hipSetDevice(entry_device);
+    return std::make_unique<SettledHandle>(std::move(failures));
+  }
+
   const bool debug = DebugEnabled();
   std::vector<GatherSkip> skips;
   const std::vector<char> gathered = GatherEligiblePlans(plans, debug ? &skips : nullptr);
@@ -782,13 +855,27 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
     //
     // hipMemcpy is BLOCKING, so this loop is already launch-to-completion and
     // the debug clock below needs no synchronize of its own.
+    //
+    // Coalesce adjacent segments before issuing hipMemcpy.  When DRAM pages are
+    // sequential in both source and destination (the common case: a key's pages
+    // occupy a contiguous run in both the DRAM pool buffer and the caller's GPU
+    // buffer) each run merges into one large call.  This is critical on the H2D
+    // pageable path: hipMemcpy without hipHostRegister allocates a temporary
+    // pinned staging buffer per call, and the per-call overhead dominates for
+    // small (e.g. 64 KiB) pages — 32,000 calls × ~50 µs ≈ 1.6 s for 500 keys.
     size_t plan_bytes = 0;
     const auto started = std::chrono::steady_clock::now();
     hipError_t err = hipSuccess;
-    for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], plan.sizes[i], kind);
+    const size_t piece = HostRegistrationChunkBytes();
+    for (size_t i = 0; i < plan.sizes.size();) {
+      // Never across a host registration piece: the builder split there, and a
+      // merged call fails with "invalid argument" (CoalescedRunEnd).
+      size_t coalesced = 0;
+      const size_t j = CoalescedRunEnd(plan, i, piece, &coalesced);
+      err = hipMemcpy(dst + plan.dst_offsets[i], src + plan.src_offsets[i], coalesced, kind);
       if (err != hipSuccess) break;
-      plan_bytes += plan.sizes[i];
+      plan_bytes += coalesced;
+      i = j;
     }
     if (debug && err == hipSuccess) {
       const double seconds = Seconds(started, std::chrono::steady_clock::now());

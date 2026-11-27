@@ -11,23 +11,6 @@ on:
     # act through ci-rerun.yml, which re-runs this workflow when one is added.
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
-    inputs:
-      run_umbp_single_node_hicache:
-        type: boolean
-        default: false
-        description: Run UMBP single-node hicache smoke test
-      sglang_repo:
-        type: string
-        default: "sgl-project/sglang"
-        description: owner/repo to checkout for SGLang
-      sglang_ref:
-        type: string
-        default: "main"
-        description: branch, tag, or SHA for SGLang checkout
-      enable_dp:
-        type: boolean
-        default: false
-        description: Enable DP/EP modes when launching the hicache test
 permissions:
   contents: read
 
@@ -321,19 +304,25 @@ jobs:
               timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
           "
 
-      - name: MORI-IO C++ (test_engine, test_transfer_wait)
+      - name: MORI-IO C++ (test_engine, test_transfer_wait, test_fence)
         if: contains(fromJSON(needs.scope.outputs.groups), 'io')
         run: |
           # `pip install .` leaves BUILD_TESTS off, so the tests are built here.
           # Its XGMI hidden-device cases re-launch the binary under a narrower
           # HIP_VISIBLE_DEVICES, so the parent must see every GPU.
+          # test_fence pins host-memory engines to one NIC: they are otherwise spread
+          # round-robin, and two NICs of one node need not reach each other. It runs
+          # again with 4 QPs per transfer, so a fence cuts transfers spread over QPs.
+          # test_fence_xnode needs two nodes and is run by hand.
           $CT exec $CONTAINER bash -c "
             set -e
             cd $GITHUB_WORKSPACE
             cmake -B build_io -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
-            cmake --build build_io -j --target test_engine test_transfer_wait
+            cmake --build build_io -j --target test_engine test_transfer_wait test_fence
             timeout 300 ./build_io/tests/cpp/test_engine
             timeout 120 ./build_io/tests/cpp/test_transfer_wait
+            MORI_IO_RDMA_NIC_IDX=0 timeout 120 ./build_io/tests/cpp/test_fence
+            MORI_IO_RDMA_NIC_IDX=0 MORI_IO_QP_PER_TRANSFER=4 timeout 120 ./build_io/tests/cpp/test_fence
           "
 
       - name: MORI-RAS C++
@@ -729,6 +718,14 @@ jobs:
             timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
           "
 
+      - name: MORI-EP JAX MoE example
+        run: |
+          $CT exec ${CONTAINER}_jax bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+            timeout 300 python3 examples/ops/dispatch_combine/moe_block_jax.py
+          "
+
       - name: Cleanup
         if: always()
         run: |
@@ -778,7 +775,8 @@ jobs:
       - name: Start container
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
-          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+          # io_uring on: the SSD tier's io_uring storage driver is tested here.
+          MORI_CI_ALLOW_IO_URING=1 CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -797,13 +795,32 @@ jobs:
             timeout 60 pytest tests/python/umbp/ -v
           "
 
+      # Every test registered under tests/cpp/umbp, selected by directory and
+      # not by name.  A name filter ('^umbp_') silently skipped each test whose
+      # add_test() name lacked the prefix: they were built here and never run.
       - name: UMBP C++ unit tests (local + distributed)
         run: |
           $CT exec -e MORI_UMBP_LOG_LEVEL=warn $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE/build
-            timeout 300 ctest --output-on-failure \
-              -R '^(umbp_|test_dummy_ssd_tier|test_ssd_tier)'
+            cd $GITHUB_WORKSPACE/build/tests/cpp/umbp &&
+            timeout 300 ctest --output-on-failure --no-tests=error
           "
+
+      # A test that asks for the io_uring backend still passes when the
+      # container cannot create a ring: the SSD tier falls back to the POSIX
+      # driver with a warning, and the driver-level cases print SKIPPED.  Fail
+      # here instead, so the io_uring driver cannot drop out of CI unnoticed.
+      - name: UMBP io_uring tests ran on io_uring
+        run: |
+          $CT exec $CONTAINER bash -c '
+            cd '"$GITHUB_WORKSPACE"'/build/tests/cpp/umbp &&
+            log=Testing/Temporary/LastTest.log &&
+            test -f "$log" || exit 1
+            grep -E "io_uring.*\.\.\. " "$log" || true
+            if grep -n -E "io_uring unavailable|falling back to POSIX backend" "$log"; then
+              echo "::error::io_uring is not usable in the test container; the io_uring tests ran on POSIX or skipped"
+              exit 1
+            fi
+          '
 
       # Five client primitives -- put / get / exists / put_ranges / get_ranges
       # -- swept over 1, 2, 4 and 8 concurrent client processes, against a
@@ -845,7 +862,8 @@ jobs:
     name: mori internode test (${{ matrix.platform }})
     # Not on build: that runs on another runner, and this job builds mori itself.
     needs: scope
-    if: needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
+    # Off: MI355X-AINIC, this job's only runner, is down.
+    if: false && needs.scope.outputs.mori == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -1507,68 +1525,6 @@ jobs:
     env: *internode-env
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps: *internode-steps
-
-  umbp-single-node-hicache:
-    name: mori umbp single-node hicache smoke test
-    needs: build
-    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache
-    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
-    timeout-minutes: 180
-    steps:
-      - name: Fix workspace permissions
-        run: |
-          WS="${GITHUB_WORKSPACE}"
-          if [ -d "$WS" ]; then
-            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
-              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
-          fi
-
-      - name: Checkout MoRI
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-          # A re-run (run_attempt > 1) checks out the PR merged with the current
-          # main; otherwise it would reuse the merge commit of the first attempt.
-          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
-
-      - name: Checkout SGLang
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.sglang_repo }}
-          ref: ${{ inputs.sglang_ref }}
-          path: sglang
-          fetch-depth: 1
-
-      - name: Ensure hicache script is executable
-        run: chmod +x src/umbp/scripts/run_umbp_single_node_hicache.sh
-
-      - name: Run hicache smoke test
-        env:
-          SGLANG_REPO: ${{ github.workspace }}/sglang
-          MORI_REPO: ${{ github.workspace }}
-          RESULTS_DIR: ${{ github.workspace }}/umbp_single_node_results
-          USE_DUMMY_WEIGHTS: "true"
-          RUN_GSM8K: "false"
-          MODEL_PATH: ${{ github.workspace }}/umbp_dummy_model
-          ENABLE_DP: ${{ inputs.enable_dp }}
-          START_UMBP_MASTER: "false"
-        run: |
-          set -euo pipefail
-          mkdir -p "$RESULTS_DIR"
-          ./src/umbp/scripts/run_umbp_single_node_hicache.sh
-
-      - name: Upload hicache artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: umbp-single-node-hicache-${{ github.run_id }}
-          path: |
-            ${{ github.workspace }}/umbp_single_node_results
-          if-no-files-found: warn
-
-      - name: Cleanup hicache container
-        if: always()
-        run: docker rm -f umbp-single-node >/dev/null 2>&1 || true
 
   cco:
     name: CCO

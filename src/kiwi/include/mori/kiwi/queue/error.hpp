@@ -61,7 +61,7 @@ class queue_error : public std::runtime_error {
 #endif
 
 // Check HIP call and throw on failure
-#define HIP_CHECK(call)                                                                           \
+#define KIWI_HIP_CHECK(call)                                                                      \
   do {                                                                                            \
     hipError_t err_ = (call);                                                                     \
     if (err_ != hipSuccess) {                                                                     \

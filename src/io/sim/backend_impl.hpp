@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/transport/tcp/tcp.hpp"
@@ -121,6 +122,11 @@ class SimBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool PopPeerFailure(PeerFailureEvent* out) override;
+  // Cuts the peer's control-plane connections, the stand-in for its QPs, and fails transfers
+  // in flight toward it. XGMI has nothing to cut and, as XgmiBackend, reports a same-node peer
+  // as not cut off.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
+  bool UnfenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   void Submit(const MemoryDesc& local, const SizeVec& localOffsets, const MemoryDesc& remote,
@@ -133,8 +139,14 @@ class SimBackend : public Backend {
     EngineDesc desc;
     std::mutex mu;  // serializes this peer's control-plane socket
     std::optional<application::TCPEndpointHandle> ep;
+    // Bumped under `mu` by each new connection; a transfer submitted on an earlier one fails
+    // on completion, as one on a QP that has since been replaced.
+    uint64_t connGen{0};
     std::atomic<bool> dead{false};
     std::unordered_map<MemoryUniqueId, size_t> verifiedMems;
+    // Bumped under `mu` by each fence; a transfer submitted before it fails on completion.
+    std::atomic<uint64_t> fenceEpoch{0};
+    std::atomic<int> inFlight{0};
   };
 
   struct Completion {
@@ -143,18 +155,30 @@ class SimBackend : public Backend {
     TransferStatus* status;
     TransferUniqueId id;
     std::shared_ptr<Peer> peer;  // null for XGMI, which has no control plane
+    uint64_t fenceEpoch{0};
+    uint64_t connGen{0};
     bool operator>(const Completion& o) const {
       return deadline != o.deadline ? deadline > o.deadline : seq > o.seq;
     }
   };
 
   bool HasControlPlane() const { return type_ != BackendType::XGMI; }
+  bool IsFenced(const EngineKey& remote) const;
   bool IsSameNode(const EngineKey& remote) const;
   std::shared_ptr<Peer> GetPeer(const EngineKey& remote) const;
+  // The current Peer for `remote` and the earlier ones still alive: a peer deregistered or
+  // replaced while its transfers were in flight keeps their connection until they complete.
+  std::vector<std::shared_ptr<Peer>> PeerIncarnations(const EngineKey& remote) const;
+  // Keeps `peer`, which is leaving peers_, reachable by a fence. Called under peersMu_.
+  void RetirePeerLocked(const EngineKey& remote, const std::shared_ptr<Peer>& peer);
   // Connects and checks the remote memory once, as RdmaBackend does when it builds QPs and MRs.
   void EnsurePeerReady(const std::shared_ptr<Peer>& peer, const MemoryDesc& remote);
   bool PeerSocketClosedLocked(Peer& peer);
   void MarkPeerDead(Peer& peer, const std::string& detail);
+  // The connection to `peer` broke (the peer closed it, or a write failed): report it and
+  // drop it, so the next transfer connects again. Only a peer nothing listens for is dead.
+  void DropPeerConnectionLocked(Peer& peer, const std::string& detail);
+  void ReportPeerUnreachable(const Peer& peer, const std::string& detail);
   std::chrono::steady_clock::time_point ReserveLink(bool isRead, size_t bytes, size_t segments);
 
   void TimerLoop();
@@ -173,6 +197,11 @@ class SimBackend : public Backend {
 
   mutable std::mutex peersMu_;
   std::unordered_map<EngineKey, std::shared_ptr<Peer>> peers_;
+  std::unordered_map<EngineKey, std::vector<std::weak_ptr<Peer>>> retiredPeers_;  // peersMu_
+  std::unordered_set<EngineKey> fencedPeers_;  // guarded by peersMu_
+  // As XgmiBackend: never forgotten, since deregistering does not revoke an IPC mapping.
+  std::unordered_map<EngineKey, bool> peerOnThisNodeSeen_;  // guarded by peersMu_
+  std::atomic<bool> exportedMemory_{false};
 
   std::mutex memsMu_;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems_;
@@ -199,6 +228,10 @@ class SimBackend : public Backend {
   int epfd_{-1};
   std::atomic<bool> serverRunning_{false};
   std::unordered_map<int, application::TCPEndpointHandle> serverConns_;
+  // Which engine each accepted connection belongs to, learned from its first message, so a
+  // fence can shut it down from the caller's thread. The server thread owns serverConns_.
+  std::mutex serverConnKeysMu_;
+  std::unordered_map<int, EngineKey> serverConnKeys_;
   std::thread serverThd_;
 };
 

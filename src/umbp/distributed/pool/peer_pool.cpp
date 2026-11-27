@@ -562,6 +562,23 @@ void PeerPool::TransitionWorkerLoop() {
   }
 }
 
+// Moves the HBM backend on the writer's GPU to the front of `order`, when the
+// policy's choices up to it are HBM too: it only reorders equals, never lifts a
+// lower tier over a higher one. The rest keep their order as the fallbacks.
+void PeerPool::PreferSourceDevice(int device, std::vector<uint32_t>* order) const {
+  if (device < 0 || order->size() < 2) return;
+  for (size_t i = 0; i < order->size(); ++i) {
+    auto* backend = backends_->Get((*order)[i]);
+    if (backend == nullptr || backend->Tier() != TierType::HBM || backend->BufferCount() == 0)
+      return;
+    const TransferRef buffer = backend->BufferRef(0);
+    if (buffer.loc != mori::io::MemoryLocationType::GPU || buffer.device != device) continue;
+    std::rotate(order->begin(), order->begin() + static_cast<std::ptrdiff_t>(i),
+                order->begin() + static_cast<std::ptrdiff_t>(i) + 1);
+    return;
+  }
+}
+
 std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     const std::vector<PoolPlacementRequest>& requests) {
   std::lock_guard<std::mutex> operation_lock(operation_mutex_);
@@ -613,6 +630,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
     }
 
     put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
+    PreferSourceDevice(requests[i].preferred_device, &put_orders[i]);
     if (!put_orders[i].empty()) {
       const uint32_t selected = put_orders[i].front();
       pending_keys_[requests[i].key] =
@@ -1111,7 +1129,8 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
 
 std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backend_ids,
                                              const std::vector<std::string>& keys,
-                                             const std::vector<uint64_t>& generations) {
+                                             const std::vector<uint64_t>& generations,
+                                             bool release) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<bool> out(keys.size(), false);
   if (keys.empty() || backends_ == nullptr) return out;
@@ -1132,7 +1151,8 @@ std::vector<bool> PeerPool::ValidateResolved(const std::vector<uint32_t>& backen
       batch_keys.push_back(keys[i]);
       batch_generations.push_back(generations[i]);
     }
-    const auto holds = backend->BatchStillHolds(batch_keys, batch_generations);
+    const auto holds = release ? backend->BatchFinishReads(batch_keys, batch_generations)
+                               : backend->BatchStillHolds(batch_keys, batch_generations);
     for (size_t j = 0; j < indices.size(); ++j) {
       out[indices[j]] = j < holds.size() && holds[j];
     }

@@ -257,6 +257,12 @@ struct EpCfg {
   // elements. Exclusive with combineFp4 (MakeEpCfg).
   bool combineFp8 = false;
   bool combineBf16Push = false;
+  // gfx942/gfx950 scatter combine with an fp8 wire: elements per scale, 32 (E8M0)
+  // or 128 (f32); 0 = off. Each sender quantizes into the origin's landing row.
+  int combineScatterQGroup = 0;
+  bool combineScatterFp4 = false;    // e2m1 instead of fp8 on that wire (gfx950)
+  bool replay = false;               // dispatch sends to the slots a handle's dest map names
+  bool combineScatterPlain = false;  // the unquantized scatter combine (bf16/fp32 rows)
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -287,6 +293,10 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(combineBf16Push);
+  MORI_FIELD(combineScatterQGroup);
+  MORI_FIELD(combineScatterFp4);
+  MORI_FIELD(replay);
+  MORI_FIELD(combineScatterPlain);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
@@ -299,7 +309,7 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 25, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 29, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -357,11 +367,14 @@ constexpr int EpBlockThreads(const EpCfg& c) { return c.warpPerBlock * c.waveSiz
 // and need the multi-iteration-safe code path. Compile-time via the Cfg NTTP.
 constexpr bool EpIsWideEp(const EpCfg& c) { return c.worldSize > c.waveSize; }
 
-// Recv-slot capacity. The flat token index encodes (pe, localTokId) with this
-// stride, so host and device must agree exactly.
+// Recv-slot capacity, and the bound on every published slot. The flat token
+// index encodes (pe, localTokId) with this stride, so host and device must agree.
 constexpr int EpMaxRecv(const EpCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
+
+// A capacity below the worst case: dispatch drops the slots past it.
+constexpr bool EpRecvCapped(const EpCfg& c) { return EpMaxRecv(c) < c.worldSize * c.maxTokPerRank; }
 
 constexpr int EpCallTok(const EpCfg& c) {
   return c.callTokMax > 0 && c.callTokMax < c.maxTokPerRank ? c.callTokMax : c.maxTokPerRank;
@@ -375,6 +388,56 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 }
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
+
+// ---------------------------------------------------------------------------
+// Intranode dispatch geometry. A block owns one token at a time and its
+// warps take fixed roles: warp 0 routes, warp 1 forwards the scale row when there
+// is one, and every other warp copies a share of the payload. All of it is a
+// function of the Cfg, so the split is exact at compile time: the payload is a
+// whole number of rows of one 16 B vector per lane, the rows are dealt out to the
+// copy warps with the remainder spread one a warp, and no warp's trip count or
+// offset is computed on the device.
+// ---------------------------------------------------------------------------
+constexpr int EpCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
+constexpr int EpCopyWarps(const EpCfg& c) { return c.warpPerBlock - EpCtrlWarps(c); }
+constexpr int EpRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
+constexpr int EpRowsPerToken(const EpCfg& c) {
+  return (EpTokenBytes(c) + EpRowBytes(c) - 1) / EpRowBytes(c);
+}
+// 16 B vectors in the last row; the lanes past it sit that row out.
+constexpr int EpLastRowVecs(const EpCfg& c) {
+  return (EpTokenBytes(c) - (EpRowsPerToken(c) - 1) * EpRowBytes(c)) / 16;
+}
+// Copy warp w takes rows [EpRowBegin, EpRowBegin + EpRowCount): the first
+// `rows % copyWarps` warps take one more than the rest.
+constexpr int EpRowCount(const EpCfg& c, int w) {
+  return EpRowsPerToken(c) / EpCopyWarps(c) + (w < EpRowsPerToken(c) % EpCopyWarps(c) ? 1 : 0);
+}
+constexpr int EpRowBegin(const EpCfg& c, int w) {
+  const int r = EpRowsPerToken(c) % EpCopyWarps(c);
+  return w * (EpRowsPerToken(c) / EpCopyWarps(c)) + (w < r ? w : r);
+}
+constexpr int EpMaxRowCount(const EpCfg& c) { return EpRowCount(c, 0); }
+// Destinations a token can fan out to: one per distinct rank, so at most topk.
+constexpr int EpMaxDests(const EpCfg& c) {
+  return c.worldSize < c.numExpertPerToken ? c.worldSize : c.numExpertPerToken;
+}
+// The warp count a request without one gets: a row a copy warp wherever the block can
+// hold that many warps, the widest split the payload has. Measured against two rows a
+// warp (what v1 used) on gfx950, EP8, hidden 7168 bf16, rocprof kernel time, fastest
+// of the run: 32 tokens a rank 11.8us against 13.4, 2048 tokens 397us against 401. The
+// small count is where it matters -- there every block holds one token, so the row
+// count IS the block's parallelism.
+//
+// Past that many rows the split is the widest the block allows, and EpRowCount
+// spreads the remainder; one row a warp is exactly even, so the common shapes also get
+// the single-constant row count.
+constexpr int EpDefaultDispatchWarps(const EpCfg& c) {
+  const int cap = 1024 / c.waveSize - EpCtrlWarps(c);  // EpBlockThreads(c) <= 1024
+  const int rows = EpRowsPerToken(c);
+  const int copy = rows < cap ? rows : cap;
+  return EpCtrlWarps(c) + (copy > 0 ? copy : 1);
+}
 
 constexpr int EpCombinePushSlotAlign = 128;
 
@@ -568,7 +631,30 @@ constexpr size_t EpRegionOutWtsBytes(const EpCfg& c) { return EpRegionOutIdxByte
 constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
   return (size_t)EpMaxRecv(c) * EpTokenBytes(c);
 }
+// The scatter combine's layout in outTok, after the pull rows: one row per (source
+// rank, origin token) holding the fp8 / e2m1 payload, its scales (an E8M0 byte a
+// 32-element group, or an f32 a 128-element block) and the token's topk weights,
+// padded to 128 B.
+constexpr bool EpCombineScatter(const EpCfg& c) {
+  return c.combineScatterQGroup != 0 || c.combineScatterPlain;
+}
+constexpr int EpScatterScaleBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return 0;
+  return c.combineScatterQGroup == 32 ? c.hiddenDim / 32 : c.hiddenDim / 128 * 4;
+}
+constexpr int EpScatterPayloadBytes(const EpCfg& c) {
+  if (c.combineScatterPlain) return EpTokenBytes(c);
+  return c.combineScatterFp4 ? c.hiddenDim / 2 : c.hiddenDim;
+}
+constexpr int EpScatterRowBytes(const EpCfg& c) {
+  return (int)EpAlignUp128((size_t)EpScatterPayloadBytes(c) + EpScatterScaleBytes(c) +
+                           4 * c.numExpertPerToken);
+}
+constexpr size_t EpScatterLandOff(const EpCfg& c) { return EpAlignUp128(EpCombinePushLandOff(c)); }
+
 constexpr size_t EpRegionOutTokBytes(const EpCfg& c) {
+  if (EpCombineScatter(c))
+    return EpScatterLandOff(c) + (size_t)c.worldSize * c.maxTokPerRank * EpScatterRowBytes(c);
   if (c.ll128 || c.ll128CombineOnly)
     return EpCombinePushLandOff(c) + (size_t)EpCombinePushLandRows(c) * EpLl128LandRowBytes(c);
   if (!EpCombinePush(c) && !c.combineBf16Push) return EpCombinePushLandOff(c);
@@ -656,11 +742,6 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          c.numExpertPerToken > 0 && c.numExpertPerRank > 0 && c.blockNum > 0 &&
          (c.waveSize == 32 || c.waveSize == 64) && c.warpPerBlock > 0 &&
          EpBlockThreads(c) <= 1024 &&
-         // The recv capacity must cover the worst case: the device slot counter is
-         // unbounded, and since EpMaxRecv is also the flat-index stride an overflow
-         // re-encodes to the next peer and combine folds in a stranger's token.
-         // Token dropping is not implemented, so reject the cap at construction.
-         EpMaxRecv(c) >= c.worldSize * c.maxTokPerRank &&
          // The dedup ballot assumes one lane per top-k slot within a wavefront.
          // worldSize may exceed waveSize (wide EP) but must fit within one
          // block so the combine XDB barrier's thdId < npes poll covers all peers.
@@ -674,7 +755,17 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096)) &&
          (!c.cardDedup || EpCardDedupOk(c)) && (c.cardDedup || c.cardPullBlocks == 0) &&
          (!c.cardFwdMark || (c.cardDedup && c.cardPullBlocks == 0)) &&
-         (!c.cardCombine || c.cardDedup || EpCardCombineOk(c));
+         (!c.cardCombine || c.cardDedup || EpCardCombineOk(c)) &&
+         // The quantized scatter combine quantizes whole 128-element blocks with 8 lanes
+         // a 64-wide wave; either scatter is the portable body's: no push, ll128 or card
+         // mode beside it.
+         (EpCombineScatter(c) || !c.combineScatterFp4) &&
+         (!c.combineScatterPlain || (c.combineScatterQGroup == 0 && !c.combineScatterFp4)) &&
+         (!EpCombineScatter(c) || ((c.combineScatterPlain || ((c.combineScatterQGroup == 32 ||
+                                                               c.combineScatterQGroup == 128) &&
+                                                              c.hiddenDim % 128 == 0)) &&
+                                   c.waveSize == 64 && !EpCombinePush(c) && !c.combineBf16Push &&
+                                   !c.ll128 && !c.ll128CombineOnly && !c.cardCombine));
 }
 
 }  // namespace v2

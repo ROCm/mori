@@ -36,6 +36,12 @@ target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(test_flat_yaml PRIVATE gtest_main)
 add_test(NAME flat_yaml COMMAND test_flat_yaml)
 
+# PCI topology over a sysfs tree built on disk; needs no hardware.
+add_executable(test_topology_pci application/test_topology_pci.cpp)
+target_include_directories(test_topology_pci PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_topology_pci PRIVATE mori_application gtest_main)
+add_test(NAME topology_pci COMMAND test_topology_pci)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -126,6 +132,18 @@ if(BUILD_IO)
   target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_peer_failure mori_application mori_io)
+
+  add_executable(test_fence io/test_fence.cpp)
+
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fence mori_application mori_io)
+
+  add_executable(test_fence_xnode io/test_fence_xnode.cpp)
+
+  target_include_directories(test_fence_xnode PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_fence_xnode PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fence_xnode mori_application mori_io)
 
   add_executable(test_topology application/test_topology.cpp)
 

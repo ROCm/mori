@@ -48,7 +48,7 @@
 namespace mori {
 namespace application {
 
-Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
+Context::Context(BootstrapNetwork& bootNet, bool deferRdma) : bootNet(bootNet) {
   // Snapshot env vars once at construction. Every subsequent decision (transport
   // selection, hipMalloc vs hipExtMallocWithFlags(uncached), etc.) must read
   // from this cached state, not getenv. Otherwise late env mutations -- e.g.
@@ -64,10 +64,10 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
     if (!railOnly)
       MORI_APP_ERROR("MORI_ENABLE_RAIL_ONLY requested but not eligible; using full mesh");
   }
-  // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
-  // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
-  // set must explicitly call BuildInitialEndpoints() afterwards.
-  InitializeTopologyAndTransports();
+  // Lightweight: peer capabilities, plus NIC selection unless deferRdma. No QP
+  // creation, no AllToAll. Modules that need the initial RDMA endpoint set must
+  // explicitly call BuildInitialEndpoints() afterwards.
+  InitializeTopologyAndTransports(deferRdma);
 }
 
 void Context::BuildInitialEndpoints() {
@@ -287,11 +287,57 @@ bool Context::RailOnlyEligible() const {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
-void Context::InitializeTopologyAndTransports() {
-  // Local rank within this host. Already derived in CollectHostNames from the
-  // exchanged nodeId ordering (seenPerNode), so reuse it instead of recounting.
+void Context::InitializeTopologyAndTransports(bool deferRdma) {
+  // rankInNode was derived in CollectHostNames from the exchanged nodeId ordering.
+  assert(peerInfos[LocalRank()].rankInNode < 8);
+
+  int numQpPerPe = 4;
+  const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
+  if (envNumQp != nullptr) {
+    numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
+  }
+  this->numQpPerPe = numQpPerPe;
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Pure capability discovery. No policy (env vars), no side-effecting
+  // setup (anvil.init / connect / EnablePeerAccess). All env-driven
+  // decisions and the SDMA queue wiring happen later, when something
+  // actually needs them: BuildInitialEndpoints() for SHMEM, or
+  // EnsureSdmaTransport() on demand for CCO.
+  //
+  // Note on canSDMA: mori currently has no true hardware probe for SDMA
+  // engine presence (anvil::GetSdmaNumChannels reads MORI_SDMA_NUM_CHANNELS
+  // env or returns default 2, regardless of hardware). The honest
+  // capability statement is therefore just "intra-node peer reachable —
+  // SDMA *might* work". The actual hardware check happens implicitly in
+  // EnsureSdmaTransport() when anvil.init() / anvil.connect() is invoked.
+  // A future probe-based check would refine canSDMA without changing
+  // the API surface.
+  // ──────────────────────────────────────────────────────────────────────
+  peerCaps.resize(WorldSize());
+  for (int i = 0; i < WorldSize(); i++) {
+    PeerCapabilities& cap = peerCaps[i];
+    cap.sameHost = peerInfos[i].sameHost;
+    cap.sameProcess = peerInfos[i].sameProcess;
+
+    // Hardware capabilities (objective, env-var-free):
+    //  - canP2P : sameHost (we assume HIP peer-access is enabled; TODO:
+    //             cross-check with TopoSystemGpu BDF info)
+    //  - canSDMA: sameHost (anvil hardware probe is TODO; see comment above)
+    //  - canRDMA: set by EnsureRdmaTransport()
+    cap.canP2P = cap.sameHost;
+    cap.canSDMA = cap.sameHost;
+  }
+
+  if (!deferRdma) EnsureRdmaTransport();
+}
+
+void Context::EnsureRdmaTransport() {
+  if (rdmaInitDone) return;
   int rankInNode = peerInfos[LocalRank()].rankInNode;
-  assert(rankInNode < 8);
+  // A retry after a throw: free the contexts built on the old devices before the devices.
+  allRdmaDeviceContexts.clear();
+  rdmaDeviceContext.reset();
 
   // Init rdma context — proxy uses vendor-agnostic IBVerbs, IBGDA uses DirectVerbs
   rdmaContext.reset(
@@ -366,62 +412,24 @@ void Context::InitializeTopologyAndTransports() {
                   allRdmaDeviceContexts.size());
   }
 
-  int numQpPerPe = 4;
-  const char* envNumQp = std::getenv("MORI_NUM_QP_PER_PE");
-  if (envNumQp != nullptr) {
-    numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
-  }
-  this->numQpPerPe = numQpPerPe;
+  // canRDMA: a NIC was selected. It covers same-host loopback as well as cross-node,
+  // so FULL-style policies can give intra-node peers NIC QPs too.
+  const bool canRdma = rdmaDeviceContext != nullptr;
+  for (PeerCapabilities& cap : peerCaps) cap.canRDMA = canRdma;
+  rdmaInitDone = true;
+  if (!canRdma) return;
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Pure capability discovery. No policy (env vars), no side-effecting
-  // setup (anvil.init / connect / EnablePeerAccess). All env-driven
-  // decisions and the SDMA queue wiring happen later, when something
-  // actually needs them: BuildInitialEndpoints() for SHMEM, or
-  // EnsureSdmaTransport() on demand for CCO.
-  //
-  // Note on canSDMA: mori currently has no true hardware probe for SDMA
-  // engine presence (anvil::GetSdmaNumChannels reads MORI_SDMA_NUM_CHANNELS
-  // env or returns default 2, regardless of hardware). The honest
-  // capability statement is therefore just "intra-node peer reachable —
-  // SDMA *might* work". The actual hardware check happens implicitly in
-  // EnsureSdmaTransport() when anvil.init() / anvil.connect() is invoked.
-  // A future probe-based check would refine canSDMA without changing
-  // the API surface.
-  // ──────────────────────────────────────────────────────────────────────
-  peerCaps.resize(WorldSize());
-  for (int i = 0; i < WorldSize(); i++) {
-    PeerCapabilities& cap = peerCaps[i];
-    cap.sameHost = peerInfos[i].sameHost;
-    cap.sameProcess = peerInfos[i].sameProcess;
-
-    // Hardware capabilities (objective, env-var-free):
-    //  - canP2P : sameHost (we assume HIP peer-access is enabled; TODO:
-    //             cross-check with TopoSystemGpu BDF info)
-    //  - canSDMA: sameHost (anvil hardware probe is TODO; see comment above)
-    //  - canRDMA: NIC is present (works for both same-host loopback and
-    //             cross-node; lets FULL-style policies allocate NIC QPs
-    //             even to intra-node peers)
-    cap.canP2P = cap.sameHost;
-    cap.canSDMA = cap.sameHost;
-    cap.canRDMA = (rdmaDeviceContext.get() != nullptr);
-
-    // Lazy-initialize savedEpConfig the first time we see a peer that *could*
-    // need an RDMA endpoint. It's just a config snapshot, no QP created.
-    if (cap.canRDMA && savedPortId < 0) {
-      savedPortId = portId;
-      savedEpConfig.portId = portId;
-      savedEpConfig.gidIdx = -1;
-      const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
-      if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
-      savedEpConfig.maxMsgsNum = 4096;
-      uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-      savedEpConfig.maxCqeNum =
-          (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
-      savedEpConfig.alignment = 4096;
-      savedEpConfig.onGpu = true;
-    }
-  }
+  // Endpoint config snapshot; no QP is created here.
+  savedPortId = portId;
+  savedEpConfig.portId = portId;
+  savedEpConfig.gidIdx = -1;
+  const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+  if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
+  savedEpConfig.maxMsgsNum = 4096;
+  uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
+  savedEpConfig.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+  savedEpConfig.alignment = 4096;
+  savedEpConfig.onGpu = true;
 }
 
 /* ------------------------------------------------------------------------ */

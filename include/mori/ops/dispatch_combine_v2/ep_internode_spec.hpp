@@ -195,6 +195,8 @@ struct EpInterNodeRequest {
   int mpCount = 0;
   // asyncLlMode 2 only; 0 = half the device (mpCount / 2).
   int asyncLlFusedRecvCtas = 0;
+  // AsyncLL combine passes only; see EpInterNodeKernelCfg.
+  int combineQGroup = 0;
 };
 
 template <typename Self, typename Visit>
@@ -221,11 +223,12 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
   MORI_FIELD(asyncLlFusedRecvCtas);
+  MORI_FIELD(combineQGroup);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 21,
+    EpInterNodeRequest, 22,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();
