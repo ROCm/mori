@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -288,6 +289,58 @@ TEST(StandaloneShmIpcTest, WorkerRegistrationUsesNonZeroOffsetsAndCanReregister)
   server_thread.join();
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
+}
+
+// Whether this process still maps a host buffer at `base`.
+bool MapsHostBufferAt(uintptr_t base) {
+  std::ifstream maps("/proc/self/maps");
+  for (std::string line; std::getline(maps, line);)
+    if (line.find("memfd:umbp_host_buffer") != std::string::npos &&
+        std::stoull(line.substr(0, line.find('-')), nullptr, 16) == base)
+      return true;
+  return false;
+}
+
+// A worker hands its shm over again to a restarted server, and keeps no extra
+// hold on the allocation for having done so.
+TEST(StandaloneShmIpcTest, WorkerHandsItsShmOverAgainAfterTheServerRestarts) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_restart_" + std::to_string(getpid()) + ".grpc.sock";
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = false;
+  cfg.standalone_process.emplace().address = address;
+  auto server = std::make_unique<standalone::StandaloneServer>(cfg, address);
+  ASSERT_TRUE(server->Start());
+  std::thread run([s = server.get()] { s->Run(); });
+  auto client = CreateUMBPClient(cfg);
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  const auto base = reinterpret_cast<uintptr_t>(handle.ptr);
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  ASSERT_TRUE(client->RegisterMemory(base, handle.mapped_size));
+
+  server->Shutdown();
+  run.join();
+  server = std::make_unique<standalone::StandaloneServer>(cfg, address);
+  ASSERT_TRUE(server->Start());
+  run = std::thread([s = server.get()] { s->Run(); });
+  std::memset(bytes, 0x5a, 16);
+  bool stored = false;  // the first calls can find the channel still reconnecting
+  for (int i = 0; i < 500 && !(stored = client->Put("after", base, 16)); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_TRUE(stored);
+  ASSERT_TRUE(client->Get("after", base + 16, 16));
+  EXPECT_EQ(std::memcmp(bytes, bytes + 16, 16), 0);
+
+  client->Close();
+  ASSERT_TRUE(MapsHostBufferAt(base));
+  allocator.Free(handle);
+  EXPECT_FALSE(MapsHostBufferAt(base));  // no registration holds it any more
+  server->Shutdown();
+  run.join();
 }
 
 TEST(StandaloneShmIpcTest, WorkerRegistrationResolvesAcrossMultipleRegions) {

@@ -66,6 +66,7 @@ message BoolResponse {
   bool ok = 1;
   string error = 2;
   bool supports_kv_metadata = 3; // ConfigureKvIndexer capability handshake.
+  bool client_unknown = 4; // Put and Get: see BatchBoolResponse.client_unknown.
 }
 
 enum StandaloneBackendMode {
@@ -163,6 +164,10 @@ message BatchBoolResponse {
   // offered fingerprint. Nothing was read; `ok` is empty. Repeat the call with
   // the keys.
   bool key_handle_unknown = 3;
+  // Data requests: the server lacks memory the request names for this
+  // client_id, which registered it with an earlier server process. Register
+  // again and repeat.
+  bool client_unknown = 4;
 }
 
 enum MemoryKind {
