@@ -37,6 +37,7 @@ _LAZY_SUBMODULES = {
     "kernel_profiler",
     "ccl",
     "allocator",
+    "umbp_l1",
 }
 
 

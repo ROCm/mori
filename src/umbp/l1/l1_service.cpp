@@ -24,6 +24,8 @@
 #include <grpcpp/grpcpp.h>
 
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "umbp_l1.grpc.pb.h"
@@ -36,6 +38,11 @@ namespace pb = ::umbp::l1;
 
 // Everything but Attach is slot bookkeeping or a bounded copy.
 constexpr std::chrono::seconds kCallDeadline{120};
+// Peer RPCs only probe or acquire/release metadata; they never copy payload.
+// Each Fetch window may visit eight peers, then acquire/release one read.
+// Bound each control call so one unavailable peer does not consume the caller's
+// whole 120-second deadline. Total control time grows with the window count.
+constexpr std::chrono::seconds kPeerCallDeadline{2};
 
 template <typename Response>
 void SetStatus(const Status& status, Response* response) {
@@ -49,7 +56,8 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Attach(grpc::ServerContext*, const pb::AttachRequest* request,
                       pb::AttachResponse* response) override {
-    ExternalMemory external{request->external_handle(), request->external_offset()};
+    ExternalMemory external{request->external_handle(), request->external_offset(),
+                            request->external_kind()};
     AttachResult result = manager_->Attach(request->pool_id(), request->group(), request->device(),
                                            request->bytes(), external);
     SetStatus(result.status, response);
@@ -57,6 +65,7 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     response->set_handle(result.memory.handle);
     response->set_bytes(result.bytes);
     response->set_created(result.created);
+    response->set_owner_incarnation(result.incarnation);
     return grpc::Status::OK;
   }
 
@@ -77,6 +86,8 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     OpenResult result = manager_->Open(request->pool_id());
     SetStatus(result.status, response);
     response->set_num_slots(result.num_slots);
+    response->set_memory_kind(result.memory_kind);
+    response->set_owner_incarnation(result.incarnation);
     return grpc::Status::OK;
   }
 
@@ -136,6 +147,51 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     response->set_copied_slots(result.copied_slots);
     response->set_copied_bytes(result.copied_bytes);
     response->set_copy_micros(result.copy_micros);
+    response->set_completion_unknown(result.completion_unknown);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status PeerProbe(grpc::ServerContext*, const pb::PeerProbeRequest* request,
+                         pb::PeerProbeResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<uint64_t> unit_bytes(request->unit_bytes().begin(), request->unit_bytes().end());
+    PeerProbeResult result = manager_->Probe(request->group(), keys, unit_bytes);
+    SetStatus(result.status, response);
+    response->set_incarnation(result.incarnation);
+    response->set_available(result.available);
+    response->set_read_epoch(result.read_epoch);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AcquireRead(grpc::ServerContext*, const pb::AcquireReadRequest* request,
+                           pb::AcquireReadResponse* response) override {
+    PeerReadRequest read;
+    read.operation_id = request->operation_id();
+    read.expected_incarnation = request->expected_incarnation();
+    read.group = request->group();
+    read.keys.assign(request->keys().begin(), request->keys().end());
+    read.unit_bytes.assign(request->unit_bytes().begin(), request->unit_bytes().end());
+    PeerReadResult result = manager_->AcquireRead(read);
+    SetStatus(result.status, response);
+    response->set_incarnation(result.incarnation);
+    response->set_available(result.available);
+    for (const std::string& handle : result.handles) response->add_handles(handle);
+    response->mutable_regions()->Reserve(result.regions.size());
+    for (const PeerReadRegion& region : result.regions) {
+      pb::PeerReadRegion* out = response->add_regions();
+      out->set_handle_index(region.handle_index + 1);
+      out->set_offset(region.offset);
+      out->set_bytes(region.bytes);
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status ReleaseRead(grpc::ServerContext*, const pb::ReleaseReadRequest* request,
+                           pb::StatusResponse* response) override {
+    SetStatus(manager_->ReleaseRead(request->operation_id(), request->expected_incarnation(),
+                                    request->drained()),
+              response);
+    response->set_owner_incarnation(manager_->Incarnation());
     return grpc::Status::OK;
   }
 
@@ -147,6 +203,12 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Detach(grpc::ServerContext*, const pb::PoolRequest* request,
                       pb::StatusResponse* response) override {
+    if (!request->expected_incarnation().empty() &&
+        request->expected_incarnation() != manager_->Incarnation()) {
+      SetStatus(Status::Error("detach: owner incarnation changed; old reads may still be active"),
+                response);
+      return grpc::Status::OK;
+    }
     SetStatus(manager_->Detach(request->pool_id()), response);
     return grpc::Status::OK;
   }
@@ -188,17 +250,120 @@ Status FromResponse(const grpc::Status& rpc, const Response& response) {
   return Status{};
 }
 
+// Each instance targets one statically configured peer. No retry ever uses a
+// fresh operation id: a caller retry must preserve the acquired read's id so
+// it cannot create a second set of source pins after a lost response.
+class L1Peer final : public PeerApi {
+ public:
+  explicit L1Peer(const std::string& address)
+      : stub_(pb::UMBPL1Pool::NewStub(
+            grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
+
+  PeerProbeResult Probe(const std::string& group, const std::vector<std::string>& keys,
+                        const std::vector<uint64_t>& unit_bytes) override {
+    pb::PeerProbeRequest request;
+    request.set_group(group);
+    for (const std::string& key : keys) request.add_keys(key);
+    for (uint64_t bytes : unit_bytes) request.add_unit_bytes(bytes);
+    pb::PeerProbeResponse response;
+    grpc::ClientContext context;
+    Bound(&context);
+    PeerProbeResult result;
+    result.status = FromResponse(stub_->PeerProbe(&context, request, &response), response);
+    result.incarnation = response.incarnation();
+    result.available = response.available();
+    result.read_epoch = response.read_epoch();
+    if (result.status.ok && result.read_epoch == 0)
+      result.status =
+          Status::Error("native L1 peer does not support admission epochs; update both services");
+    return result;
+  }
+
+  PeerReadResult AcquireRead(const PeerReadRequest& read) override {
+    pb::AcquireReadRequest request;
+    request.set_operation_id(read.operation_id);
+    request.set_expected_incarnation(read.expected_incarnation);
+    request.set_group(read.group);
+    for (const std::string& key : read.keys) request.add_keys(key);
+    for (uint64_t bytes : read.unit_bytes) request.add_unit_bytes(bytes);
+    pb::AcquireReadResponse response;
+    grpc::ClientContext context;
+    Bound(&context);
+    PeerReadResult result;
+    const auto rpc = stub_->AcquireRead(&context, request, &response);
+    result.status = FromResponse(rpc, response);
+    // Only a received owner reply can prove an incarnation mismatch rejected
+    // the request before creating a grant; a failed RPC has unknown effects.
+    if (!rpc.ok()) return result;
+    result.incarnation = response.incarnation();
+    result.available = response.available();
+    if (!result.status.ok) return result;
+    std::unordered_map<std::string, uint32_t> handles;
+    auto intern = [&](const std::string& handle) {
+      const auto [entry, added] = handles.try_emplace(handle, result.handles.size());
+      if (added) result.handles.push_back(handle);
+      return entry->second;
+    };
+    std::vector<uint32_t> indices;
+    indices.reserve(response.handles_size());
+    for (const std::string& handle : response.handles()) {
+      if (handle.empty())
+        return {Status::Error("native L1 read has an empty handle dictionary entry"),
+                result.incarnation};
+      indices.push_back(intern(handle));
+    }
+    result.regions.reserve(response.regions_size());
+    for (const pb::PeerReadRegion& region : response.regions()) {
+      const uint32_t index = region.handle_index();
+      if (index == 0 || index > static_cast<uint32_t>(indices.size())) {
+        return {Status::Error("native L1 read has an invalid handle reference"), result.incarnation};
+      }
+      result.regions.push_back(PeerReadRegion{indices[index - 1], region.offset(), region.bytes()});
+    }
+    return result;
+  }
+
+  PeerReleaseResult ReleaseRead(const std::string& operation_id,
+                                const std::string& expected_incarnation, bool drained) override {
+    pb::ReleaseReadRequest request;
+    request.set_operation_id(operation_id);
+    request.set_expected_incarnation(expected_incarnation);
+    request.set_drained(drained);
+    pb::StatusResponse response;
+    grpc::ClientContext context;
+    Bound(&context);
+    const auto rpc = stub_->ReleaseRead(&context, request, &response);
+    return {FromResponse(rpc, response), rpc.ok() ? response.owner_incarnation() : std::string{}};
+  }
+
+ private:
+  static void Bound(grpc::ClientContext* context) {
+    context->set_deadline(std::chrono::system_clock::now() + kPeerCallDeadline);
+  }
+
+  std::unique_ptr<pb::UMBPL1Pool::Stub> stub_;
+};
+
 }  // namespace
 
 std::unique_ptr<grpc::Service> MakeL1PoolService(std::shared_ptr<PoolManager> manager) {
   return std::make_unique<L1PoolService>(std::move(manager));
 }
 
+std::shared_ptr<PeerApi> MakeL1Peer(const std::string& address) {
+  return std::make_shared<L1Peer>(address);
+}
+
 class L1Server::Impl {
  public:
-  Impl(const std::string& address, std::shared_ptr<MemoryApi> api)
+  Impl(const std::string& address, std::shared_ptr<MemoryApi> api,
+       const std::vector<std::string>& peers)
       : manager_(std::make_shared<PoolManager>(std::move(api))),
         service_(MakeL1PoolService(manager_)) {
+    std::vector<std::shared_ptr<PeerApi>> connections;
+    connections.reserve(peers.size());
+    for (const std::string& peer : peers) connections.push_back(MakeL1Peer(peer));
+    manager_->ConfigurePeers(std::move(connections));
     grpc::ServerBuilder builder;
     builder.AddListeningPort(address, grpc::InsecureServerCredentials());
     builder.RegisterService(service_.get());
@@ -213,8 +378,9 @@ class L1Server::Impl {
   std::unique_ptr<grpc::Server> server_;
 };
 
-L1Server::L1Server(const std::string& address, std::shared_ptr<MemoryApi> api)
-    : impl_(std::make_unique<Impl>(address, std::move(api))) {}
+L1Server::L1Server(const std::string& address, std::shared_ptr<MemoryApi> api,
+                   const std::vector<std::string>& peers)
+    : impl_(std::make_unique<Impl>(address, std::move(api), peers)) {}
 L1Server::~L1Server() = default;
 bool L1Server::ok() const { return impl_->server_ != nullptr; }
 
@@ -229,6 +395,12 @@ class L1Client::Impl {
   }
 
   std::unique_ptr<pb::UMBPL1Pool::Stub> stub_;
+  struct Owner {
+    std::string incarnation;
+    bool requires_incarnation = false;
+  };
+  std::mutex owners_mutex_;
+  std::unordered_map<std::string, Owner> owners_;
 };
 
 L1Client::L1Client(const std::string& address) : impl_(std::make_unique<Impl>(address)) {}
@@ -236,6 +408,12 @@ L1Client::~L1Client() = default;
 
 AttachResult L1Client::Attach(const std::string& pool_id, const std::string& group, int device,
                               uint64_t bytes, const ExternalMemory& external) {
+  if (external.kind == "hip_fabric") {
+    // Remember this even if the RPC fails: the server may already have
+    // adopted/exported the pool when its response gets lost.
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    impl_->owners_[pool_id].requires_incarnation = true;
+  }
   pb::AttachRequest request;
   request.set_pool_id(pool_id);
   request.set_group(group);
@@ -243,6 +421,7 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
   request.set_bytes(bytes);
   request.set_external_handle(external.handle);
   request.set_external_offset(external.offset);
+  request.set_external_kind(external.kind);
   pb::AttachResponse response;
   // A long deadline: the server allocates and zero-fills the whole pool.
   grpc::ClientContext context;
@@ -251,6 +430,15 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
   AttachResult result;
   result.status = FromResponse(impl_->stub_->Attach(&context, request, &response), response);
   if (!result.status.ok) return result;
+  result.incarnation = response.owner_incarnation();
+  if (external.kind == "hip_fabric" && result.incarnation.empty()) {
+    result.status = Status::Error("attach: fabric owner did not provide an incarnation");
+    return result;
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    impl_->owners_[pool_id] = {result.incarnation, external.kind == "hip_fabric"};
+  }
   result.memory.kind = response.handle_kind();
   result.memory.handle = response.handle();
   result.bytes = response.bytes();
@@ -283,6 +471,18 @@ OpenResult L1Client::Open(const std::string& pool_id) {
   OpenResult result;
   result.status = FromResponse(impl_->stub_->Open(&context, request, &response), response);
   result.num_slots = response.num_slots();
+  result.memory_kind = response.memory_kind();
+  result.incarnation = response.owner_incarnation();
+  if (result.status.ok && !result.incarnation.empty() &&
+      (result.memory_kind == "hip_fabric" || result.memory_kind == "hip_ipc" ||
+       result.memory_kind == "host")) {
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    // Open may discover a restarted server; it must not replace an Attach fence
+    // protecting an allocation still owned by this client.
+    auto& owner = impl_->owners_[pool_id];
+    if (!owner.requires_incarnation)
+      owner = {result.incarnation, result.memory_kind == "hip_fabric"};
+  }
   return result;
 }
 
@@ -301,13 +501,14 @@ AllocateResult L1Client::Allocate(const std::string& pool_id, uint32_t count, ui
   return result;
 }
 
-Status L1Client::Commit(const std::string& pool_id, uint64_t committed) {
+Status L1Client::Commit(const std::string& pool_id, uint64_t committed, uint32_t timeout_ms) {
+  if (timeout_ms == 0) return Status::Error("commit timeout_ms must be positive");
   pb::CommitRequest request;
   request.set_pool_id(pool_id);
   request.set_committed(committed);
   pb::StatusResponse response;
   grpc::ClientContext context;
-  Impl::Bound(&context);
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
   return FromResponse(impl_->stub_->Commit(&context, request, &response), response);
 }
 
@@ -339,7 +540,21 @@ FetchResult L1Client::Fetch(const std::string& pool_id, const std::vector<std::s
   grpc::ClientContext context;
   Impl::Bound(&context);
   FetchResult result;
-  result.status = FromResponse(impl_->stub_->Fetch(&context, request, &response), response);
+  bool requires_completion_proof = true;
+  {
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    auto owner = impl_->owners_.find(pool_id);
+    if (owner != impl_->owners_.end())
+      requires_completion_proof = owner->second.requires_incarnation;
+  }
+  const grpc::Status rpc = impl_->stub_->Fetch(&context, request, &response);
+  result.status = FromResponse(rpc, response);
+  // A deadline or connection loss does not cancel work already submitted by
+  // the server. In particular the caller must not recycle supplied dst_slots
+  // as if a failed RPC were an ordinary cache miss.
+  result.completion_unknown =
+      response.completion_unknown() ||
+      (requires_completion_proof && !rpc.ok() && !options.probe_only && !keys.empty());
   result.slots.assign(response.slots().begin(), response.slots().end());
   result.evicted_keys.assign(response.evicted_keys().begin(), response.evicted_keys().end());
   result.copied_slots = response.copied_slots();
@@ -361,10 +576,31 @@ Status L1Client::Clear(const std::string& pool_id) {
 Status L1Client::Detach(const std::string& pool_id) {
   pb::PoolRequest request;
   request.set_pool_id(pool_id);
+  {
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    auto owner = impl_->owners_.find(pool_id);
+    if (owner != impl_->owners_.end()) {
+      if (owner->second.requires_incarnation && owner->second.incarnation.empty()) {
+        return Status::Error("detach: fabric owner incarnation is unknown; retain allocation");
+      }
+      if (owner->second.requires_incarnation)
+        request.set_expected_incarnation(owner->second.incarnation);
+    }
+  }
   pb::StatusResponse response;
   grpc::ClientContext context;
   Impl::Bound(&context);
-  return FromResponse(impl_->stub_->Detach(&context, request, &response), response);
+  Status result = FromResponse(impl_->stub_->Detach(&context, request, &response), response);
+  if (result.ok) {
+    std::lock_guard<std::mutex> lock(impl_->owners_mutex_);
+    auto owner = impl_->owners_.find(pool_id);
+    if (owner != impl_->owners_.end() &&
+        (!owner->second.requires_incarnation ||
+         owner->second.incarnation == request.expected_incarnation())) {
+      impl_->owners_.erase(owner);
+    }
+  }
+  return result;
 }
 
 Status L1Client::Stats(std::vector<PoolStats>* out) {

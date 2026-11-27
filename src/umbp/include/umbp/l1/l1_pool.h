@@ -21,13 +21,16 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -75,9 +78,16 @@ struct ExportedMemory {
 };
 
 // The device operations, injectable so the slot logic is testable on CPU.
+struct CopyOutcome {
+  bool ok = false;
+  bool drained = false;  // no previously submitted write can still touch the destination
+  std::string error;
+};
+
 class MemoryApi {
  public:
   virtual ~MemoryApi() = default;
+  virtual bool SupportsFabric() const { return false; }
   // Allocate `bytes` zero-filled on `device` and export it for another process.
   virtual bool Allocate(int device, uint64_t bytes, void** base, ExportedMemory* exported,
                         std::string* error) = 0;
@@ -86,6 +96,7 @@ class MemoryApi {
   // the pool starts `offset` bytes into it. `*mapped` is what Unimport takes.
   virtual bool Import(int device, const std::string& handle, uint64_t offset, void** base,
                       void** mapped, std::string* error) = 0;
+  // Returning confirms the mapping is gone. On exception, retain its allocation.
   virtual void Unimport(int device, void* mapped) = 0;
   // Copy `bytes`. The bytes are only guaranteed visible at `dst` after a
   // Synchronize of the destination device.
@@ -104,6 +115,7 @@ class MemoryApi {
   // Fragments must not overlap. By default one Copy each, then Synchronize.
   virtual bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
                          std::string* error);
+  virtual CopyOutcome CopyBatchTracked(int dst_device, const std::vector<Fragment>& fragments);
 };
 
 std::shared_ptr<MemoryApi> MakeHipMemoryApi();
@@ -128,10 +140,12 @@ struct Op {
 struct ExternalMemory {
   std::string handle;  // empty: the server allocates
   uint64_t offset = 0;
+  std::string kind;  // empty / hip_ipc, or hip_fabric for direct native L1
 };
 
 struct AttachResult {
   Status status;
+  std::string incarnation;
   ExportedMemory memory;
   uint64_t bytes = 0;
   bool created = false;
@@ -140,6 +154,8 @@ struct AttachResult {
 struct OpenResult {
   Status status;
   uint32_t num_slots = 0;
+  std::string memory_kind;
+  std::string incarnation;
 };
 
 struct AllocateResult {
@@ -150,8 +166,8 @@ struct AllocateResult {
 
 // How a Fetch places what it copies (`PoolManager::Fetch`).
 struct FetchOptions {
-  // Copy key i into dst_slots[i], a slot the caller holds, rather than into
-  // free slots: nothing here is evicted or indexed; the caller publishes.
+  // Copy key i into dst_slots[i], an unindexed slot the caller holds, rather
+  // than into free slots: nothing here is evicted or indexed; the caller publishes.
   // Regranted destinations must be settled (their old owner's writes
   // committed). An unsettled destination ends the returned leading prefix;
   // every supplied destination remains held by the caller, copied or not.
@@ -162,6 +178,7 @@ struct FetchOptions {
 
 struct FetchResult {
   Status status;
+  bool completion_unknown = false;  // caller must retain all supplied destinations
   std::vector<uint32_t> slots;
   std::vector<std::string> evicted_keys;
   uint32_t copied_slots = 0;
@@ -169,6 +186,48 @@ struct FetchResult {
   uint64_t copy_micros = 0;
   // probe_only: leading keys this pool or another pool of the group holds.
   uint32_t available = 0;
+};
+
+// Direct native-HBM peer protocol. Regions are key-major, then layout-region-major.
+// A grant pins the original slots until an explicit drained ReleaseRead; no TTL.
+struct PeerProbeResult {
+  Status status;
+  std::string incarnation;
+  uint32_t available = 0;
+  uint64_t read_epoch = 0;  // Owner-issued admission epoch, not a lease on active pins.
+};
+struct PeerReadRequest {
+  std::string operation_id;
+  std::string expected_incarnation;
+  std::string group;
+  std::vector<std::string> keys;
+  std::vector<uint64_t> unit_bytes;
+};
+struct PeerReadRegion {
+  uint32_t handle_index = 0;  // Zero-based index into PeerReadResult::handles.
+  uint64_t offset = 0;
+  uint64_t bytes = 0;
+};
+struct PeerReadResult {
+  Status status;
+  std::string incarnation;
+  uint32_t available = 0;
+  std::vector<PeerReadRegion> regions;
+  // Own the descriptors: a returned/replayed result can outlive its read grant.
+  std::vector<std::string> handles;
+};
+struct PeerReleaseResult {
+  Status status;
+  std::string incarnation;  // Only a received owner reply may establish a restart.
+};
+class PeerApi {
+ public:
+  virtual ~PeerApi() = default;
+  virtual PeerProbeResult Probe(const std::string& group, const std::vector<std::string>& keys,
+                                const std::vector<uint64_t>& unit_bytes) = 0;
+  virtual PeerReadResult AcquireRead(const PeerReadRequest& request) = 0;
+  virtual PeerReleaseResult ReleaseRead(const std::string& operation_id,
+                                        const std::string& expected_incarnation, bool drained) = 0;
 };
 
 struct PoolStats {
@@ -189,7 +248,9 @@ struct PoolStats {
 
 class PoolManager {
  public:
-  explicit PoolManager(std::shared_ptr<MemoryApi> api);
+  using Clock = std::chrono::steady_clock;
+  explicit PoolManager(std::shared_ptr<MemoryApi> api,
+                       std::function<Clock::time_point()> now = Clock::now);
   ~PoolManager();
 
   PoolManager(const PoolManager&) = delete;
@@ -225,7 +286,7 @@ class PoolManager {
   // slot holds or no settled slot is free for.
   //
   // With `options.dst_slots` key i is copied into dst_slots[i] instead, which
-  // the caller must hold; keys already in this pool are not looked up here,
+  // the caller must hold without an indexed key; keys already in this pool are not looked up here,
   // and nothing in this pool is evicted, indexed or changes state, so the
   // caller may keep allocating and applying while the copy runs. With
   // `options.probe_only` nothing is copied: `available` counts the leading
@@ -252,6 +313,15 @@ class PoolManager {
   // Read from UMBP_L1_GRANT_SETTLED_FIRST at construction (default 1). Set
   // before any pool is in use.
   void SetGrantSettledFirst(bool on);
+
+  // Configure once, before attaching pools. Peer discovery is static in this version.
+  void ConfigurePeers(std::vector<std::shared_ptr<PeerApi>> peers);
+  const std::string& Incarnation() const { return incarnation_; }
+  PeerProbeResult Probe(const std::string& group, const std::vector<std::string>& keys,
+                        const std::vector<uint64_t>& unit_bytes);
+  PeerReadResult AcquireRead(const PeerReadRequest& request);
+  Status ReleaseRead(const std::string& operation_id, const std::string& expected_incarnation,
+                     bool drained);
 
  private:
   enum class SlotState : uint8_t { kVacant, kCached, kHeld, kFilling };
@@ -303,6 +373,7 @@ class PoolManager {
     // A cached slot stands in `Pool::lru`, or in `Pool::kept` when `kept`.
     bool kept = false;
     uint32_t pins = 0;  // in-flight copies reading this slot
+    uint32_t writers = 0;  // held destinations may not be released or published while writing
     // Its neighbours in that list.
     uint32_t prev = kNoSlot;
     uint32_t next = kNoSlot;
@@ -330,6 +401,14 @@ class PoolManager {
     uint64_t slots = 0;  // of every pool bound so far: what `content` is sized for
   };
 
+  struct PeerHint {
+    // One proved prefix from probe_only; AcquireRead must still resolve and pin it.
+    std::vector<std::string> keys;
+    std::shared_ptr<PeerApi> peer;
+    std::string incarnation;
+    uint64_t read_epoch = 0;
+  };
+
   struct Pool {
     std::string id;
     // Tells this pool from a later one attached under the same id.
@@ -343,7 +422,9 @@ class PoolManager {
     bool external = false;   // adopted, not allocated: unmap, never free
     void* mapped = nullptr;  // what Import returned, for Unimport
     std::string external_handle;
+    std::string external_kind;
     uint64_t external_offset = 0;
+    bool quarantined = false;  // Unmapping, or completion could not be confirmed.
     Layout layout;
     bool bound = false;
     std::vector<Slot> slots;
@@ -356,6 +437,7 @@ class PoolManager {
     // Cached slots an eviction passed over as last copies (`keep_copies`),
     // oldest first. Evicted from only when `lru` has nothing to take.
     SlotList kept;
+    PeerHint probe_hint;
     uint32_t held = 0;
     uint32_t busy = 0;       // in-flight copies into or out of this pool
     uint64_t committed = 0;  // how far the owner's device has got
@@ -374,6 +456,27 @@ class PoolManager {
     size_t key_index = 0;
   };
 
+  struct ReadGrant {
+    PeerReadRequest request;
+    PeerReadResult result;
+    std::vector<Holder> sources;
+    bool released = false;
+  };
+  struct PendingRelease {
+    std::shared_ptr<PeerApi> peer;
+    std::string incarnation;
+    bool ready = false;  // Set only after no submission or a confirmed drain.
+    Clock::time_point retry_at;
+    unsigned attempts = 0;
+  };
+  uint64_t ReadEpochLocked();
+  bool ReserveRelease(const std::string& operation, std::shared_ptr<PeerApi> peer,
+                      const std::string& incarnation);
+  void FinishRelease(const std::string& operation, const PeerReleaseResult& result);
+  void RetryReleases();
+  FetchResult FetchLocal(const std::string& pool_id, const std::vector<std::string>& keys,
+                         const FetchOptions& options);
+  const Holder* PeerSourceLocked(const std::string& group, const std::string& key);
   Pool* FindLocked(const std::string& pool_id);
   static void PushBack(Pool* pool, SlotList* list, uint32_t slot);
   static void PushFront(Pool* pool, SlotList* list, uint32_t slot);
@@ -406,17 +509,29 @@ class PoolManager {
     return slot.released <= pool.committed && slot.written <= pool.committed;
   }
   bool HasPinnedFreeLocked(const Pool* pool) const;
-  // Waits, without the lock, for the pool's copies to finish. Destroys nothing
-  // if the pool was detached or replaced under its id in the meantime.
-  void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
-  // Unmap an adopted pool's memory, free an allocated one's.
-  void ReleaseMemoryLocked(Pool* pool);
+  Status WaitIdleLocked(std::unique_lock<std::mutex>& lock, const std::string& pool_id,
+                        const char* operation);
+  // Waits without the lock and leaves any replacement under this id untouched.
+  Status DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
 
   std::shared_ptr<MemoryApi> api_;
   uint32_t keep_copies_ = 0;
   // A grant prefers evicting cold content to handing out a slot whose owner's
   // writes have not landed (UMBP_L1_GRANT_SETTLED_FIRST, default on).
   bool settled_first_ = true;
+  const std::string incarnation_;
+  uint64_t next_read_ = 0;
+  std::vector<std::shared_ptr<PeerApi>> peers_;
+  std::unordered_map<std::string, ReadGrant> read_grants_;
+  std::function<Clock::time_point()> now_;
+  uint64_t read_epoch_ = 1;
+  Clock::time_point epoch_expires_;
+  std::mutex releases_mutex_;
+  std::condition_variable releases_changed_;
+  std::unordered_map<std::string, PendingRelease> pending_releases_;
+  bool stop_releases_ = false;
+  std::thread release_thread_;
+
   mutable std::mutex mutex_;
   std::condition_variable idle_;
   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;

@@ -545,6 +545,20 @@ TEST_F(L1PoolTest, FetchIntoDefersUntilPreviousOwnersWritesComplete) {
   EXPECT_EQ(StatsOf("p1").held, 1u);
 }
 
+TEST_F(L1PoolTest, IpcFetchIntoPreservesIndexedAndRepeatedDestinations) {
+  Cache(0, {"new"}, 10);
+  const uint32_t dst = manager->Allocate("p1", 1).slots.at(0);
+  Fill(1, dst, 77);
+  ASSERT_TRUE(manager->Apply("p1", {{OpKind::kPublish, dst, "old"}}).ok);
+  FetchOptions options;
+  options.dst_slots = {dst, dst};
+  FetchResult result = manager->Fetch("p1", {"new", "new"}, options);
+  EXPECT_TRUE(result.status.ok);
+  EXPECT_EQ(result.copied_slots, 2u);
+  EXPECT_EQ(result.slots, options.dst_slots);
+  EXPECT_TRUE(Holds(1, dst, 10));
+}
+
 TEST_F(L1PoolTest, FetchIntoWaitsForTheOwnersCommitThenCopiesEverything) {
   Cache(0, {"a", "b"}, 10);
   const auto dst = manager->Allocate("p1", 2).slots;
