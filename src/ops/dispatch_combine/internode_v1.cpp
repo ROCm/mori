@@ -936,18 +936,18 @@ inline __device__ int CompactGatherSources(P** ptrs, int topk, int laneId) {
 // at 128 VGPRs, and reading them through a pointer cast put the load buffers on the stack.
 inline __device__ void GatherCompactedBf16(hip_bfloat16* dest, hip_bfloat16* const* srcs, int nSrc,
                                            size_t nelems) {
-  constexpr int kBatch = 4;
+  constexpr int kBatch = 4, kVecElems = 16 / sizeof(hip_bfloat16);
   const int laneId = threadIdx.x & (warpSize - 1);
   const size_t vecEnd = (nelems / 8) * 8;
   for (size_t off = static_cast<size_t>(laneId) * 8; off < vecEnd;
        off += static_cast<size_t>(warpSize) * 8) {
-    float acc[8];
+    float acc[kVecElems];
 #pragma unroll
-    for (int j = 0; j < 8; j++) acc[j] = 0.0f;
+    for (int j = 0; j < kVecElems; j++) acc[j] = 0.0f;
 #pragma unroll
     for (int b = 0; b < kMaxGatherSrc; b += kBatch) {
       if (b < nSrc) {
-        ulong2 v[kBatch];
+        VecTypeT<16> v[kBatch];
 #pragma unroll
         for (int i = 0; i < kBatch; i++) {
           if (b + i < nSrc) v[i] = core::load<16>(srcs[b + i] + off);
@@ -956,21 +956,22 @@ inline __device__ void GatherCompactedBf16(hip_bfloat16* dest, hip_bfloat16* con
         for (int i = 0; i < kBatch; i++) {
           if (b + i < nSrc) {
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-              acc[j] += __uint_as_float(static_cast<uint32_t>(v[i].x >> (16 * j)) << 16);
-              acc[4 + j] += __uint_as_float(static_cast<uint32_t>(v[i].y >> (16 * j)) << 16);
+            for (int j = 0; j < kVecElems; j++) {
+              // operator float() does `__hip_uint32_t(data) << 16`
+              acc[j] += float(core::VecElem<hip_bfloat16>(v[i], j));
             }
           }
         }
       }
     }
-    ulong2 out;
-    out.x = 0;
-    out.y = 0;
+
+    union {
+      VecTypeT<16> out;
+      uint16_t u16x8[kVecElems];
+    };
 #pragma unroll
-    for (int j = 0; j < 4; j++) {
-      out.x |= static_cast<uint64_t>(hip_bfloat16(acc[j]).data) << (16 * j);
-      out.y |= static_cast<uint64_t>(hip_bfloat16(acc[4 + j]).data) << (16 * j);
+    for (int j = 0; j < kVecElems; j++) {
+      u16x8[j] = static_cast<uint16_t>(hip_bfloat16(acc[j]).data);
     }
     core::store<16>(dest + off, out);
   }

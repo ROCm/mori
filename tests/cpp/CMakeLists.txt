@@ -22,6 +22,47 @@ if(DEFINED GPU_TARGETS)
     PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
 endif()
 
+# WarpAccum / WarpAccumLF correctness sweep + micro-benchmark on a single GPU
+# (header-only, no MPI/shmem). Needs a GPU, so it is not registered with ctest.
+add_executable(test_warp_accum ops/test_warp_accum.cpp)
+set_source_files_properties(ops/test_warp_accum.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(test_warp_accum PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                                   ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_warp_accum hip::host hip::device)
+# Match the kernel hipcc line (src/ops/CMakeLists.txt) so line tables in the
+# disassembly point at device_primitives.hpp and assert() stays compiled out.
+target_compile_options(test_warp_accum PRIVATE -gline-tables-only -DNDEBUG)
+if(DEFINED GPU_TARGETS)
+  set_target_properties(test_warp_accum PROPERTIES HIP_ARCHITECTURES
+                                                   "${GPU_TARGETS}")
+  # Same as the JIT build: HW fp4/fp8 converts on gfx950. The define cannot be
+  # set per arch, so only add it when gfx950 is the sole target.
+  if(GPU_TARGETS STREQUAL "gfx950")
+    target_compile_definitions(test_warp_accum
+                               PRIVATE HIP_ENABLE_GFX950_OCP_BUILTINS=1)
+  endif()
+endif()
+
+# Two-GPU BlockCopy alignment sweep (P2P via shmem). Needs MPI and two GPUs,
+# so it is not registered with ctest.
+if(BUILD_SHMEM AND WITH_MPI)
+  find_package(MPI REQUIRED)
+  add_executable(test_block_copy_alignment ops/test_block_copy_alignment.cpp)
+  set_source_files_properties(ops/test_block_copy_alignment.cpp PROPERTIES LANGUAGE HIP)
+  target_include_directories(
+    test_block_copy_alignment PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}
+                            ${MPI_CXX_INCLUDE_DIRS})
+  target_link_libraries(test_block_copy_alignment mori_shmem hip::host hip::device
+                        ${MPI_CXX_LIBRARIES})
+  if(MORI_DEVICE_NIC_DEFINE)
+    target_compile_definitions(test_block_copy_alignment PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+  endif()
+  if(DEFINED GPU_TARGETS)
+    set_target_properties(test_block_copy_alignment PROPERTIES HIP_ARCHITECTURES
+                                                     "${GPU_TARGETS}")
+  endif()
+endif()
+
 # Core logging is header-only (spdlog); test its thread-safety independently of
 # BUILD_IO. Run under ThreadSanitizer to actually prove the maps are safe.
 add_executable(test_logging utils/test_logging.cpp)

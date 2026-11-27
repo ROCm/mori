@@ -453,7 +453,7 @@ __device__ void EpDispatchBody(EpArgs args) {
   const unsigned long long win = args.window;
   const int numTokens = args.numTokens;
 
-  using Vec = typename core::VecTypeSelector<16>::dataType;
+  using Vec = core::VecTypeT<16>;
 
   __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2];
 

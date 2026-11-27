@@ -139,8 +139,9 @@ __device__ void EpConvertCombineBody(EpLocalArgs a) {
       const long long s = a.slotMap[tok * kTopk + laneId];
       srcPtrs[laneId] = s >= 0 ? packedX + s * kHidden + off : nullptr;
     }
-    core::WarpAccum<T, 16, kTopk, 1>(outTok + tok * kHidden + off, srcPtrs, a.outWts + tok * kTopk,
-                                     len);
+    // This collapses to WarpAccumImpl<T, 16, kTopk, 1> after switch
+    core::WarpAccumLF<T, 16, 1>(outTok + tok * kHidden + off, srcPtrs, a.outWts + tok * kTopk,
+                                kTopk, len);
   }
 }
 

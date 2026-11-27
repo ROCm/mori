@@ -108,7 +108,6 @@ incompatibilities.
 | `ep_internode_v1.hip` | InterNodeV1 dispatch/combine + sync | Runtime JIT |
 | `ep_internode_v1ll.hip` | InterNodeV1LL low-latency variant | Runtime JIT |
 | `ep_async_ll.hip` | AsyncLL send/recv | Runtime JIT |
-| `cast_kernel.hip` | Float→FP4 cast | Runtime JIT |
 | `shmem_kernels.hip` | shmem barrier + `globalGpuStates` shim | Runtime JIT |
 | `shmem_device_api_wrapper.cpp` | shmem device bitcode (put/get/signal) | Runtime JIT (bitcode) |
 
@@ -239,8 +238,6 @@ Bitcode search order in `find_bitcode()`:
     │   └── ep_intranode.hsaco
     ├── afcfa60c20a2/
     │   └── libmori_shmem_device.bc
-    ├── 575fe0455099/
-    │   └── cast_kernel.hsaco
     └── ...
 ```
 
@@ -306,7 +303,7 @@ export PYTHONPATH=/workspace/mori:$PYTHONPATH
 ```bash
 rm -rf ~/.mori/jit
 MORI_PRECOMPILE=1 python -c "import mori"
-# Expected: ~22s, 6 .hsaco files + 1 .bc + 1 cast_kernel.hsaco
+# Expected: ~22s, 6 .hsaco files + 1 .bc
 ```
 
 ### 4. Verify JIT Configuration
@@ -407,7 +404,6 @@ src/ops/kernels/
 ├── ep_internode_v1.hip           # InterNodeV1 dispatch + combine + sync
 ├── ep_internode_v1ll.hip         # InterNodeV1LL low-latency variant
 ├── ep_async_ll.hip               # AsyncLL send/recv
-├── cast_kernel.hip               # Float→FP4 cast (Python-side launcher)
 └── shmem_kernels.hip             # shmem barrier kernel + globalGpuStates
 ```
 
