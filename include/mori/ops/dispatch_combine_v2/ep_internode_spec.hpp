@@ -70,6 +70,9 @@ struct EpInterNodeCfg {
   // Segmented direct dispatch (needs asyncLlDirect): SlotAssign writes the field rows and
   // SendTransferSeg stages the count and mode words, so the host drops SendCopySeg.
   bool asyncLlFuseMeta{false};
+  // Compact layout (needs asyncLlFuseMeta): each sender reserves its rows' range in the receiver's
+  // packed output and the engines place them there, so the dispatch receive copies nothing.
+  bool asyncLlCompactReserve{false};
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -106,6 +109,7 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
   MORI_FIELD(asyncLlMode);
   MORI_FIELD(asyncLlDirect);
   MORI_FIELD(asyncLlFuseMeta);
+  MORI_FIELD(asyncLlCompactReserve);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -118,7 +122,7 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 13, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 14, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
 // text: RenderSource renders the kernel specialisation (and AsyncLL mode), not
@@ -208,6 +212,8 @@ struct EpInterNodeRequest {
   bool asyncLlDirect = false;
   // asyncLlDirect only; see EpInterNodeCfg::asyncLlFuseMeta.
   bool asyncLlFuseMeta = false;
+  // asyncLlFuseMeta only; see EpInterNodeCfg::asyncLlCompactReserve.
+  bool asyncLlCompactReserve = false;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
@@ -243,6 +249,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(asyncLlMode);
   MORI_FIELD(asyncLlDirect);
   MORI_FIELD(asyncLlFuseMeta);
+  MORI_FIELD(asyncLlCompactReserve);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -255,7 +262,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 26,
+    EpInterNodeRequest, 27,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

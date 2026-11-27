@@ -323,6 +323,15 @@ class EpDispatchCombineConfig:
     #
     # "segmented" is refused on a config that does not support it; "auto" picks
     # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
+    #
+    # MORI_ASYNCLL_COMPACT_RESERVE=1 (gfx950, "compact", no quant_type) keeps the
+    # compact contract -- the dense prefix [0, total_recv), each row's origin in the
+    # reverse map -- but each source reserves its rows' range in the receiver's
+    # views and the copy engines place them there, so nothing is copied on receive.
+    # Sources then appear in arrival order, not rank order (each one's rows stay
+    # contiguous, in its slot order), and since peers write the views, they hold
+    # until this rank's combine_send, as in a segmented round: consume or clone
+    # them before it.
     async_ll_recv_layout: str = "compact"
     low_latency: bool | None = None
 
@@ -1708,8 +1717,8 @@ class EpDispatchCombineOp:
     # The send half returns the same tuple dispatch() does, but the output buffers
     # are NOT populated until the matching recv call has run. Reading them in the
     # seam reads stale data: the previous round's on a compact round, and on a
-    # segmented round (async_ll_recv_layout) bytes the engines are still writing,
-    # since those views are the landing region itself.
+    # segmented round (async_ll_recv_layout) or with MORI_ASYNCLL_COMPACT_RESERVE
+    # bytes the engines are still writing, since those views are where they land.
 
     # The AsyncLL protocol's call order, as a state machine. What each call is
     # allowed to see, and what it leaves behind:

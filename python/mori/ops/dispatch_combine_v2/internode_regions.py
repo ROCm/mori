@@ -151,7 +151,7 @@ def internode_regions(cfg):
     return regions
 
 
-def asyncll_regions(cfg, direct=False):
+def asyncll_regions(cfg, direct=False, reserve=False):
     """``[(name, nbytes)]`` for the AsyncLL family.
 
     Same names as :func:`internode_regions` so the backend's region lookups and
@@ -175,6 +175,8 @@ def asyncll_regions(cfg, direct=False):
     ``direct`` must be the op's resolved MORI_ASYNCLL_DIRECT (the value its
     kernels render): the direct kernels stage metadata only, so the arena shrinks
     (see _asyncll_direct_regions). False returns the list above unchanged.
+    ``reserve`` (MORI_ASYNCLL_COMPACT_RESERVE, implies direct) drops the landing:
+    peers place rows straight into the packed output.
     """
     regions = dict(internode_regions(cfg))
     order = [name for name, _ in internode_regions(cfg)]
@@ -244,8 +246,11 @@ def asyncll_regions(cfg, direct=False):
     order.append("inter_combine_staging")
     regions["inter_combine_staging"] = send_slots * hidden_bytes
 
-    if direct:
-        _asyncll_direct_regions(cfg, regions, order, per_rank)
+    if reserve:
+        # Segmented words, then the reserve words (asyncll_reserve_words).
+        regions["send_count"] = asyncll_reserve_words(world_size)["words"] * _U64
+    if direct or reserve:
+        _asyncll_direct_regions(cfg, regions, order, per_rank, reserve)
     return [(name, regions[name]) for name in order]
 
 
@@ -261,7 +266,7 @@ _ASYNCLL_DIRECT_DROPPED = (
 )
 
 
-def _asyncll_direct_regions(cfg, regions, order, per_rank):
+def _asyncll_direct_regions(cfg, regions, order, per_rank, reserve=False):
     """Resize ``regions`` / prune ``order`` in place for direct sources.
 
     Regions peers write keep the extent the kernels address (landing
@@ -290,7 +295,14 @@ def _asyncll_direct_regions(cfg, regions, order, per_rank):
     regions["inter_dispatch_out"] = cfg.world_size * per_rank * cfg.token_nbytes
     # Indexed by receive row; a round receives at most world_size * M rows.
     regions["disp_tok_id_to_src_tok_id"] = slots * _I32
-    order[:] = [name for name in order if name not in _ASYNCLL_DIRECT_DROPPED]
+    dropped = _ASYNCLL_DIRECT_DROPPED
+    if reserve:
+        # Field rows staged per destination, own rank's included; nothing lands in a landing.
+        regions["inter_staging"] = max(
+            slots * meta, asyncll_seg_layout(cfg, hidden_nbytes=0)["bytes"]
+        )
+        dropped += ("inter_dispatch_inp",)
+    order[:] = [name for name in order if name not in dropped]
 
 
 _SEG_ALIGN = 256
@@ -310,6 +322,22 @@ def asyncll_seg_words(world_size):
         "errors": 3 * w + 1,
         "counts": 3 * w + 3,
         "extra": 2 * w + 3,
+    }
+
+
+def asyncll_reserve_words(world_size):
+    """Indices (u64 words) of the compact-reserve words in ``send_count``, past the
+    segmented ones (asyncll_seg_words): each source's base this round (``base``),
+    this rank's reservation at each peer (``place``), and the counter peers reserve
+    from (``counter``, alone on a 256 B line). ``words`` is the region's length.
+    Must match the Reserve*Slot helpers in ep_asyncll_kernel.hpp."""
+    w = world_size
+    counter = -(-(6 * w + 3) // 32) * 32
+    return {
+        "base": 4 * w + 3,
+        "place": 5 * w + 3,
+        "counter": counter,
+        "words": counter + 32,
     }
 
 

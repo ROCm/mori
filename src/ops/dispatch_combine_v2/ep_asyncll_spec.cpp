@@ -116,6 +116,7 @@ std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind) 
   std::string name = "mori_ep_asyncll_";
   if (cfg.asyncLlDirect) name += "direct_";
   if (cfg.asyncLlFuseMeta) name += "fusemeta_";
+  if (cfg.asyncLlCompactReserve) name += "reserve_";
   if (cfg.asyncLlMode == 2)
     name += "fused_";
   else if (cfg.asyncLlMode == 1)
@@ -159,6 +160,8 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
     throw std::runtime_error("AsyncLL direct sources require early notification");
   if (cfg.asyncLlFuseMeta && !cfg.asyncLlDirect)
     throw std::runtime_error("AsyncLL fused metadata requires direct sources");
+  if (cfg.asyncLlCompactReserve && !cfg.asyncLlFuseMeta)
+    throw std::runtime_error("AsyncLL compact reserve requires fused metadata");
   if (early && (kind == EpAsyncLLKernel::DispatchSendCopyLsa ||
                 kind == EpAsyncLLKernel::DispatchSendTransferLsa ||
                 kind == EpAsyncLLKernel::DispatchRecvTransferLsa ||
@@ -173,6 +176,8 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   source += "#define MORI_ASYNCLL_FUSED_RECV " + std::to_string(fused ? 1 : 0) + "\n";
   source += "#define MORI_ASYNCLL_DIRECT " + std::to_string(cfg.asyncLlDirect ? 1 : 0) + "\n";
   source += "#define MORI_ASYNCLL_FUSE_META " + std::to_string(cfg.asyncLlFuseMeta ? 1 : 0) + "\n";
+  source += "#define MORI_ASYNCLL_COMPACT_RESERVE " +
+            std::to_string(cfg.asyncLlCompactReserve ? 1 : 0) + "\n";
   source +=
       "#include \"src/ops/dispatch_combine_v2/ep_asyncll_kernel.hpp\"\n"
       "constexpr ::mori::ops::v2::EpInterNodeKernelCfg kConfig = ";
@@ -284,6 +289,10 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
       geometry.sharedBytes = static_cast<unsigned>(EpInterNodeCombineSharedBytes(cfg));
       break;
   }
+
+  // Compact reserve: the receive is an epilogue on one wave (and a drain wave when fused).
+  if (kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg && cfg.asyncLlCompactReserve)
+    geometry.gridX = 1;
 
   // The segmented dispatch receive copies no tokens: it fills the rows past each count, a few
   // words each. On gfx942/gfx950 (wave64, the RECV_TRIM body) two rows per thread of the largest

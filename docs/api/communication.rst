@@ -141,6 +141,18 @@ These options are read once when an op is constructed:
        also writes the metadata rows, so a segmented round's ``dispatch_send``
        runs two passes instead of three. ``0`` keeps the separate metadata
        pass. Ignored without direct sources or the segmented layout.
+   * - ``MORI_ASYNCLL_COMPACT_RESERVE``
+     - ``0``. ``1`` on a compact op (gfx950, single-node SDMA with early
+       notification, no ``quant_type``): each source reserves its rows' range
+       in every receiver's recv views with one remote atomic per peer, and the
+       copy engines place rows, scales and metadata there, so
+       ``dispatch_recv`` copies nothing. Direct sources and fused metadata
+       come with it; it is refused elsewhere and with
+       ``MORI_ASYNCLL_DIRECT=0`` or ``MORI_ASYNCLL_FUSE_META=0``. The views keep
+       the compact contract, a dense prefix of ``total_recv`` rows, but sources
+       appear in arrival order, and the views are valid only until this rank's
+       ``combine_send``. The arena leaves out the dispatch landing, so every
+       rank must use the same value.
    * - ``MORI_ASYNCLL_SEND_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the send-side copy
        passes: slot assignment and the dispatch and combine gathers (not the
@@ -148,7 +160,8 @@ These options are read once when an op is constructed:
        to a multiple of the world size, and up to the world size if smaller; it
        never widens a pass's default grid. With direct sources and
        fused metadata (``MORI_ASYNCLL_FUSE_META``, on by default) in the
-       segmented layout it also sets the send transfer's blocks per peer,
+       segmented layout, or with ``MORI_ASYNCLL_COMPACT_RESERVE=1``, it also
+       sets the send transfer's blocks per peer,
        ceiling / world size (one when 0), up to the device.
    * - ``MORI_ASYNCLL_RECV_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
@@ -173,8 +186,8 @@ These options are read once when an op is constructed:
        and 0 means no ceiling. All entries share one compiled module.
 
 ``MORI_ASYNCLL_EARLY_NOTIFY``, ``MORI_ASYNCLL_SKIP_RESET``,
-``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_DIRECT`` and
-``MORI_ASYNCLL_FUSE_META`` accept ``0`` or ``1``; the ``*_BLOCKS`` variables
+``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_DIRECT``,
+``MORI_ASYNCLL_FUSE_META`` and ``MORI_ASYNCLL_COMPACT_RESERVE`` accept ``0`` or ``1``; the ``*_BLOCKS`` variables
 accept a non-negative integer and the schedules a comma-separated list of
 ``tokens:blocks`` pairs. Skipping the reset or fusing receive requires
 early notification. Set the first three to ``0`` for the legacy sequence.

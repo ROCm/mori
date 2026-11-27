@@ -785,7 +785,7 @@ TEST(AsyncLLMode, DirectSendTransferSplitsPeersByTheSendCeiling) {
                              EpAsyncLLKernel::DispatchSendTransferSeg)
         .gridX;
   };
-  EXPECT_EQ(grid(true, 0), 8u);    // no ceiling: one block per peer
+  EXPECT_EQ(grid(true, 0), 8u);  // no ceiling: one block per peer
   EXPECT_EQ(grid(true, 8), 8u);
   EXPECT_EQ(grid(true, 32), 32u);  // four per peer
   EXPECT_EQ(grid(true, 36), 32u);  // rounded down to the world size
@@ -895,6 +895,45 @@ TEST(AsyncLLMode, FuseMetaNeedsDirectAndForksEntryAndSource) {
   // A hand-built cfg goes through the same check in the render funnel.
   auto hand = fuse;
   hand.asyncLlDirect = false;
+  EXPECT_THROW(EpAsyncLLRenderSource(hand, EpAsyncLLKernel::DispatchSlotAssign),
+               std::runtime_error);
+}
+
+TEST(AsyncLLMode, CompactReserveNeedsFuseMetaAndForksEntrySourceAndGrid) {
+  EpInterNodeRequest request;
+  request.worldSize = 8;
+  request.gpuPerNode = 8;
+  request.asyncLlMode = 1;
+  request.asyncLlDirect = true;
+  request.asyncLlCompactReserve = true;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlFuseMeta = true;
+  const auto reserve = MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                          EpInterNodeFamily::AsyncLL);
+  request.asyncLlCompactReserve = false;
+  const auto plain = MakeEpInterNodeCfg("gfx950", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+  EXPECT_TRUE(reserve.asyncLlCompactReserve);
+  EXPECT_NE(Describe(reserve).find("asyncLlCompactReserve=true\n"), std::string::npos);
+  EXPECT_NE(EpInterNodeRequestSchema().find("asyncLlCompactReserve:b=0"), std::string::npos);
+  for (const auto kind :
+       {EpAsyncLLKernel::DispatchSlotAssign, EpAsyncLLKernel::DispatchSendTransferSeg,
+        EpAsyncLLKernel::DispatchRecvFinalizeSeg, EpAsyncLLKernel::CombineSendTransfer,
+        EpAsyncLLKernel::CombineRecvCopy}) {
+    EXPECT_NE(EpAsyncLLEntryName(reserve, kind).find("reserve_"), std::string::npos);
+    EXPECT_EQ(EpAsyncLLEntryName(plain, kind).find("reserve_"), std::string::npos);
+    EXPECT_NE(EpAsyncLLRenderSource(reserve, kind).find("#define MORI_ASYNCLL_COMPACT_RESERVE 1\n"),
+              std::string::npos);
+    EXPECT_NE(EpAsyncLLRenderSource(plain, kind).find("#define MORI_ASYNCLL_COMPACT_RESERVE 0\n"),
+              std::string::npos);
+  }
+  // The receive is one block's epilogue; the segmented finalize keeps its row grid.
+  EXPECT_EQ(EpAsyncLLGeometry(reserve, EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX, 1u);
+  EXPECT_GT(EpAsyncLLGeometry(plain, EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX, 1u);
+  auto hand = reserve;
+  hand.asyncLlFuseMeta = false;
   EXPECT_THROW(EpAsyncLLRenderSource(hand, EpAsyncLLKernel::DispatchSlotAssign),
                std::runtime_error);
 }

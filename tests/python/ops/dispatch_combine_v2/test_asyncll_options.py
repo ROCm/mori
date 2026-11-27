@@ -30,7 +30,9 @@ from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchComb
 from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
 from mori.ops.dispatch_combine_v2.internode_regions import (
     asyncll_regions,
+    asyncll_reserve_words,
     asyncll_seg_layout,
+    asyncll_seg_words,
 )
 
 
@@ -553,6 +555,136 @@ class AsyncLLSegmentedTest(unittest.TestCase):
         # Direct rides on early notification; without it the arena is the staged one.
         off = {"MORI_ASYNCLL_DIRECT": "1", "MORI_ASYNCLL_EARLY_NOTIFY": "0"}
         self.assertEqual(vmm(off), staged)
+
+
+class AsyncLLCompactReserveTest(unittest.TestCase):
+    compact = SimpleNamespace(
+        async_ll_segmented=False, quant_type="none", async_ll_transport="sdma", nodes=1
+    )
+
+    def reserve(self, env, mode=1, cfg=None, arch="gfx950"):
+        with patch.dict(os.environ, env, clear=True):
+            return EpDispatchCombineOpHip._asyncll_reserve(
+                mode, cfg or self.compact, arch
+            )
+
+    def test_off_unless_asked(self):
+        self.assertFalse(self.reserve({}))
+        self.assertFalse(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "0"}))
+        self.assertTrue(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "1"}))
+        self.assertTrue(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "1"}, mode=2))
+        with self.assertRaises(ValueError):
+            self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "yes"})
+
+    def test_refused_where_it_cannot_run(self):
+        on = {"MORI_ASYNCLL_COMPACT_RESERVE": "1"}
+        seg = SimpleNamespace(async_ll_segmented=True, quant_type="none")
+        quant = SimpleNamespace(
+            async_ll_segmented=False, quant_type="fp8_blockwise_1x128"
+        )
+        for env, mode, cfg, arch in [
+            (
+                on,
+                0,
+                None,
+                "gfx950",
+            ),  # no early notification (LSA, several nodes, opted out)
+            (on, 1, seg, "gfx950"),
+            (on, 1, quant, "gfx950"),
+            (on, 1, None, "gfx942"),
+            (on, 1, None, "gfx1250"),
+            ({**on, "MORI_ASYNCLL_DIRECT": "0"}, 1, None, "gfx950"),
+            ({**on, "MORI_ASYNCLL_FUSE_META": "0"}, 1, None, "gfx950"),
+        ]:
+            with self.subTest(env=env, mode=mode, cfg=cfg, arch=arch):
+                with self.assertRaises(ValueError):
+                    self.reserve(env, mode, cfg, arch)
+
+    def test_sequences(self):
+        seq = EpDispatchCombineOpHip._asyncll_seq(self.compact, 1, True, reserve=True)
+        self.assertEqual(
+            seq["dispatch_send"], ("dispatch_slotassign", "dispatch_sendtransfer_seg")
+        )
+        self.assertEqual(
+            seq["dispatch_recv"], ("dispatch_recvtransfer", "dispatch_recvfinalize_seg")
+        )
+        self.assertEqual(seq["combine_send"], ("combine_sendtransfer",))
+        self.assertEqual(
+            seq["combine_recv"], ("combine_recvtransfer", "combine_recvcopy")
+        )
+        fused = EpDispatchCombineOpHip._asyncll_seq(self.compact, 2, True, reserve=True)
+        self.assertEqual(fused["dispatch_recv"], ("dispatch_recvfinalize_seg",))
+        self.assertEqual(fused["combine_recv"], ("combine_recvcopy",))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(
+                EpDispatchCombineOpHip._asyncll_fuse_meta(True, False, True)
+            )
+            self.assertFalse(EpDispatchCombineOpHip._asyncll_fuse_meta(True, False))
+
+    def test_words_follow_the_segmented_ones(self):
+        for w in (2, 8, 16):
+            with self.subTest(world_size=w):
+                seg, res = asyncll_seg_words(w), asyncll_reserve_words(w)
+                self.assertEqual(res["base"], seg["counts"] + w)
+                self.assertEqual(res["place"], res["base"] + w)
+                # The counter sits alone on a 256 B line past the place words.
+                self.assertGreaterEqual(res["counter"], res["place"] + w)
+                self.assertEqual(res["counter"] % 32, 0)
+                self.assertEqual(res["words"], res["counter"] + 32)
+
+    def test_regions_drop_the_landing(self):
+        for scale_dim, token_nbytes, cap in (
+            (0, 14336, 0),
+            (224, 7168, 0),
+            (224, 7168, 400),
+        ):
+            with self.subTest(scales=scale_dim, cap=cap):
+                cfg = AsyncLLSegmentedTest.regions_cfg(scale_dim, token_nbytes, 0, cap)
+                direct = dict(asyncll_regions(cfg, direct=True))
+                reserve = dict(asyncll_regions(cfg, direct=True, reserve=True))
+                self.assertNotIn("inter_dispatch_inp", reserve)
+                self.assertEqual(
+                    reserve["send_count"], asyncll_reserve_words(8)["words"] * 8
+                )
+                # Field rows for every destination, own rank included, in the seg staging layout.
+                self.assertGreaterEqual(
+                    reserve["inter_staging"],
+                    asyncll_seg_layout(cfg, hidden_nbytes=0)["bytes"],
+                )
+                # What peers place into and combine sends from keep the compact extents.
+                for name in (
+                    "inter_dispatch_out",
+                    "out_indices",
+                    "dispatch_out_weights",
+                    "disp_tok_id_to_src_tok_id",
+                    "inter_combine_inp",
+                    "inter_dispatch_staging",
+                    "recv_token_num",
+                ):
+                    self.assertEqual(reserve[name], direct[name], name)
+                if scale_dim:
+                    self.assertEqual(reserve["out_scales"], direct["out_scales"])
+
+    def test_per_rank_vmm_follows_the_reserve_flag(self):
+        cfg = EpDispatchCombineConfig(
+            rank=0,
+            world_size=8,
+            hidden_dim=7168,
+            max_num_inp_token_per_rank=16384,
+            num_experts_per_rank=32,
+            num_experts_per_token=8,
+            kernel_backend="hip",
+            async_ll=True,
+            async_ll_transport="sdma",
+        )
+
+        def vmm(env):
+            with patch.dict(os.environ, env, clear=True):
+                return EpDispatchCombineOp.per_rank_vmm(cfg, arch="gfx950")
+
+        direct = vmm({"MORI_ASYNCLL_DIRECT": "1"})
+        reserve = vmm({"MORI_ASYNCLL_COMPACT_RESERVE": "1"})
+        self.assertLess(reserve, direct)
 
 
 def _fake_plan_type(name):

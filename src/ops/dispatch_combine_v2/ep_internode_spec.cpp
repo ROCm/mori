@@ -104,6 +104,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.combineQGroup = request.combineQGroup;
   cfg.asyncLlDirect = request.asyncLlDirect;
   cfg.asyncLlFuseMeta = request.asyncLlFuseMeta;
+  cfg.asyncLlCompactReserve = request.asyncLlCompactReserve;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -149,6 +150,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   }
   if (cfg.asyncLlFuseMeta && !cfg.asyncLlDirect) {
     throw std::runtime_error("mori ep v2: asyncLlFuseMeta requires asyncLlDirect");
+  }
+  if (cfg.asyncLlCompactReserve && !cfg.asyncLlFuseMeta) {
+    throw std::runtime_error("mori ep v2: asyncLlCompactReserve requires asyncLlFuseMeta");
   }
   if (cfg.asyncLlDirect && cfg.kernelCfg.combineQGroup != 0) {
     throw std::runtime_error("mori ep v2: asyncLlDirect sends the combine input unquantized");
