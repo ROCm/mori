@@ -520,6 +520,7 @@ saves its state in its destructor (or `release()`).
 | `ccoCoopWarp` | all 64 lanes of the wavefront, converged, same arguments | one | SPSC, MPSC | one |
 | `ccoCoopBlock` | the whole block, converged, same arguments; wavefront 0 issues | one | SPSC, MPSC | one |
 | `ccoCoopLaneMasked{active}` | all 64 lanes, converged | one per lane with `active`, in one push, in lane order | SPSC, MPSC | one per lane |
+| `ccoCoopLaneMaskedGroup{active}` | all 64 lanes, converged | as `ccoCoopLaneMasked` | SPSC, MPSC | `put` / `putValue`: one per peer group; `signal`: one per lane |
 | `ccoCoopThread` | any lanes: from divergent code, or a single lane | one per calling lane | MPSC only | `put` / `putValue`: one per peer group; `signal`: one per lane |
 
 - Builds without `NDEBUG` check that `ccoCoopWarp` / `ccoCoopBlock` lanes pass
@@ -527,13 +528,15 @@ saves its state in its destructor (or `release()`).
   `ccoCoopThread`. For `ccoCoopBlock`, wavefront 0 (linear thread ids 0–63,
   also in 2-D and 3-D blocks) issues.
 - `ccoCoopThread`, as in `ccoGda`: the calling lanes of one call enter the queue
-  together, in lane order. A `put` / `putValue` carrying a signal signals once
-  per group of lanes with the same peer, after the group's data, with the
-  group's highest lane's arguments: count expected signals per group.
+  together, in lane order. With `ccoCoopThread` and `ccoCoopLaneMaskedGroup`, a
+  `put` / `putValue` carrying a signal signals once per group of lanes with the
+  same peer, after the group's data, with the group's highest lane's arguments:
+  count expected signals per group.
 - `ccoGdaThreadAggregate` (`put<CCO_TEAM_WORLD, ccoGdaThreadAggregate>(...)`)
   promises that all calling lanes target one peer, so the call skips the
-  grouping; builds without `NDEBUG` check it. It needs `ccoCoopThread`.
-- SPSC queues reject `ccoCoopThread`, and `ccoGda` rejects `ccoCoopLaneMasked`,
+  grouping; builds without `NDEBUG` check it. It needs `ccoCoopThread` or
+  `ccoCoopLaneMaskedGroup`.
+- SPSC queues reject `ccoCoopThread`, and `ccoGda` rejects the lane-masked Coops,
   at compile time.
 - Call `flush()` with `ccoCoopWarp` or `ccoCoopBlock`, as in `ccoGda`: after
   lane-masked or thread ops, flush from the converged wavefront.
@@ -547,6 +550,7 @@ How to choose:
 | the lowest cost per op, with a queue per wavefront or block | SPSC with `ccoCoopWarp` / `ccoCoopBlock` |
 | many wavefronts sharing a few queues | MPSC |
 | a different peer, offset or size per thread, from a full wavefront | `ccoCoopLaneMasked`: one push for all lanes |
+| the same, with one signal per peer after the lanes' data (as `ccoCoopThread`) | `ccoCoopLaneMaskedGroup` |
 | `ccoGda` thread code as is (divergent calls, single lanes) | `ccoCoopThread` on MPSC |
 | all calling lanes go to one peer | add `ccoGdaThreadAggregate` |
 
@@ -555,7 +559,8 @@ push needs no atomic, while each MPSC push claims its lines with a device-memory
 atomic. In new code, avoid calling ccoProxy from divergent code: each
 `ccoCoopThread` call pushes on its own, so calls on both sides of a branch claim
 twice. Compute the per-lane arguments and call once from converged code, e.g.
-`put(c ? p1 : p2, ...)` or `ccoCoopLaneMasked{active}`.
+`put(c ? p1 : p2, ...)`, or `ccoCoopLaneMaskedGroup{active}`, which keeps
+`ccoCoopThread`'s signal counts.
 
 ### Signal slots
 
@@ -570,7 +575,7 @@ consumed. The semantics are the same as `ccoGda`'s:
   `waitSignal(id, n)` waits for `n` more. (`ccoSdma::waitSignal` does take an
   absolute value.)
 - Have one waiter per slot at a time: two concurrent waiters on one slot can
-  both take the same arrival. `waitSignal` does not take `ccoCoopLaneMasked`.
+  both take the same arrival. `waitSignal` does not take the lane-masked Coops.
 - Call `resetSignal(id)` only when no signal to the slot is in flight. It zeroes
   the slot and its consumed count.
 - Use slot ids from 0 to `gdaSignalCount - 1`. Unlike `ccoGda`, `ccoProxy`

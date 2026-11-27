@@ -251,15 +251,28 @@ __host__ __device__ inline ccoGdaSignal_t LaneSlot(int nranks, int src, int unit
 }
 
 enum ThreadCase {
-  kThreadPutSignal,      // `rounds` x put carrying SignalAdd{LaneSlot(me, u, L), L + 1}
-  kThreadPutLaneSignal,  // put, then signal(SignalInc{LaneSlot(me, u, L)})
-  kThreadPutFlush        // put, flush, overwrite the source, signal(SignalAdd{Slot(me, u), L + 1})
+  kThreadPutSignal,       // `rounds` x put carrying SignalAdd{LaneSlot(me, u, L), L + 1}
+  kThreadPutGroupSignal,  // `rounds` x ccoCoopLaneMaskedGroup put carrying SignalInc{Slot(me, u)}:
+                          // one signal per call and peer group
+  kThreadPutLaneSignal,   // put, then signal(SignalInc{LaneSlot(me, u, L)})
+  kThreadPutFlush         // put, flush, overwrite the source, signal(SignalAdd{Slot(me, u), L + 1})
 };
 
 // Lane L's k-th peer: every lane sends to every peer once, and with more than
 // two ranks the lanes of one call target different peers.
 __device__ inline int ThreadPeer(int me, int n, int k, int lane) {
   return (me + 1 + (k + lane) % (n - 1)) % n;
+}
+
+// Calls k of rank s with an active lane targeting me: one per-group signal each.
+__device__ inline uint64_t GroupSignals(int s, int n, int me) {
+  uint64_t want = 0;
+  for (int k = 0; k < n - 1; k++) {
+    bool any = false;
+    for (int l = 0; l < 64; l++) any = any || (ThreadActive(l) && ThreadPeer(s, n, k, l) == me);
+    want += any ? 1 : 0;
+  }
+  return want;
 }
 
 // Checks this lane's written words of chunk slot (s, v), nSlots slots per sender.
@@ -308,6 +321,9 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
         proxy.put(peer, dst, off(me, r), src, off(p, r), bytes,
                   ccoGda_SignalAdd{LaneSlot(n, me, u, lane), static_cast<uint64_t>(lane + 1)},
                   ccoCoopLaneMasked{active});
+      } else if constexpr (Mode == kThreadPutGroupSignal) {
+        proxy.put(peer, dst, off(me, r), src, off(p, r), bytes, ccoGda_SignalInc{Slot(me, u)},
+                  ccoCoopLaneMaskedGroup{active});
       } else {
         proxy.put(peer, dst, off(me, r), src, off(p, r), bytes, ccoGda_NoSignal{},
                   ccoCoopLaneMasked{active});
@@ -341,6 +357,9 @@ __global__ void ProxyThreadKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWindow_
     if (s == me) continue;
     if constexpr (Mode == kThreadPutFlush) {
       if (lane == 0) proxy.waitSignal(Slot(s, u), ThreadSignalSum());
+    } else if constexpr (Mode == kThreadPutGroupSignal) {
+      if (lane == 0)
+        proxy.waitSignal(Slot(s, u), static_cast<uint64_t>(rounds) * GroupSignals(s, n, me));
     } else if (active) {
       proxy.waitSignal(LaneSlot(n, s, u, lane),
                        Mode == kThreadPutSignal ? static_cast<uint64_t>(rounds) * (lane + 1) : 1);
@@ -370,8 +389,9 @@ enum ThreadModeCase {
   kTmGroupSignal,      // puts carry SignalInc{Slot(me, u)}: per call, one signal per
                        // peer its lanes target (ccoGda's per-group signal)
   kTmLaneSignal,       // puts, then signal(SignalInc{LaneSlot(me, u, L)}): per lane
-  kTmAggregate         // call k: every active lane puts to ThreadPeer(me, n, k, 0)
+  kTmAggregate,        // call k: every active lane puts to ThreadPeer(me, n, k, 0)
                        // with ccoGdaThreadAggregate and SignalSet{Slot(me, u), 1}
+  kTmLaneAggregate     // as kTmAggregate, from converged code with ccoCoopLaneMaskedGroup
 };
 
 template <int Mode>
@@ -387,12 +407,17 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
   auto off = [&](int p) {  // this lane's slice of chunk slot (p, u)
     return (static_cast<size_t>(p) * nUnits + u) * chunk + lane * kLaneSlice;
   };
-  auto peerOf = [&](int k) { return ThreadPeer(me, n, k, Mode == kTmAggregate ? 0 : lane); };
+  constexpr bool kAgg = Mode == kTmAggregate || Mode == kTmLaneAggregate;
+  auto peerOf = [&](int k) { return ThreadPeer(me, n, k, kAgg ? 0 : lane); };
   auto putTo = [&](int k, auto action) {
     const int p = peerOf(k);
     if constexpr (Mode == kTmAggregate) {
       proxy.template put<CCO_TEAM_WORLD, ccoGdaThreadAggregate>(
           p, recvWin, off(me), sendWin, off(p), ThreadBytes(lane), action, ccoCoopThread{});
+    } else if constexpr (Mode == kTmLaneAggregate) {
+      proxy.template put<CCO_TEAM_WORLD, ccoGdaThreadAggregate>(p, recvWin, off(me), sendWin,
+                                                                off(p), ThreadBytes(lane), action,
+                                                                ccoCoopLaneMaskedGroup{active});
     } else {
       proxy.put(p, recvWin, off(me), sendWin, off(p), ThreadBytes(lane), action, ccoCoopThread{});
     }
@@ -436,6 +461,8 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
         proxy.signal(peerOf(k), ccoGda_SignalInc{LaneSlot(n, me, u, lane)}, ccoCoopThread{});
       }
     }
+  } else if constexpr (Mode == kTmLaneAggregate) {
+    for (int k = 0; k < n - 1; k++) putTo(k, ccoGda_SignalSet{Slot(me, u), 1});  // every lane calls
   } else {
     if (active) {
       for (int k = 0; k < n - 1; k++) putTo(k, ccoGda_SignalSet{Slot(me, u), 1});
@@ -453,16 +480,7 @@ __global__ void ProxyThreadModeKernel(ccoDevComm dc, ccoWindow_t sendWin, ccoWin
       if (active) proxy.waitSignal(LaneSlot(n, s, u, lane), 1);  // one per lane
     } else {
       uint64_t want = 1;
-      if constexpr (Mode == kTmGroupSignal) {
-        want = 0;  // the calls of s with a lane targeting me: one signal each
-        for (int k = 0; k < n - 1; k++) {
-          bool any = false;
-          for (int l = 0; l < 64; l++) {
-            any = any || (ThreadActive(l) && ThreadPeer(s, n, k, l) == me);
-          }
-          want += any ? 1 : 0;
-        }
-      }
+      if constexpr (Mode == kTmGroupSignal) want = GroupSignals(s, n, me);
       proxy.waitSignal(Slot(s, u), want, ccoCoopWarp{});
     }
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
@@ -545,7 +563,8 @@ __device__ inline void CheckValues(const ccoDevComm& dc, P& proxy, const uint64_
 template <typename Q, typename Coop, bool kSet>
 __global__ void ProxyValueKernel(ccoDevComm dc, ccoWindow_t recvWin, const uint64_t* recvLocal,
                                  uint32_t salt, int nUnits, int* err) {
-  constexpr bool kLaneMasked = std::is_same_v<Coop, ccoCoopLaneMasked>;
+  constexpr bool kLaneMasked =
+      std::is_same_v<Coop, ccoCoopLaneMasked> || std::is_same_v<Coop, ccoCoopLaneMaskedGroup>;
   const int u = blockIdx.x;
   const int me = dc.rank;
   const int n = dc.worldSize;
@@ -567,7 +586,7 @@ __global__ void ProxyValueKernel(ccoDevComm dc, ccoWindow_t recvWin, const uint6
       const int j = base + __lane_id();
       const bool active = j < n - 1;
       const int p = active ? (me + 1 + j) % n : me;  // an idle lane's peer is not read
-      for (int k = 0; k < kValueSlots; k++) send(p, k, ccoCoopLaneMasked{active});
+      for (int k = 0; k < kValueSlots; k++) send(p, k, Coop{active});
     }
   } else if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
     // Lane j writes to the j-th next rank from a divergent branch: one lane per
@@ -954,10 +973,20 @@ __global__ void ProxyResetKernel(ccoDevComm dc, int nSlots) {
 }
 
 // Positive cases that use no NIC atomics (MORI_CCO_PROXY_TEST_CASES=atomic_free).
-static const char* const kAtomicFreeCases[] = {
-    "lane_value_set",      "mpsc_lane_value_set", "set_put",      "set_signal",
-    "set_window",          "mpsc_set_put",        "conn_set_put", "tm_branch",
-    "tm_branch_contended", "tm_single",           "tm_agg_set",   "tm_value_set"};
+static const char* const kAtomicFreeCases[] = {"lane_value_set",
+                                               "mpsc_lane_value_set",
+                                               "set_put",
+                                               "set_signal",
+                                               "set_window",
+                                               "mpsc_set_put",
+                                               "conn_set_put",
+                                               "tm_branch",
+                                               "tm_branch_contended",
+                                               "tm_single",
+                                               "tm_agg_set",
+                                               "tm_value_set",
+                                               "tm_lane_agg_set",
+                                               "mpsc_lane_group_value_set"};
 
 // Whether the comma-separated `list` names `name`.
 static bool Listed(const char* list, const char* name) {
@@ -1468,6 +1497,9 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunThreadModeCase<kTmBranchContended>(c, "tm_branch_contended", 59);
   fails += RunThreadModeCase<kTmSingle>(c, "tm_single", 52);
   fails += RunThreadModeCase<kTmAggregate>(c, "tm_agg_set", 56);
+  fails += RunThreadModeCase<kTmLaneAggregate>(c, "tm_lane_agg_set", 60);
+  fails += RunValueCase<MPSCD2HQueue, ccoCoopLaneMaskedGroup, true>(c, "mpsc_lane_group_value_set",
+                                                                    61, kMaxUnits);
   fails += RunValueCase<MPSCD2HQueue, ccoCoopThread, true>(c, "tm_value_set", 58, kMaxUnits);
   fails += RunPutCase<SPSCD2HQueue, ccoCoopWarp, kPutSignal>(c, "put_sig_warp", 1, kChunk,
                                                              kSpscQueues, 64);
@@ -1507,6 +1539,14 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
   fails += RunThreadCase<MPSCD2HQueue, kThreadPutSignal>(c, "mpsc_thr_sig", 21, kMaxUnits, 256);
   fails += RunThreadCase<MPSCD2HQueue, kThreadPutLaneSignal>(c, "mpsc_thr_lane", 22, kMaxUnits);
   fails += RunThreadCase<MPSCD2HQueue, kThreadPutFlush>(c, "mpsc_thr_flush", 23, kMaxUnits);
+  // ccoCoopLaneMaskedGroup: one signal per call and peer group, SPSC and MPSC.
+  fails += RunThreadCase<SPSCD2HQueue, kThreadPutGroupSignal>(c, "lane_group_sig", 62, kSpscQueues);
+  fails += RunThreadCase<SPSCD2HQueue, kThreadPutGroupSignal>(c, "lane_group_split", 63,
+                                                              kSpscQueues, 256);
+  fails += RunThreadCase<MPSCD2HQueue, kThreadPutGroupSignal>(c, "mpsc_lane_group_sig", 64,
+                                                              kMaxUnits, 0, true);
+  fails += RunValueCase<SPSCD2HQueue, ccoCoopLaneMaskedGroup, false>(c, "lane_group_value", 65,
+                                                                     kSpscQueues);
   // Lane-masked pushes on kThreadCapacity-line rings, kThreadRounds rounds: the
   // rings wrap, SPSC pushes retry for credit, MPSC claims wait.
   fails += RunThreadCase<SPSCD2HQueue, kThreadPutSignal>(c, "thr_small_spsc", 24, kSpscQueues, 256,

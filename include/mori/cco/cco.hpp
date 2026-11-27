@@ -630,6 +630,15 @@ struct ccoCoopLaneMasked {
   __device__ void sync() {}
 };
 
+// ccoCoopLaneMasked, but a put / putValue carrying a signal signals once per
+// group of active lanes with the same peer, as ccoCoopThread does.
+struct ccoCoopLaneMaskedGroup {
+  bool active = true;
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
+};
+
 /* ════════════════════════════════════════════════════════════════════════════
  *  3. Teams — logical rank-subset descriptors used by per-backend sessions
  *     (especially ccoGda) to address peers without leaking topology into kernels.
