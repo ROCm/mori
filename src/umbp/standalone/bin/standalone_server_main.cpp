@@ -22,6 +22,7 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 //
 // MIT License
+#include <malloc.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -288,9 +289,37 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   return true;
 }
 
+// Keep the data path's call-scoped buffers on the heap.  Under glibc's
+// defaults an allocation above the mmap threshold is an mmap, freeing it is a
+// munmap, and free space at a heap's top goes back to the kernel; each takes
+// the process's mmap_lock for writing.  With every client putting and getting
+// at once those calls queue behind one another and behind page faults, and a
+// thread that allocates while holding a pool lock holds up every lookup.  A
+// setting glibc already read from the environment (MALLOC_MMAP_THRESHOLD_,
+// MALLOC_TRIM_THRESHOLD_, MALLOC_TOP_PAD_) is left alone.
+void KeepTransferBuffersOnTheHeap() {
+  struct Setting {
+    int param;
+    const char* env;
+    int value;
+  };
+  constexpr Setting kSettings[] = {
+      {M_MMAP_THRESHOLD, "MALLOC_MMAP_THRESHOLD_", 32 << 20},  // glibc's largest
+      {M_TRIM_THRESHOLD, "MALLOC_TRIM_THRESHOLD_", 1 << 30},
+      {M_TOP_PAD, "MALLOC_TOP_PAD_", 256 << 20},
+  };
+  for (const auto& setting : kSettings) {
+    if (std::getenv(setting.env) != nullptr) continue;
+    if (mallopt(setting.param, setting.value) != 1) {
+      MORI_UMBP_WARN("[StandaloneServer] mallopt({}) = {} failed", setting.env, setting.value);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  KeepTransferBuffersOnTheHeap();
   // Backend and GPU initialization create threads. They must inherit the mask
   // so SIGTERM reaches the waiter and shutdown can withdraw Indexer residency.
   sigset_t signal_set;
