@@ -139,13 +139,17 @@ These options are read once when an op is constructed:
      - ``1``. With direct sources (``MORI_ASYNCLL_DIRECT``) on an op whose
        ``async_ll_recv_layout`` resolves to ``"segmented"``, slot assignment
        also writes the metadata rows, so a segmented round's ``dispatch_send``
-       runs two passes instead of three. ``0`` keeps the separate metadata
-       pass. Ignored without direct sources or the segmented layout.
+       runs two passes instead of three; compact reserve needs it. ``0`` keeps
+       the separate metadata pass, and on a compact op also turns compact
+       reserve off, which changes the arena, so every rank must use the same
+       value. Otherwise ignored without direct sources.
    * - ``MORI_ASYNCLL_COMPACT_RESERVE``
-     - Unset: on for a compact op on gfx950 (single-node SDMA with early
-       notification, no ``quant_type``) unless ``MORI_ASYNCLL_DIRECT`` or
+     - Applies to a compact op with early notification (single-node SDMA);
+       segmented, LSA and multi-node ops ignore it. Unset: on for such an op on
+       gfx950 without a ``quant_type`` unless ``MORI_ASYNCLL_DIRECT`` or
        ``MORI_ASYNCLL_FUSE_META`` is ``0``; ``0`` turns it off; ``1`` requires
-       it, and is refused where it cannot run. Each source reserves its rows'
+       it, and is refused there on another arch, with a ``quant_type``, or with
+       either of those set to ``0``. Each source reserves its rows'
        range in every receiver's recv views with one remote atomic per peer,
        and the copy engines place rows, scales and metadata there, so
        ``dispatch_recv`` copies nothing. Direct sources and fused metadata
@@ -153,8 +157,10 @@ These options are read once when an op is constructed:
        ``total_recv`` rows located by the reverse map, but sources appear in
        arrival order (each source's rows contiguous, in slot order), and since
        peers write them the views are valid only until this rank's
-       ``combine_send``. The arena leaves out the dispatch landing, so every
-       rank must use the same value.
+       ``combine_send``. A combine input inside the recv views (an expert run
+       in place on them) is first copied to ``combine_in_view()``; any other
+       tensor, or ``combine_in_view()`` itself, is sent in place. The arena
+       leaves out the dispatch landing, so every rank must use the same value.
    * - ``MORI_ASYNCLL_SEND_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the send-side copy
        passes: slot assignment and the dispatch and combine gathers (not the

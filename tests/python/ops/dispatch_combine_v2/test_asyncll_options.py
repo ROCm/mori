@@ -600,13 +600,6 @@ class AsyncLLCompactReserveTest(unittest.TestCase):
             async_ll_segmented=False, quant_type="fp8_blockwise_1x128"
         )
         for env, mode, cfg, arch in [
-            (
-                on,
-                0,
-                None,
-                "gfx950",
-            ),  # no early notification (LSA, several nodes, opted out)
-            (on, 1, seg, "gfx950"),
             (on, 1, quant, "gfx950"),
             (on, 1, None, "gfx942"),
             (on, 1, None, "gfx1250"),
@@ -616,6 +609,25 @@ class AsyncLLCompactReserveTest(unittest.TestCase):
             with self.subTest(env=env, mode=mode, cfg=cfg, arch=arch):
                 with self.assertRaises(ValueError):
                     self.reserve(env, mode, cfg, arch)
+        # Ops it never applies to ignore it, like the other SDMA options.
+        self.assertFalse(self.reserve(on, mode=0))  # LSA, several nodes, legacy
+        self.assertFalse(self.reserve(on, cfg=seg))
+
+    def test_direct_value_still_validated(self):
+        cfg = EpDispatchCombineConfig(
+            rank=0,
+            world_size=8,
+            hidden_dim=7168,
+            max_num_inp_token_per_rank=128,
+            num_experts_per_rank=32,
+            num_experts_per_token=8,
+            kernel_backend="hip",
+            async_ll=True,
+            async_ll_transport="sdma",
+        )
+        with patch.dict(os.environ, {"MORI_ASYNCLL_DIRECT": "false"}, clear=True):
+            with self.assertRaises(ValueError):
+                EpDispatchCombineOp.per_rank_vmm(cfg, arch="gfx950")
 
     def test_sequences(self):
         seq = EpDispatchCombineOpHip._asyncll_seq(self.compact, 1, True, reserve=True)

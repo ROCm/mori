@@ -331,8 +331,9 @@ class EpDispatchCombineConfig:
     # views and the copy engines place them there, so nothing is copied on receive.
     # Sources then appear in arrival order, not rank order (each one's rows stay
     # contiguous, in its slot order), and since peers write the views, they hold
-    # until this rank's combine_send, as in a segmented round: consume or clone
-    # them before it.
+    # until this rank's combine_send: consume or clone them before it. A combine
+    # input inside them (an expert run in place) is copied to combine_in_view()
+    # first.
     async_ll_recv_layout: str = "compact"
     low_latency: bool | None = None
 

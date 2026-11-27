@@ -1466,6 +1466,190 @@ def run_segmented_refused(d, comm):
     return failures
 
 
+# --- compact reserve (MORI_ASYNCLL_COMPACT_RESERVE) ---------------------------
+#
+# The default compact receive on gfx950: each source reserves its rows' range in every
+# receiver's views and the copy engines place them there. Inputs come from CPU generators
+# seeded by (rank, round), so every rank rebuilds every source's rows without a collective,
+# and the "alias" case can run its rounds with no barrier between them.
+_RES_HIDDEN, _RES_TOPK, _RES_EPR, _RES_M = 2048, 8, 8, 64
+
+
+def _res_inputs(rank, rnd, world, n, fp8):
+    g = torch.Generator().manual_seed(9001 + 131 * rnd + rank)
+    x = torch.randn(_RES_M, _RES_HIDDEN, generator=g)
+    idx = torch.stack(
+        [
+            torch.randperm(_RES_EPR * world, generator=g)[:_RES_TOPK]
+            for _ in range(_RES_M)
+        ]
+    ).to(torch.int32)
+    sc = None
+    if fp8:
+        x = (x * 0.1).to(torch.float8_e4m3fn)
+        sc = torch.randint(0, 255, (_RES_M, _RES_HIDDEN // 32), generator=g).to(
+            torch.uint8
+        )
+    else:
+        x = x.to(torch.bfloat16)
+    return x[:n], idx[:n], None if sc is None else sc[:n]
+
+
+def _res_bits(t):
+    # Bytes per row: recv_scales() is an int32 view of the same bytes the source passes.
+    return t.contiguous().view(torch.uint8)
+
+
+def _res_check_dispatch(d, srcs, out, out_idx, out_sc, total, reverse, cap, tag):
+    """total_recv == min(demand, cap); rows [0, total) a dense prefix of distinct,
+    decodable origins, each row's hidden, indices (and scales) its source's."""
+    recv = int(total[0].item())
+    demand = sum(int(((s[1] // _RES_EPR) == d.rank).any(dim=1).sum()) for s in srcs)
+    bad = 0
+    if recv != min(demand, cap):
+        print(f"[rank {d.rank}] {tag}: total_recv {recv}, demand {demand}, cap {cap}")
+        bad += 1
+    rev = reverse[:recv].cpu().long()
+    if len(set(rev.tolist())) != recv:
+        print(f"[rank {d.rank}] {tag}: duplicate origins", flush=True)
+        bad += 1
+    src, tok = rev // _RES_M, rev % _RES_M
+    o, oi = _res_bits(out[:recv].cpu()), out_idx[:recv].cpu()
+    osc = None if out_sc is None else out_sc[:recv].cpu()
+    for s in range(d.world):
+        rows = (src == s).nonzero().flatten()
+        if not rows.numel():
+            continue
+        x, idx, sc = srcs[s]
+        t = tok[rows]
+        if int(t.max()) >= x.shape[0] or not bool(
+            ((idx[t] // _RES_EPR) == d.rank).any(dim=1).all()
+        ):
+            print(f"[rank {d.rank}] {tag}: rows from rank {s} with a bad origin")
+            bad += 1
+            continue
+        same = torch.equal(o[rows], _res_bits(x[t])) and torch.equal(oi[rows], idx[t])
+        if sc is not None:
+            same = same and torch.equal(_res_bits(osc[rows]), _res_bits(sc[t]))
+        if not same:
+            print(f"[rank {d.rank}] {tag}: rows from rank {s} differ", flush=True)
+            bad += 1
+    bad += int((src >= d.world).any())
+    return recv, rev, bad
+
+
+def run_compact_reserve(d, comm, case):
+    """order: rounds with skewed starts, so reservations land out of rank order, and the
+    combine must still use each source's base. cap: a receive cap below demand; rows past
+    it are dropped from the round trip. fp8: fp8 dispatch with scale rows. alias: the
+    expert output is the recv view itself (no clone) and rounds run with no barrier while
+    some ranks hold their combine_recv back, so peers start the next dispatch first."""
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    fp8 = case == "fp8"
+    cfg = _seg_config(d, _RES_HIDDEN, _RES_TOPK, _RES_EPR, _RES_M, "compact", fp8)
+    if case == "cap":
+        cfg.max_total_recv_tokens = world * _RES_M // 4
+    failures, out_of_order = 0, 0
+    with EpDispatchCombineOp(cfg, comm) as op:
+        if not getattr(op, "_reserve_on", lambda: False)():
+            return 0, None
+        cap = cfg.effective_max_recv
+        rounds = 6
+        # Every round's inputs up front: in "alias" no host work may sit between rounds.
+        counts_all = [
+            [
+                _RES_M if case != "alias" else ((r + rnd) * 23) % (_RES_M + 1)
+                for r in range(world)
+            ]
+            for rnd in range(rounds)
+        ]
+        srcs_all = [
+            [_res_inputs(r, rnd, world, counts_all[rnd][r], fp8) for r in range(world)]
+            for rnd in range(rounds)
+        ]
+        mine_all = [
+            tuple(t if t is None else t.to(dev) for t in srcs_all[rnd][rank])
+            for rnd in range(rounds)
+        ]
+        hold = 0
+        if case == "alias":
+            # ~300 ms of GPU sleep, far past a peer's turnaround to its next dispatch.
+            ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+            ev[0].record()
+            torch.cuda._sleep(1_000_000)
+            ev[1].record()
+            torch.cuda.synchronize()
+            hold = int(300_000 / max(ev[0].elapsed_time(ev[1]) * 1000, 1.0) * 1_000_000)
+        for rnd in range(rounds):
+            counts, srcs = counts_all[rnd], srcs_all[rnd]
+            x, idx, sc = mine_all[rnd]
+            tag = f"compact reserve {case} round={rnd}"
+            if case != "alias":
+                torch.cuda.synchronize()
+                dist.barrier()
+                # Higher ranks start first, so they reserve first.
+                torch.cuda._sleep((world - 1 - rank) * 200000)
+            out, _, out_sc, out_idx, total, routing = op.dispatch_send(
+                x, None, sc, idx, return_routing=True
+            )
+            op.dispatch_recv()
+            torch.cuda.synchronize()
+            recv, rev, bad = _res_check_dispatch(
+                d,
+                srcs,
+                out,
+                out_idx,
+                out_sc if fp8 else None,
+                total,
+                routing.disp_tok_id_to_src_tok_id_local,
+                cap,
+                tag,
+            )
+            failures += bad
+            counts_by_src = [int((rev // _RES_M == s).sum()) for s in range(world)]
+            bases = op._reserve_bases().cpu().tolist()
+            prefix = [sum(counts_by_src[:s]) for s in range(world)]
+            if any(counts_by_src[s] and bases[s] != prefix[s] for s in range(world)):
+                out_of_order += 1
+            # Which (token, rank) pairs were accepted decides the round trip.
+            if case == "cap":
+                accepted = [None] * world
+                dist.all_gather_object(accepted, rev.tolist())
+                mult = torch.zeros(counts[rank])
+                for dst in range(world):
+                    for v in accepted[dst]:
+                        if v // _RES_M == rank:
+                            mult[v % _RES_M] += 1
+            else:
+                mult = torch.tensor(
+                    [len({int(e) // _RES_EPR for e in row}) for row in idx.cpu()],
+                    dtype=torch.float32,
+                )
+            if case == "alias":
+                expert = out[:recv]  # the recv view itself, in place
+            elif fp8:
+                expert = out[:recv].to(torch.bfloat16)
+            else:
+                expert = out[:recv].clone()
+            cout, _ = op.combine_send(expert, None, idx, routing=routing)
+            if case == "alias" and (rank + rnd) % 2 == 0:
+                torch.cuda._sleep(hold)  # peers move on to the next dispatch
+            op.combine_recv()
+            torch.cuda.synchronize()
+            if counts[rank]:
+                want = (srcs[rank][0].float() * mult[:, None]).to(torch.bfloat16)
+                ok, diff = _combine_close(cout[: counts[rank]].cpu(), want)
+                if not ok:
+                    print(f"[rank {rank}] {tag}: combine max |diff| {diff:.4f}")
+                    failures += 1
+        errs = op.segment_error_counts()
+        if errs != (0, 0):
+            print(f"[rank {rank}] compact reserve {case}: error counts {errs}")
+            failures += 1
+    return failures, out_of_order
+
+
 def main():
     d = Dist()
     shapes = _shapes()
@@ -1551,6 +1735,27 @@ def main():
     if d.rank == 0:
         print("# asyncll call order: done", flush=True)
 
+    reserve_runs = "off"
+    if os.environ.get("TRANSPORT", "sdma") == "sdma" and _QUANT == "none":
+        ran = []
+        for case in ("order", "cap", "fp8", "alias"):
+            bad, ooo = own_comm(
+                lambda c: run_compact_reserve(d, c, case), _RES_HIDDEN, _RES_M
+            )
+            failures += bad
+            if ooo is None:
+                continue
+            ran.append(case)
+            # Skewed starts must produce at least one round out of rank order somewhere,
+            # or the base bookkeeping went untested.
+            if case == "order" and d.world > 1 and d.allreduce_sum(ooo) == 0:
+                if d.rank == 0:
+                    print("# compact reserve order: every round in rank order")
+                failures += 1
+        reserve_runs = ", ".join(ran) or "not resolved"
+        if d.rank == 0:
+            print(f"# asyncll compact reserve: {reserve_runs}", flush=True)
+
     seg_runs = "off"
     if segmented:
         transport = os.environ.get("TRANSPORT", "sdma")
@@ -1596,7 +1801,7 @@ def main():
             f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations x 2 APIs, "
             f"2 graph scenarios x {graph_replays} replays, "
             f"{back_to_back} back-to-back rounds, {two_ops} two-op layers, call order, "
-            f"segmented {seg_runs}",
+            f"compact reserve {reserve_runs}, segmented {seg_runs}",
             flush=True,
         )
     dist.destroy_process_group()

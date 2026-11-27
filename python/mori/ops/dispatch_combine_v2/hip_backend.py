@@ -579,9 +579,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._asyncll_reserve_on = self._asyncll_reserve(
                 self._asyncll_mode, cfg, self._arch
             )
-            self._asyncll_direct_on = self._asyncll_reserve_on or self._asyncll_direct(
-                self._asyncll_mode, cfg, self._arch
-            )
+            # Resolved even when reserve decides it, so a bad value still raises.
+            direct = self._asyncll_direct(self._asyncll_mode, cfg, self._arch)
+            self._asyncll_direct_on = self._asyncll_reserve_on or direct
             if self._asyncll_direct_on and not self._arch.startswith(
                 ("gfx942", "gfx950")
             ):
@@ -1175,11 +1175,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             mode, _ = cls._asyncll_options(cfg, arch)
             reserve = cls._asyncll_reserve(mode, cfg, arch)
-            regions = asyncll_regions(
-                cfg,
-                direct=reserve or cls._asyncll_direct(mode, cfg, arch),
-                reserve=reserve,
-            )
+            direct = cls._asyncll_direct(mode, cfg, arch)
+            regions = asyncll_regions(cfg, direct=reserve or direct, reserve=reserve)
         else:
             regions = internode_regions(cfg)
         # SymmArena's packing.
@@ -1719,24 +1716,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _asyncll_reserve(mode, cfg, arch):
         # Compact reserve: a compact op whose senders reserve their rows' range in each
         # receiver's packed output (one remote fetch_add per peer) and place them there, so
-        # dispatch_recv copies nothing. Direct sources and fused metadata come with it.
-        # MORI_ASYNCLL_COMPACT_RESERVE unset: on wherever it can run -- the compact layout
-        # (`cfg` resolved, so every rank and per_rank_vmm agree) on gfx950, single-node SDMA with
-        # early notification (mode >= 1), no quant_type, and MORI_ASYNCLL_DIRECT /
-        # MORI_ASYNCLL_FUSE_META not set to 0. "0" turns it off; "1" raises where it cannot run
-        # instead of falling back.
+        # dispatch_recv copies nothing. Direct sources and fused metadata come with it. Only a
+        # compact op (`cfg` resolved, so every rank and per_rank_vmm agree) with early
+        # notification (mode >= 1: single-node SDMA) can run it; others ignore the variable, as
+        # they do the other SDMA options. There, MORI_ASYNCLL_COMPACT_RESERVE unset turns it on
+        # on gfx950 without a quant_type unless MORI_ASYNCLL_DIRECT or MORI_ASYNCLL_FUSE_META is
+        # 0; "0" turns it off; "1" raises where it cannot run instead of falling back.
         value = os.environ.get("MORI_ASYNCLL_COMPACT_RESERVE", "")
         if value not in ("", "0", "1"):
             raise ValueError(
                 f"MORI_ASYNCLL_COMPACT_RESERVE must be '0' or '1', got {value!r}"
             )
-        if value == "0":
+        if value == "0" or mode == 0 or cfg.async_ll_segmented:
             return False
         bad = []
-        if mode == 0:
-            bad.append("single-node SDMA with early notification")
-        if cfg.async_ll_segmented:
-            bad.append("the compact layout")
         if cfg.quant_type != "none":
             bad.append("quant_type 'none'")
         if not arch.startswith("gfx950"):
@@ -1856,7 +1849,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlDirect"] = self._asyncll_direct_on
         request["asyncLlFuseMeta"] = self._asyncll_fuse_meta_on
-        request["asyncLlCompactReserve"] = self._asyncll_reserve_on
+        request["asyncLlCompactReserve"] = self._reserve_on()
         # Grid ceilings for the send- and receive-side copy passes; 0 = the whole device.
         for side, field in (
             ("SEND", "asyncLlSendBlocks"),
@@ -2122,6 +2115,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             stride = self._seg_stride
             if stride and "combine_send" in groups:
                 input = self._seg_combine_input(input, stride)
+            elif phase == "combine" and self._reserve_on():
+                input = self._reserve_combine_input(input, "combine_send" in groups)
             if phase == "dispatch":
                 if groups[0] == "dispatch_recv":
                     # dispatch_recv() launches this half with only input/dest_map/
@@ -2258,6 +2253,39 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if input.data_ptr() != view.data_ptr():
             view.copy_(input)
         return view
+
+    # Regions of this rank's arena that peers write during a compact-reserve dispatch: the recv
+    # views (the reverse map included).
+    _RESERVE_PEER_WRITTEN = (
+        "inter_dispatch_out",
+        "out_indices",
+        "dispatch_out_weights",
+        "out_scales",
+        "disp_tok_id_to_src_tok_id",
+    )
+
+    def _reserve_combine_input(self, input, copy):
+        """Compact reserve reads the combine input in place until combine_recv, while a peer may
+        write this rank's recv views for its next round as soon as this rank's combine_send is
+        out. An input inside those views (an expert run in place on recv_tokens()) moves to
+        combine_in_view(), which peers never write: copied on the stream ahead of combine_send,
+        before any peer can start its next round; combine_recv (copy=False) reads the copy.
+        """
+        if input.numel() == 0:
+            return input
+        span = sum((n - 1) * st for n, st in zip(input.shape, input.stride())) + 1
+        lo = input.data_ptr()
+        hi = lo + span * input.element_size()
+        for name in self._RESERVE_PEER_WRITTEN:
+            if not self.arena.has(name):
+                continue
+            base = self.arena.local_ptr(name)
+            if lo < base + self.arena.size(name) and base < hi:
+                view = self.combine_in_view()[: input.shape[0]]
+                if copy:
+                    view.copy_(input)
+                return view
+        return input
 
     def _seg_words_view(self, key, first, n):
         view = self._views.get(key)
