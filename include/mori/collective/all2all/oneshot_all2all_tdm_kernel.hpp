@@ -569,6 +569,10 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 
   if (from == nullptr) return;
+  // Every peer wrote straight into the output: nothing landed in the transit half, and walking
+  // the tiles only to skip each of them is not free (two 64-bit divisions a tile).
+  const uint64_t allPeers = ((1ULL << np) - 1ULL) & ~(1ULL << me);
+  if ((recvDirect & allPeers) == allPeers) return;
   for (size_t i = first; i < items; i += totalWarps) {
     const size_t srcPe = (me + np - 1 - i % peers) % np;
     if (((recvDirect >> srcPe) & 1ULL) != 0) continue;
