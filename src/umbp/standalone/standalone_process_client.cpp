@@ -27,14 +27,18 @@
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -51,8 +55,6 @@
 
 namespace mori::umbp::standalone {
 namespace {
-
-std::atomic<uint64_t> g_client_counter{0};
 
 void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* request) {
   request->set_hash(block.hash);
@@ -359,8 +361,19 @@ StandaloneProcessClient::~StandaloneProcessClient() { Close(); }
 std::string StandaloneProcessClient::ClientId() {
   std::lock_guard<std::mutex> lock(registration_mu_);
   if (!client_id_.empty()) return client_id_;
+  // PIDs and process-local counters repeat across containers. The server uses
+  // this ID to own registrations, so a collision can unmap another live client.
+  std::array<unsigned char, 16> nonce{};
+  size_t filled = 0;
+  while (filled < nonce.size()) {
+    const ssize_t n = getrandom(nonce.data() + filled, nonce.size() - filled, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) throw std::runtime_error("StandaloneProcessClient: cannot generate client ID");
+    filled += static_cast<size_t>(n);
+  }
   std::ostringstream oss;
-  oss << "umbp-" << getpid() << "-" << g_client_counter.fetch_add(1);
+  oss << "umbp-" << std::hex << std::setfill('0');
+  for (const auto byte : nonce) oss << std::setw(2) << static_cast<unsigned int>(byte);
   client_id_ = oss.str();
   return client_id_;
 }
@@ -1007,8 +1020,8 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
   }
 
   bool acquired_kept = false;
-  const std::string client_id = ClientId();
   try {
+    const std::string client_id = ClientId();
     std::string error;
     int status = SendFdRegistration(
         fd_socket_path_, allocation->fd, client_id, reinterpret_cast<uintptr_t>(allocation->base),
