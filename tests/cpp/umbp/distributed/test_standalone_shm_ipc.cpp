@@ -1190,5 +1190,63 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
   unlink(fd_path.c_str());
 }
 
+// The removal crosses the process boundary and drops the server's copy, so
+// the key is free for a new object.
+TEST(StandaloneShmIpcTest, BatchRemoveDropsTheKeysTheServerHolds) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_remove_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+  auto client = CreateUMBPClient(server_cfg);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(handle.valid());
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));
+  std::memset(bytes, 0x5a, 96);
+  ASSERT_TRUE(client->Put("remove-a", reinterpret_cast<uintptr_t>(bytes), 32));
+  ASSERT_TRUE(client->Put("remove-b", reinterpret_cast<uintptr_t>(bytes + 32), 32));
+  ASSERT_TRUE(client->Put("remove-kept", reinterpret_cast<uintptr_t>(bytes + 64), 32));
+
+  // Named twice, a key is dropped once.
+  EXPECT_EQ(client->BatchRemove({"remove-a", "remove-missing", "remove-b", "remove-a"}), 2u);
+  EXPECT_EQ(client->BatchRemove({}), 0u);
+  EXPECT_EQ(client->BatchExists({"remove-a", "remove-b", "remove-kept"}),
+            (std::vector<bool>{false, false, true}));
+
+  std::memset(bytes + 128, 0xa5, 32);
+  ASSERT_TRUE(client->Put("remove-a", reinterpret_cast<uintptr_t>(bytes + 128), 32));
+  std::memset(bytes + 256, 0, 32);
+  ASSERT_TRUE(client->Get("remove-a", reinterpret_cast<uintptr_t>(bytes + 256), 32));
+  EXPECT_EQ(std::vector<unsigned char>(bytes + 256, bytes + 288),
+            std::vector<unsigned char>(32, 0xa5));
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
+  client->Close();
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
