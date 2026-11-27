@@ -77,7 +77,54 @@ size_t HostRegistrationChunkBytes() {
   return bytes;
 }
 
+size_t ParseHostRegistrationMaxMb(const char* value) {
+  if (value == nullptr || *value == '\0') return SIZE_MAX;
+  char* end = nullptr;
+  const unsigned long long mib = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || mib == 0 || mib > (SIZE_MAX >> 20)) return SIZE_MAX;
+  return static_cast<size_t>(mib) << 20;
+}
+
+size_t HostRegistrationMaxBytes() {
+  static const size_t bytes =
+      ParseHostRegistrationMaxMb(std::getenv("UMBP_DRAM_HOST_REGISTER_MAX_MB"));
+  return bytes;
+}
+
+size_t HostRegistrationBudget::Reserve(const std::vector<size_t>& piece_bytes, size_t* bytes) {
+  size_t reserved = reserved_.load(std::memory_order_relaxed);
+  for (;;) {
+    const size_t left = limit_ > reserved ? limit_ - reserved : 0;
+    size_t pieces = 0;
+    size_t total = 0;
+    while (pieces < piece_bytes.size() && piece_bytes[pieces] <= left - total) {
+      total += piece_bytes[pieces];
+      ++pieces;
+    }
+    if (reserved_.compare_exchange_weak(reserved, reserved + total, std::memory_order_relaxed)) {
+      *bytes = total;
+      return pieces;
+    }
+  }
+}
+
+void HostRegistrationBudget::Release(size_t bytes) {
+  reserved_.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+namespace {
+
+HostRegistrationBudget* ProcessBudget() {
+  static HostRegistrationBudget* budget = new HostRegistrationBudget(HostRegistrationMaxBytes());
+  return budget;
+}
+
+}  // namespace
+
 HostTierRegistration::HostTierRegistration(void* base, size_t bytes)
+    : HostTierRegistration(base, bytes, ProcessBudget()) {}
+
+HostTierRegistration::HostTierRegistration(void* base, size_t bytes, HostRegistrationBudget* budget)
     : base_(static_cast<char*>(base)), bytes_(bytes), piece_bytes_(HostRegistrationChunkBytes()) {
   if (base_ == nullptr || bytes_ == 0 || !HostRegistrationEnabled() || !HasDevice()) {
     bytes_ = 0;
@@ -93,6 +140,18 @@ HostTierRegistration::HostTierRegistration(void* base, size_t bytes)
     start = next;
   }
 
+  // This region's share of the process's limit, taken now: in the order the
+  // regions are declared, not the order their workers get to run.
+  allowed_pieces_ = pieces_.size();
+  allowed_bytes_ = bytes_;
+  if (budget != nullptr && budget->limited()) {
+    std::vector<size_t> sizes;
+    sizes.reserve(pieces_.size());
+    for (const Piece& piece : pieces_) sizes.push_back(piece.bytes);
+    budget_ = budget;
+    allowed_pieces_ = budget->Reserve(sizes, &allowed_bytes_);
+  }
+
   if (bytes_ <= kSyncThresholdBytes) {
     Register();
     return;
@@ -106,6 +165,7 @@ HostTierRegistration::~HostTierRegistration() {
   for (size_t i = 0; i < registered; ++i) {
     if (hipHostUnregister(pieces_[i].base) != hipSuccess) (void)hipGetLastError();
   }
+  if (budget_ != nullptr) budget_->Release(allowed_bytes_);
 }
 
 void HostTierRegistration::Register() {
@@ -120,7 +180,7 @@ void HostTierRegistration::Register() {
   if (!have_previous) (void)hipGetLastError();
 
   size_t gatherable = 0;
-  for (size_t i = 0; i < pieces_.size(); ++i) {
+  for (size_t i = 0; i < allowed_pieces_; ++i) {
     Piece& piece = pieces_[i];
     // hipHostRegisterPortable so every rank's device can reach the tier;
     // hipHostRegisterMapped so a kernel can dereference it directly.
@@ -171,12 +231,18 @@ void HostTierRegistration::Register() {
   if (have_previous) (void)hipSetDevice(previous);
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  // One line a region, also for a region the limit left nothing for: whoever
+  // waits for the regions to be ready counts these.
+  const size_t over_limit = bytes_ - allowed_bytes_;
   MORI_UMBP_INFO(
       "[DRAMTier] host memory registered for GPU access: {} MiB in {:.1f} s as {} pieces of up "
-      "to {} MiB ({}/{} devices gatherable)",
+      "to {} MiB ({}/{} devices gatherable){}",
       registered_bytes_.load(std::memory_order_relaxed) >> 20, seconds,
       registered_pieces_.load(std::memory_order_relaxed),
-      std::min<size_t>(piece_bytes_, bytes_) >> 20, gatherable, devices);
+      std::min<size_t>(piece_bytes_, bytes_) >> 20, gatherable, devices,
+      over_limit == 0 ? std::string()
+                      : ", " + std::to_string(over_limit >> 20) +
+                            " MiB left unregistered (UMBP_DRAM_HOST_REGISTER_MAX_MB)");
 }
 
 const HostTierRegistration::Piece* HostTierRegistration::FindPiece(const void* ptr,

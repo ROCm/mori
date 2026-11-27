@@ -68,6 +68,7 @@
 #include "umbp/sim/sim.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
+#include "umbp/standalone/l1_backing_store.h"
 #include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
@@ -492,7 +493,6 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
   bool Synchronize(int device, std::string* error) override {
     return inner_->Synchronize(device, error);
   }
-
   bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
                  std::string* error) override {
     if (fragments.size() < 2) return inner_->CopyBatch(dst_device, fragments, error);
@@ -556,6 +556,11 @@ std::shared_ptr<l1::MemoryApi> MakeL1MemoryApi() {
   if (raw != nullptr && std::strcmp(raw, "0") == 0) return api;
   MORI_UMBP_INFO("[StandaloneServer] L1 fetch copies go through the HBM copy engine (gather)");
   return std::make_shared<EngineL1MemoryApi>(std::move(api));
+}
+
+bool EnvSwitchOn(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw != nullptr && raw[0] != '\0' && std::strcmp(raw, "0") != 0;
 }
 
 }  // namespace
@@ -622,7 +627,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       memory_importer_ = std::make_unique<RealMemoryImporter>();
   }
 
-  ~Impl() override { Shutdown(); }
+  ~Impl() override {
+    Shutdown();
+    // In this order, and here rather than as members go: the gRPC server
+    // first, since its handlers call the L1 pools; then the pools, which give
+    // their memory back to the store through client_mu_ while it still exists.
+    server_.reset();
+    l1_service_.reset();
+    l1_manager_.reset();
+  }
 
   bool Start() {
     std::string error;
@@ -652,6 +665,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // L1 block pools ride the same socket. Registering costs nothing: no GPU
     // context or memory exists until an engine attaches a pool.
     l1_manager_ = std::make_shared<l1::PoolManager>(MakeL1MemoryApi());
+    PutStoreUnderL1Pools();
     l1_service_ = l1::MakeL1PoolService(l1_manager_);
     builder.RegisterService(l1_service_.get());
     mode_t old_umask = umask(0077);
@@ -696,6 +710,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
     UnregisterAllExternalIdentities();
+    // The pools stop writing evicted content to the store before it closes.
+    if (l1_manager_) l1_manager_->StopBackingStore();
     {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
       client_->Flush();
@@ -1228,6 +1244,151 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     void* base = nullptr;
     size_t refcount = 0;
   };
+
+  // The store this server hosts, as the L1 pools' backing store: every call
+  // is made as the server's own data-path handlers make theirs, under
+  // client_mu_ in the mode the deployment asks for, and refused once the
+  // server is shutting down. What it calls is `MakeL1BackingStore`.
+  class L1Store final : public l1::BackingStore {
+   public:
+    explicit L1Store(Impl* server)
+        : server_(server), inner_(MakeL1BackingStore(server->client_.get())) {}
+
+    bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) override {
+      Stage stage(this, kRegister);
+      std::unique_lock<std::shared_mutex> lock(server_->client_mu_);
+      stage.Entered();
+      if (server_->shutdown_.load()) {
+        *error = "the server is shutting down";
+        return false;
+      }
+      return inner_->AddMemory(base, bytes, device, error);
+    }
+    void RemoveMemory(void* base) override {
+      Stage stage(this, kRegister);
+      std::unique_lock<std::shared_mutex> lock(server_->client_mu_);
+      stage.Entered();
+      inner_->RemoveMemory(base);
+    }
+    std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) override {
+      Stage stage(this, kWrite);
+      DataPathLock lock(server_->client_mu_, server_->WriteLocking());
+      stage.Entered();
+      if (server_->shutdown_.load()) return std::vector<bool>(blocks.size(), false);
+      return inner_->Write(space, blocks);
+    }
+    std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) override {
+      Stage stage(this, kRead);
+      DataPathLock lock(server_->client_mu_, server_->ReadLocking());
+      stage.Entered();
+      if (server_->shutdown_.load()) return std::vector<bool>(blocks.size(), false);
+      return inner_->Read(space, blocks);
+    }
+    std::vector<bool> Contains(const std::string& space,
+                               const std::vector<std::string>& keys) override {
+      Stage stage(this, kLookup);
+      DataPathLock lock(server_->client_mu_, server_->LookupLocking());
+      stage.Entered();
+      if (server_->shutdown_.load()) return std::vector<bool>(keys.size(), false);
+      return inner_->Contains(space, keys);
+    }
+
+    // For the pool manager's report of a call that does not come back: where
+    // this wrapper's calls are. One waiting for client_mu_ is behind a
+    // registration or the shutdown, which take it alone; one inside the store
+    // is behind something of the store's or of the device runtime's.
+    std::string Describe() override {
+      static const char* const kNames[kKinds] = {"write", "read", "lookup", "register"};
+      std::string waiting;
+      std::string inside;
+      for (int kind = 0; kind < kKinds; ++kind) {
+        const int at_lock = waiting_[kind].load(std::memory_order_relaxed);
+        const int in_store = inside_[kind].load(std::memory_order_relaxed);
+        if (at_lock != 0) {
+          waiting += (waiting.empty() ? "" : ", ") + std::to_string(at_lock) + " " + kNames[kind];
+        }
+        if (in_store != 0) {
+          inside += (inside.empty() ? "" : ", ") + std::to_string(in_store) + " " + kNames[kind];
+        }
+      }
+      return "waiting for client_mu_: " + (waiting.empty() ? std::string("none") : waiting) +
+             "; inside the store: " + (inside.empty() ? std::string("none") : inside);
+    }
+
+   private:
+    enum Kind { kWrite, kRead, kLookup, kRegister, kKinds };
+
+    // Counts a call as waiting for client_mu_ until `Entered`, then as inside
+    // the store, and says so when the wait was a long one.
+    class Stage {
+     public:
+      Stage(L1Store* store, Kind kind)
+          : store_(store), kind_(kind), started_(std::chrono::steady_clock::now()) {
+        store_->waiting_[kind_].fetch_add(1, std::memory_order_relaxed);
+      }
+      void Entered() {
+        store_->waiting_[kind_].fetch_sub(1, std::memory_order_relaxed);
+        store_->inside_[kind_].fetch_add(1, std::memory_order_relaxed);
+        entered_ = true;
+        const double waited =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+        if (waited >= 1.0) {
+          static const char* const kNames[kKinds] = {"write", "read", "lookup", "register"};
+          MORI_UMBP_WARN("[StandaloneServer] an L1 store {} waited {:.3f} s for client_mu_",
+                         kNames[kind_], waited);
+        }
+      }
+      ~Stage() {
+        (entered_ ? store_->inside_ : store_->waiting_)[kind_].fetch_sub(1,
+                                                                         std::memory_order_relaxed);
+      }
+      Stage(const Stage&) = delete;
+      Stage& operator=(const Stage&) = delete;
+
+     private:
+      L1Store* const store_;
+      const Kind kind_;
+      const std::chrono::steady_clock::time_point started_;
+      bool entered_ = false;
+    };
+
+    Impl* const server_;
+    const std::shared_ptr<l1::BackingStore> inner_;
+    std::atomic<int> waiting_[kKinds] = {};
+    std::atomic<int> inside_[kKinds] = {};
+  };
+
+  // UMBP_L1_DRAM_STORE=1: what the L1 pools evict goes to this server's store,
+  // and comes back from it. Off by default; how much the store holds, and
+  // where, is the store's own configuration (UMBP_DRAM_CAPACITY and the rest).
+  void PutStoreUnderL1Pools() {
+    if (!EnvSwitchOn("UMBP_L1_DRAM_STORE")) return;
+    if (!BackendIsDistributed() || backend_config_.sim.enabled) {
+      MORI_UMBP_ERROR(
+          "[StandaloneServer] UMBP_L1_DRAM_STORE needs a real store in this server; the L1 "
+          "pools keep no evicted content");
+      return;
+    }
+    if (BackendMedium(backend_config_) != UMBPMedium::DRAM) {
+      MORI_UMBP_ERROR(
+          "[StandaloneServer] UMBP_L1_DRAM_STORE needs this server's store on the DRAM medium "
+          "(it is on {}); the L1 pools keep no evicted content",
+          TierTypeName(ToTierType(BackendMedium(backend_config_))));
+      return;
+    }
+    const bool has_master = backend_config_.distributed.has_value() &&
+                            !backend_config_.distributed->master_config.master_address.empty();
+    if (has_master && !client_->SupportsRangedIO()) {
+      MORI_UMBP_WARN(
+          "[StandaloneServer] UMBP_L1_DRAM_STORE with a master and no ranged scratch arena: an "
+          "evicted L1 slot the master routes to another node cannot be sent and is lost");
+    }
+    l1_manager_->SetBackingStore(std::make_shared<L1Store>(this), l1::BackingStoreOptionsFromEnv());
+    MORI_UMBP_INFO(
+        "[StandaloneServer] L1 pools write their evicted last copies to this server's store "
+        "({})",
+        has_master ? "placed by the master" : "this node's DRAM");
+  }
 
   bool BackendIsDistributed() const {
     return client_ && client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed;

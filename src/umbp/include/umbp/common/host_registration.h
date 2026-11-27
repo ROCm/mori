@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <thread>
 #include <vector>
 
@@ -38,6 +39,44 @@ bool HostRegistrationEnabled();
 // them. UMBP_DRAM_HOST_REGISTER_CHUNK_MB, default 1024; 0 registers each
 // region whole.
 size_t HostRegistrationChunkBytes();
+
+// The most host memory this process registers for GPU access, over every
+// region: UMBP_DRAM_HOST_REGISTER_MAX_MB, in MiB. Unset or 0 is no limit
+// (SIZE_MAX), and nothing below changes.
+//
+// Registered host memory is not free: the driver accounts it against the
+// host, and an engine on the same node registers host memory of its own. A
+// store too large to register whole can still be used whole: what is over the
+// limit stays plain memory, which a copy reaches on the pageable path and a
+// gather kernel never touches.
+size_t HostRegistrationMaxBytes();
+// The limit `value` asks for; SIZE_MAX for null, empty, 0 or anything that is
+// not a number.
+size_t ParseHostRegistrationMaxMb(const char* value);
+
+// What is left of that limit. A region takes its share when it is declared,
+// before it registers anything, so the regions are served in the order they
+// are declared whatever order their background registrations finish in: the
+// first regions whole, one region up to the last piece that fits, the rest
+// not at all.
+class HostRegistrationBudget {
+ public:
+  explicit HostRegistrationBudget(size_t limit_bytes) : limit_(limit_bytes) {}
+
+  // Reserves as many of a region's leading pieces as fit in what is left.
+  // Returns how many; `*bytes` is their total. A piece is taken whole or not
+  // at all, and none after the first that does not fit.
+  size_t Reserve(const std::vector<size_t>& piece_bytes, size_t* bytes);
+  // Gives back what a region reserved, when the region goes.
+  void Release(size_t bytes);
+
+  bool limited() const { return limit_ != SIZE_MAX; }
+  size_t reserved() const { return reserved_.load(std::memory_order_relaxed); }
+
+ private:
+  const size_t limit_;
+  std::atomic<size_t> reserved_{0};
+};
 
 // Makes a host region addressable from GPU kernels via hipHostRegister.
 //
@@ -62,7 +101,10 @@ size_t HostRegistrationChunkBytes();
 // slower, because it serializes inside the driver -- so anything larger than
 // the synchronous threshold is registered on a background thread, piece by
 // piece in address order. Each piece is usable as soon as it is registered;
-// until then a copy touching it simply takes the path it took before.
+// until then a copy touching it simply takes the path it took before. So does
+// a copy touching a piece that is never registered: one that failed, or one
+// past the process's limit (`HostRegistrationMaxBytes`). A region registered
+// in part, from its lowest address up, is an ordinary state.
 //
 // The device need not see a piece at the host's address -- hipHostRegister's
 // own documentation says the two "will have a different value" on many systems
@@ -75,14 +117,20 @@ class HostTierRegistration {
   // length, not the usable capacity. Never throws and never fails hard: if
   // registration is unavailable DeviceAddress() simply returns null forever.
   HostTierRegistration(void* base, size_t bytes);
+  // The same against `budget` instead of the process's; for tests.
+  HostTierRegistration(void* base, size_t bytes, HostRegistrationBudget* budget);
   ~HostTierRegistration();
 
   HostTierRegistration(const HostTierRegistration&) = delete;
   HostTierRegistration& operator=(const HostTierRegistration&) = delete;
 
   // Whether a kernel on `device_id` can reach this region at all, i.e. whether
-  // DeviceAddress() will return non-null for a covered pointer.
+  // DeviceAddress() will return non-null for a pointer in a registered piece.
   bool GatherableOn(int device_id) const;
+
+  // Bytes registered so far, and bytes the limit keeps unregistered for good.
+  size_t RegisteredBytes() const { return registered_bytes_.load(std::memory_order_relaxed); }
+  size_t BytesOverLimit() const { return bytes_ - allowed_bytes_; }
 
   // The address `device_id` must use to reach [host_ptr, host_ptr + size), or
   // null when that range is not inside one registered piece or the device has
@@ -106,6 +154,11 @@ class HostTierRegistration {
   size_t piece_bytes_{0};
   // Laid out by the constructor, before any reader or the worker exists.
   std::vector<Piece> pieces_;
+  // Pieces [0, allowed_pieces_) may be registered: all of them, unless the
+  // process's limit was reached inside or before this region.
+  HostRegistrationBudget* budget_{nullptr};
+  size_t allowed_pieces_{0};
+  size_t allowed_bytes_{0};
   // Pieces [0, registered_pieces_) are registered. A piece, aliases included,
   // is written before the count that covers it is released, and is read-only
   // after, so that release/acquire pair is what publishes it.

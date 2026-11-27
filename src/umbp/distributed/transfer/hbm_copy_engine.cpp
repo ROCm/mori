@@ -477,6 +477,12 @@ void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes) {
   host_regions_.push_back(std::make_unique<HostTierRegistration>(base, bytes));
 }
 
+void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes, HostRegistrationBudget* budget) {
+  if (base == nullptr || bytes == 0) return;
+  std::lock_guard<std::mutex> lock(host_regions_mutex_);
+  host_regions_.push_back(std::make_unique<HostTierRegistration>(base, bytes, budget));
+}
+
 void HbmCopyEngine::ClearHostGatherRegions() {
   std::lock_guard<std::mutex> lock(host_regions_mutex_);
   host_regions_.clear();

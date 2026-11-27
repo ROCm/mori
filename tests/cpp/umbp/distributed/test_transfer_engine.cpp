@@ -27,9 +27,11 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -376,6 +378,170 @@ TEST(HbmCopyEngine, CopyRunsStopAtHostRegistrationPieces) {
 // Gathers submitted from a succession of short-lived threads, the way the
 // standalone server's gRPC pool retires and spawns threads under load, share a
 // pooled stream.  A stream per thread grew until HIP could not create another.
+// UMBP_DRAM_HOST_REGISTER_MAX_MB: unset, empty or 0 is no limit at all.
+TEST(HostRegistrationLimit, UnsetOrZeroIsNoLimit) {
+  EXPECT_EQ(ParseHostRegistrationMaxMb(nullptr), SIZE_MAX);
+  EXPECT_EQ(ParseHostRegistrationMaxMb(""), SIZE_MAX);
+  EXPECT_EQ(ParseHostRegistrationMaxMb("0"), SIZE_MAX);
+  EXPECT_EQ(ParseHostRegistrationMaxMb("lots"), SIZE_MAX);
+  EXPECT_EQ(ParseHostRegistrationMaxMb("12x"), SIZE_MAX);
+  EXPECT_EQ(ParseHostRegistrationMaxMb("1048576"), size_t{1} << 40);
+
+  HostRegistrationBudget unlimited(SIZE_MAX);
+  EXPECT_FALSE(unlimited.limited());
+  size_t bytes = 0;
+  EXPECT_EQ(unlimited.Reserve({size_t{512} << 30, size_t{512} << 30, size_t{276} << 30}, &bytes),
+            3u);
+  EXPECT_EQ(bytes, size_t{1300} << 30);
+}
+
+// The limit is the process's, spent over the regions in the order they are
+// declared: whole pieces from each region's start, none after the first that
+// does not fit, and a region that goes gives its share back.
+TEST(HostRegistrationLimit, IsSpentOverTheRegionsInTheOrderTheyAreDeclared) {
+  constexpr size_t kPiece = size_t{1} << 30;
+  HostRegistrationBudget budget(5 * kPiece);
+  EXPECT_TRUE(budget.limited());
+  size_t first = 0;
+  EXPECT_EQ(budget.Reserve({kPiece, kPiece, kPiece}, &first), 3u);
+  EXPECT_EQ(first, 3 * kPiece);
+  // A region that starts inside a piece: its first piece is short. Two GiB
+  // are left: the short piece and one whole one fit, the next does not, and
+  // the smaller one behind it is not taken out of turn.
+  size_t second = 0;
+  EXPECT_EQ(budget.Reserve({kPiece / 2, kPiece, kPiece, kPiece / 4}, &second), 2u);
+  EXPECT_EQ(second, kPiece + kPiece / 2);
+  size_t third = 0;
+  EXPECT_EQ(budget.Reserve({kPiece, kPiece}, &third), 0u);
+  EXPECT_EQ(third, 0u);
+  EXPECT_EQ(budget.reserved(), 4 * kPiece + kPiece / 2);
+  budget.Release(first);
+  size_t fourth = 0;
+  EXPECT_EQ(budget.Reserve({kPiece, kPiece, kPiece, kPiece}, &fourth), 3u);
+  EXPECT_EQ(fourth, 3 * kPiece);
+
+  // A 1,300 GiB store in three buffers under a 1,024 GiB limit, in 1 GiB
+  // pieces: the first two buffers whole, the third not at all.
+  HostRegistrationBudget store(size_t{1024} << 30);
+  size_t bytes = 0;
+  EXPECT_EQ(store.Reserve(std::vector<size_t>(512, kPiece), &bytes), 512u);
+  EXPECT_EQ(store.Reserve(std::vector<size_t>(512, kPiece), &bytes), 512u);
+  EXPECT_EQ(store.Reserve(std::vector<size_t>(276, kPiece), &bytes), 0u);
+  EXPECT_EQ(bytes, 0u);
+}
+
+// A region past the limit is not registered at all, and says so: no device
+// address, so no gather kernel is ever pointed at it.
+TEST(HostRegistrationLimit, ARegionPastTheLimitIsNotRegistered) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  constexpr size_t kBytes = 1 << 20;
+  AlignedBuffer first(kBytes);
+  AlignedBuffer second(kBytes);
+  HostRegistrationBudget budget(kBytes);
+  HostTierRegistration within(first.data(), kBytes, &budget);
+  HostTierRegistration past(second.data(), kBytes, &budget);
+  if (within.RegisteredBytes() == 0) GTEST_SKIP() << "host memory cannot be registered here";
+  EXPECT_EQ(within.RegisteredBytes(), kBytes);
+  EXPECT_EQ(within.BytesOverLimit(), 0u);
+  EXPECT_EQ(past.RegisteredBytes(), 0u);
+  EXPECT_EQ(past.BytesOverLimit(), kBytes);
+  EXPECT_FALSE(past.GatherableOn(0));
+  EXPECT_EQ(past.DeviceAddress(second.data(), 4096, 0), nullptr);
+  if (within.GatherableOn(0)) {
+    EXPECT_NE(within.DeviceAddress(first.data(), 4096, 0), nullptr);
+  }
+}
+
+// A region registered in part: bytes copied to a GPU and back are right
+// whether they sit in the registered piece, in the unregistered one, or in
+// both, and only a plan that lies wholly in the registered piece is gathered.
+TEST(HostRegistrationLimit, ARegionRegisteredInPartIsCopiedRightOnBothSidesOfTheLimit) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  // Two pieces need a region that crosses a multiple of the piece size: map
+  // twice a piece of address space, untouched, and use the 4 MiB around the
+  // multiple inside it.
+  const size_t piece = HostRegistrationChunkBytes();
+  if (piece > (size_t{1} << 32)) GTEST_SKIP() << "pieces too large to straddle one";
+  constexpr size_t kHalf = size_t{2} << 20;
+  constexpr size_t kFragment = 4096;
+  void* const mapping = mmap(nullptr, 2 * piece, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  ASSERT_NE(mapping, MAP_FAILED);
+  const uintptr_t boundary = (reinterpret_cast<uintptr_t>(mapping) / piece + 1) * piece;
+  char* const host = reinterpret_cast<char*>(boundary - kHalf);
+  for (size_t i = 0; i < 2 * kHalf; ++i) host[i] = static_cast<char>(i * 131 + 7);
+
+  HostRegistrationBudget budget(kHalf);  // the first piece, and not the second
+  {
+    HbmCopyEngine engine;
+    engine.AddHostGatherRegion(host, 2 * kHalf, &budget);
+    EXPECT_EQ(budget.reserved(), kHalf);
+    void* device = nullptr;
+    ASSERT_EQ(hipMalloc(&device, 2 * kHalf), hipSuccess);
+    ASSERT_EQ(hipMemset(device, 0, 2 * kHalf), hipSuccess);
+    const auto host_ref = TransferRef::HostBytes(host, 2 * kHalf);
+    const auto device_ref =
+        TransferRef::HostBytes(device, 2 * kHalf, mori::io::MemoryLocationType::GPU, 0);
+    const auto copy = [&](const TransferRef& src, const TransferRef& dst,
+                          const std::vector<uint64_t>& offsets) {
+      std::vector<TransferItem> items;
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        items.push_back(MakeItem(src, offsets[i], dst, offsets[i], kFragment, i + 1));
+      }
+      auto planned = engine.Plan(items);
+      EXPECT_TRUE(planned.rejected_tags.empty());
+      std::vector<TransferFailure> failures;
+      if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+      EXPECT_TRUE(failures.empty());
+    };
+    // Fragments far apart, so they stay fragments; the last one of the mixed
+    // set lies across the limit itself.
+    const std::vector<uint64_t> registered = {0, 64 * kFragment, 128 * kFragment};
+    const std::vector<uint64_t> unregistered = {kHalf + 8 * kFragment, kHalf + 72 * kFragment};
+    const std::vector<uint64_t> mixed = {16 * kFragment, kHalf + 200 * kFragment,
+                                         kHalf - kFragment / 2};
+    const bool gather = DeviceGatherEnabled();
+    uint64_t launches = DeviceGatherLaunchCount();
+    copy(host_ref, device_ref, registered);
+    const bool gathered = DeviceGatherLaunchCount() != launches;
+    launches = DeviceGatherLaunchCount();
+    copy(host_ref, device_ref, unregistered);
+    copy(host_ref, device_ref, mixed);
+    EXPECT_EQ(DeviceGatherLaunchCount(), launches)
+        << "a gather kernel was pointed at memory that is not registered";
+    if (gather && !gathered) {
+      std::printf(
+          "the registered piece was not gathered here either: only the bytes are checked\n");
+    }
+
+    std::vector<char> on_device(2 * kHalf);
+    ASSERT_EQ(hipMemcpy(on_device.data(), device, 2 * kHalf, hipMemcpyDeviceToHost), hipSuccess);
+    std::vector<uint64_t> all = registered;
+    all.insert(all.end(), unregistered.begin(), unregistered.end());
+    all.insert(all.end(), mixed.begin(), mixed.end());
+    for (const uint64_t offset : all) {
+      EXPECT_EQ(std::memcmp(on_device.data() + offset, host + offset, kFragment), 0)
+          << "to the device, offset " << offset;
+    }
+    // And back: the device's bytes into the host region, both sides of the limit.
+    std::vector<char> expected(host, host + 2 * kHalf);
+    std::memset(host, 0, 2 * kHalf);
+    launches = DeviceGatherLaunchCount();
+    copy(device_ref, host_ref, registered);
+    copy(device_ref, host_ref, unregistered);
+    copy(device_ref, host_ref, mixed);
+    for (const uint64_t offset : all) {
+      EXPECT_EQ(std::memcmp(host + offset, expected.data() + offset, kFragment), 0)
+          << "from the device, offset " << offset;
+    }
+    (void)hipFree(device);
+  }
+  EXPECT_EQ(budget.reserved(), 0u) << "the region gave its share of the limit back";
+  ASSERT_EQ(munmap(mapping, 2 * piece), 0);
+}
+
 TEST(HbmCopyEngine, GatherStreamsOutliveTheirThreads) {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
