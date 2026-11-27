@@ -52,6 +52,14 @@ std::chrono::milliseconds EvictDemotionRetryBudget() {
 // Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
 
+// How long a lookup keeps the keys it finds from eviction, so the load that
+// follows it still finds them.
+std::chrono::milliseconds LookupLeaseTtl() {
+  static const auto v = GetEnvMilliseconds("UMBP_LOOKUP_LEASE_MS", std::chrono::milliseconds(5000),
+                                           /*min_allowed=*/0);
+  return v;
+}
+
 // One tier over one backend that never offloads or promotes (pure SSD): no
 // transition to plan, so a resolve can take the policy-free direct path.
 bool TrivialTierGraph(const LogicalTierGraph& graph) {
@@ -1094,7 +1102,6 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   std::vector<size_t> pending(keys.size());
   std::iota(pending.begin(), pending.end(), 0);
   std::vector<std::string> batch;
-  std::vector<std::string> found;
   std::vector<size_t> still_missing;
   for (uint32_t backend_id : read_order) {
     if (pending.empty()) break;
@@ -1104,25 +1111,16 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
     batch.reserve(pending.size());
     for (size_t i : pending) batch.push_back(keys[i]);
 
-    const auto hits = backend->BatchContains(batch);
+    const auto hits = backend->Lease(batch, LookupLeaseTtl());
     still_missing.clear();
-    found.clear();
     for (size_t j = 0; j < pending.size(); ++j) {
       if (j < hits.size() && hits[j]) {
         out[pending[j]] = true;
-        found.push_back(std::move(batch[j]));
       } else {
         still_missing.push_back(pending[j]);
       }
     }
-    if (!found.empty()) backend->Touch(found);
     pending.swap(still_missing);
-  }
-  if (track_access_order_) {
-    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (out[i]) TouchLocked(keys[i]);
-    }
   }
   return out;
 }

@@ -132,8 +132,11 @@ class PeerPool {
                                               const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
-  // check discards. Takes no read lease, but renews recency: a client looks
-  // keys up to load them next, and evicting them in between fails that load.
+  // check discards. Leases what it finds for UMBP_LOOKUP_LEASE_MS: a client
+  // looks keys up to load them next, and evicting them in between fails that
+  // load.  Recency stays put: a lookup asks about more than the client loads
+  // (a hybrid model asks for its state at every boundary and loads one), and
+  // renewing all of it would keep what is never read over what is.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest

@@ -912,6 +912,23 @@ size_t PageBackend::Touch(const std::vector<std::string>& keys) {
   return held.size();
 }
 
+std::vector<bool> PageBackend::Lease(const std::vector<std::string>& keys,
+                                     std::chrono::milliseconds ttl) {
+  std::vector<bool> found(keys.size(), false);
+  if (keys.empty()) return found;
+  // Shared, like the resolve paths: the lease is an atomic, renewed CAS-max.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const int64_t deadline = SteadyNs(std::chrono::steady_clock::now() + ttl);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = owned_.find(keys[i]);
+    if (it != owned_.end()) {
+      RenewLeaseAtomic(it->second, deadline);
+      found[i] = true;
+    }
+  }
+  return found;
+}
+
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
   if (slot.in_lru) {

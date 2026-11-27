@@ -1675,6 +1675,57 @@ TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
 }
 
+// Force the legal interleaving between containment and lease acquisition.
+class EvictBeforeLookupLease final : public PageBackend {
+ public:
+  using PageBackend::PageBackend;
+  std::vector<bool> Lease(const std::vector<std::string>& keys,
+                          std::chrono::milliseconds ttl) override {
+    evicted = Evict(keys);
+    return PageBackend::Lease(keys, ttl);
+  }
+  std::vector<EvictResult> evicted;
+};
+
+TEST(PeerPoolLocalEviction, LookupDoesNotReportAnObjectLostBeforeItsLease) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {10 * kHostPage};
+  auto backend = std::make_unique<EvictBeforeLookupLease>(TierType::DRAM, kHostPage, ownership,
+                                                          kNoExpiry, std::chrono::milliseconds(1));
+  auto* dram = backend.get();
+  ASSERT_TRUE(backend->Init(&engine));
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  CommitKey(&pool, "raced");
+  ASSERT_TRUE(dram->Contains("raced"));
+  EXPECT_EQ(pool.BatchContains({"raced", "missing"}), (std::vector<bool>{false, false}));
+  ASSERT_FALSE(dram->evicted.empty());
+  EXPECT_GT(dram->evicted.front().bytes_freed, 0u);
+  EXPECT_FALSE(dram->Contains("raced"));
+}
+
+TEST(PeerPoolLocalEviction, ALookupFencesTheKeysItFindsUntilTheLoad) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  EXPECT_EQ(pool.BatchContains({"k0", "missing"}), (std::vector<bool>{true, false}));
+  CommitKey(&pool, "k8");
+
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_TRUE(dram->Contains("k0")) << "a looked-up key was evicted before its load";
+  for (int i = 1; i <= 4; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i = 5; i <= 8; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+}
+
 TEST(PeerPool, ATouchReachesEveryCopyInAMediumThatKeepsAnOrder) {
   LocalCopyEngine engine;
   BackendRegistry registry;
