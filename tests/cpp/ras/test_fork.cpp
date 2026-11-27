@@ -77,7 +77,11 @@ TEST(RasFork, EveryRasFdIsCloseOnExec) {
   EXPECT_EQ(RunInChild([] {
               std::set<int> before = ras_test::SocketLikeFds();
               setenv("MORI_RAS_ENABLE", "1", 1);
-              CHILD_CHECK(RasRuntime::EnsureStarted(Params()) != nullptr);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              // Otherwise a short-lived fd's number could be reused, between the listing and
+              // fcntl, by a file the starting thread reads.
+              CHILD_CHECK(ras_test::WaitUntilStarted(*r));
               int checked = 0;
               for (int fd : ras_test::SocketLikeFds()) {
                 if (before.count(fd) != 0) continue;

@@ -276,6 +276,10 @@ bool LinkManager::InitLoop(std::string* error) {
 
 void LinkManager::SetIdentity(const RasProcessId& self) {
   self_ = self;
+  {
+    std::lock_guard<std::mutex> lock(labelsMu_);
+    self_.labels = labels_;
+  }
   MarkDirty();
 }
 
@@ -322,6 +326,11 @@ void LinkManager::RunOnce(int maxWaitMs) {
     size_t handled =
         opts_.events->Drain([&](RasEvent& ev) { HandleEvent(ev, now); }, kEventsPerIteration);
     moreEvents_ = handled == kEventsPerIteration;
+  }
+  if (labelsChanged_.exchange(false, std::memory_order_acq_rel)) {
+    std::lock_guard<std::mutex> lock(labelsMu_);
+    self_.labels = labels_;
+    MarkDirty();
   }
   now = MonoNowNs();
   RunTimers(now);
@@ -1287,6 +1296,17 @@ RuntimeSnapshot LinkManager::Snapshot() const {
   s.listenPort = port_;
   s.degraded = Degraded();  // any thread may set a bit between publications
   return s;
+}
+
+bool LinkManager::SetLabels(const Labels& labels) {
+  if (!ValidLabels(labels)) return false;
+  {
+    std::lock_guard<std::mutex> lock(labelsMu_);
+    labels_ = labels;
+  }
+  labelsChanged_.store(true, std::memory_order_release);
+  if (opts_.events != nullptr) opts_.events->Wake();
+  return true;
 }
 
 void LinkManager::AddDegraded(uint32_t reasons) {

@@ -160,7 +160,8 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
   int fdsOfOneRuntime = RunInChild([] {
     size_t before = ras_test::SocketLikeFds().size();
     setenv("MORI_RAS_ENABLE", "1", 1);
-    if (RasRuntime::EnsureStarted(Params()) == nullptr) return 0;
+    RasRuntime* r = RasRuntime::EnsureStarted(Params());
+    if (r == nullptr || !ras_test::WaitUntilStarted(*r)) return 0;
     return static_cast<int>(ras_test::SocketLikeFds().size() - before);
   });
   ASSERT_GT(fdsOfOneRuntime, 0);
@@ -188,6 +189,7 @@ TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
                 CHILD_CHECK(got[0] != nullptr);
                 for (RasRuntime* r : got) CHILD_CHECK(r == got[0]);
                 CHILD_CHECK(RasRuntime::Status().state == RunState::kRunning);
+                CHILD_CHECK(ras_test::WaitUntilStarted(*got[0]));
                 CHILD_CHECK(static_cast<int>(ras_test::SocketLikeFds().size() - before) ==
                             fdsOfOneRuntime);
                 // The thread names itself once it is configured, so give a second one time to.
@@ -371,6 +373,21 @@ TEST(RasRuntime, TheRasThreadRunsAtLowPriorityWhereItIsPinned) {
               std::string status = ReadAll(base + "/status");
               std::string want = "Cpus_allowed_list:\t" + std::to_string(cpu) + "\n";
               CHILD_CHECK(status.find(want) != std::string::npos);
+              return 0;
+            }),
+            0);
+}
+
+TEST(RasRuntime, LabelsAreValidatedAndJoinTheIdentity) {
+  EXPECT_EQ(RunInChild([] {
+              setenv("MORI_RAS_ENABLE", "1", 1);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              CHILD_CHECK(r->SetLabels({{"role", "decode"}, {"instance", "2"}}));
+              CHILD_CHECK(WaitFor([&] { return r->Snapshot().self.labels.size() == 2; }, 2000));
+              CHILD_CHECK(r->Snapshot().self.labels.at("role") == "decode");
+              CHILD_CHECK(!r->SetLabels({{"", "empty key"}}));
+              CHILD_CHECK(r->Snapshot().self.labels.size() == 2);
               return 0;
             }),
             0);
