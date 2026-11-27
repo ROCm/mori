@@ -469,7 +469,8 @@ void Context::EnsureRdmaTransport() {
   for (PeerCapabilities& cap : peerCaps) cap.canRDMA = canRdma;
   rdmaInitDone = true;
   // The NIC is open now: exchange the identities again so they carry it. All ranks get here
-  // together, as they open their NICs at the same points (constructor, ccoCommCreate, FULL DevComm).
+  // together, as they open their NICs at the same points (constructor, ccoCommCreate, FULL
+  // DevComm).
   CollectPeIdentities();
   if (!canRdma) return;
 

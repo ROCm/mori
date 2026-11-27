@@ -574,6 +574,8 @@ def _run(d, comm):
                     cap is not None,
                 )
 
+        _check_traffic_stats(op, d, rank, npes)
+
 
 def _lec_ref(d, idx, ct_point):
     """This rank's expected local_expert_count: its experts' ids over every rank's
@@ -647,8 +649,6 @@ def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, cap
             f"({REROUTE} rounds, {errs} stale reads)",
             flush=True,
         )
-
-        _check_traffic_stats(op, d, rank, npes)
 
 
 def _check_traffic_stats(op, d, rank, npes):

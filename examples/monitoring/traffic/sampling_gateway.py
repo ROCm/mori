@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """One address for the metrics sampling of every running MORI process.
 
 Grafana reaches it as the data source `mori-sampling`; GET or POST /sampling is passed on to
@@ -107,14 +128,18 @@ def forget_state():
 def instant_vector(args, expr, at):
     """The answer to one of the two queries in the module comment; empty for anything else, and
     when no process answers (the switch then shows no setting)."""
-    m = re.fullmatch(r"\s*(mori_sampling_period|mori_sampling_is|mori_scrape_is)\s*\{(.*)\}\s*",
-                     expr or "")
+    m = re.fullmatch(
+        r"\s*(mori_sampling_period|mori_sampling_is|mori_scrape_is)\s*\{(.*)\}\s*",
+        expr or "",
+    )
     if not m:
         return []
     labels = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', m.group(2)))
     if m.group(1) == "mori_scrape_is":
         value = 1 if scrape_interval(args) == labels.get("interval") else 0
-        return [{"metric": dict(labels, __name__=m.group(1)), "value": [at, str(value)]}]
+        return [
+            {"metric": dict(labels, __name__=m.group(1)), "value": [at, str(value)]}
+        ]
     module = labels.get("module")
     if module not in ("ep", "io"):
         return []
@@ -142,21 +167,31 @@ def set_scrape_interval(args, interval):
     file is bind-mounted into the Prometheus container: a new file would not be seen there) and
     has Prometheus reload it."""
     seconds = int(interval[:-1])
-    timeout = "%dms" % min(4000, seconds * 800)  # under the interval, as Prometheus requires
+    timeout = "%dms" % min(
+        4000, seconds * 800
+    )  # under the interval, as Prometheus requires
     with open(args.prometheus_config, "r+") as f:
         text = f.read()
         head, sep, rest = text.partition("scrape_configs:")
-        head = re.sub(r"(?m)^(\s*scrape_interval:\s*)\S+", r"\g<1>" + interval, head, count=1)
-        head = re.sub(r"(?m)^(\s*scrape_timeout:\s*)\S+", r"\g<1>" + timeout, head, count=1)
+        head = re.sub(
+            r"(?m)^(\s*scrape_interval:\s*)\S+", r"\g<1>" + interval, head, count=1
+        )
+        head = re.sub(
+            r"(?m)^(\s*scrape_timeout:\s*)\S+", r"\g<1>" + timeout, head, count=1
+        )
         f.seek(0)
         f.write(head + sep + rest)
         f.truncate()
     url = args.prometheus.rstrip("/") + "/-/reload"
-    urllib.request.urlopen(urllib.request.Request(url, data=b""), timeout=TIMEOUT_S).read()
+    urllib.request.urlopen(
+        urllib.request.Request(url, data=b""), timeout=TIMEOUT_S
+    ).read()
     return scrape_interval(args)
 
 
-class Server(ThreadingMixIn, HTTPServer):  # http.server has its own only from Python 3.7 on
+class Server(
+    ThreadingMixIn, HTTPServer
+):  # http.server has its own only from Python 3.7 on
     daemon_threads = True
 
 
@@ -183,8 +218,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(404, {"error": "started without --prometheus-config"})
             interval = dict(urllib.parse.parse_qsl(url.query)).get("interval")
             if interval not in SCRAPE_INTERVALS:
-                return self.reply(400, {"error": "interval is one of %s" % ", ".join(SCRAPE_INTERVALS)})
-            return self.reply(200, {"scrape_interval": set_scrape_interval(self.args, interval)})
+                return self.reply(
+                    400,
+                    {"error": "interval is one of %s" % ", ".join(SCRAPE_INTERVALS)},
+                )
+            return self.reply(
+                200, {"scrape_interval": set_scrape_interval(self.args, interval)}
+            )
         except Exception as e:
             return self.reply(502, {"error": "%s: %s" % (type(e).__name__, e)})
 
@@ -196,10 +236,18 @@ class Handler(BaseHTTPRequestHandler):
         if change:
             # Exactly what a process accepts, and nothing else goes through.
             pairs = urllib.parse.parse_qsl(url.query, keep_blank_values=True)
-            bad = [k for k, v in pairs if k not in SETTINGS or not re.fullmatch(r"\d{1,9}", v)]
+            bad = [
+                k
+                for k, v in pairs
+                if k not in SETTINGS or not re.fullmatch(r"\d{1,9}", v)
+            ]
             if bad or not pairs:
                 return self.reply(
-                    400, {"error": "settings are ep=<n>, io=<n>, interval_ms=<n>", "bad": bad}
+                    400,
+                    {
+                        "error": "settings are ep=<n>, io=<n>, interval_ms=<n>",
+                        "bad": bad,
+                    },
                 )
             query = urllib.parse.urlencode(pairs)
         try:
@@ -209,7 +257,9 @@ class Handler(BaseHTTPRequestHandler):
         if change:
             forget_state()
         if out["processes"] == 0:
-            return self.reply(404 if change else 200, dict(out, error="no running MORI process"))
+            return self.reply(
+                404 if change else 200, dict(out, error="no running MORI process")
+            )
         self.reply(502 if change and out["failed"] else 200, out)
 
     def handle_prometheus(self, params):
@@ -217,13 +267,20 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path != "/api/v1/query":
             # Labels, metadata, build information: nothing to say.
-            return self.reply(200, {"status": "success", "data": {} if "status" in path else []})
+            return self.reply(
+                200, {"status": "success", "data": {} if "status" in path else []}
+            )
         try:
             at = float(params.get("time") or time.time())
             result = instant_vector(self.args, params.get("query"), at)
         except Exception as e:
-            return self.reply(200, {"status": "error", "errorType": "execution", "error": str(e)})
-        self.reply(200, {"status": "success", "data": {"resultType": "vector", "result": result}})
+            return self.reply(
+                200, {"status": "error", "errorType": "execution", "error": str(e)}
+            )
+        self.reply(
+            200,
+            {"status": "success", "data": {"resultType": "vector", "result": result}},
+        )
 
     def do_GET(self):
         url = urllib.parse.urlsplit(self.path)
@@ -255,9 +312,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--listen", default=os.environ.get("TRAFFIC_GATEWAY_LISTEN", "127.0.0.1:9390"))
     p.add_argument(
-        "--prometheus", default=os.environ.get("TRAFFIC_PROM_URL", "http://127.0.0.1:9090")
+        "--listen", default=os.environ.get("TRAFFIC_GATEWAY_LISTEN", "127.0.0.1:9390")
+    )
+    p.add_argument(
+        "--prometheus",
+        default=os.environ.get("TRAFFIC_PROM_URL", "http://127.0.0.1:9090"),
     )
     p.add_argument("--targets", default=os.environ.get("TRAFFIC_TARGETS", ""))
     p.add_argument(

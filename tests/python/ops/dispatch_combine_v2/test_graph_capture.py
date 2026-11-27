@@ -215,7 +215,8 @@ def main():
                 and one > 0
                 and total == REPLAYS * one
                 and back == total
-                and stats1["dispatch_kernel_seconds"] > stats0["dispatch_kernel_seconds"]
+                and stats1["dispatch_kernel_seconds"]
+                > stats0["dispatch_kernel_seconds"]
                 and stats1["combine_kernel_seconds"] > stats0["combine_kernel_seconds"]
             )
             errs_stats = d.allreduce_sum(0 if ok_stats else 1)
