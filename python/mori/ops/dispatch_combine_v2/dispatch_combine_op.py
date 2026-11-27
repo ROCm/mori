@@ -324,8 +324,9 @@ class EpDispatchCombineConfig:
     # "segmented" is refused on a config that does not support it; "auto" picks
     # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
     #
-    # MORI_ASYNCLL_COMPACT_RESERVE=1 (gfx950, "compact", no quant_type) keeps the
-    # compact contract -- the dense prefix [0, total_recv), each row's origin in the
+    # On gfx950 a "compact" op without a quant_type runs compact reserve
+    # (MORI_ASYNCLL_COMPACT_RESERVE, on by default there): it keeps the compact
+    # contract -- the dense prefix [0, total_recv), each row's origin in the
     # reverse map -- but each source reserves its rows' range in the receiver's
     # views and the copy engines place them there, so nothing is copied on receive.
     # Sources then appear in arrival order, not rank order (each one's rows stay
@@ -1830,7 +1831,7 @@ class EpDispatchCombineOp:
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
         only valid after :meth:`dispatch_recv`. With direct sources (MORI_ASYNCLL_DIRECT;
-        on by default for the segmented layout on gfx950) the copy
+        on by default on gfx950 without a quant_type, in either layout) the copy
         engines read ``input`` and ``scales`` until then, so do not write either in
         between.
         """

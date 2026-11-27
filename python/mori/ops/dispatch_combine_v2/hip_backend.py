@@ -1699,7 +1699,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # until the matching recv. Rides on early notification; mode 0 means this op has none
         # (another transport, several nodes, or MORI_ASYNCLL_EARLY_NOTIFY=0). Unset, it is on
         # for the segmented layout on gfx950 without a quantized combine (`cfg` resolved, so
-        # every rank and per_rank_vmm agree); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
+        # every rank and per_rank_vmm agree), and compact reserve turns it on for the compact
+        # one (_asyncll_reserve); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
         value = os.environ.get("MORI_ASYNCLL_DIRECT", "")
         if value not in ("", "0", "1"):
             raise ValueError(f"MORI_ASYNCLL_DIRECT must be '0' or '1', got {value!r}")
@@ -1716,13 +1717,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     @staticmethod
     def _asyncll_reserve(mode, cfg, arch):
-        # MORI_ASYNCLL_COMPACT_RESERVE=1 (default 0): a compact op whose senders reserve their
-        # rows' range in each receiver's packed output (one remote fetch_add per peer) and place
-        # them there, so dispatch_recv copies nothing. Direct sources and fused metadata come
-        # with it. Asked for where it cannot run, it raises instead of falling back: every rank
-        # must size the same arena.
-        value = os.environ.get("MORI_ASYNCLL_COMPACT_RESERVE", "0")
-        if value not in ("0", "1"):
+        # Compact reserve: a compact op whose senders reserve their rows' range in each
+        # receiver's packed output (one remote fetch_add per peer) and place them there, so
+        # dispatch_recv copies nothing. Direct sources and fused metadata come with it.
+        # MORI_ASYNCLL_COMPACT_RESERVE unset: on wherever it can run -- the compact layout
+        # (`cfg` resolved, so every rank and per_rank_vmm agree) on gfx950, single-node SDMA with
+        # early notification (mode >= 1), no quant_type, and MORI_ASYNCLL_DIRECT /
+        # MORI_ASYNCLL_FUSE_META not set to 0. "0" turns it off; "1" raises where it cannot run
+        # instead of falling back.
+        value = os.environ.get("MORI_ASYNCLL_COMPACT_RESERVE", "")
+        if value not in ("", "0", "1"):
             raise ValueError(
                 f"MORI_ASYNCLL_COMPACT_RESERVE must be '0' or '1', got {value!r}"
             )
@@ -1740,9 +1744,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for name in ("MORI_ASYNCLL_DIRECT", "MORI_ASYNCLL_FUSE_META"):
             if os.environ.get(name) == "0":
                 bad.append(f"{name} unset or 1")
-        if bad:
+        if bad and value == "1":
             raise ValueError("MORI_ASYNCLL_COMPACT_RESERVE=1 needs " + ", ".join(bad))
-        return True
+        return not bad
 
     @staticmethod
     def _asyncll_fuse_meta(direct, segmented, reserve=False):

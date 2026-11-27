@@ -568,13 +568,30 @@ class AsyncLLCompactReserveTest(unittest.TestCase):
                 mode, cfg or self.compact, arch
             )
 
-    def test_off_unless_asked(self):
-        self.assertFalse(self.reserve({}))
+    def test_default_on_where_it_runs(self):
+        on = {"MORI_ASYNCLL_COMPACT_RESERVE": "1"}
+        self.assertTrue(self.reserve({}))
+        self.assertTrue(self.reserve({}, mode=2))
+        self.assertTrue(self.reserve(on))
         self.assertFalse(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "0"}))
-        self.assertTrue(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "1"}))
-        self.assertTrue(self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "1"}, mode=2))
         with self.assertRaises(ValueError):
             self.reserve({"MORI_ASYNCLL_COMPACT_RESERVE": "yes"})
+        # Unset, it falls back silently wherever "1" would be refused.
+        seg = SimpleNamespace(async_ll_segmented=True, quant_type="none")
+        quant = SimpleNamespace(
+            async_ll_segmented=False, quant_type="fp8_blockwise_1x128"
+        )
+        for env, mode, cfg, arch in [
+            ({}, 0, None, "gfx950"),
+            ({}, 1, seg, "gfx950"),
+            ({}, 1, quant, "gfx950"),
+            ({}, 1, None, "gfx942"),
+            ({}, 1, None, "gfx1250"),
+            ({"MORI_ASYNCLL_DIRECT": "0"}, 1, None, "gfx950"),
+            ({"MORI_ASYNCLL_FUSE_META": "0"}, 1, None, "gfx950"),
+        ]:
+            with self.subTest(env=env, mode=mode, cfg=cfg, arch=arch):
+                self.assertFalse(self.reserve(env, mode, cfg, arch))
 
     def test_refused_where_it_cannot_run(self):
         on = {"MORI_ASYNCLL_COMPACT_RESERVE": "1"}
@@ -683,9 +700,14 @@ class AsyncLLCompactReserveTest(unittest.TestCase):
             with patch.dict(os.environ, env, clear=True):
                 return EpDispatchCombineOp.per_rank_vmm(cfg, arch="gfx950")
 
-        direct = vmm({"MORI_ASYNCLL_DIRECT": "1"})
-        reserve = vmm({"MORI_ASYNCLL_COMPACT_RESERVE": "1"})
+        direct = vmm({"MORI_ASYNCLL_COMPACT_RESERVE": "0", "MORI_ASYNCLL_DIRECT": "1"})
+        reserve = vmm({})  # the default on gfx950
         self.assertLess(reserve, direct)
+        self.assertEqual(vmm({"MORI_ASYNCLL_COMPACT_RESERVE": "1"}), reserve)
+        self.assertEqual(
+            vmm({"MORI_ASYNCLL_DIRECT": "0"}),
+            vmm({"MORI_ASYNCLL_COMPACT_RESERVE": "0"}),
+        )
 
 
 def _fake_plan_type(name):

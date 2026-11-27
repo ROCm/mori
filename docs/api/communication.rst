@@ -119,10 +119,10 @@ These options are read once when an op is constructed:
        fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
        The former name, ``MORI_ASYNCLL_FUSED_RECV_CTAS``, is still accepted.
    * - ``MORI_ASYNCLL_DIRECT``
-     - Unset: on for an op whose ``async_ll_recv_layout`` resolves to
-       ``"segmented"`` on gfx950 without a quantized combine, off otherwise.
-       ``1`` turns it on (also for the compact layout and on gfx942), ``0``
-       off. Direct sources have the copy engines read the tokens where the
+     - Unset: on for an op on gfx950 without a quantized combine (the
+       segmented layout directly, the compact one through
+       ``MORI_ASYNCLL_COMPACT_RESERVE``), off otherwise. ``1`` turns it on
+       (also on gfx942), ``0`` off, which also turns compact reserve off. Direct sources have the copy engines read the tokens where the
        caller left them: dispatch posts each peer's rows from the input, one
        packet per run of adjacent source tokens (and, in the segmented layout,
        one more for the run's scale rows), and combine posts each peer's rows
@@ -142,15 +142,17 @@ These options are read once when an op is constructed:
        runs two passes instead of three. ``0`` keeps the separate metadata
        pass. Ignored without direct sources or the segmented layout.
    * - ``MORI_ASYNCLL_COMPACT_RESERVE``
-     - ``0``. ``1`` on a compact op (gfx950, single-node SDMA with early
-       notification, no ``quant_type``): each source reserves its rows' range
-       in every receiver's recv views with one remote atomic per peer, and the
-       copy engines place rows, scales and metadata there, so
+     - Unset: on for a compact op on gfx950 (single-node SDMA with early
+       notification, no ``quant_type``) unless ``MORI_ASYNCLL_DIRECT`` or
+       ``MORI_ASYNCLL_FUSE_META`` is ``0``; ``0`` turns it off; ``1`` requires
+       it, and is refused where it cannot run. Each source reserves its rows'
+       range in every receiver's recv views with one remote atomic per peer,
+       and the copy engines place rows, scales and metadata there, so
        ``dispatch_recv`` copies nothing. Direct sources and fused metadata
-       come with it; it is refused elsewhere and with
-       ``MORI_ASYNCLL_DIRECT=0`` or ``MORI_ASYNCLL_FUSE_META=0``. The views keep
-       the compact contract, a dense prefix of ``total_recv`` rows, but sources
-       appear in arrival order, and the views are valid only until this rank's
+       come with it. The views keep the compact contract, a dense prefix of
+       ``total_recv`` rows located by the reverse map, but sources appear in
+       arrival order (each source's rows contiguous, in slot order), and since
+       peers write them the views are valid only until this rank's
        ``combine_send``. The arena leaves out the dispatch landing, so every
        rank must use the same value.
    * - ``MORI_ASYNCLL_SEND_BLOCKS``
@@ -160,7 +162,7 @@ These options are read once when an op is constructed:
        to a multiple of the world size, and up to the world size if smaller; it
        never widens a pass's default grid. With direct sources and
        fused metadata (``MORI_ASYNCLL_FUSE_META``, on by default) in the
-       segmented layout, or with ``MORI_ASYNCLL_COMPACT_RESERVE=1``, it also
+       segmented layout, or with compact reserve, it also
        sets the send transfer's blocks per peer,
        ceiling / world size (one when 0), up to the device.
    * - ``MORI_ASYNCLL_RECV_BLOCKS``
@@ -197,14 +199,17 @@ every AsyncLL op. The resolved notification mode is part of every native Plan's
 configuration and generated source, so different ops can coexist without
 changing the protocol of an already constructed Plan.
 
-For two-batch overlap on the fewest compute units, use the segmented receive
-layout, which turns on direct sources by default on gfx950 (set
-``MORI_ASYNCLL_DIRECT=1`` on gfx942), plus ``MORI_ASYNCLL_FUSED_RECV=1`` when
+For two-batch overlap on the fewest compute units on gfx950, either receive
+layout works: the segmented one turns on direct sources by default, and the
+compact one compact reserve, which runs the same send and combine passes and
+keeps the dense compact views (on gfx942 use the segmented layout with
+``MORI_ASYNCLL_DIRECT=1``). Add ``MORI_ASYNCLL_FUSED_RECV=1`` when
 both micro-batches run on one stream (see below), with schedules such as
 ``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE=1024:8,0:32`` and
 ``MORI_ASYNCLL_RECV_BLOCKS_SCHEDULE=128:64,0:128``. Both send phases then run on
 eight blocks, the dispatch receive only marks the unused rows of each segment
-on its own small grid, and the combine receive, the one phase whose time follows
+on its own small grid (compact reserve: one block, nothing to mark), and the
+combine receive, the one phase whose time follows
 its block count, is sized by the token count. The send schedule assumes direct
 sources: without them the send passes gather the token rows and need the whole
 device.
