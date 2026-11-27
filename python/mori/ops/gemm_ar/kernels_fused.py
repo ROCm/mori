@@ -683,6 +683,10 @@ class _PermlaneStoreC(_SwapABStoreC):
     _adjacent_probe = False
     _lane_transpose = False
     _peer_uncached = False
+    # fp8 "lds" epilogue: (LDS array, byte shift from it to the lowest LDS
+    # array, tile row 0, tile col 0, row stride), set
+    # by the kernel before the stores. The tile then goes to LDS, not to C.
+    _lds = None
 
     def store(self, c_frag, base_row, base_col):
         self._emit(
@@ -780,7 +784,12 @@ class _PermlaneStoreC(_SwapABStoreC):
                 col = base_col + (grp % 2) * 16 + (grp // 2) * 8
             oob = fx.Int32(self.c_rows * self.c_cols)
             idx = arith.select(col + 7 < self.c_cols, row * self.c_cols + col, oob)
-            if self._peer_rsrc is not None:
+            if const_expr(self._lds is not None):
+                arr, shift, r0, c0, ld = self._lds
+                _lds_16b(arr, shift + ((row - r0) * ld + (col - c0)) * 2).store(
+                    out8.bitcast(fx.Uint8)
+                )
+            elif self._peer_rsrc is not None:
                 # The store goes to a *peer*, so a cached one leaves the line
                 # dirty in whichever XCD's L2 this block ran on, where nothing
                 # downstream can reach it -- the barrier kernel is one block and
@@ -802,6 +811,12 @@ class _PermlaneStoreC(_SwapABStoreC):
                     self.reg_bf16_8,
                     fx.slice(self.c_div, (None, fx.Int32(idx))),
                 )
+
+
+def _lds_16b(arr, byte_off):
+    """16-byte view of LDS at ``byte_off`` bytes from ``arr``'s base."""
+    it = fx.recast_iter(fx.Uint8, fx.add_offset(arr.ptr, fx.make_int_tuple(byte_off)))
+    return fx.make_view(it, fx.make_layout(16, 1))
 
 
 class _LaneTransposeStoreC(_PermlaneStoreC):
@@ -950,8 +965,13 @@ def compile_fused_gemm_scatter(
     chunk_bands: int = 0,
     relaxed_rows: bool = False,
     scale_prefetch: bool | None = None,
+    fp8_lds_epilogue: bool = True,
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
+
+    ``fp8_lds_epilogue`` (fp8 scatter only) stages each bf16 tile in the idle
+    A/B LDS and quantises from there instead of round-tripping it through the
+    window; bit-exact with the window path, which ``False`` restores.
 
     ``fuse=False`` emits the identical kernel minus the epilogue tail, so the
     split baseline and the fused kernel differ in exactly one thing. That is why
@@ -1242,6 +1262,27 @@ def compile_fused_gemm_scatter(
         _kname_tag += "R"
     if fp8_scatter:
         _kname_tag += "F"
+    # fp8 scatter: stage the bf16 tile in the A/B LDS, which is idle once the K
+    # loop is done, and quantise from there, instead of storing it to the
+    # window and reading it back (64 KiB per tile, with one workgroup per CU
+    # nothing hides that store and re-read). Same values in, same order: the
+    # output is bit-exact with the window path. Needs the lane-transpose
+    # store and a tile that fits the 96 KiB LDS; otherwise the window path.
+    # Measured on blockscale only, so other quantisations keep the window path.
+    fp8_lds = (
+        fp8_scatter
+        and fp8_lds_epilogue
+        and blockscale
+        and swap_ab
+        and permlane
+        and lane_transpose
+        and not direct_lsa
+        and not mxfp8_raw
+        and N % BLOCK_N == 0
+        and BLOCK_M * BLOCK_N * 2 <= 98304
+    )
+    if fp8_lds:
+        _kname_tag += "L"
 
     _kname = (
         f"mori_fused_{(transport if fuse else 'split')}_8w_"
@@ -1766,6 +1807,33 @@ def compile_fused_gemm_scatter(
         if wave_m == 0:
             rocdl.s_barrier()
 
+        if const_expr(fp8_lds):
+            # Every wave's last A/B LDS reads are done before the tile lands
+            # on them.
+            read_done_barrier()
+            # The tile needs 64 KiB from the lowest A/B array, whichever it is
+            # (a_cur0 is not: the allocator does not keep declaration order).
+            lds_lo = None
+            for f in (
+                a_cur0,
+                a_cur1,
+                a_next0,
+                a_next1,
+                b_cur0,
+                b_cur1,
+                b_next0,
+                b_next1,
+            ):
+                p = fx.Int32(fx.ptrtoint(f.ptr))
+                lds_lo = p if lds_lo is None else (p < lds_lo).select(p, lds_lo)
+            lds_shift = lds_lo - fx.Int32(fx.ptrtoint(a_cur0.ptr))
+            store_c._lds = (
+                a_cur0,
+                lds_shift,
+                block_m * BLOCK_M,
+                block_n * BLOCK_N,
+                BLOCK_N,
+            )
         if const_expr(hoist_scales) and hasattr(store_c, "store_all"):
             store_c.store_all(
                 [
@@ -1790,7 +1858,10 @@ def compile_fused_gemm_scatter(
             # Reuse the BF16 output region as GEMM staging, then
             # compress each completed tile before electing its SDMA producer.
             # Sixteen lanes own a 256-column row segment; no inter-CTA amax.
-            wait_barrier(0)
+            if const_expr(fp8_lds):
+                read_done_barrier()
+            else:
+                wait_barrier(0)
             qsrc = create_buffer_resource_from_addr(
                 wave_uniform_i64(w_pre.lsa_ptr(rank, output_off))
             )
@@ -1809,8 +1880,20 @@ def compile_fused_gemm_scatter(
                     pos = row * N + col
                     halves = [
                         Vec(
-                            buffer_load(
-                                qsrc, pos // 2 + hh * 4, vec_width=4, dtype=i32_type()
+                            _lds_16b(
+                                a_cur0,
+                                lds_shift
+                                + ((qrow + rr * 32) * BLOCK_N + qlane * 16 + hh * 8)
+                                * 2,
+                            )
+                            .load()
+                            .bitcast(fx.Int32)
+                            if fp8_lds
+                            else buffer_load(
+                                qsrc,
+                                pos // 2 + hh * 4,
+                                vec_width=4,
+                                dtype=i32_type(),
                             )
                         )
                         .bitcast(fx.BFloat16)
