@@ -53,7 +53,13 @@ class SdmaQueue {
 
   SdmaQueueDeviceHandle* deviceHandle() const;
 
+  // False only under MORI_SDMA_ALIGN_DEVICE_DOORBELL, when this queue's engine
+  // had no slot left with a doorbell a kernel can ring. Such a queue starts
+  // INTERMITTENTLY from device code, so connect() drops it instead of using it.
+  bool deviceDoorbellUsable() const { return deviceDoorbellUsable_; }
+
  private:
+  bool deviceDoorbellUsable_{true};
   uint64_t* cachedWptr_;
   uint64_t* committedWptr_;
   void* queueBuffer_;
@@ -95,6 +101,10 @@ class AnvilLib {
   // /sys/class/kfd/kfd/topology/nodes) of the given HIP device WITHOUT initializing
   // HSA. It can differ from HSA_AGENT_INFO_NODE when this process cannot open every GPU.
   static int kfdNodeIdForHipDevice(int hipDev);
+
+  // Map a HIP device ordinal to the libhsakmt node id SdmaQueue takes, for the
+  // callers that pin a queue to one engine instead of going through connect().
+  static uint32_t hsakmtNodeForHipDevice(int hipDev);
 
  private:
   /*
