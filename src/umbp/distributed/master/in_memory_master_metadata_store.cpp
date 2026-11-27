@@ -350,6 +350,15 @@ HeartbeatResult InMemoryMasterMetadataStore::ApplyHeartbeat(
     }
     auto& record = it->second;
 
+    // A delta at or below the cursor was already applied; its ack was lost and
+    // the node resent it. Ack the cursor without applying the events again. An
+    // EXPIRED row lost its locations and has to resync, so it is not acked here.
+    if (!is_full_sync && seq != 0 && seq <= record.last_applied_seq &&
+        record.status == ClientStatus::ALIVE) {
+      record.last_heartbeat = now;
+      return HeartbeatResult{HeartbeatResult::DUPLICATE, record.last_applied_seq};
+    }
+
     // Gap check (CAS) on the delta path only — full_sync replaces wholesale and
     // re-baselines last_applied_seq.
     if (!is_full_sync && seq != record.last_applied_seq + 1) {

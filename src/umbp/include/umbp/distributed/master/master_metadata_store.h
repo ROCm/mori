@@ -299,6 +299,12 @@ class IMasterMetadataStore {
   //      separate Get() then UpdateHeartbeatState(); two in-flight
   //      heartbeats can both observe the same seq and corrupt
   //      last_applied_seq (see hazard #1 in header preamble).
+  //      Exception: 0 < seq <= last_applied_seq on an ALIVE record is
+  //      a bundle already applied, resent because its ack was lost.
+  //      Returns DUPLICATE with acked_seq = last_applied_seq so the
+  //      peer drops it; bumps last_heartbeat and touches nothing
+  //      else. The Redis split-write layouts return SEQ_GAP instead
+  //      (see kApplyHeartbeatControlLua).
   //   3. On APPLIED, updates caps, last_heartbeat, last_applied_seq,
   //      status←ALIVE.
   //   4. Applies events to block locations:
