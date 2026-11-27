@@ -335,6 +335,12 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
+add_test(NAME umbp_pool_client_ranges_fused
+         COMMAND test_umbp_pool_client_ranges
+                 --gtest_filter=PoolClientRangesTest.GpuPagedRangesPreserveBytesAndFailures)
+set_tests_properties(umbp_pool_client_ranges_fused PROPERTIES
+                     ENVIRONMENT "UMBP_FUSED_PAGED_GATHER=1;UMBP_HBM_RESTORE_SCHEDULER=off"
+                     LABELS "integration")
 
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node
 # (doc/design-ssd-ranged-io.md, D0): the capability flag now turning on the

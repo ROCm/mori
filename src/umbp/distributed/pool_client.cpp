@@ -3510,6 +3510,34 @@ bool PoolClient::RouteMissedRanges(const std::vector<std::string>& route_keys,
   return true;
 }
 
+std::optional<bool> PoolClient::TryPagedGather(
+    const std::vector<size_t>& candidates, const std::vector<MediumBackend*>& holders,
+    const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& offsets) {
+  auto* backend = holders[candidates.front()];
+  if (!backend || backend->Tier() != TierType::DRAM) return std::nullopt;
+  // ResolvedEntry::hold pins source pages. As on the normal transfer path,
+  // callers keep destination buffers registered and alive until completion.
+  // DRAM hits supply complete, pinned page lists at the backend's fixed page size.
+  if (!std::all_of(candidates.begin(), candidates.end(), [&](size_t i) {
+        return holders[i] == backend &&
+               RangesAreDisjointAndInBounds(resolved[i].size, sizes[i], offsets[i]);
+      })) return std::nullopt;
+
+  int device = -1;
+  for (size_t i : candidates) {
+    for (size_t j = 0; j < sizes[i].size(); ++j) {
+      if (sizes[i][j] == 0) continue;
+      const int destination_device = SourceDeviceFor(dsts[i][j], sizes[i][j]);
+      if (destination_device < 0) return std::nullopt;
+      if (device < 0) device = destination_device;
+      if (device != destination_device) return std::nullopt;
+    }
+  }
+  return platform_->CopyPagedRanges(*backend, candidates, resolved, dsts, sizes, offsets, device);
+}
+
 std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& keys,
                                              const std::vector<std::vector<void*>>& dsts,
                                              const std::vector<std::vector<size_t>>& sizes,
@@ -3630,6 +3658,21 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
             return !key_dsts.empty();
           },
           &later, &extents);
+    }
+
+    static const bool fused_paged_gather = RangedDebugEnvFlag("UMBP_FUSED_PAGED_GATHER", false);
+    const auto copied = fused_paged_gather && later.empty()
+        ? TryPagedGather(candidates, holders, resolutions, dsts, sizes, src_offsets)
+        : std::nullopt;
+    // No value means fallback; a failed copy leaves these candidates false.
+    if (copied.has_value()) {
+      if (!*copied) return results;
+      for (size_t i : candidates) {
+        results[i] = true;
+        record_local_get(i);
+      }
+      if (dbg != nullptr) dbg->local_keys += candidates.size();
+      return results;
     }
     std::vector<char> is_later(later.empty() ? 0 : n, 0);
     for (size_t i : later) is_later[i] = 1;

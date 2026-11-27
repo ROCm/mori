@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -39,7 +40,9 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_copy.h"
 #include "umbp/common/device_gather.h"
+#include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/transfer/plan_builder.h"
 #include "umbp/distributed/transfer/restore_scheduler.h"
 
@@ -492,6 +495,74 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
 }
 
 uint64_t HbmCopyEngine::GatherStreamsCreated() { return GatherStreamPool::Instance().Created(); }
+
+std::optional<bool> HbmCopyEngine::CopyPagedRanges(
+    const MediumBackend& backend, const std::vector<size_t>& candidates,
+    const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& offsets, int device) {
+    // TODO(Badr): Allow striped restores to use the PagedGather kernel!!
+  if (GatherDisabled().load(std::memory_order_relaxed) || !DeviceGatherEnabled() ||
+      StripedRestoreEnabled() || device < 0) return std::nullopt;
+  const size_t page_size = backend.PageSize();
+  // PoolClient already validated these resolved objects and holds their pages.
+  // Build kernel metadata here, translating each page directly to a GPU address.
+  std::vector<size_t> object_page_offsets;
+  std::vector<DeviceGatherRange> ranges;
+  std::vector<const void*> page_addresses;
+  size_t page_count = 0, range_count = 0;
+  for (size_t i : candidates) {
+    page_count += resolved[i].pages.size();
+    range_count += sizes[i].size();
+  }
+  object_page_offsets.reserve(candidates.size());
+  ranges.reserve(range_count);
+  page_addresses.reserve(page_count);
+  for (size_t i : candidates) {
+    const size_t object_index = object_page_offsets.size();
+    object_page_offsets.push_back(page_addresses.size());
+    const auto& pages = resolved[i].pages;
+    std::transform(pages.begin(), pages.end(), std::back_inserter(page_addresses),
+                   [&](const PageLocation& page) {
+                     const auto buffer = backend.BufferRef(page.buffer_index);
+                     const auto* source = static_cast<const char*>(buffer.host_ptr) +
+                                          page.page_index * page_size;
+                     return HostRegionDeviceAddress(source, page_size, device);
+                   });
+    for (size_t j = 0; j < sizes[i].size(); ++j) {
+      if (sizes[i][j] != 0)
+        ranges.push_back({dsts[i][j], object_index, offsets[i][j], sizes[i][j]});
+    }
+  }
+  if (ranges.empty() ||
+      !std::all_of(page_addresses.begin(), page_addresses.end(), [](const void* address) {
+        return address && reinterpret_cast<uintptr_t>(address) % 16 == 0;
+      })) return std::nullopt;
+  ScopedHipDevice device_guard(device);
+  if (!device_guard.IsValid()) return std::nullopt;
+  hipStream_t stream = GatherStreamPool::Instance().Acquire(device);
+  if (!stream) return std::nullopt;
+  const bool launched = LaunchDevicePagedGather(
+      object_page_offsets.data(), object_page_offsets.size(), page_size, page_addresses.data(),
+      page_addresses.size(), ranges.data(), ranges.size(), device, stream);
+  const auto status = hipStreamSynchronize(stream);
+  if (status == hipSuccess) {
+    GatherStreamPool::Instance().Release(device, stream);
+  } else {
+    // Match the existing gather path: a failed stream is not reused, and
+    // subsequent restores take the fallback rather than retrying the kernel.
+    (void)hipGetLastError();
+    GatherStreamPool::Instance().Discard(device);
+    GatherDisabled().store(true, std::memory_order_relaxed);
+  }
+  if (!launched || status != hipSuccess) {
+    MORI_UMBP_ERROR("[PagedGather] launch_ok={} sync={}", launched, hipGetErrorString(status));
+    return false;
+  }
+  MORI_UMBP_DEBUG("[PagedGather] objects={} pages={} ranges={}",
+                   object_page_offsets.size(), page_addresses.size(), ranges.size());
+  return true;
+}
 
 void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
   if (gather_streams_per_device == 0) return;

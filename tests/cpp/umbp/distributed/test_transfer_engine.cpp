@@ -567,6 +567,53 @@ TEST(HbmCopyEngine, SameGpuFragmentsTakeOneGatherLaunch) {
   pair.ExpectCopied(items);
 }
 
+TEST(HbmCopyEngine, PagedGatherCopiesShuffledPagesAndPreservesGaps) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  constexpr size_t kPageSize = 4096;
+  AlignedBuffer host(4 * kPageSize);
+  for (size_t i = 0; i < host.size(); ++i)
+    host.data()[i] = static_cast<char>(i * 37 + i / kPageSize * 19);
+  HostTierRegistration registration(host.data(), host.size());
+  std::vector<const void*> pages;
+  for (size_t page : {2u, 0u, 3u, 1u}) {
+    const void* address = registration.DeviceAddress(host.data() + page * kPageSize, kPageSize, 0);
+    if (!address) GTEST_SKIP() << "host region not gatherable on this device";
+    pages.push_back(address);
+  }
+  void* gpu = nullptr;
+  ASSERT_EQ(hipMalloc(&gpu, 256), hipSuccess);
+  std::unique_ptr<void, decltype(&hipFree)> allocation(gpu, hipFree);
+  ASSERT_EQ(hipMemset(gpu, 0x5a, 256), hipSuccess);
+  auto* dst = static_cast<char*>(gpu);
+  const std::vector<size_t> object_pages = {0, 2};
+  const std::vector<DeviceGatherRange> ranges{
+      {dst, 0, kPageSize - 16, 48}, {dst + 65, 1, kPageSize - 17, 51},
+      {dst + 144, 0, 100, 7}, {dst + 192, 1, 0, 0}};
+  const auto launches_before = DeviceGatherLaunchCount();
+  ASSERT_TRUE(LaunchDevicePagedGather(object_pages.data(), object_pages.size(), kPageSize,
+                                    pages.data(), pages.size(), ranges.data(), ranges.size(),
+                                    0, nullptr));
+  ASSERT_EQ(hipStreamSynchronize(nullptr), hipSuccess);
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + 1);
+  std::vector<char> expected(256, 0x5a), actual(256);
+  std::memcpy(expected.data(), host.data() + 3 * kPageSize - 16, 16);
+  std::memcpy(expected.data() + 16, host.data(), 32);
+  std::memcpy(expected.data() + 65, host.data() + 4 * kPageSize - 17, 17);
+  std::memcpy(expected.data() + 82, host.data() + kPageSize, 34);
+  std::memcpy(expected.data() + 144, host.data() + 2 * kPageSize + 100, 7);
+  ASSERT_EQ(hipMemcpy(actual.data(), gpu, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(HbmCopyEngine, EmptyPagedGatherDoesNotLaunch) {
+  const auto launches_before = DeviceGatherLaunchCount();
+  EXPECT_TRUE(LaunchDevicePagedGather(nullptr, 0, 4096, nullptr, 0, nullptr, 0, 0, nullptr));
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before);
+}
+
 // Reads from two source buffers into one destination are two plans, and still
 // one launch: the bucket is the GPU, not the buffer pair.
 TEST(HbmCopyEngine, SameGpuPlansShareOneGatherLaunch) {

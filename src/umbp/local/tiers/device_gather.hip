@@ -72,6 +72,38 @@ __global__ void GatherFragmentsKernel(const DeviceGatherFragment* __restrict__ f
   for (size_t i = index; i < fragment.bytes; i += stride) dst[i] = src[i];
 }
 
+// One range per group of blocks. Each thread resolves its own page directly;
+__global__ void GatherPagedRangesKernel(const size_t* object_page_offsets, size_t page_size,
+                                       const void* const* pages,
+                                       const DeviceGatherRange* ranges, unsigned blocks_per_range) {
+  const auto range = ranges[blockIdx.x / blocks_per_range];
+  const size_t first_page = object_page_offsets[range.object];
+  char* __restrict__ dst = static_cast<char*>(range.dst);
+
+  const size_t slice = blockIdx.x % blocks_per_range;
+  const size_t index = slice * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blocks_per_range) * blockDim.x;
+
+  const uintptr_t mask = reinterpret_cast<uintptr_t>(dst) | range.offset | range.bytes | page_size;
+  if ((mask & (kVectorBytes - 1)) == 0) {
+    uint4* __restrict__ dst_vector = reinterpret_cast<uint4*>(dst);
+    const size_t count = range.bytes / kVectorBytes;
+    for (size_t i = index; i < count; i += stride) {
+      const size_t offset = range.offset + i * kVectorBytes;
+      const auto* src = static_cast<const char*>(pages[first_page + offset / page_size])
+                        + offset % page_size;
+      dst_vector[i] = *reinterpret_cast<const uint4*>(src);
+    }
+    return;
+  }
+  for (size_t i = index; i < range.bytes; i += stride) {
+    const size_t offset = range.offset + i;
+    const auto* src = static_cast<const char*>(pages[first_page + offset / page_size])
+                      + offset % page_size;
+    dst[i] = *src;
+  }
+}
+
 // Per-stream descriptor staging.
 //
 // The caller holds `stream` exclusively from the upload to the synchronize
@@ -188,6 +220,52 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
   return true;
 }
 
+bool LaunchDevicePagedGather(const size_t* object_page_offsets, size_t object_count, size_t page_size,
+                            const void* const* pages, size_t page_count,
+                            const DeviceGatherRange* ranges, size_t range_count,
+                            int device_id, hipStream_t stream) {
+  if (range_count == 0) return true;
+  size_t max_bytes = 0;
+  for (size_t i = 0; i < range_count; ++i) max_bytes = std::max(max_bytes, ranges[i].bytes);
+  const size_t chunks = (max_bytes + kVectorBytes - 1) / kVectorBytes;
+  const unsigned blocks = static_cast<unsigned>(std::clamp<size_t>(
+      (chunks + kThreadsPerBlock - 1) / kThreadsPerBlock, 1, kMaxBlocksPerFragment));
+  if (range_count > std::numeric_limits<unsigned>::max() / blocks) return false;
+  const size_t offset_bytes = object_count * sizeof(size_t);
+  const size_t page_bytes = page_count * sizeof(void*);
+  const size_t range_bytes = range_count * sizeof(DeviceGatherRange);
+  const size_t bytes = offset_bytes + page_bytes + range_bytes;
+  auto* staging = StagingFor(stream, device_id,
+                             (bytes + sizeof(DeviceGatherFragment) - 1) / sizeof(DeviceGatherFragment));
+  if (!staging) return false;
+  auto* host = reinterpret_cast<char*>(staging->host);
+  auto* device = reinterpret_cast<char*>(staging->device);
+  std::memcpy(host, object_page_offsets, offset_bytes);
+  std::memcpy(host + offset_bytes, pages, page_bytes);
+  std::memcpy(host + offset_bytes + page_bytes, ranges, range_bytes);
+  hipError_t status = hipMemcpyAsync(device, host, bytes, hipMemcpyHostToDevice, stream);
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] paged descriptor upload failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    (void)hipGetLastError();
+    return false;
+  }
+  hipLaunchKernelGGL(GatherPagedRangesKernel, dim3(static_cast<unsigned>(range_count) * blocks),
+                     dim3(kThreadsPerBlock), 0, stream,
+                     reinterpret_cast<const size_t*>(device), page_size,
+                     reinterpret_cast<const void* const*>(device + offset_bytes),
+                     reinterpret_cast<const DeviceGatherRange*>(device + offset_bytes + page_bytes),
+                     blocks);
+  status = hipGetLastError();
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] paged kernel launch failed on device {} (ranges={}): {}",
+                    device_id, range_count, hipGetErrorString(status));
+    return false;
+  }
+  LaunchCounter().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
   DescriptorStaging* staging = StagingFor(stream, device_id, capacity);
   if (staging == nullptr) return false;
@@ -206,6 +284,14 @@ bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
   hipLaunchKernelGGL(GatherFragmentsKernel, dim3(1), dim3(kThreadsPerBlock), 0, stream,
                      staging->device, 1u);
   status = hipGetLastError();
+  if (status == hipSuccess) {
+    // The same zeroed storage also describes a zero-byte paged copy.
+    hipLaunchKernelGGL(GatherPagedRangesKernel, dim3(1), dim3(kThreadsPerBlock), 0, stream,
+                       reinterpret_cast<const size_t*>(staging->device), kVectorBytes,
+                       reinterpret_cast<const void* const*>(staging->device),
+                       reinterpret_cast<const DeviceGatherRange*>(staging->device), 1u);
+    status = hipGetLastError();
+  }
   if (status != hipSuccess) {
     MORI_UMBP_ERROR("[DeviceGather] prewarm kernel launch failed on device {}: {}", device_id,
                     hipGetErrorString(status));
