@@ -177,6 +177,115 @@
         ]
       },
       {
+        "name": "window",
+        "label": "Average over",
+        "type": "custom",
+        "query": "5s,10s,30s,1m,5m,15m,1h",
+        "current": {
+          "selected": true,
+          "text": "1m",
+          "value": "1m"
+        },
+        "options": [
+          {
+            "text": "5s",
+            "value": "5s",
+            "selected": false
+          },
+          {
+            "text": "10s",
+            "value": "10s",
+            "selected": false
+          },
+          {
+            "text": "30s",
+            "value": "30s",
+            "selected": false
+          },
+          {
+            "text": "1m",
+            "value": "1m",
+            "selected": true
+          },
+          {
+            "text": "5m",
+            "value": "5m",
+            "selected": false
+          },
+          {
+            "text": "15m",
+            "value": "15m",
+            "selected": false
+          },
+          {
+            "text": "1h",
+            "value": "1h",
+            "selected": false
+          }
+        ],
+        "description": "Window of the tiles and of the GPU to GPU matrices. The charts over time follow the dashboard's own resolution. 5s and 10s are for the millisecond data source: scraped data has a point every few seconds."
+      },
+      {
+        "name": "xhost",
+        "label": "Host with XGMI traffic",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "query_result(count by (h) (label_replace(last_over_time(mori_ep_xgmi_bytes_total{host=~\"$host\"}[$__range]), \"h\", \"$1\", \"host\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=~\"$host\"}[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\")))",
+          "refId": "A"
+        },
+        "definition": "query_result(count by (h) (label_replace(last_over_time(mori_ep_xgmi_bytes_total{host=~\"$host\"}[$__range]), \"h\", \"$1\", \"host\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=~\"$host\"}[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\")))",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "hide": 2,
+        "regex": "/h=\"([^\"]+)\"/",
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "rpair",
+        "label": "Hosts with RDMA between them",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "query_result(count by (pair) (label_join(label_replace(label_replace(label_replace(label_replace((last_over_time(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__range]) or last_over_time(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__range])) unless on (src_host, dst_host) label_replace((last_over_time(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__range]) or last_over_time(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__range])), \"dst_host\", \"$1\", \"src_host\", \"(.+)\"), \"snode\", \"$1\", \"src_host\", \"(.*)\"), \"snode\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"dnode\", \"$1\", \"dst_host\", \"(.*)\"), \"dnode\", \"$1\", \"dst_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"pair\", \" → \", \"snode\", \"dnode\")))",
+          "refId": "A"
+        },
+        "definition": "query_result(count by (pair) (label_join(label_replace(label_replace(label_replace(label_replace((last_over_time(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__range]) or last_over_time(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__range])) unless on (src_host, dst_host) label_replace((last_over_time(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__range]) or last_over_time(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__range])), \"dst_host\", \"$1\", \"src_host\", \"(.+)\"), \"snode\", \"$1\", \"src_host\", \"(.*)\"), \"snode\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"dnode\", \"$1\", \"dst_host\", \"(.*)\"), \"dnode\", \"$1\", \"dst_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"pair\", \" → \", \"snode\", \"dnode\")))",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "hide": 2,
+        "regex": "/pair=\"([^\"]+)\"/",
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
         "name": "xgmi_limit",
         "label": "XGMI limit per GPU (GB/s)",
         "type": "textbox",
@@ -1331,19 +1440,502 @@
     },
     {
       "id": 3,
+      "type": "canvas",
+      "title": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mori-sampling-now"
+      },
+      "description": "How often Prometheus reads (scrapes) /metrics of every MORI process: one point per process and series that often, for the data source mori-traffic. A click rewrites scrape_interval in Prometheus' configuration and reloads it. Shorter: finer charts and shorter rate windows possible (a rate needs two samples in its window), more load on Prometheus and the processes. Does not change the millisecond data source (mori-traffic-ms), which the processes push to themselves. The ring marks the interval in effect. Needs the sampling gateway of traffic.sh.",
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 24,
+        "h": 2
+      },
+      "targets": [
+        {
+          "refId": "S1",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_scrape_is{interval=\"1s\"}",
+          "legendFormat": "scrape_is_1s",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "S2",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_scrape_is{interval=\"2s\"}",
+          "legendFormat": "scrape_is_2s",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "S3",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_scrape_is{interval=\"5s\"}",
+          "legendFormat": "scrape_is_5s",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "S4",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_scrape_is{interval=\"10s\"}",
+          "legendFormat": "scrape_is_10s",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transparent": true,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^scrape_is_/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0
+                      },
+                      "1": {
+                        "color": "#9aa0a6",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "inlineEditing": false,
+        "showAdvancedTypes": false,
+        "panZoom": false,
+        "infinitePan": false,
+        "root": {
+          "type": "frame",
+          "name": "scrape",
+          "elements": [
+            {
+              "type": "text",
+              "name": "scrape label",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "Prometheus reads the processes every:"
+                },
+                "align": "left",
+                "valign": "middle",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 8,
+                "width": 246,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "scrape 1s ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "scrape_is_1s",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 253,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "scrape 1s",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1s"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/scrape",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "interval",
+                      "1s"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "Prometheus now reads every process every 1s. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 256,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "scrape 2s ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "scrape_is_2s",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 329,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "scrape 2s",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "2s"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/scrape",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "interval",
+                      "2s"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "Prometheus now reads every process every 2s. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 332,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "scrape 5s ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "scrape_is_5s",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 405,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "scrape 5s",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "5s"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/scrape",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "interval",
+                      "5s"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "Prometheus now reads every process every 5s. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 408,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "scrape 10s ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "scrape_is_10s",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 481,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "scrape 10s",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "10s"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/scrape",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "interval",
+                      "10s"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "Prometheus now reads every process every 10s. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 484,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            }
+          ],
+          "background": {
+            "color": {
+              "fixed": "transparent"
+            }
+          },
+          "border": {
+            "color": {
+              "fixed": "transparent"
+            }
+          },
+          "constraint": {
+            "horizontal": "left",
+            "vertical": "top"
+          },
+          "placement": {
+            "top": 0,
+            "left": 0,
+            "width": 100,
+            "height": 100
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
       "type": "row",
       "title": "IO and EP on the same links, over time (bytes / wall time)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 3,
+        "y": 5,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 4,
+      "id": 5,
       "type": "timeseries",
       "title": "XGMI: sent by IO and by EP",
       "description": "Bytes per second the selected GPUs send over XGMI, all of them together: for the IO engines, and as EP payload (dispatch and combine). The thin grey line is the two added up: what XGMI carries in total. Dashed: what it can carry, the XGMI limit per GPU (variable at the top; 291.25 GB/s measured on MI300X, 2.33 TB/s for 8 GPUs) times the selected GPUs that send. Read the two lines against each other: peaks that alternate mean IO and EP take turns on these links; peaks at the same time mean both are on them at once.",
@@ -1353,7 +1945,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 6,
         "w": 12,
         "h": 10
       },
@@ -1516,7 +2108,7 @@
       }
     },
     {
-      "id": 5,
+      "id": 6,
       "type": "timeseries",
       "title": "RDMA: sent by IO and by EP",
       "description": "Bytes per second the selected GPUs send over RDMA through their NICs, all of them together: for the IO engines, and what the GPUs put on RDMA themselves (EP between nodes). The thin grey line is the two added up. Read the two lines against each other: peaks that alternate mean IO and EP take turns on these links; peaks at the same time mean both are on them at once.",
@@ -1526,7 +2118,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 6,
         "w": 12,
         "h": 10
       },
@@ -1647,20 +2239,20 @@
       }
     },
     {
-      "id": 6,
+      "id": 7,
       "type": "row",
       "title": "Per GPU: XGMI by IO and by EP, RDMA by IO and by EP",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 14,
+        "y": 16,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 7,
+      "id": 8,
       "type": "timeseries",
       "title": "XGMI per GPU: IO",
       "description": "Bytes per second each selected GPU sends over XGMI for the IO engines, to all its peers together. Dashed: what one GPU can send over XGMI to all its peers together (the XGMI limit per GPU at the top); IO and EP of a GPU share it.",
@@ -1670,7 +2262,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 15,
+        "y": 17,
         "w": 6,
         "h": 11
       },
@@ -2021,7 +2613,7 @@
       }
     },
     {
-      "id": 8,
+      "id": 9,
       "type": "timeseries",
       "title": "XGMI per GPU: EP",
       "description": "EP payload bytes per second each selected GPU sends over XGMI (dispatch and combine), to all its peers together. Dashed: what one GPU can send over XGMI to all its peers together (the XGMI limit per GPU at the top); IO and EP of a GPU share it.",
@@ -2031,7 +2623,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 15,
+        "y": 17,
         "w": 6,
         "h": 11
       },
@@ -2382,7 +2974,7 @@
       }
     },
     {
-      "id": 9,
+      "id": 10,
       "type": "timeseries",
       "title": "RDMA per GPU: IO",
       "description": "Bytes per second each selected GPU sends over RDMA for the IO engines, through its NIC (the RDMA backend's completed bytes, by source GPU).",
@@ -2392,7 +2984,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 15,
+        "y": 17,
         "w": 6,
         "h": 11
       },
@@ -2701,7 +3293,7 @@
       }
     },
     {
-      "id": 10,
+      "id": 11,
       "type": "timeseries",
       "title": "RDMA per GPU: EP",
       "description": "Bytes per second each selected GPU puts on RDMA itself, through its NIC (EP between nodes: payload, headers and signals).",
@@ -2711,7 +3303,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 15,
+        "y": 17,
         "w": 6,
         "h": 11
       },
@@ -3020,20 +3612,349 @@
       }
     },
     {
-      "id": 11,
+      "id": 12,
       "type": "row",
-      "title": "EP kernels: how much data a dispatch / combine moves, and how long it takes",
+      "title": "Mesh: IO + EP between each pair, average over $window",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 28,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 12,
+      "repeat": "xhost",
+      "repeatDirection": "h",
+      "maxPerRow": 1,
+      "id": 13,
+      "type": "table",
+      "title": "$xhost: GPU to GPU over XGMI, IO + EP (sender -> receiver), average over $window",
+      "description": "Bytes per second between the GPUs of this host over XGMI: what the IO engines submitted plus the EP payload (dispatch and combine), added up per pair. \"48.5 GB/s (4 -> 5)\" is what GPU 4 sent to GPU 5; the row is the sender, the column the receiver. Payload, not link bytes: xgmi-netmon counts more on the same link (docs/METRICS_PERF.md). All GPUs of the host, whatever the GPU selection. Stronger blue: 10 GB/s and more; weaker: 1 to 10; faint: less. Averaged over the window at the top (Average over). With the scraped data source (a sample every 5 s) a window under about 10 s holds too few samples; the table then uses the rate interval of that data source (20 s) instead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_join(label_replace(label_replace(label_replace(count_values by (src_gpu, dst_gpu) (\"rate\", round(((sum by (src_gpu, dst_gpu) ((rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$window]) or rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$__rate_interval]))) or sum by (src_gpu, dst_gpu) (label_replace(label_replace((rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$window]) or rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$__rate_interval])), \"src_gpu\", \"$1\", \"gpu\", \"(.*)\"), \"dst_gpu\", \"$1\", \"peer_gpu\", \"(.*)\")) * 0) + (sum by (src_gpu, dst_gpu) (label_replace(label_replace((rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$window]) or rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$__rate_interval])), \"src_gpu\", \"$1\", \"gpu\", \"(.*)\"), \"dst_gpu\", \"$1\", \"peer_gpu\", \"(.*)\")) or sum by (src_gpu, dst_gpu) ((rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$window]) or rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$__rate_interval]))) * 0) >= 1e9) / 1e8)), \"rate\", \"0.$1\", \"rate\", \"(\\\\d)\"), \"rate\", \"$1.$2\", \"rate\", \"(\\\\d+)(\\\\d)\"), \"unit\", \"GB/s\", \"\", \"\") or label_replace(label_replace(label_replace(count_values by (src_gpu, dst_gpu) (\"rate\", round(((sum by (src_gpu, dst_gpu) ((rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$window]) or rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$__rate_interval]))) or sum by (src_gpu, dst_gpu) (label_replace(label_replace((rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$window]) or rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$__rate_interval])), \"src_gpu\", \"$1\", \"gpu\", \"(.*)\"), \"dst_gpu\", \"$1\", \"peer_gpu\", \"(.*)\")) * 0) + (sum by (src_gpu, dst_gpu) (label_replace(label_replace((rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$window]) or rate(mori_ep_xgmi_bytes_total{host=\"${xhost:raw}\",direction=\"tx\"}[$__rate_interval])), \"src_gpu\", \"$1\", \"gpu\", \"(.*)\"), \"dst_gpu\", \"$1\", \"peer_gpu\", \"(.*)\")) or sum by (src_gpu, dst_gpu) ((rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$window]) or rate(mori_io_submitted_bytes_total{backend=\"xgmi\",src_host=\"${xhost:raw}\",dst_host=\"${xhost:raw}\"}[$__rate_interval]))) * 0) < 1e9 >= 5e4) / 1e5)), \"rate\", \"0.$1\", \"rate\", \"(\\\\d)\"), \"rate\", \"$1.$2\", \"rate\", \"(\\\\d+)(\\\\d)\"), \"unit\", \"MB/s\", \"\", \"\"), \"tmp\", \"|\", \"rate\", \"unit\", \"src_gpu\", \"dst_gpu\"), \"cell\", \"$1 $2 ($3 -> $4)\", \"tmp\", \"(.*)\\\\|(.*)\\\\|(.*)\\\\|(.*)\")",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "dst_gpu"
+              }
+            ]
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "dst_gpu",
+            "rowField": "src_gpu",
+            "valueField": "cell",
+            "emptyValue": "empty"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "src_gpu\\dst_gpu"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "src_gpu\\dst_gpu": "from \\ to"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "transparent"
+          },
+          "mappings": [
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^\\d{2,}(\\.\\d+)? GB/s.*",
+                "result": {
+                  "color": "#1F60C4",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^\\d(\\.\\d+)? GB/s.*",
+                "result": {
+                  "color": "#1F60C499",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": ".* MB/s.*",
+                "result": {
+                  "color": "#1F60C440",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "custom": {
+            "align": "center",
+            "minWidth": 150,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "from \\ to"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": []
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 90
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "repeat": "rpair",
+      "repeatDirection": "h",
+      "maxPerRow": 1,
+      "id": 14,
+      "type": "table",
+      "title": "$rpair: NIC to NIC over RDMA, IO + EP, average over $window",
+      "description": "Bytes per second the NICs of the first host send to the NICs of the second: the IO RDMA backend's bytes (mori_io_nic_bytes_total) plus what the GPUs put on RDMA themselves (EP between nodes, mori_gpu_rdma_bytes_total), added up per NIC pair. The row is the sending NIC, the column the receiving NIC. One table for each direction between two hosts; traffic inside a host (NIC loopback) is left out. Payload: the NIC's own counters are about 1 % higher on InfiniBand (headers). Stronger blue: 10 GB/s and more; weaker: 1 to 10; faint: less. Averaged over the window at the top (Average over). With the scraped data source (a sample every 5 s) a window under about 10 s holds too few samples; the table then uses the rate interval of that data source (20 s) instead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_join(label_replace(label_replace(label_replace(count_values by (src_ibdev, dst_ibdev) (\"rate\", round((sum by (src_ibdev, dst_ibdev) (label_join(label_replace(label_replace(label_replace(label_replace((sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) + (sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) unless on (src_host, dst_host) label_replace((sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) + (sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0), \"dst_host\", \"$1\", \"src_host\", \"(.+)\"), \"snode\", \"$1\", \"src_host\", \"(.*)\"), \"snode\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"dnode\", \"$1\", \"dst_host\", \"(.*)\"), \"dnode\", \"$1\", \"dst_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"pair\", \" → \", \"snode\", \"dnode\") and on (pair) label_replace(vector(1), \"pair\", \"${rpair:raw}\", \"\", \"\")) >= 1e9) / 1e8)), \"rate\", \"0.$1\", \"rate\", \"(\\\\d)\"), \"rate\", \"$1.$2\", \"rate\", \"(\\\\d+)(\\\\d)\"), \"unit\", \"GB/s\", \"\", \"\") or label_replace(label_replace(label_replace(count_values by (src_ibdev, dst_ibdev) (\"rate\", round((sum by (src_ibdev, dst_ibdev) (label_join(label_replace(label_replace(label_replace(label_replace((sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) + (sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) unless on (src_host, dst_host) label_replace((sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0) + (sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) or sum by (src_host, src_ibdev, dst_host, dst_ibdev) ((rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$window]) or rate(mori_io_nic_bytes_total{src_host=~\"$host\"}[$__rate_interval]))) * 0), \"dst_host\", \"$1\", \"src_host\", \"(.+)\"), \"snode\", \"$1\", \"src_host\", \"(.*)\"), \"snode\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"dnode\", \"$1\", \"dst_host\", \"(.*)\"), \"dnode\", \"$1\", \"dst_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\"), \"pair\", \" → \", \"snode\", \"dnode\") and on (pair) label_replace(vector(1), \"pair\", \"${rpair:raw}\", \"\", \"\")) < 1e9 >= 5e4) / 1e5)), \"rate\", \"0.$1\", \"rate\", \"(\\\\d)\"), \"rate\", \"$1.$2\", \"rate\", \"(\\\\d+)(\\\\d)\"), \"unit\", \"MB/s\", \"\", \"\"), \"tmp\", \"|\", \"rate\", \"unit\"), \"cell\", \"$1 $2\", \"tmp\", \"(.*)\\\\|(.*)\")",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "dst_ibdev"
+              }
+            ]
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "dst_ibdev",
+            "rowField": "src_ibdev",
+            "valueField": "cell",
+            "emptyValue": "empty"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "src_ibdev\\dst_ibdev"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "src_ibdev\\dst_ibdev": "from \\ to"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "transparent"
+          },
+          "mappings": [
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^\\d{2,}(\\.\\d+)? GB/s.*",
+                "result": {
+                  "color": "#1F60C4",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^\\d(\\.\\d+)? GB/s.*",
+                "result": {
+                  "color": "#1F60C499",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": ".* MB/s.*",
+                "result": {
+                  "color": "#1F60C440",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "custom": {
+            "align": "center",
+            "minWidth": 150,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "from \\ to"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": []
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 90
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "EP kernels: how much data a dispatch / combine moves, and how long it takes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
       "type": "timeseries",
       "title": "EP bytes per call",
       "description": "How much data one dispatch and one combine of a rank moves: the bytes of the tokens a dispatch delivers to the rank's experts, and of the tokens a combine gives back, tokens that stay on the GPU included (what an EP benchmark reports as bytes), divided by the calls; averaged over the selected GPUs. Divided by the kernel time per call on the right it is the kernel bandwidth (EP dashboard).",
@@ -3043,7 +3964,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 50,
         "w": 12,
         "h": 8
       },
@@ -3127,7 +4048,7 @@
       }
     },
     {
-      "id": 13,
+      "id": 17,
       "type": "timeseries",
       "title": "EP kernel time per call",
       "description": "Time one dispatch and one combine take, measured on the device from the start of the kernel to its end (an inter-node dispatch or combine: its whole sequence of launches): kernel seconds / calls, averaged over the selected GPUs.",
@@ -3137,7 +4058,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 27,
+        "y": 50,
         "w": 12,
         "h": 8
       },
@@ -3221,20 +4142,20 @@
       }
     },
     {
-      "id": 14,
+      "id": 18,
       "type": "row",
       "title": "IO transfers: how much a put / get carries, and how long it takes",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 58,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 15,
+      "id": 19,
       "type": "timeseries",
       "title": "IO bytes per transfer",
       "description": "How much data one put (write) and one get (read) carries: bytes submitted / transfers submitted, for the transfers the selected GPUs issue, by backend. Dashed: get.",
@@ -3244,7 +4165,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 59,
         "w": 12,
         "h": 8
       },
@@ -3355,7 +4276,7 @@
       }
     },
     {
-      "id": 16,
+      "id": 20,
       "type": "timeseries",
       "title": "IO time per transfer",
       "description": "How long one put (write) and one get (read) takes, from its submission to its completion: the time the transfers took / the transfers that completed, for the transfers the selected GPUs issue, by backend. Dashed: get. RDMA: until the completion was processed. XGMI: until the caller looked at the transfer's status, so this is the time the caller saw.",
@@ -3365,7 +4286,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 36,
+        "y": 59,
         "w": 12,
         "h": 8
       },

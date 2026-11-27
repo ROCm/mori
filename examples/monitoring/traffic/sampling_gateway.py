@@ -9,6 +9,11 @@ with what the processes are set to at this moment, whatever time the query names
 dashboard's switch shows the setting in effect even when the dashboard looks at the past.
   mori_sampling_period{module="ep"}             the period (the largest among the processes)
   mori_sampling_is{module="ep",period="8"}      1 if every process is at that period, else 0
+
+With --prometheus-config it also sets how often Prometheus reads the processes: POST
+/scrape?interval=2s rewrites scrape_interval (and scrape_timeout) in that file and asks
+Prometheus to reload it (Prometheus needs --web.enable-lifecycle). Queries:
+  mori_scrape_is{interval="2s"}                 1 if Prometheus reads every 2 s, else 0
 """
 import argparse
 import concurrent.futures
@@ -25,6 +30,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 SETTINGS = ("ep", "io", "interval_ms")
+# Scrape intervals the switch offers. Longer than 10 s and the dashboards' 20 s rate window
+# (the data source's $__rate_interval) holds fewer than two samples.
+SCRAPE_INTERVALS = ("1s", "2s", "5s", "10s")
 JOB = "mori_traffic"
 TIMEOUT_S = 10
 
@@ -99,10 +107,14 @@ def forget_state():
 def instant_vector(args, expr, at):
     """The answer to one of the two queries in the module comment; empty for anything else, and
     when no process answers (the switch then shows no setting)."""
-    m = re.fullmatch(r"\s*(mori_sampling_period|mori_sampling_is)\s*\{(.*)\}\s*", expr or "")
+    m = re.fullmatch(r"\s*(mori_sampling_period|mori_sampling_is|mori_scrape_is)\s*\{(.*)\}\s*",
+                     expr or "")
     if not m:
         return []
     labels = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', m.group(2)))
+    if m.group(1) == "mori_scrape_is":
+        value = 1 if scrape_interval(args) == labels.get("interval") else 0
+        return [{"metric": dict(labels, __name__=m.group(1)), "value": [at, str(value)]}]
     module = labels.get("module")
     if module not in ("ep", "io"):
         return []
@@ -114,6 +126,34 @@ def instant_vector(args, expr, at):
     else:
         value = 1 if values == [int(labels.get("period", "-1"))] else 0
     return [{"metric": dict(labels, __name__=m.group(1)), "value": [at, str(value)]}]
+
+
+def scrape_interval(args):
+    """What Prometheus reads at: the global scrape_interval of the configuration it runs."""
+    url = args.prometheus.rstrip("/") + "/api/v1/status/config"
+    with urllib.request.urlopen(url, timeout=TIMEOUT_S) as r:
+        yaml = json.load(r)["data"]["yaml"]
+    m = re.search(r"^\s*scrape_interval:\s*(\S+)", yaml, re.M)
+    return m.group(1) if m else None
+
+
+def set_scrape_interval(args, interval):
+    """Rewrites the global scrape_interval / scrape_timeout of --prometheus-config in place (the
+    file is bind-mounted into the Prometheus container: a new file would not be seen there) and
+    has Prometheus reload it."""
+    seconds = int(interval[:-1])
+    timeout = "%dms" % min(4000, seconds * 800)  # under the interval, as Prometheus requires
+    with open(args.prometheus_config, "r+") as f:
+        text = f.read()
+        head, sep, rest = text.partition("scrape_configs:")
+        head = re.sub(r"(?m)^(\s*scrape_interval:\s*)\S+", r"\g<1>" + interval, head, count=1)
+        head = re.sub(r"(?m)^(\s*scrape_timeout:\s*)\S+", r"\g<1>" + timeout, head, count=1)
+        f.seek(0)
+        f.write(head + sep + rest)
+        f.truncate()
+    url = args.prometheus.rstrip("/") + "/-/reload"
+    urllib.request.urlopen(urllib.request.Request(url, data=b""), timeout=TIMEOUT_S).read()
+    return scrape_interval(args)
 
 
 class Server(ThreadingMixIn, HTTPServer):  # http.server has its own only from Python 3.7 on
@@ -133,6 +173,20 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the client gave up: a dashboard cancels the queries of the refresh before
+
+    def handle_scrape(self, change):
+        url = urllib.parse.urlsplit(self.path)
+        try:
+            if not change:
+                return self.reply(200, {"scrape_interval": scrape_interval(self.args)})
+            if not self.args.prometheus_config:
+                return self.reply(404, {"error": "started without --prometheus-config"})
+            interval = dict(urllib.parse.parse_qsl(url.query)).get("interval")
+            if interval not in SCRAPE_INTERVALS:
+                return self.reply(400, {"error": "interval is one of %s" % ", ".join(SCRAPE_INTERVALS)})
+            return self.reply(200, {"scrape_interval": set_scrape_interval(self.args, interval)})
+        except Exception as e:
+            return self.reply(502, {"error": "%s: %s" % (type(e).__name__, e)})
 
     def handle_sampling(self, change):
         url = urllib.parse.urlsplit(self.path)
@@ -175,6 +229,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         if url.path.startswith("/api/v1/"):
             return self.handle_prometheus(dict(urllib.parse.parse_qsl(url.query)))
+        if url.path.rstrip("/") == "/scrape":
+            return self.handle_scrape(change=False)
         self.handle_sampling(change=False)
 
     def do_POST(self):
@@ -187,10 +243,12 @@ class Handler(BaseHTTPRequestHandler):
             params.update(urllib.parse.parse_qsl(body.decode(errors="replace")))
             return self.handle_prometheus(params)
         # A button sends a body with its request; the settings are in the query.
+        if url.path.rstrip("/") == "/scrape":
+            return self.handle_scrape(change=True)
         self.handle_sampling(change=True)
 
     def log_message(self, fmt, *a):
-        if self.command == "POST" and self.path.startswith("/sampling"):
+        if self.command == "POST" and self.path.startswith(("/sampling", "/scrape")):
             sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % a))
             sys.stderr.flush()
 
@@ -202,6 +260,11 @@ def main():
         "--prometheus", default=os.environ.get("TRAFFIC_PROM_URL", "http://127.0.0.1:9090")
     )
     p.add_argument("--targets", default=os.environ.get("TRAFFIC_TARGETS", ""))
+    p.add_argument(
+        "--prometheus-config",
+        default=os.environ.get("TRAFFIC_PROM_CONFIG", ""),
+        help="the Prometheus configuration file, writable: enables POST /scrape",
+    )
     args = p.parse_args()
     host, _, port = args.listen.rpartition(":")
     Handler.args = args

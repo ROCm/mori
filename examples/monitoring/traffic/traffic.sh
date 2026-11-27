@@ -88,7 +88,8 @@ up() {
     -v "$targets_dir:/targets:ro" \
     prom/prometheus:v3.16.0 \
     --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus \
-    --storage.tsdb.retention.time="$retention" --web.listen-address="$listen:$prom_port" >/dev/null
+    --storage.tsdb.retention.time="$retention" --web.listen-address="$listen:$prom_port" \
+    --web.enable-lifecycle >/dev/null
   if [ -z "$vm_url" ]; then
     # No -dedup.minScrapeInterval: nothing may merge samples that are a millisecond apart.
     docker run -d --name "$name-vm" --network host --restart unless-stopped \
@@ -98,13 +99,16 @@ up() {
       -search.latencyOffset=0s >/dev/null
     vm_url="http://127.0.0.1:$vm_port"
   fi
-  # Only Grafana talks to the sampling gateway, on 127.0.0.1.
+  # Only Grafana talks to the sampling gateway, on 127.0.0.1. It also sets the scrape interval
+  # (the overview's second switch): it rewrites the same prometheus.yml in place and has
+  # Prometheus reload it (--web.enable-lifecycle above).
   cp sampling_gateway.py "$data/conf/"
   docker run -d --name "$name-sampling" --network host --restart unless-stopped \
     --user "$(id -u):$(id -g)" \
     -v "$data/conf/sampling_gateway.py:/sampling_gateway.py:ro" \
+    -v "$data/conf/prometheus.yml:/prometheus.yml" \
     "$gateway_image" python3 -u /sampling_gateway.py --listen "127.0.0.1:$gateway_port" \
-    --prometheus "http://$listen:$prom_port" >/dev/null
+    --prometheus "http://$listen:$prom_port" --prometheus-config /prometheus.yml >/dev/null
   # The buttons call Grafana at the address it knows itself by: it has to be the browser's.
   if [ -z "$grafana_url" ] && [ "$listen" != 127.0.0.1 ]; then
     grafana_url="http://$listen:$grafana_port/"
