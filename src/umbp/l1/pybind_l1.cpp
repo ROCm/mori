@@ -43,6 +43,24 @@ void Check(const Status& status) {
   if (!status.ok) throw std::runtime_error(status.error);
 }
 
+// The calls below run with the GIL held and give it up only around a wait
+// (`L1Client::SetBlockingHooks`): an RPC, or a sleep for a shared-memory
+// reply that did not come while polling. A call that is only queued in shared
+// memory never gives it up -- winning the GIL back from another thread can
+// cost far more than the call.
+thread_local PyThreadState* g_released = nullptr;
+
+void ReleaseGil() {
+  if (g_released == nullptr && PyGILState_Check()) g_released = PyEval_SaveThread();
+}
+
+void AcquireGil() {
+  if (g_released != nullptr) {
+    PyEval_RestoreThread(g_released);
+    g_released = nullptr;
+  }
+}
+
 py::list BytesList(const std::vector<std::string>& values) {
   py::list out;
   for (const std::string& value : values) out.append(py::bytes(value));
@@ -58,17 +76,40 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
   m.attr("OP_PUBLISH") = static_cast<uint32_t>(OpKind::kPublish);
 
   py::class_<L1Client>(m, "L1Client")
-      .def(py::init<const std::string&>(), py::arg("address"))
+      .def(py::init([](const std::string& address, const py::object& transport) {
+             L1ClientOptions options = L1ClientOptions::FromEnv();
+             if (!transport.is_none()) {
+               const std::string name = transport.cast<std::string>();
+               if (name != "shm" && name != "grpc") {
+                 throw std::invalid_argument("transport is 'shm' or 'grpc'");
+               }
+               options.shm = name == "shm";
+             }
+             std::unique_ptr<L1Client> client;
+             {
+               py::gil_scoped_release release;
+               client = std::make_unique<L1Client>(address, options);
+             }
+             // From here on the client gives the GIL up itself, and only
+             // where it waits.
+             client->SetBlockingHooks(ReleaseGil, AcquireGil);
+             return client;
+           }),
+           py::arg("address"), py::arg("transport") = py::none(),
+           "`transport` 'shm' carries Apply, Commit, Allocate and probing fetches in shared "
+           "memory, 'grpc' sends every call over the socket; None reads UMBP_L1_TRANSPORT "
+           "(default grpc). A client asked for 'shm' that cannot get it stays on gRPC: see "
+           "`transport`.")
+      .def_property_readonly(
+          "transport", [](L1Client& client) { return client.shm_active() ? "shm" : "grpc"; },
+          "The transport the per-step calls actually use.")
       .def(
           "attach",
           [](L1Client& client, const std::string& pool_id, const std::string& group, int device,
              uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset) {
             ExternalMemory external{std::string(external_handle), external_offset};
             AttachResult result;
-            {
-              py::gil_scoped_release release;
-              result = client.Attach(pool_id, group, device, bytes, external);
-            }
+            result = client.Attach(pool_id, group, device, bytes, external);
             Check(result.status);
             return py::make_tuple(result.memory.kind, py::bytes(result.memory.handle), result.bytes,
                                   result.created);
@@ -89,10 +130,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
               layout.regions.push_back(Region{region.first, region.second});
             }
             Status status;
-            {
-              py::gil_scoped_release release;
-              status = client.BindLayout(pool_id, layout);
-            }
+            status = client.BindLayout(pool_id, layout);
             Check(status);
           },
           py::arg("pool_id"), py::arg("num_slots"), py::arg("regions"),
@@ -101,10 +139,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "open",
           [](L1Client& client, const std::string& pool_id) {
             OpenResult result;
-            {
-              py::gil_scoped_release release;
-              result = client.Open(pool_id);
-            }
+            result = client.Open(pool_id);
             Check(result.status);
             return result.num_slots;
           },
@@ -113,10 +148,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "allocate",
           [](L1Client& client, const std::string& pool_id, uint32_t count, uint32_t min_count) {
             AllocateResult result;
-            {
-              py::gil_scoped_release release;
-              result = client.Allocate(pool_id, count, min_count);
-            }
+            result = client.Allocate(pool_id, count, min_count);
             Check(result.status);
             return py::make_tuple(result.slots, BytesList(result.evicted_keys));
           },
@@ -144,12 +176,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
               }
               ops.push_back(std::move(op));
             }
-            Status status;
-            {
-              py::gil_scoped_release release;
-              status = client.Apply(pool_id, ops, stamp);
-            }
-            Check(status);
+            Check(client.Apply(pool_id, ops, stamp));
           },
           py::arg("pool_id"), py::arg("kinds"), py::arg("slots"), py::arg("keys"),
           py::arg("stamp") = 0,
@@ -158,12 +185,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
       .def(
           "commit",
           [](L1Client& client, const std::string& pool_id, uint64_t committed) {
-            Status status;
-            {
-              py::gil_scoped_release release;
-              status = client.Commit(pool_id, committed);
-            }
-            Check(status);
+            Check(client.Commit(pool_id, committed));
           },
           py::arg("pool_id"), py::arg("committed"),
           "The owner's device has finished every write issued before `committed`.")
@@ -175,10 +197,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
             options.dst_slots = dst_slots;
             options.probe_only = probe_only;
             FetchResult result;
-            {
-              py::gil_scoped_release release;
-              result = client.Fetch(pool_id, keys, options);
-            }
+            result = client.Fetch(pool_id, keys, options);
             Check(result.status);
             return py::make_tuple(result.slots, BytesList(result.evicted_keys), result.copied_slots,
                                   result.copied_bytes, result.copy_micros, result.available);
@@ -193,10 +212,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "clear",
           [](L1Client& client, const std::string& pool_id) {
             Status status;
-            {
-              py::gil_scoped_release release;
-              status = client.Clear(pool_id);
-            }
+            status = client.Clear(pool_id);
             Check(status);
           },
           py::arg("pool_id"))
@@ -204,20 +220,14 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "detach",
           [](L1Client& client, const std::string& pool_id) {
             Status status;
-            {
-              py::gil_scoped_release release;
-              status = client.Detach(pool_id);
-            }
+            status = client.Detach(pool_id);
             Check(status);
           },
           py::arg("pool_id"))
       .def("stats", [](L1Client& client) {
         std::vector<PoolStats> pools;
         Status status;
-        {
-          py::gil_scoped_release release;
-          status = client.Stats(&pools);
-        }
+        status = client.Stats(&pools);
         Check(status);
         py::list out;
         for (const PoolStats& stats : pools) {

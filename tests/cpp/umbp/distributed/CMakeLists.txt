@@ -482,6 +482,12 @@ target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
 target_compile_features(test_l1_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_l1_pool COMMAND test_l1_pool)
 
+# What the L1 pool's control calls cost an engine over the socket and over
+# shared memory (serve / rank / percall modes; see the file's header).
+add_executable(bench_l1_control bench_l1_control.cpp)
+target_link_libraries(bench_l1_control PRIVATE umbp_l1)
+target_compile_features(bench_l1_control PRIVATE cxx_std_17)
+
 # HipMemoryApi::CopyBatch when the runtime fails under it, on real devices
 # (skipped with fewer than two GPUs). The two HIP calls are wrapped at link
 # time so the test can make one of them fail.
