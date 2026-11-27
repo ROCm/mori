@@ -219,6 +219,12 @@ class PoolClient {
   // reads reported to the master.  Never contacts another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
 
+  // Pool rules of this node's default pool (IUMBPClient; pool/pool_rules.h).
+  size_t BatchSetKeyClass(const std::string& pool, const std::vector<std::string>& keys,
+                          const std::vector<uint32_t>& tags);
+  bool SetPoolRules(const std::string& pool, const std::string& table_json, std::string* error);
+  std::string GetPoolRulesState();
+
   MasterClient& Master();
 
   // Every named storage backend live on this node.  Callers use them through

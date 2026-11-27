@@ -880,6 +880,8 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   if (!track_eviction_order_) return out;
   const auto now = std::chrono::steady_clock::now();
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
     auto owned_it = owned_.find(*it);
@@ -888,8 +890,10 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
     // offered so the caller can count it as in flight.
     if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
     // Whole pages, as Capacity() counts them.
-    out.push_back(
-        EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
+    const int64_t idle_ns = now_ns - owned_it->second.last_touch_ns;
+    out.push_back(EvictionOffer{*it,
+                                static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_,
+                                idle_ns > 0 ? idle_ns / 1000000 : 0});
   }
   return out;
 }
@@ -914,6 +918,9 @@ size_t PageBackend::Touch(const std::vector<std::string>& keys) {
 
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
+  slot.last_touch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
   if (slot.in_lru) {
     lru_.splice(lru_.begin(), lru_, slot.lru_it);
     return;

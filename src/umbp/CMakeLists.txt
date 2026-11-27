@@ -443,6 +443,7 @@ add_library(
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/pool/policy_config.cpp
   distributed/pool/tier_graph.cpp
+  distributed/pool/pool_rules.cpp
   distributed/pool/tier_transition.cpp
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp

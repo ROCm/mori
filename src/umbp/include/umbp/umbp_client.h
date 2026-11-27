@@ -149,6 +149,33 @@ class IUMBPClient {
   /// `master` mode), or from an older server.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
+  // ---- Pool rules (doc/pool-rules.md) ----
+
+  /// Give keys their class: a pool (a name of the caller's choosing) and one
+  /// opaque tag per key, or a single tag for all of them.  UMBP interprets
+  /// neither; it only applies the pool's rule for that tag.  Call it before
+  /// the put so the put decision can use it; a key that is already stored
+  /// changes class at once.  Applies to this node's media only.  Returns the
+  /// number of keys recorded: 0 from a client or server without pool rules.
+  virtual size_t BatchSetKeyClass(const std::string& /*pool*/,
+                                  const std::vector<std::string>& /*keys*/,
+                                  const std::vector<uint32_t>& /*tags*/) {
+    return 0;
+  }
+
+  /// Replace `pool`'s rule table (JSON, see PoolRuleTable) while the store
+  /// runs.  Stored bytes are untouched; the next decision uses the new table.
+  /// False, with the reason in *error, when the table is malformed or pool
+  /// rules are unsupported.
+  virtual bool SetPoolRules(const std::string& /*pool*/, const std::string& /*table_json*/,
+                            std::string* error = nullptr) {
+    if (error != nullptr) *error = "pool rules are unsupported by this client";
+    return false;
+  }
+
+  /// Every pool's table and per-class counters as JSON; "" when unsupported.
+  virtual std::string GetPoolRulesState() { return {}; }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

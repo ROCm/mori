@@ -379,6 +379,27 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_touch", &IUMBPClient::BatchTouch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
+      .def("batch_set_key_class", &IUMBPClient::BatchSetKeyClass, py::arg("pool"), py::arg("keys"),
+           py::arg("tags"), py::call_guard<py::gil_scoped_release>(),
+           "Give keys their pool and tag (one tag per key, or one for all). Call before the "
+           "put. Returns the number of keys recorded; 0 when pool rules are unsupported.")
+      .def(
+          "set_pool_rules",
+          [](IUMBPClient& client, const std::string& pool, const std::string& table_json) {
+            std::string error;
+            bool ok = false;
+            {
+              py::gil_scoped_release release;
+              ok = client.SetPoolRules(pool, table_json, &error);
+            }
+            if (!ok) throw py::value_error("pool rules for '" + pool + "' rejected: " + error);
+          },
+          py::arg("pool"), py::arg("table_json"),
+          "Replace a pool's rule table (JSON) while the store runs. Raises ValueError with "
+          "the reason when the table is rejected.")
+      .def("get_pool_rules_state", &IUMBPClient::GetPoolRulesState,
+           py::call_guard<py::gil_scoped_release>(),
+           "Every pool's table and per-class counters, as a JSON string ('' when unsupported).")
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O

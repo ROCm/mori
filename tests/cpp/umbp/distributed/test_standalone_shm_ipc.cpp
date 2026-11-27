@@ -1190,5 +1190,75 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
   unlink(fd_path.c_str());
 }
 
+TEST(StandaloneShmIpcTest, PoolRulesReachTheServerThroughTheClient) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_rules_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+  auto client = CreateUMBPClient(server_cfg);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(handle.valid());
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));
+  std::memset(bytes, 0x5a, 96);
+  const auto put = [&](const std::string& key, size_t offset) {
+    return client->Put(key, reinterpret_cast<uintptr_t>(bytes + offset), 32);
+  };
+
+  // A malformed table is refused with the reason and changes nothing.
+  std::string error;
+  EXPECT_FALSE(client->SetPoolRules("state", R"({"default": {"weight": 0}})", &error));
+  EXPECT_NE(error.find("weight"), std::string::npos) << error;
+
+  ASSERT_TRUE(client->SetPoolRules(
+      "state", R"({"policy": "test", "rules": {"7": {"admit": false}}})", &error))
+      << error;
+  EXPECT_EQ(client->BatchSetKeyClass("state", {"declined", "kept"}, {7, 1}), 2u);
+  EXPECT_FALSE(put("declined", 0)) << "its class is not admitted";
+  EXPECT_TRUE(put("kept", 32));
+  EXPECT_TRUE(put("unclassified", 64));
+  EXPECT_EQ(client->BatchExists({"declined", "kept", "unclassified"}),
+            (std::vector<bool>{false, true, true}));
+
+  std::string state = client->GetPoolRulesState();
+  EXPECT_NE(state.find("\"policy\":\"test\""), std::string::npos) << state;
+  EXPECT_NE(state.find("\"declined\":1"), std::string::npos) << state;
+
+  // Replace the table while the server runs: the class is stored from now on.
+  ASSERT_TRUE(client->SetPoolRules("state", "{}", &error)) << error;
+  EXPECT_EQ(client->BatchSetKeyClass("state", {"declined"}, {7}), 1u);
+  EXPECT_TRUE(put("declined", 0));
+  EXPECT_TRUE(client->Exists("kept")) << "a table change must not touch stored keys";
+  state = client->GetPoolRulesState();
+  EXPECT_NE(state.find("\"version\":2"), std::string::npos) << state;
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
+  client->Close();
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp

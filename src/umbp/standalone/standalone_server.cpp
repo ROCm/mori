@@ -1064,6 +1064,40 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchSetKeyClass(grpc::ServerContext*, const ::umbp::KeyClassRequest* request,
+                                ::umbp::CountResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<uint32_t> tags(request->tags().begin(), request->tags().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      response->set_count(0);
+      return grpc::Status::OK;
+    }
+    response->set_count(client_->BatchSetKeyClass(request->pool(), keys, tags));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status SetPoolRules(grpc::ServerContext*, const ::umbp::PoolRulesRequest* request,
+                            ::umbp::BoolResponse* response) override {
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      response->set_ok(false);
+      response->set_error("the server is shutting down");
+      return grpc::Status::OK;
+    }
+    std::string error;
+    response->set_ok(client_->SetPoolRules(request->pool(), request->table_json(), &error));
+    response->set_error(error);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetPoolRulesState(grpc::ServerContext*, const ::umbp::Empty*,
+                                 ::umbp::PoolRulesStateResponse* response) override {
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (!shutdown_.load()) response->set_json(client_->GetPoolRulesState());
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

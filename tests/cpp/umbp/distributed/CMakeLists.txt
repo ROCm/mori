@@ -515,6 +515,13 @@ target_link_libraries(test_peer_pool PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_peer_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
 
+# test_pool_rules — per-pool rule tables: parsing, the four decisions, the
+# weighted eviction order and the per-class counters, on a hand-moved clock.
+add_executable(test_pool_rules test_pool_rules.cpp)
+target_link_libraries(test_pool_rules PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_pool_rules PRIVATE cxx_std_17)
+add_test(NAME umbp_pool_rules COMMAND test_pool_rules)
+
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
 # every engine's planner, LocalCopyEngine's executor and the composite's routing.
 # MoriIoEngine's transfers need a fabric: see test_cross_node_smoke.

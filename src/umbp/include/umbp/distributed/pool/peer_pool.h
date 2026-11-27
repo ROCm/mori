@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "umbp/distributed/pool/pool_policy.h"
+#include "umbp/distributed/pool/pool_rules.h"
 #include "umbp/distributed/pool/tier_transition.h"
 
 namespace mori::umbp {
@@ -53,6 +54,9 @@ struct PoolAllocateResult {
   AllocateResult allocation;
   // Failed because another writer is storing this key right now.
   bool in_flight = false;
+  // The key's pool rule does not admit it (PoolRule::admit): nothing was
+  // allocated, and a retry gets the same answer until the rule changes.
+  bool declined = false;
 };
 
 struct PoolSlotRef {
@@ -120,6 +124,11 @@ class PeerPool {
   ~PeerPool();
 
   BackendRegistry* Backends() const { return backends_; }
+
+  // Per-pool management rules and the per-class counters behind them; see
+  // pool_rules.h.  Safe to call from any thread while the pool runs.
+  PoolRules& Rules() { return rules_; }
+  const PoolRules& Rules() const { return rules_; }
 
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
@@ -276,6 +285,7 @@ class PeerPool {
 
   BackendRegistry* backends_;
   std::unique_ptr<PoolPolicy> policy_;
+  PoolRules rules_;
   TransferEngine* transfer_engine_;
   std::shared_ptr<const LogicalTierGraph> tier_graph_;
   TierTransitionExecutor transition_executor_;
