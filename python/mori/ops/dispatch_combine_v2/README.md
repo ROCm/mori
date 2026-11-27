@@ -55,7 +55,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 |---|---|
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig`, `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
-| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding (gather; scatter and push combines per arch); rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
+| `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding (gather; scatter and push combines per arch); rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
 | `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
 | `quant_types.py` | the combine quant type names, what each resolves to on this arch, and the format each names (see "Combine quant types") |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
@@ -195,7 +195,7 @@ the **hip** backend implements it.
 |---|---|---|
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
 | `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch. `low_latency` `True` / `False` sets it to `"v2_ll"` / `"v2"` ([Low latency](#low-latency)) |
-| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against the `max_num_inp_token_across_ranks` the dispatch is given (its combine reuses it): `<=` runs `v2_ll`; `>`, or a dispatch without it, runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
+| `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against the `max_num_inp_token_across_ranks` the dispatch is given (its combine reuses it): `<=` runs `v2_ll`; `>`, or a dispatch without it, runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0. It is one number for every shape: with fp8 dispatch, hidden 3584 and top-16 at EP32 on MI355X, `v2_ll` stays the faster kernel above 512 tokens, so a caller of such a shape names `v2_ll` or raises the crossover |
 | `num_qp_per_pe` | `8` | QPs **allocated** per connected peer, fixed for the DevComm's lifetime; at most 64. Unused by intranode kernels |
 | `active_qps` | `None` | Pin the **active** count -- how many of the allocated QPs a kernel sends on -- for every bucket and both phases. `None`: the tuning table's count, else `min(2, num_qp_per_pe)` |
 | `active_qp_counts` | `None` | Extra counts, e.g. `(1, 2, 4, 8)`, compiled for every bucket geometry so `op.set_active_qps()` can switch to them |
@@ -457,6 +457,21 @@ Set `MORI_RDMA_TC` / `MORI_RDMA_SL` to match the fabric's RoCE class; unset, eve
 transfer goes out on SL 1 / DSCP 0. `tools/env_setup.sh` derives both from
 `ROCE_DSCP`/`ROCE_PRIO`.
 
+`MORI_EP_DISABLE_RDMA_ATOMICS` (set, and not `0`/`false`/`off`/`no`) builds the
+`v2` and `v2_ll` plans without RDMA atomics: the chunk flags, the node token
+counts and the combine barrier marks become RDMA WRITEs, and when the op drains
+more than one QP, `v2_ll` sends a full 64-token chunk as two 32-token pieces, each
+with its own flag. Use it where RDMA atomics into GPU memory fail or are slow; it
+cannot be combined with `MORI_IB_ENABLE_RELAXED_ORDERING=1` or a cross-node
+AsyncLL op. Every rank must set it alike and, with it, drain the same QP count;
+when torch.distributed's default group is exactly the op's ranks, construction
+checks both across ranks.
+
+A combine whose input is `combine_in_view()` and that folds no weights skips the
+CombineSync pass: the input already is the staging area. `--combine-zero-copy`
+feeds the test's and the bench's combines through `combine_in_view()`; the test
+alternates rounds with and without weights, so both launch paths run.
+
 ## Design notes (intranode kernels)
 
 - **dispatch**: per (token, k) dedup same-dest-PE via ballot; lane0 remote
@@ -694,8 +709,8 @@ at 2048, dispatch flat, and still a wash after `Unroll=4` removed the real
 bottleneck. Two reasons, and the second is the general one:
 
 * Dispatch never reached the TDM path at all. `XferBytesPerToken` is
-  7168*2 + 32 + 32 + 4 = 14404, so the slot stride is 4-byte aligned and source
-  and destination never share a 128 B phase.
+  7168*2 + 32 + 32 + 4 = 14404, padded to 14416, so the slot stride is 16 B but
+  not 128 B aligned and source and destination never share a 128 B phase.
 * The same ualoe data says TDM's advantage is a *grid-width* one, and below
   about 1 MB neither transport is grid-limited -- there the CU path is often the
   faster of the two. AsyncLL's transfer hands each warp tens of KB, so it sits in
@@ -704,11 +719,10 @@ bottleneck. Two reasons, and the second is the general one:
   transfer pass has none.
 
 **Padding the slot stride to a 128 B row.** The alignment above is real, and
-fixing it (`XferBytesPerToken` rounded up to 128, with `internode_regions.py`
-following) is worth ~3.4% on the dispatch half and ~1% on the pair, measured in
-the same matrix. Not taken here because it changes the arena layout shared with
-the v2 / v2_ll families for a gain that `Unroll=4` dwarfs; it is a reasonable
-separate change.
+fixing it (`XferBytesPerToken` rounded up to 128 rather than 16, with
+`internode_regions.py` following) is worth ~3.4% on the dispatch half and ~1% on
+the pair, measured in the same matrix. Not taken here: the gain is small next to
+`Unroll=4`, and it is a reasonable separate change.
 
 ### Reproducing
 

@@ -24,7 +24,7 @@
 The only EP-specific part of the C++/JIT binding: load ``libmori_ops_v2.so`` so
 its kernels register into the shared JIT registry, then expose the Plan classes:
 the intranode ``EpDispatchPlan`` / ``EpCombinePlan``, the local kernels through
-``local_plan()``, plus the eight internode passes in ``EP_INTERNODE_PLANS``. Everything else -- the ABI, the Plan factory,
+``local_plan()``, plus the seven internode passes in ``EP_INTERNODE_PLANS``. Everything else -- the ABI, the Plan factory,
 schema-driven arg structs -- is generic and lives in ``mori.jit.v2.plan_api``.
 
 Importing this module loads the library (raising OSError if it is not built),
@@ -220,7 +220,7 @@ def local_plan(name):
     return _local_plans[name]
 
 
-# The internode sequence. Eight plans rather than two: its dispatch and combine
+# The internode sequence. Seven plans rather than two: its dispatch and combine
 # are several passes each, and each pass is its own module. Both name tables must
 # match the C++ enums, which are now v2's own -- EpInterNodeDType and
 # EpQuantType, both in ep_internode_cfg.hpp.
@@ -240,7 +240,6 @@ EP_INTERNODE_PLANS = {
         "dispatch",
         "dispatch_ll",
         "combinesync",
-        "combinesyncbarrier",
         "combine",
         "combine_ll",
         "combineall",

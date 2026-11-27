@@ -261,6 +261,8 @@ class RdmaDeviceContext {
     assert(false && "not implemented");
   }
   virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
+  // Whether DestroyRdmaEndpointNoThrow releases an endpoint before context teardown.
+  virtual bool SupportsEndpointDestroy() const { return false; }
   // Moves the QP to the Error state. A QP in Error accepts no further inbound
   // requests, so a peer's writes through it stop landing in local memory. Returns
   // true only once the transition has completed; the default does nothing and

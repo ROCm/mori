@@ -124,6 +124,10 @@ class Context {
     int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
     return allRdmaDeviceContexts[agreedRail].get();
   }
+  // The device context that holds the additional endpoints to peerRank.
+  RdmaDeviceContext* EndpointContext(int peerRank) const {
+    return proxyEnabled ? GetRailContext(peerRank) : rdmaDeviceContext.get();
+  }
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
@@ -186,6 +190,10 @@ class Context {
   // INIT → RTR → RTS. Must use the same peerMask as CreateAdditionalEndpoints.
   void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe,
                                   const std::vector<bool>& peerMask);
+
+  // Release a set from CreateAdditionalEndpoints; stub slots are skipped. A provider that
+  // cannot destroy endpoints early keeps them until the context is torn down. Local only.
+  void DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoints, int numQpPerPe);
 
  private:
   void CollectHostNames();

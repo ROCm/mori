@@ -155,11 +155,12 @@ inline constexpr int kCombineBarrierMarkerTotal = 64;
 //   header, because the kernel reads its grid from gridDim/blockDim rather than
 //   from kConfig. See the note there.
 //
-// Three fields are not shape: numQpPerPe (the active QP count) and
-// combineLoadFirst are chosen per token bucket from the tuning table, and
-// numQpToDrain is the op's largest active count. cfg.active_qps, a
-// MORI_EP_*_GEOM override or set_active_qps() replaces the table's QP count;
-// AsyncLL uses one op-wide count.
+// Five fields are not shape: numQpPerPe (the active QP count) and
+// combineLoadFirst are chosen per token bucket from the tuning table,
+// numQpToDrain is the op's largest active count, noRdmaAtomics is the
+// op-wide signalling choice and windowUncached describes the cco window. cfg.active_qps, a
+// MORI_EP_*_GEOM override or set_active_qps() replaces the table's QP count; AsyncLL uses one
+// op-wide count.
 //
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
@@ -185,6 +186,13 @@ struct EpInterNodeKernelCfg {
   // token bucket by the tuning table (combine_load_first), so it is part of the
   // compiled identity; every other pass is built with the default.
   bool combineLoadFirst{false};
+  // Cross-node flags and barriers as RDMA WRITEs instead of atomics (MORI_EP_DISABLE_RDMA_ATOMICS),
+  // for NICs whose atomics cannot target GPU memory. Op-wide.
+  bool noRdmaAtomics{false};
+  // The cco window is uncached (ccoWindowUncached), so stores to it bypass L2 and a combine relay
+  // only waits for its staging stores before counting them, instead of writing back L2. Combine
+  // passes only.
+  bool windowUncached{false};
   // AsyncLL combine passes only: elements per scale of the fp8 combine wire, 32
   // (E8M0) or 128 (f32); 0 = bf16 wire. Set on the combine leg alone, so the
   // dispatch passes keep their cache entries.
@@ -227,12 +235,14 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
   MORI_FIELD(combineLoadFirst);
+  MORI_FIELD(noRdmaAtomics);
+  MORI_FIELD(windowUncached);
   MORI_FIELD(combineQGroup);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 15,
+    EpInterNodeKernelCfg, 17,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 

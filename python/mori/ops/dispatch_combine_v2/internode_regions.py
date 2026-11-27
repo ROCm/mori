@@ -57,6 +57,24 @@ _U64 = 8
 _F32 = 4
 
 
+# A dispatch chunk is one warp's tokens; the internode kernels are wave64 only (MakeEpInterNodeCfg).
+CHUNK_TOKENS = 64
+# kMaxDispatchPieces: an atomic-free v2_ll chunk splits into pieces of at least 32 tokens.
+DISPATCH_PIECES_PER_CHUNK = CHUNK_TOKENS // 32
+
+
+def xfer_bytes_per_token(cfg):
+    """XferBytesPerToken(maxTokenTypeSize): hidden + index + weight + srcTokenId +
+    scale, padded to 16 B."""
+    raw = (
+        cfg.hidden_dim * cfg.max_token_type_size
+        + cfg.num_experts_per_token * (_I32 + _F32)
+        + _I32
+        + cfg.scale_dim * cfg.scale_type_size
+    )
+    return (raw + 15) // 16 * 16
+
+
 def internode_regions(cfg):
     """``[(name, nbytes)]`` for :class:`SymmArena`, in v1's allocation order.
 
@@ -93,15 +111,8 @@ def internode_regions(cfg):
         max_tokens_to_recv_per_rank = max_tokens_to_send_per_rank
     max_tokens_to_recv = world_size * max_tokens_to_recv_per_rank
 
-    # XferBytesPerToken(maxTokenTypeSize): hidden + index + weight + srcTokenId + scale.
     scale_bytes = cfg.scale_dim * cfg.scale_type_size
-    xfer_bytes = (
-        hidden_dim * max_token_type_size
-        + topk * _I32
-        + topk * _F32
-        + _I32
-        + scale_bytes
-    )
+    xfer_bytes = xfer_bytes_per_token(cfg)
 
     # maxNumOutToken, the stride of the order maps.
     max_out_token = world_size * max_tokens_to_send_per_rank * cfg.num_experts_per_rank
@@ -138,8 +149,24 @@ def internode_regions(cfg):
         ("disp_tok_offset", _I32),
         ("disp_tok_id_to_src_tok_id", max_out_token * _I32),
         # --- barriers and flags ----------------------------------------------
-        ("cross_device_barrier", barrier_bytes * 2 * _U64),
-        ("inter_node_chunk_flag", n_nodes * max_tokens_to_send_per_rank * _U64),
+        # The atomic-free combine barrier adds one slot per (sender, qp) after the
+        # world_size per-rank slots (CombineBarrierQpSlot).
+        (
+            "cross_device_barrier",
+            max(barrier_bytes * 2 * _U64, world_size * (1 + cfg.num_qp_per_pe) * _U64),
+        ),
+        # Chunk flags, then the flags of each atomic-free v2_ll chunk's later pieces
+        # (DispatchPieceFlagSlot).
+        (
+            "inter_node_chunk_flag",
+            n_nodes
+            * max(
+                max_tokens_to_send_per_rank,
+                DISPATCH_PIECES_PER_CHUNK
+                * -(-max_tokens_to_send_per_rank // CHUNK_TOKENS),
+            )
+            * _U64,
+        ),
     ]
 
     # Scales are absent, not zero-sized, when the transport is off: the kernel
@@ -177,10 +204,8 @@ def asyncll_regions(cfg):
 
     world_size = cfg.world_size
     max_send_per_rank = cfg.max_num_inp_token_per_rank
-    topk = cfg.num_experts_per_token
     hidden_bytes = cfg.hidden_dim * cfg.max_token_type_size
-    scale_bytes = cfg.scale_dim * cfg.scale_type_size
-    xfer_bytes = hidden_bytes + topk * _I32 + topk * _F32 + _I32 + scale_bytes
+    xfer_bytes = xfer_bytes_per_token(cfg)
 
     send_slots = world_size * max_send_per_rank
     regions["inter_staging"] = send_slots * xfer_bytes
@@ -193,9 +218,9 @@ def asyncll_regions(cfg):
     # their combine payloads at SendBufSlotOffset strides: those two address
     # ranges overlap, and a peer's transfer would then overwrite the local expert
     # output while CombineSendCopy is still reading it. The internode family
-    # avoids the same collision by staging through EpCombineSync behind a
-    # grid-wide barrier pass; AsyncLL has no such barrier in its send half by
-    # design, so the buffers are kept apart instead.
+    # avoids the same collision by staging through EpCombineSync, with a barrier
+    # at the start of its combine pass; AsyncLL has no such barrier in its send
+    # half by design, so the buffers are kept apart instead.
     #
     # inter_dispatch_staging is free for it: the AsyncLL kernels never touch the
     # region that name was coined for.

@@ -1,0 +1,7 @@
+num_experts,topk,phase,dtype,hidden_dim,num_tokens,block_num,rdma_block_num,warp_per_block,active_qps,combine_load_first,avg_latency_us,bandwidth_gbps,avg_rdma_bandwidth_gbps,avg_xgmi_bandwidth_gbps,avg_ll_bandwidth_gbps,bandwidth_metric
+896,16,dispatch,fp8_e4m3,3584,1024,128,80,8,2,,463.3,31.4,31.4,101.69,126.02,grand_mean
+896,16,dispatch,fp8_e4m3,3584,2048,256,192,4,2,,810.6,35.88,35.88,116.21,144.47,grand_mean
+896,16,dispatch,fp8_e4m3,3584,4096,128,85,16,2,,1582.9,36.74,36.74,119.04,148.12,grand_mean
+896,16,combine,bf16,3584,1024,64,48,16,2,,560.4,51.92,51.92,168.14,208.39,grand_mean
+896,16,combine,bf16,3584,2048,64,48,16,2,,1043.9,55.71,55.71,180.47,224.36,grand_mean
+896,16,combine,bf16,3584,4096,96,64,8,,,2063.4,56.36,56.36,182.64,227.26,grand_mean

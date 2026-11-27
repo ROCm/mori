@@ -187,12 +187,17 @@ ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
+// Host endpoints of each DevComm's QPs, keyed by its ibgda.endpoints, for ccoDevCommDestroy.
+static std::mutex gDevCommEpsMutex;
+static std::unordered_map<const void*, std::vector<application::RdmaEndpoint>> gDevCommEps;
+
 static constexpr size_t kMrPadThreshold = 2ULL << 30;
 static constexpr size_t kMrPadAlign = 2ULL << 20;
 
 // Symmetric-window VMM allocation type. Default = uncached (fine-grained),
 // matching mori-shmem's hipDeviceMallocUncached heap: P2P remote reads/writes
 // stay coherent over the fabric without coarse-grained L2 coherence handling.
+// HIP runtimes before 7.14 still place it in the cached pool (ccoWindowUncached).
 // Opt out with CCO_UNCACHED_WINDOW=0 (reverts to coarse-grained pinned memory).
 // MUST be used for BOTH the granularity query and the actual hipMemCreate so
 // the granularity matches the allocation.
@@ -829,6 +834,18 @@ int ccoCommDestroy(ccoComm* comm) {
 /* ========================================================================== */
 /*                              ccoMemAlloc                                */
 /* ========================================================================== */
+
+// ROCm before 7.14 accepts hipMemAllocationTypeUncached for a VMM allocation but still places it in
+// the coarse-grained (cached) pool, so the request alone does not make the window uncached.
+static bool CcoRuntimeHonoursUncachedVmm() {
+  int version = 0;
+  return hipRuntimeGetVersion(&version) == hipSuccess && version >= 71400000;
+}
+
+int ccoWindowUncached() {
+  return CcoWindowAllocType() != hipMemAllocationTypePinned && CcoRuntimeHonoursUncachedVmm() ? 1
+                                                                                              : 0;
+}
 
 int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   if (outPtr == nullptr) {
@@ -1786,9 +1803,10 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     }
   }
 
+  std::vector<application::RdmaEndpoint> newEps;
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
     // Collective: every rank must call CreateAdditionalEndpoints together.
-    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, peerMask);
+    newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, peerMask);
     comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, peerMask);
 
     // Note: post-Connect RTS verification via ibv_query_qp doesn't work for
@@ -1833,6 +1851,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), epsBytes, hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
+  // Undoes the endpoints above when a later step fails.
+  auto releaseEndpoints = [&] {
+    comm->ctx->DestroyAdditionalEndpoints(newEps, numQpPerPe);
+    if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+  };
 
   // Resource window backing this DevComm's session state (IBGDA
   // signal/shadows/counter pool, LSA barrier inbox+state). signalBufOffset is
@@ -1914,7 +1937,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   if (layout.totalSize > 0) {
     if (ccoMemAlloc(comm, layout.totalSize, &resourceWindowPtr) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window MemAlloc failed");
-      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      releaseEndpoints();
       return -1;
     }
     // resourceWindowPtr is fabric-exportable (ccoMemAlloc) — avoid hipMemset,
@@ -1923,7 +1946,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     if (ccoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window Register failed");
       (void)ccoMemFree(comm, resourceWindowPtr);
-      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      releaseEndpoints();
       return -1;
     }
     auto* base = static_cast<uint8_t*>(resourceWindowPtr);
@@ -1950,6 +1973,10 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                                 sizeof(ccoWindowDevice), hipMemcpyDeviceToHost));
   }
   hostShadow.resourceWindow = resourceWindow;
+  if (epsGpu) {
+    std::lock_guard<std::mutex> lock(gDevCommEpsMutex);
+    gDevCommEps[epsGpu] = std::move(newEps);
+  }
 
   // GDA barrier handles point into ibgda.signalBuf; no resource-window bytes
   // consumed. Disabled handles stay {0,0}.
@@ -2201,7 +2228,21 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // QP endpoints array. signalBuf/Shadows/counterBuf are sub-pointers into
   // the resource window — they were freed above by ccoWindowDeregister +
   // ccoMemFree, so no separate hipFree needed.
-  if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
+  if (ibgda.endpoints) {
+    std::vector<application::RdmaEndpoint> eps;
+    {
+      std::lock_guard<std::mutex> lock(gDevCommEpsMutex);
+      auto it = gDevCommEps.find(ibgda.endpoints);
+      if (it != gDevCommEps.end()) {
+        eps = std::move(it->second);
+        gDevCommEps.erase(it);
+      }
+    }
+    if (!eps.empty() && comm && comm->ctx) {
+      comm->ctx->DestroyAdditionalEndpoints(eps, ibgda.numQpPerPe);
+    }
+    HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
+  }
 
   // SDMA pool cleanup. peerSignalPtrs is a GPU array of host-mapped peer
   // pointers — only the cross-process entries came from hipIpcOpenMemHandle

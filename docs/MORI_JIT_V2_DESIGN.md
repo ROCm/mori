@@ -56,7 +56,7 @@ mori 特有的简化：走 `.hsaco` + `hipModuleGetFunction` 而非链接，所�
 | | 文件 | 内容 | 谁编译 |
 |---|---|---|---|
 | ① Cfg | `include/mori/ops/dispatch_combine_v2/ep_cfg.hpp`（intranode）<br>`include/mori/ops/dispatch_combine_v2/ep_internode_args.hpp` + `ep_internode_cfg.hpp`（internode） | Cfg + Args + `VisitFields` + 共享几何 constexpr | **两侧**（HIP-free） |
-| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM）<br>`src/ops/dispatch_combine_v2/ep_internode_kernel.hpp`（internode，八个 pass 各一个 body） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
+| ② body | `src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp`（portable）<br>`src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp`（gfx125x TDM）<br>`src/ops/dispatch_combine_v2/ep_internode_kernel.hpp`（internode，七个 pass 各一个 body） | `template <EpCfg kCfg, typename T> __device__ void Body(EpArgs)` | 只有生成的 TU |
 | ③ Spec | `ep_spec.hpp` / `ep_spec.cpp`（intranode）<br>`ep_internode_spec.hpp` / `ep_internode_spec.cpp`（internode） | Request + `EntryName` + `RenderSource` + `Geometry` + 注册宏 | host |
 
 新增一个 kernel 就是写这三样。**Python 侧零行**——Plan 类由 C++ 发布的 schema 生成。
@@ -416,7 +416,7 @@ mori_jit_precompile / mori_jit_registered_plans / mori_jit_last_error
 
 `_launch_multi` 是批量发射：N 个共享同一 args 布局的 plan，填一次参数结构、穿一次 ABI，
 然后按序发射（C++ 侧就是对同一个 `argBuf` 循环 `vt->launch`，不认识任何具体 kernel）。
-EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 4 个，本来要穿 6 次。
+EP 的 internode 序列一次 dispatch 是 2 个 pass、一次 combine 是 3 个(zero-copy 且不折叠 weights 时跳过 CombineSync,只剩 2 个),本来要穿 5 次。
 
 Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 handle 数组挪到构建期**，
 发射路径只剩填参数和那一次 ABI 调用。「共享同一 args 布局」按完整的
@@ -438,7 +438,7 @@ Python 侧对应 `plan_api.LaunchGroup`：**plan 集合固定时把校验和 han
 EP 专用的只有薄 shim `ops/dispatch_combine_v2/ep_plans.py`——它 `load_library("libmori_ops_v2.so")`
 触发注册，再暴露 intranode 的 `EpDispatchPlan`/`EpCombinePlan`，以及 internode 的
 `EP_INTERNODE_PLANS`：按 pass 名（`copystaging` / `dispatch` / `dispatch_ll` / `combinesync` /
-`combinesyncbarrier` / `combine` / `combine_ll` / `combineall`）索引的八个 plan，因为它的一次
+`combine` / `combine_ll` / `combineall`）索引的七个 plan，因为它的一次
 dispatch/combine 就是一串 pass，每个 pass 各是一个模块。约定两条：标为 `e` 的字段接受 dtype 名或 torch
 dtype；launch 参数里 `off<Region>` 是 arena region 偏移，传 `arena=` 就绑定一次。internode 的枚举不走
 通用的 `DTYPES`，而是 `make_plan(..., enums=...)` 传进去的两张自己的表 `INTERNODE_DTYPES` /
@@ -523,7 +523,7 @@ PULL/QUAD gather combine。
 op 不声明这两个能力，调用时报 `NotImplementedError`）；这些在 FlyDSL 后端都有。
 
 gfx942/gfx950 的 dispatch 在 grid barrier 前让每个 block 用一次 `s_waitcnt` 排空自己的对端写（HIP 与
-FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_WINDOW=0`，或 ROCm 7.2.x 的 VMM
+FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_WINDOW=0`，或 ROCm 7.14 之前的 VMM
 路径忽略 uncached）按内存模型应改为每 block 一次 system release；但这些对端写不经 release 也已可见
 （`FRESH=1` 在 cached 窗口下同样通过），而 release 会让 dispatch 慢 6–40%，所以只做排空。
 `local_expert_count` 与 StdMoE 的两个 convert 是三个只读写本 rank 行的本地 kernel
@@ -533,11 +533,12 @@ FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_W
 已经支持（§3.7）——那是搬运已量化的载荷，和让 mori 自己量化的 `quant_type` 是两回事。
 
 **cross-node 也有了**：`src/ops/dispatch_combine_v2/` 现在是三个 body 头文件——两个 intranode
-（portable / gfx125x TDM）加一个 `ep_internode_kernel.hpp`，后者在一个头里放八个 pass 的 body，
-对应 `ep_internode_spec.cpp` 注册的八个 Spec / 八个 plan（`ep_internode_` + `copystaging` /
-`dispatch` / `dispatch_ll` / `combinesync` / `combinesyncbarrier` / `combine` / `combine_ll` /
-`combineall`）。一轮 dispatch 发 copystaging + dispatch 或 dispatch_ll，一轮 combine 发
-combinesync + combinesyncbarrier + combine 或 combine_ll + combineall。
+（portable / gfx125x TDM）加一个 `ep_internode_kernel.hpp`，后者在一个头里放七个 pass 的 body，
+对应 `ep_internode_spec.cpp` 注册的七个 Spec / 七个 plan（`ep_internode_` + `copystaging` /
+`dispatch` / `dispatch_ll` / `combinesync` / `combine` / `combine_ll` / `combineall`）。一轮
+dispatch 发 copystaging + dispatch 或 dispatch_ll，一轮 combine 发 combinesync + combine 或
+combine_ll + combineall（节点内 barrier 在 combine pass 开头；输入已在 `combine_in_view()` 且不折叠
+weights 时不发 combinesync）。
 
 选择仍然没有 `kernel_type` 枚举，但有两级选择器：走不走 internode 由 `gpu_per_node < world_size`
 （`EpDispatchCombineConfig.is_internode`）决定，只有 `hip` 后端实现它，FlyDSL 后端在能力门里直接
