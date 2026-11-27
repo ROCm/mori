@@ -41,6 +41,12 @@ target_include_directories(sdma_latency
                            PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
 target_link_libraries(sdma_latency mori_application hip::host hip::device)
 
+# Experimental probe: device-posted copies on odd SDMA engines. Contains device
+# code, so it is compiled as HIP.
+add_executable(sdma_odd_engine sdma/sdma_odd_engine.cpp)
+set_source_files_properties(sdma/sdma_odd_engine.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(sdma_odd_engine mori_application hip::host hip::device)
+
 # --- Dist RDMA examples ---
 add_executable(dist_write dist_rdma_ops/dist_write.cpp utils/args_parser.cpp)
 target_include_directories(dist_write

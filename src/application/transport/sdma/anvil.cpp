@@ -41,10 +41,42 @@
 #include <tuple>
 #include <unordered_map>
 
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace anvil {
 
 namespace {
+
+// EXPERIMENTAL (MORI_SDMA_ALIGN_DEVICE_DOORBELL=1): make the ODD SDMA engines
+// usable from device code. A doorbell written by a GPU kernel is routed at 32B
+// granularity, so a queue whose doorbell is not 32B aligned rings the engine
+// that owns that 32B block -- the PREVIOUS engine -- and the copy never starts;
+// the same doorbell value written by the host always works. KFD spaces the
+// engine doorbell ranges 80B apart, so an odd engine starts 16B into a block --
+// only the queues BELOW the engine's first 32B boundary are lost, the ones above
+// it are fine whatever their own alignment (measured on gfx950 engine 3: the
+// slots at base+0 and base+8 never run, base+16 and base+24 run 3/3). KFD hands
+// the slots out in ascending order over two doorbell pages, so burning up to the
+// first aligned doorbell costs four slots of the engine's eight, ONCE -- every
+// later queue on it is usable. amdkfd aligns the base itself since ee1379e6d7da
+// ("drm/amdkfd: align SDMA doorbell base for shader doorbell writes", ROCm 7.4),
+// where nothing is burned. Off by default: it spends those four slots.
+bool alignDeviceDoorbell() {
+  static const bool on = mori::env::IsEnvVarEnabled("MORI_SDMA_ALIGN_DEVICE_DOORBELL");
+  return on;
+}
+
+// The queues SdmaQueue burned to reach an aligned doorbell, and the engines it
+// has already walked past their first 32B boundary. Alive only while a link is
+// still creating channels: a destroyed queue hands its slot straight back to the
+// next create, so releasing one mid-burn would loop on the same doorbell.
+// connect() calls releaseBurnedQueues() once the link has all its channels --
+// an already created queue keeps its doorbell, so dropping the burned ones is
+// safe, it only returns the slots to the engine. The map is cleared with them:
+// the next queue on that engine starts at the bad doorbells again.
+// No lock of their own: connect() is the only user and holds channels_mutex_.
+std::vector<std::pair<void*, HsaQueueResource>> burnedQueues;
+std::unordered_map<uint32_t, bool> enginePastFirstBlock;
 
 #define CHECK_HSA_ERROR(cmd)                                                                 \
   do {                                                                                       \
@@ -70,6 +102,18 @@ namespace {
       exit(EXIT_FAILURE);                                                                 \
     }                                                                                     \
   } while (0)
+
+void releaseBurnedQueues() {
+  if (burnedQueues.empty()) return;
+  for (auto& [buf, queue] : burnedQueues) {
+    CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue.QueueId), "Failed");
+    CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(buf), "Failed");
+    CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(buf, SDMA_QUEUE_SIZE), "Failed");
+  }
+  MORI_APP_INFO("SDMA: gave back {} burned doorbell slot(s)", burnedQueues.size());
+  burnedQueues.clear();
+  enginePastFirstBlock.clear();
+}
 
 // MI308X xGMI SDMA engines; 0 is the general engine and keeps loopback and host
 // copies. KFD exposes 8 user-queue slots per engine on gfx942.
@@ -245,18 +289,58 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
-                       "Failed");
-  CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
+  // Keep creating queues on this engine until one gets a doorbell a kernel can
+  // ring (see alignDeviceDoorbell; a no-op unless that is enabled). Only the
+  // first aligned doorbell has to be waited for -- past it the engine's slots
+  // are all above its first 32B boundary -- so an engine is burned once, and
+  // connect() hands the burned slots back when the link is fully connected.
+  constexpr int kMaxBurn = 6;  // gfx950 burns 4 of the 8 queue slots of an odd engine
+  for (int attempt = 0;; ++attempt) {
+    CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+                         "Failed");
+    CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
 
-  // Create SDMA Queue
-  // TODO needed here?
-  memset(&queue_, 0, sizeof(HsaQueueResource));
+    // Create SDMA Queue
+    // TODO needed here?
+    memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+    const HSAKMT_STATUS created = hsaKmtCreateQueueExt(
+        hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM, engineId,
+        queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
+    if (created != HSAKMT_STATUS_SUCCESS && !burnedQueues.empty()) {
+      // The engine ran out of queue slots while burning -- it only has 8, and a
+      // link that connected earlier may hold some. Take the last burned queue
+      // back so this object is valid, and mark it unusable from device code:
+      // connect() drops it and puts the channel on the link's even engine. A
+      // misaligned doorbell is intermittent, so it must never be handed out.
+      MORI_APP_WARN("SDMA: engine {} has no queue slot left to reach an aligned doorbell ({})",
+                    engineId, static_cast<int>(created));
+      deviceDoorbellUsable_ = false;
+      CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
+      CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
+      std::tie(queueBuffer_, queue_) = burnedQueues.back();
+      burnedQueues.pop_back();
+      break;
+    }
+    CHECK_HSAKMT_SUCCESS(created, "Failed");
+
+    const bool aligned = reinterpret_cast<uintptr_t>(queue_.Queue_DoorBell_aql) % 32 == 0;
+    if (!alignDeviceDoorbell() || aligned || enginePastFirstBlock[engineId]) {
+      if (aligned) enginePastFirstBlock[engineId] = true;
+      if (attempt) {
+        MORI_APP_INFO("SDMA: engine {} gave a 32B aligned doorbell after burning {} queue slot(s)",
+                      engineId, attempt);
+      }
+      break;
+    }
+    if (attempt == kMaxBurn) {
+      MORI_APP_WARN("SDMA: engine {} still has a misaligned doorbell ({:#x}) after {} queue slots",
+                    engineId, reinterpret_cast<uintptr_t>(queue_.Queue_DoorBell_aql), kMaxBurn);
+      deviceDoorbellUsable_ = false;
+      break;
+    }
+    burnedQueues.emplace_back(queueBuffer_, queue_);
+  }
 
   // Populate Device Handle
   // TODO uncached
@@ -335,6 +419,10 @@ void AnvilLib::init() {
   if (node < 0)
     throw std::runtime_error("SDMA: no KFD node for HIP device " + std::to_string(hipDev));
   return static_cast<uint32_t>(node);
+}
+
+/*static*/ uint32_t AnvilLib::hsakmtNodeForHipDevice(int hipDev) {
+  return hsakmtNodeForKfdNode(static_cast<int>(nodeForHipDevice(hipDev)));
 }
 
 // Resolve the KFD topology node id of the given HIP device WITHOUT initializing HSA.
@@ -418,6 +506,14 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     }
   }
 
+  // EXPERIMENTAL: KFD recommends ONE engine per peer link (an even one), so every
+  // channel of a link shares it. Once a kernel can ring an odd engine's doorbell
+  // (see alignDeviceDoorbell), the link's odd sibling can carry channels too; any
+  // engine reaches any peer, the recommendation is only load balancing.
+  if (alignDeviceDoorbell() && srcNode != dstNode && engines.size() == 1) {
+    engines.push_back(engines[0] ^ 1u);
+  }
+
   // MI308X is a 4-XCD harvest of the 8-XCD MI300X: only 4 physical SDMA engines
   // exist, exposed at the even KFD logical engine ids (0,2,4,6); the odd ids
   // (1,3,5,7) name fused-off engines. IP-discovery firmware still advertises the
@@ -460,8 +556,22 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
       const uint32_t engineId =
           balance ? mi308xQueueEngine(srcNode, dstNode) : engines[c % numEngines];
-      channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+      auto queue = std::make_unique<SdmaQueue>(hsakmtNode, engineId);
+      // The odd sibling engine is an optimisation. If it has no slot left whose
+      // doorbell a kernel can ring, drop the queue -- which also frees that slot
+      // again -- and put the channel on the link's first (recommended, even)
+      // engine, which never needs an aligned doorbell hunt.
+      if (!queue->deviceDoorbellUsable() && engineId != engines[0]) {
+        MORI_APP_WARN("SDMA: node {} -> {} channel {} falls back from engine {} to engine {}",
+                      srcNode, dstNode, c, engineId, engines[0]);
+        queue.reset();
+        queue = std::make_unique<SdmaQueue>(hsakmtNode, engines[0]);
+      }
+      channels.emplace_back(std::move(queue));
     }
+    // This link has every channel it asked for, so the slots burned to place
+    // them go back to the engine -- a link that lands on it later burns again.
+    releaseBurnedQueues();
   }
   return true;
 }
