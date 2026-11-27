@@ -241,6 +241,25 @@ def _resolve_all2all_auto_register() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Without copy_output_to_user the result used to land in the output transit
+# buffer, in the symmetric heap. That heap is uncached memory by default, and
+# blocks of this rank copying into it while the peers push into it are slow:
+# with 5 of 64 blocks copying the kept chunk during the push a call took 808 us
+# at 1 GiB a rank on 4 gfx1250 GPUs, against 558 on a heap of ordinary memory
+# and 594 with the copy after the push. So the handle now keeps the result in
+# ordinary device memory of its own, registered like a caller's output: the
+# peers write it directly and the kernel runs as it does for a registered
+# output. get_output_transit_buffer returns that memory. The output transit
+# buffer is then twice the room the caller asked for, so that a rank whose
+# memory the peers cannot reach still receives through a half of it, and the
+# handle takes three times that room in all, as one with copy_output_to_user
+# does with the caller's output. MORI_CCL_ALL2ALL_RESULT_IN_HEAP=1 restores
+# the result in the output transit buffer.
+def _resolve_all2all_result_in_heap() -> bool:
+    raw = os.environ.get("MORI_CCL_ALL2ALL_RESULT_IN_HEAP", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _resolve_all2all_blocks() -> int:
     raw = os.environ.get("MORI_CCL_ALL2ALL_BLOCKS", "").strip()
     if not raw:
@@ -375,7 +394,16 @@ class All2allSdma:
         _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
-        self._copy_out = copy_output_to_user
+        # How the kernel is driven: with an output to fill, the caller's or, for a
+        # handle without copy_output_to_user on the TDM transport, the handle's
+        # own (see _resolve_all2all_result_in_heap).
+        own_result = (
+            self._backend == "tdm"
+            and not copy_output_to_user
+            and not _resolve_all2all_result_in_heap()
+        )
+        self._copy_out = copy_output_to_user or own_result
+        self._tdm_result = None
         # The TDM kernel copies into the caller's output itself, so the C++
         # handle never copies: its copy is a hipMemcpyAsync between two host
         # synchronizations.
@@ -399,9 +427,19 @@ class All2allSdma:
                 room = 512 * 1024 * 1024 // 2
             # The kernel is told halves of at most this size (below), so the
             # words cover every tile it can be asked to move.
+            result_bytes = room
+            if own_result:
+                # A half as large as the result the caller asked room for.
+                room *= 2
+                if output_buffer_size is not None:
+                    output_buffer_size *= 2
+                elif transit_buffer_size is not None:
+                    transit_buffer_size = transit_buffer_size // 2 * 3
+                else:
+                    transit_buffer_size = 512 * 1024 * 1024 // 2 * 3
             half_cap = room // 2 // _TDM_A2A_HALF_ALIGN * _TDM_A2A_HALF_ALIGN
             words_bytes = _tdm_a2a_words_bytes(
-                npes, half_cap, copy_output_to_user, self._tdm_blocks
+                npes, half_cap, self._copy_out, self._tdm_blocks
             )
             extra = words_bytes + _TDM_A2A_WORD_GAP_BYTES
             if ll_half:
@@ -419,7 +457,11 @@ class All2allSdma:
             if total is None:
                 total = 512 * 1024 * 1024
             self._handle = handle_class(
-                my_pe, npes, total // 2, total // 2 + extra, handle_copy
+                my_pe,
+                npes,
+                total // 3 if own_result else total // 2,
+                (total // 3 * 2 if own_result else total // 2) + extra,
+                handle_copy,
             )
         elif transit_buffer_size is not None:
             self._handle = handle_class(my_pe, npes, transit_buffer_size, handle_copy)
@@ -490,6 +532,11 @@ class All2allSdma:
             ctypes.c_uint64.from_buffer(
                 self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 40
             ).value = (ll_half // 4)
+            if own_result:
+                self._tdm_result = torch.empty(
+                    result_bytes // 4, dtype=torch.int32, device=self._tdm_sync.device
+                )
+                self.register_output_buffer(self._tdm_result)
 
     def _check_tdm_count(self, count: int) -> None:
         # The TDM kernel writes count * npes uint32 into every rank's output
@@ -565,6 +612,8 @@ class All2allSdma:
         )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> float:
+        if self._tdm_result is not None:
+            output_data = self._tdm_result
         s = _stream_to_int(stream)
         t0 = time.perf_counter()
         if self._backend == "tdm":
@@ -585,6 +634,8 @@ class All2allSdma:
         return time.perf_counter() - t0
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
+        if self._tdm_result is not None:
+            output_data = self._tdm_result
         s = _stream_to_int(stream)
         if self._backend == "tdm":
             self._check_tdm_count(count)
@@ -696,6 +747,13 @@ class All2allSdma:
         # caller's output and this buffer is the kernel's scratch. The TDM
         # kernel's words and LL128 area after the caller's room are left out.
         dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
+        if self._tdm_result is not None:
+            return _ptr_to_tensor(
+                self._tdm_result.data_ptr(),
+                self._tdm_result.numel() * 4,
+                dtype,
+                device,
+            )
         ptr = self._handle.get_output_transit_buffer()[0]
         return _ptr_to_tensor(ptr, self._output_transit_bytes, dtype, device)
 
