@@ -49,11 +49,13 @@ graph capture, because ITERS pairs are ~10 ms against a 50 ms sampling tick.
 
     torchrun --standalone --nproc_per_node=8 bench_ep.py
     BACKENDS=flydsl,hip COMB_MODE=pull SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
+    BACKENDS=hip,hip@128,hip@256 COMB_MODE=pull torchrun ... bench_ep.py   # dispatch grids
     MORI_SMI_MONITOR=1 MORI_SMI_DURATION=1.0 torchrun ... bench_ep.py
 """
 
 import math
 import os
+import re
 import sys
 import time
 
@@ -62,6 +64,7 @@ import torch.distributed as dist
 
 import mori.cco as cco
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+from mori.ops.dispatch_combine_v2.hip_backend import ll128_layout
 from mori.ops.dispatch_combine_v2.quant_types import is_gfx125x, resolve_quant_type
 
 import _data
@@ -203,6 +206,23 @@ _G = {
 }
 
 
+def regrid(cfg, common, blocks, warp=None):
+    """cfg with its dispatch blocks set to `blocks` (and warps to `warp` if given);
+    the combine and the bucket edges are kept."""
+    geom = dict(
+        dispatch_block_num=blocks,
+        combine_block_num=cfg.combine_block_num,
+        combine_warp_num_per_block=cfg.combine_warp_num_per_block,
+    )
+    if warp:
+        geom["warp_num_per_block"] = warp
+    if cfg.schedule:
+        geom["schedule"] = tuple(
+            (edge, blocks, warp or dw, cb, cw) for edge, _, dw, cb, cw in cfg.schedule
+        )
+    return EpDispatchCombineConfig(**common, **geom)
+
+
 def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -309,8 +329,18 @@ def main():
     vmm = len(BACKENDS) * 2 * (world * M * HIDDEN * 2 * 2 + (16 << 20)) + (512 << 20)
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
-    def build(backend):
-        cfg = EpDispatchCombineConfig(
+    geom_name = re.compile(r"([a-z]+)(?:@([1-9]\d*)(?:x([1-9]\d*))?)?")
+
+    def build(name):
+        """One op per BACKENDS entry; "<backend>@<blocks>[x<warps>]" is regrid() of
+        the plain op (x<warps> defaults to DWPB)."""
+        m = geom_name.fullmatch(name)
+        if not m:
+            raise ValueError(
+                f"BACKENDS entry {name!r}: want <backend>[@<blocks>[x<warps>]]"
+            )
+        backend, blocks, warps = m.group(1), m.group(2), m.group(3)
+        common = dict(
             rank=rank,
             world_size=world,
             hidden_dim=HIDDEN,
@@ -323,10 +353,6 @@ def main():
             scale_dim=SCALE_DIM,
             scale_type_size=SCALE_TS,
             kernel_backend=backend,
-            dispatch_block_num=_G["DBN"],
-            warp_num_per_block=_G["DWPB"],
-            combine_block_num=_G["CBN"],
-            combine_warp_num_per_block=_G["CWPB"],
             quant_type=(
                 PUSH_QUANT if _PUSH else (ASYNC_LL_QUANT if ASYNC_LL else "none")
             ),
@@ -334,7 +360,27 @@ def main():
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
         )
-        return EpDispatchCombineOp(cfg, comm)
+        cfg = EpDispatchCombineConfig(
+            **common,
+            dispatch_block_num=_G["DBN"],
+            warp_num_per_block=_G["DWPB"],
+            combine_block_num=_G["CBN"],
+            combine_warp_num_per_block=_G["CWPB"],
+        )
+        if blocks:
+            # Both set the grid themselves and would time the plain op's kernels.
+            if ASYNC_LL or (
+                backend == "hip" and _GFX125X and ll128_layout(cfg) is not None
+            ):
+                raise ValueError(
+                    f"BACKENDS entry {name!r}: "
+                    f"{'AsyncLL' if ASYNC_LL else 'the gfx1250 LL128 plan for this shape'}"
+                    " sets its own grid, so <backend>@<blocks> does not apply"
+                )
+            cfg = regrid(cfg, common, int(blocks), int(warps) if warps else _G["DWPB"])
+        op = EpDispatchCombineOp(cfg, comm)
+        op.bench_name = name
+        return op
 
     ops = {b: build(b) for b in BACKENDS}
 
@@ -419,20 +465,20 @@ def main():
         dist.all_reduce(n)
         if rank == 0 and n[0].item():
             print(
-                f"  [{op.backend_name}] DISPATCH BYTE MISMATCH: "
+                f"  [{op.bench_name}] DISPATCH BYTE MISMATCH: "
                 f"{int(n[0])} rows across {world} ranks",
                 flush=True,
             )
         mt_ok = int(n[4]) == 0 and int(n[5]) == 0 and int(n[6]) == int(n[7])
         if rank == 0:
             print(
-                f"  [{op.backend_name}] METACHECK rows={int(n[7])} idx_bad={int(n[4])} "
+                f"  [{op.bench_name}] METACHECK rows={int(n[7])} idx_bad={int(n[4])} "
                 f"wts_bad={int(n[5])} ctl={int(n[6])} ok={int(mt_ok)}",
                 flush=True,
             )
             if not mt_ok:
                 print(
-                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (ids / weights): "
+                    f"  [{op.bench_name}] DISPATCH BYTE MISMATCH (ids / weights): "
                     f"{int(n[4])} / {int(n[5])} rows across {world} ranks, control "
                     f"{int(n[6])} of {int(n[7])}",
                     flush=True,
@@ -440,13 +486,13 @@ def main():
         sc_ok = int(n[1]) == 0 and int(n[2]) == int(n[3])
         if rank == 0 and SCALE_DIM:
             print(
-                f"  [{op.backend_name}] SCALECHECK rows={int(n[3])} bad={int(n[1])} "
+                f"  [{op.bench_name}] SCALECHECK rows={int(n[3])} bad={int(n[1])} "
                 f"ctl={int(n[2])} ok={int(sc_ok)}",
                 flush=True,
             )
             if not sc_ok:
                 print(
-                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (scales): "
+                    f"  [{op.bench_name}] DISPATCH BYTE MISMATCH (scales): "
                     f"{int(n[1])} rows across {world} ranks, control {int(n[2])} "
                     f"of {int(n[3])}",
                     flush=True,
@@ -669,7 +715,7 @@ def main():
         dist.all_reduce(bad)
         if rank == 0 and bad.item():
             print(
-                f"  ct={ct:<5d} [{op.backend_name}] CHECK FAIL "
+                f"  ct={ct:<5d} [{op.bench_name}] CHECK FAIL "
                 f"({int(bad.item())}/{world} ranks, identity expert, U in "
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
@@ -696,7 +742,7 @@ def main():
         wt_ok = int(nw[0]) == 0 and int(nw[1]) == int(nw[2])
         if rank == 0:
             print(
-                f"  [{op.backend_name}] WTSCHECK rows={int(nw[2])} bad={int(nw[0])} "
+                f"  [{op.bench_name}] WTSCHECK rows={int(nw[2])} bad={int(nw[0])} "
                 f"ctl={int(nw[1])} ok={int(wt_ok)}",
                 flush=True,
             )
