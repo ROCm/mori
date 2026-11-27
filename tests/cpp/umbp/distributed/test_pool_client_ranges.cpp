@@ -252,7 +252,8 @@ class PoolClientRangesTest : public ::testing::Test {
                                          std::vector<char>& get_scratch,
                                          std::vector<char>& put_scratch,
                                          bool locality_prefetch = true,
-                                         bool remote_single_flight = true) {
+                                         bool remote_single_flight = true,
+                                         bool whole_object_cache = true) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -277,6 +278,7 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
+    cfg.ranged_whole_object_cache = whole_object_cache;
     cfg.remote_single_flight = remote_single_flight;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
@@ -1391,6 +1393,49 @@ TEST_F(PoolClientRangesTest, WholeObjectReadStillInstallsWithPrefetchOff) {
   EXPECT_TRUE(LocallyResident(quiet.get(), key))
       << "a switch named for the background pull must not disable the free install";
   quiet->Shutdown();
+}
+
+TEST_F(PoolClientRangesTest, WholeObjectCacheOffPreservesBytesWithoutResidentCopies) {
+  std::vector<char> get_scratch(kScratchSize), put_scratch(kScratchSize);
+  auto reader = MakeClient("ranges-no-whole-cache", kCallerCapacity, get_scratch, put_scratch,
+                           /*locality_prefetch=*/false, /*remote_single_flight=*/true,
+                           /*whole_object_cache=*/false);
+  const std::string key = "no-whole-cache";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < object.size(); ++i) object[i] = static_cast<char>((i * 83 + 7) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  reader->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(reader.get(), key));
+
+  // Repeat with partial and complete objects. Concurrent full reads must not
+  // wait for a leader to publish a local copy that the policy forbids.
+  for (size_t length : {kObjectSize / 2, kObjectSize}) {
+    std::atomic<size_t> ready{0}, bad{0};
+    std::vector<std::thread> readers;
+    for (size_t r = 0; r < 8; ++r) {
+      readers.emplace_back([&] {
+        std::vector<char> out(kObjectSize, 0x55);
+        ready.fetch_add(1);
+        while (ready.load() < 8) std::this_thread::yield();
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          const auto result = reader->BatchGetRanges({key}, {{out.data()}}, {{length}}, {{0}});
+          if (result != std::vector<bool>{true} ||
+              std::memcmp(out.data(), object.data(), length) != 0 ||
+              !std::all_of(out.begin() + length, out.end(), [](char c) { return c == 0x55; })) {
+            bad.fetch_add(1);
+          }
+        }
+      });
+    }
+    for (auto& thread : readers) thread.join();
+    EXPECT_EQ(bad.load(), 0u);
+    EXPECT_FALSE(LocallyResident(reader.get(), key));
+  }
+  const auto stats = reader->RemoteSingleFlightStats();
+  EXPECT_EQ(stats.lead, 0u);
+  EXPECT_EQ(stats.joined, 0u);
+  reader->Shutdown();
 }
 
 // The sglang shape against a cold key: eight layer groups, each naming the same

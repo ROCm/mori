@@ -257,6 +257,10 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
     return false;
   }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_WHOLE_OBJECT_CACHE", &dist.ranged_whole_object_cache,
+                    error)) {
+    return false;
+  }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_REMOTE_SINGLE_FLIGHT", &dist.remote_single_flight, error)) {
     return false;
   }

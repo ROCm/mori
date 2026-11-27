@@ -193,6 +193,21 @@ operators can find them in one place.
 
 ## Pre-existing / unrelated knobs
 
+The distributed standalone server also accepts
+`UMBP_DISTRIBUTED_RANGED_WHOLE_OBJECT_CACHE` (default `true`). It controls
+whether a complete object fetched by a ranged read is retained in this node's
+local medium, both for direct-to-slot and scratch-arena reads. The Python/C++
+configuration field is `UMBPDistributedConfig.ranged_whole_object_cache`.
+
+Setting it to `false` preserves local capacity but may repeat remote transfers.
+Whole-object ranged reads then bypass single-flight, because its followers
+normally consume the leader's retained copy. Existing local hits still work.
+This setting does not disable generic re-cache or background partial-read
+prefetch. To avoid all three automatic replica paths, also set
+`UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES=false` and
+`UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH=false`. Explicit writes/prefetch are
+unchanged. The default retains the previous behavior.
+
 | Env var | Default | Description |
 |---|---|---|
 | `MORI_UMBP_LOG_LEVEL` | unset, which means `error` | UMBP's log level: `trace`, `debug`, `info`, `warn`, `error` or `critical` (case-insensitive; anything else means `error`). `MORI_GLOBAL_LOG_LEVEL` sets every MORI module. See `include/mori/utils/mori_log.hpp`. |

@@ -399,13 +399,19 @@ struct UMBPDistributedConfig {
   // gated by cache_remote_admission / admission_max_block_bytes.
   bool ranged_locality_prefetch = true;
 
+  // Retain complete objects fetched by ranged reads in the local medium.
+  // Disable to trade repeated remote reads for more unique cache capacity.
+  // Independent of generic re-cache and partial-read locality prefetch.
+  bool ranged_whole_object_cache = true;
+
   // One remote pull per key per node at a time.  Concurrent whole-object ranged
   // reads of the same remote key (every TP rank of an engine reading one
   // TP-replicated object through a node-shared server) otherwise each pull it
   // over RDMA and each commit it, and all but the first commit are thrown away.
   // With this on, the first read pulls and commits; the others wait for that
   // commit (up to remote_single_flight_wait_ms) and read the local copy, or
-  // pull it themselves if it did not land.
+  // pull it themselves if it did not land. Whole-object ranged reads bypass
+  // single-flight when ranged_whole_object_cache is disabled.
   bool remote_single_flight = true;
   uint32_t remote_single_flight_wait_ms = 30000;
 

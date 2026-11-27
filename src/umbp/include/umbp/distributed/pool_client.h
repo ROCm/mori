@@ -653,9 +653,9 @@ class PoolClient {
   // Landing the object in this node's medium when it is ALREADY IN HAND -- the
   // arena slice is the whole object, or the peer can write straight into a slot
   // -- costs nothing on the wire. The pre-ranged code did it on every remote
-  // ranged read, unconditionally, so gating it would be a silent regression
-  // against a switch whose documented job is something else. The only question
-  // worth asking is whether there is a medium to install into.
+  // ranged read, unconditionally. ranged_whole_object_cache preserves that
+  // default while allowing capacity-sensitive callers to opt out separately.
+  // This predicate checks medium availability, not the individual policies.
   bool CanInstallLocally() const;
   // Fetching the object a SECOND time in the background costs up to one extra
   // copy of it on the wire. That is what ranged_locality_prefetch switches off,
