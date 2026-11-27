@@ -328,14 +328,16 @@ def asyncll_seg_words(world_size):
 def asyncll_reserve_words(world_size):
     """Indices (u64 words) of the compact-reserve words in ``send_count``, past the
     segmented ones (asyncll_seg_words): each source's base this round (``base``),
-    this rank's reservation at each peer (``place``), and the counter peers reserve
-    from (``counter``, alone on a 256 B line). ``words`` is the region's length.
-    Must match the Reserve*Slot helpers in ep_asyncll_kernel.hpp."""
+    this rank's reservation at each peer (``place``) and the round it is for
+    (``tag``), and the counter peers reserve from (``counter``, alone on a 256 B
+    line). ``words`` is the region's length. Must match the Reserve*Slot helpers in
+    ep_asyncll_kernel.hpp."""
     w = world_size
-    counter = -(-(6 * w + 3) // 32) * 32
+    counter = -(-(7 * w + 3) // 32) * 32
     return {
         "base": 4 * w + 3,
         "place": 5 * w + 3,
+        "tag": 6 * w + 3,
         "counter": counter,
         "words": counter + 32,
     }

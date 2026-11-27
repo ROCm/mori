@@ -627,8 +627,9 @@ class AsyncLLCompactReserveTest(unittest.TestCase):
                 seg, res = asyncll_seg_words(w), asyncll_reserve_words(w)
                 self.assertEqual(res["base"], seg["counts"] + w)
                 self.assertEqual(res["place"], res["base"] + w)
-                # The counter sits alone on a 256 B line past the place words.
-                self.assertGreaterEqual(res["counter"], res["place"] + w)
+                self.assertEqual(res["tag"], res["place"] + w)
+                # The counter sits alone on a 256 B line past the tags.
+                self.assertGreaterEqual(res["counter"], res["tag"] + w)
                 self.assertEqual(res["counter"] % 32, 0)
                 self.assertEqual(res["words"], res["counter"] + 32)
 

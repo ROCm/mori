@@ -1036,6 +1036,7 @@ __device__ __forceinline__ size_t SegCountSlot(const EpInterNodeDeviceCfg& confi
 //   [4W+3, 5W+3)  base of source s's rows in this rank's packed output this round (the receive
 //                 writes it, combine reads it)
 //   [5W+3, 6W+3)  this rank's reservation at peer d: (base << 32) | rows accepted
+//   [6W+3, 7W+3)  the round (epoch + 1) that reservation is for, as a u32
 //   then, alone on a 256 B line, the u32 counter peers reserve from
 // Must match asyncll_reserve_words() in internode_regions.py.
 __device__ __forceinline__ size_t ReserveBaseSlot(const EpInterNodeDeviceCfg& config, int srcPe) {
@@ -1044,8 +1045,11 @@ __device__ __forceinline__ size_t ReserveBaseSlot(const EpInterNodeDeviceCfg& co
 __device__ __forceinline__ size_t ReservePlaceSlot(const EpInterNodeDeviceCfg& config, int destPe) {
   return (static_cast<size_t>(config.worldSize) * 5 + 3 + destPe) * sizeof(uint64_t);
 }
+__device__ __forceinline__ size_t ReserveTagSlot(const EpInterNodeDeviceCfg& config, int destPe) {
+  return (static_cast<size_t>(config.worldSize) * 6 + 3 + destPe) * sizeof(uint64_t);
+}
 __device__ __forceinline__ size_t ReserveCounterSlot(const EpInterNodeDeviceCfg& config) {
-  return ((static_cast<size_t>(config.worldSize) * 6 + 3 + 31) / 32 * 32) * sizeof(uint64_t);
+  return ((static_cast<size_t>(config.worldSize) * 7 + 3 + 31) / 32 * 32) * sizeof(uint64_t);
 }
 // The mode word a reserving sender sends: the round's epoch (as SegModeWord), bit 31 to tell it
 // from a compact or segmented word, and the base of its rows.
@@ -1074,65 +1078,6 @@ __device__ __forceinline__ void SegCheckModeWords(const EpDispatchCombineArgs& a
       args.reg(args.offSendCount)->template GetAs<uint8_t*>() + SegStrideSlot(config, lane));
   if (core::AtomicLoadRelaxedSystem(const_cast<uint64_t*>(word)) != want)
     SegCountError(args, config, SegErrMismatch);
-}
-
-// The end of SlotAssign under compact reserve. The last block to finish reserves this rank's rows
-// in every peer's packed output, one remote fetch_add per peer from a lane each (one round trip),
-// and stages (base, rows accepted) for SendTransferSeg. An output holds MaxNumTokensToRecv rows,
-// first come first served: rows past it are not sent, and their dispDestTokIdMap entries are
-// nulled so combine does not wait for them. The ticket is dispatchGridBarrier[0], which no other
-// send pass uses; the receive clears it again.
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ void ReserveTail(const EpDispatchCombineArgs& args,
-                                            const EpInterNodeDeviceCfg& config) {
-  static_assert(kConfig.worldSize <= 64, "one lane of wave 0 reserves per peer");
-  __shared__ bool lastBlock;
-  __shared__ bool anyShort;
-  __shared__ int accepted[64];
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    __threadfence();  // this block's counter claims, before its ticket
-    lastBlock = atomicAdd(args.dispatchGridBarrier, 1u) == gridDim.x - 1;
-  }
-  __syncthreads();
-  if (!lastBlock) return;
-  const int lane = threadIdx.x & (warpSize - 1);
-  if (threadIdx.x < warpSize) {
-    __threadfence();
-    bool isShort = false;
-    if (lane < kConfig.worldSize) {
-      const int n = SendTokenCount(config, core::AtomicLoadRelaxed(args.destPeTokenCounter + lane));
-      uint32_t base = 0;
-      if (n > 0)
-        base = __hip_atomic_fetch_add(
-            static_cast<uint32_t*>(RegionPeerPtr(args.reg(args.offSendCount), lane - args.lsaBase,
-                                                 ReserveCounterSlot(config))),
-            static_cast<uint32_t>(n), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      const int64_t room = static_cast<int64_t>(config.MaxNumTokensToRecv()) - base;
-      const int ok = static_cast<int>(room < 0 ? 0 : (room < n ? room : n));
-      accepted[lane] = ok;
-      isShort = ok < n;
-      // Nothing placed: base 0, so the receiver's range check holds for a reservation past the end.
-      *reinterpret_cast<uint64_t*>(args.reg(args.offSendCount)->template GetAs<uint8_t*>() +
-                                   ReservePlaceSlot(config, lane)) =
-          (static_cast<uint64_t>(ok ? base : 0u) << 32) | static_cast<uint32_t>(ok);
-    }
-    const bool shortAny = __ballot(isShort) != 0;
-    if (lane == 0) {
-      anyShort = shortAny;
-      args.dispatchGridBarrier[0] = 0;
-    }
-  }
-  __syncthreads();
-  if (!anyShort) return;
-  const index_t null = NullSendBufSlotOffset(config);
-  const int entries = args.curRankNumToken * kConfig.numExpertPerToken;
-  for (int e = threadIdx.x; e < entries; e += blockDim.x) {
-    const index_t d = args.dispDestTokIdMap[e];
-    if (d < null &&
-        SlotIdFromSendBufSlotOffset(config, d) >= accepted[PeFromSendBufSlotOffset(config, d)])
-      args.dispDestTokIdMap[e] = null;
-  }
 }
 
 // The dispatch receive under compact reserve: rows and fields are already in place, so only
@@ -1257,12 +1202,18 @@ __device__ __forceinline__ void DirectPostRowsPerWarp(
 // returns true in the one block that reserved last (counted at `arrival`), so what that block
 // reserves next lands behind every block's rows. Always true with one part. The caller follows
 // with a block barrier before anything that must land behind the rows.
-template <EpInterNodeKernelCfg kConfig, bool kSplit = false>
+// `late` (optional): thread 0 calls late(false) just after the first pass's loads and late(true)
+// after the first pass, before this block reserves ring space or is counted; the latter returns a
+// row offset added to both destinations (compact reserve's base, whose round trip the first pass
+// hides).
+struct NoLateRows {};
+template <EpInterNodeKernelCfg kConfig, bool kSplit = false, typename Late = NoLateRows>
 __device__ __forceinline__ bool DirectPostRows(
     const EpDispatchCombineArgs& args, const ::mori::cco::ccoDevComm& comm,
     const EpInterNodeDeviceCfg& config, int peer, int q, uint8_t* dst, const uint8_t* srcTokAt,
     size_t srcTokStride, int tokenNum, size_t hiddenBytes, uint8_t* scaleDst = nullptr,
-    size_t scaleBytes = 0, int part = 0, int parts = 1, int* arrival = nullptr) {
+    size_t scaleBytes = 0, int part = 0, int parts = 1, int* arrival = nullptr, Late late = {}) {
+  constexpr bool kLate = !std::is_same_v<Late, NoLateRows>;
 #if MORI_ASYNCLL_BATCH_POST
   // All waves place the peer's runs at their run index; one reservation and doorbell per half ring.
   constexpr int kMaxBatches = (kConfig.maxNumInpTokenPerRank + 31) / 32;
@@ -1277,6 +1228,7 @@ __device__ __forceinline__ bool DirectPostRows(
           : kHalfRingRuns;
   __shared__ int runStart[kMaxBatches + 1];
   __shared__ uint64_t runBase;
+  __shared__ uint64_t lateRows;
   ::mori::cco::ccoSdma sdma{comm};
   const int laneId = threadIdx.x & (warpSize - 1);
   const int warpId = threadIdx.x / warpSize;
@@ -1323,6 +1275,10 @@ __device__ __forceinline__ bool DirectPostRows(
 #pragma unroll
   for (int i = 0; i < kReg; ++i) tok0[i] = srcTokOf(warpId + i * warpNum);
   __builtin_amdgcn_sched_barrier(0);  // keep the loads above ahead of the first wait below
+  // Behind the loads: the first wait for them also covers this round trip.
+  if constexpr (kLate) {
+    if (threadIdx.x == 0) late(false);
+  }
   ::mori::cco::ccoSdmaQueueDeviceHandle* const qh = WaveUniform(qhLoaded);
   uint32_t* const ring = WaveUniform(::mori::cco::ccoSdma::ring(qh));
   ::mori::cco::ccoSdmaQueueDeviceHandle h{};  // thread 0's copy for every reserve and publish
@@ -1360,6 +1316,8 @@ __device__ __forceinline__ bool DirectPostRows(
     }
     if (laneId == 0) {
       runStart[0] = 0;
+      // Before this block holds ring space: a part waiting on another must not hold any.
+      if constexpr (kLate) lateRows = late(true);
       runBase =
           carry ? h.ReserveSlot(static_cast<uint64_t>(min(carry, chunkRuns)) * perRun * kPkt, qh)
                 : 0;
@@ -1367,6 +1325,10 @@ __device__ __forceinline__ bool DirectPostRows(
     }
   }
   __syncthreads();
+  if constexpr (kLate) {
+    dst += lateRows * hiddenBytes;
+    if (scaleDst) scaleDst += lateRows * scaleBytes;
+  }
 
   // Pass 2: run g in [lo, hi) to packet g - lo at base; regs: first kReg batches from pass 1.
   auto placeRange = [&](int lo, int hi, uint64_t base, bool regs) {
@@ -1439,10 +1401,130 @@ __device__ __forceinline__ bool DirectPostRows(
   __syncthreads();
   return lastBlock;
 #else
+  static_assert(!kLate, "late rows need MORI_ASYNCLL_BATCH_POST");
   DirectPostRowsPerWarp<kConfig>(args, comm, config, peer, q, dst, srcTokAt, srcTokStride, tokenNum,
                                  hiddenBytes, scaleDst, scaleBytes);
   return true;
 #endif
+}
+
+// Compact reserve: a part's wait for part 0's reservation of this round (tag, then the place word).
+__device__ __forceinline__ uint64_t ReserveAwait(uint32_t* tagWord, uint64_t* placeWord,
+                                                 uint32_t tag) {
+  while (__hip_atomic_load(tagWord, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != tag)
+    __builtin_amdgcn_s_sleep(1);
+  return __hip_atomic_load(placeWord, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+// Compact reserve's rows to one peer. Part 0 reserves this rank's rows in the peer's packed output
+// with one remote fetch_add on its counter and publishes (base << 32 | accepted) at
+// ReservePlaceSlot, then this round's tag at ReserveTagSlot; the other parts and the tail read
+// them there. Without a receive cap every row fits, so the base is needed only to place packets
+// and the round trip hides behind DirectPostRows' first pass. With one, the accepted count decides
+// the rows: part 0 waits for it, and nulls the dispDestTokIdMap entries past it so combine does
+// not wait for them. Returns DirectPostRows' result; `tokenNum` becomes the accepted count.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ bool ReservePostRows(const EpDispatchCombineArgs& args,
+                                                const ::mori::cco::ccoDevComm& comm, int destPe,
+                                                int part, int parts, const uint8_t* srcTokAt,
+                                                size_t& tokenNum, size_t hiddenBytes,
+                                                size_t scaleBytes) {
+  constexpr EpInterNodeDeviceCfg config = EpInterNodeDeviceCfgOf(kConfig);
+  // MaxNumTokensToRecvPerRank() < MaxNumTokensToSendPerRank(), from the rendered cfg.
+  constexpr bool kCapped =
+      kConfig.maxTotalRecvTokens > 0 &&
+      (kConfig.maxTotalRecvTokens + kConfig.worldSize - 1) / kConfig.worldSize <
+          kConfig.maxNumInpTokenPerRank;
+  const int peer = destPe - args.lsaBase;
+  const int q = QueueForPe(comm, destPe, args.sdmaQueueOffset);
+  const uint32_t want = static_cast<uint32_t>(tokenNum);
+  // The words' addresses are rebuilt where used: the row posting between needs every register.
+  auto words = [&]() { return args.reg(args.offSendCount)->template GetAs<uint8_t*>(); };
+  auto placeWord = [&]() {
+    return reinterpret_cast<uint64_t*>(words() + ReservePlaceSlot(config, destPe));
+  };
+  auto tagWord = [&]() {
+    return reinterpret_cast<uint32_t*>(words() + ReserveTagSlot(config, destPe));
+  };
+  auto tag = [&]() { return static_cast<uint32_t>(args.crossDeviceBarrierFlag[0]) + 1u; };
+  // Left undefined unless part 0 reserves, so the branch does not force the result early.
+  uint32_t pending;
+  auto reserve = [&]() {
+    if (part == 0 && want > 0)
+      pending = __hip_atomic_fetch_add(
+          static_cast<uint32_t*>(
+              RegionPeerPtr(args.reg(args.offSendCount), peer, ReserveCounterSlot(config))),
+          want, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  };
+  // Part 0's thread 0: the place word, then the tag, both ahead of its arrival count.
+  auto publish = [&](uint32_t base, uint32_t accepted) {
+    __hip_atomic_store(placeWord(), (static_cast<uint64_t>(base) << 32) | accepted,
+                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(tagWord(), tag(), __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  };
+  uint8_t* hiddenOut = static_cast<uint8_t*>(RegionPeerPtr(args.reg(args.offDispatchOut), peer, 0));
+  uint8_t* scaleOut =
+      scaleBytes ? static_cast<uint8_t*>(RegionPeerPtr(args.reg(args.offOutScales), peer, 0))
+                 : nullptr;
+  int* const arrival = args.blockFlagCounter + destPe;
+  if constexpr (kCapped) {
+    __shared__ uint64_t placed;
+    if (threadIdx.x == 0) {
+      reserve();
+      if (part == 0) {
+        if (want == 0) pending = 0;
+        const int64_t room = static_cast<int64_t>(config.MaxNumTokensToRecv()) - pending;
+        const uint32_t ok = room <= 0 ? 0u : (room < want ? static_cast<uint32_t>(room) : want);
+        // Nothing placed: base 0, so the receiver's range check holds past the end.
+        publish(ok ? pending : 0u, ok);
+        placed = (static_cast<uint64_t>(ok ? pending : 0u) << 32) | ok;
+      } else {
+        placed = ReserveAwait(tagWord(), placeWord(), tag());
+      }
+    }
+    __syncthreads();
+    const uint32_t ok = static_cast<uint32_t>(placed);
+    const size_t base = placed >> 32;
+    if (part == 0 && ok < want) {
+      const index_t null = NullSendBufSlotOffset(config);
+      const int entries = args.curRankNumToken * kConfig.numExpertPerToken;
+      for (int e = threadIdx.x; e < entries; e += blockDim.x) {
+        const index_t d = args.dispDestTokIdMap[e];
+        if (d < null && PeFromSendBufSlotOffset(config, d) == destPe &&
+            SlotIdFromSendBufSlotOffset(config, d) >= static_cast<int>(ok))
+          args.dispDestTokIdMap[e] = null;
+      }
+    }
+    tokenNum = ok;
+    hiddenOut += base * hiddenBytes;
+    if (scaleOut) scaleOut += base * scaleBytes;
+    auto post = [&](auto split) {
+      return DirectPostRows<kConfig, decltype(split)::value>(
+          args, comm, config, peer, q, hiddenOut, srcTokAt, sizeof(index_t), static_cast<int>(ok),
+          hiddenBytes, scaleOut, scaleBytes, part, parts, arrival);
+    };
+    return parts > 1 ? post(std::true_type{}) : post(std::false_type{});
+  } else {
+    auto late = [&](bool resolve) -> uint64_t {
+      if (!resolve) {
+        reserve();
+        return 0;
+      }
+      if (part == 0) {
+        const uint32_t base = want ? pending : 0u;  // waits for the fetch_add here
+        publish(base, want);
+        return base;
+      }
+      return ReserveAwait(tagWord(), placeWord(), tag()) >> 32;
+    };
+    auto post = [&](auto split) {
+      return DirectPostRows<kConfig, decltype(split)::value, decltype(late)>(
+          args, comm, config, peer, q, hiddenOut, srcTokAt, sizeof(index_t), static_cast<int>(want),
+          hiddenBytes, scaleOut, scaleBytes, part, parts, arrival, late);
+    };
+    return parts > 1 ? post(std::true_type{}) : post(std::false_type{});
+  }
 }
 
 // Direct compact dispatch to one peer: the rows (DirectPostRows), then after a block barrier
@@ -1655,7 +1737,6 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
     // blockClaims is reset at the top of the next round.
     __syncthreads();
   }
-  if constexpr (asyncll::CompactReserve<kConfig>) asyncll::ReserveTail<kConfig>(args, config);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -2561,19 +2642,29 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
       // before the engine is handed either.
       const uint64_t flag = args.crossDeviceBarrierFlag[0];
       uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+      // Compact reserve: the peer's base and row count, loaded beside the count below.
+      uint64_t reserved[2] = {0, 0};
+      if constexpr (asyncll::CompactReserve<kConfig>) {
+        reserved[0] =
+            *reinterpret_cast<const uint64_t*>(words + asyncll::ReserveBaseSlot(config, destPe));
+        reserved[1] = *reinterpret_cast<const uint64_t*>(words + asyncll::SendCountSlot(destPe));
+      }
       uint64_t announced = 0;
       if (laneId == 0) {
         uint64_t* slot = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe));
         announced = core::AtomicLoadRelaxedSystem(slot);
         core::AtomicStoreRelaxedSystem(slot, uint64_t{0});
-        *reinterpret_cast<uint64_t*>(words + asyncll::SendFlagSlot(destPe)) = flag;
-        __threadfence_system();
+        // Compact reserve sends the epoch as a packet immediate (below): nothing to stage.
+        if constexpr (!asyncll::CompactReserve<kConfig>) {
+          *reinterpret_cast<uint64_t*>(words + asyncll::SendFlagSlot(destPe)) = flag;
+          __threadfence_system();
+        }
       }
       announced = __shfl(static_cast<unsigned long long>(announced), 0);
       // Compact reserve: where the peer reserved its rows (the receive recorded it).
       const uint64_t first =
           asyncll::CompactReserve<kConfig>
-              ? *reinterpret_cast<const uint64_t*>(words + asyncll::ReserveBaseSlot(config, destPe))
+              ? reserved[0]
               : __shfl(
                     static_cast<unsigned long long>(asyncll::CombineRowStart(words, npes, laneId)),
                     destPe);
@@ -2581,7 +2672,9 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
       const uint64_t tokenNum =
           (announced == 0)
               ? 0
-              : *reinterpret_cast<const uint64_t*>(words + asyncll::SendCountSlot(destPe));
+              : (asyncll::CompactReserve<kConfig>
+                     ? reserved[1]
+                     : *reinterpret_cast<const uint64_t*>(words + asyncll::SendCountSlot(destPe)));
       if (destPe == myPe) {
         if (laneId == 0) {
           uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
@@ -2590,6 +2683,25 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         continue;
       }
       const int peer = destPe - args.lsaBase;
+      if constexpr (asyncll::CompactReserve<kConfig>) {
+        // As CombineSendTransferSeg: the epoch rides the packet behind the rows; the count clear
+        // above is released first.
+#if MORI_ASYNCLL_INLINE_CLEAR_FENCE
+        if (laneId == 0) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+#endif
+        asyncll::PostPayloadAndInlineNotify(
+            comm, peer, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
+            asyncll::RegionPeerPtr(
+                args.reg(args.offCombineInp), peer,
+                static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes),
+            const_cast<uint8_t*>(static_cast<const uint8_t*>(args.inpTokenBuf) +
+                                 first * hiddenBytes),
+            static_cast<size_t>(tokenNum) * hiddenBytes,
+            asyncll::RegionPeerPtr(args.reg(args.offCrossDeviceBarrier), peer,
+                                   myPe * sizeof(uint64_t)),
+            flag);
+        continue;
+      }
       asyncll::PostPayloadAndNotifyPtr(
           comm, peer, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
           asyncll::RegionPeerPtr(
@@ -3088,13 +3200,9 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
     const int destPe = unit % npes;
     const int part = unit / npes;
     const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
-    // Compact reserve: SlotAssign reserved [base, base + accepted) of the peer's packed output.
-    uint64_t place = 0;
-    if constexpr (kReserve)
-      place = *reinterpret_cast<const uint64_t*>(words + asyncll::ReservePlaceSlot(config, destPe));
-    const size_t tokenNum =
-        kReserve ? static_cast<uint32_t>(place) : static_cast<size_t>(min(raw, stride));
-    const size_t base = place >> 32;
+    // Compact reserve: every row this rank has for the peer, until ReservePostRows reserves them.
+    size_t tokenNum = kReserve ? static_cast<size_t>(asyncll::SendTokenCount(config, raw))
+                               : static_cast<size_t>(min(raw, stride));
     // This block reserved the peer's last rows, so it posts what follows them.
     bool postTail = true;
     if constexpr (asyncll::Direct<kConfig> && MORI_ASYNCLL_FUSE_META) {
@@ -3118,7 +3226,6 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
       // the other fields.
       if (destPe / config.gpuPerNode == myNode) {
         const EpInterNodeRegion landing = args.reg(args.offDispatchInp);
-        const int peer = destPe - args.lsaBase;
         // Compact reserve stages own rows' fields too (DirectWriteMetaGroup).
         const uint8_t* srcTokAt =
             (destPe == myPe && !kReserve)
@@ -3130,19 +3237,12 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
                           srcTokenIdBytes;
         // With fused metadata the scale rows ride the same runs instead of the staging.
         const bool scaleRuns = MORI_ASYNCLL_FUSE_META && args.scalesBuf && scaleBytes > 0;
-        auto post = [&](auto split) {
-          if constexpr (kReserve) {
-            // The rows this rank reserved in the peer's packed output.
-            return asyncll::DirectPostRows<kConfig, decltype(split)::value>(
-                args, comm, config, peer, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
-                static_cast<uint8_t*>(asyncll::RegionPeerPtr(args.reg(args.offDispatchOut), peer,
-                                                             base * hiddenBytes)),
-                srcTokAt, srcTokenIdBytes, static_cast<int>(tokenNum), hiddenBytes,
-                scaleRuns ? static_cast<uint8_t*>(asyncll::RegionPeerPtr(
-                                args.reg(args.offOutScales), peer, base * scaleBytes))
-                          : nullptr,
-                scaleRuns ? scaleBytes : 0, part, parts, args.blockFlagCounter + destPe);
-          } else {
+        if constexpr (kReserve) {
+          postTail =
+              asyncll::ReservePostRows<kConfig>(args, comm, destPe, part, parts, srcTokAt, tokenNum,
+                                                hiddenBytes, scaleRuns ? scaleBytes : 0);
+        } else {
+          auto post = [&](auto split) {
             return asyncll::DirectPostRows<kConfig, decltype(split)::value>(
                 args, comm, config, destPe - args.lsaBase,
                 asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
@@ -3155,9 +3255,9 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
                                 layout.scale + static_cast<size_t>(myPe) * stride * scaleBytes))
                           : nullptr,
                 scaleRuns ? scaleBytes : 0, part, parts, args.blockFlagCounter + destPe);
-          }
-        };
-        postTail = parts > 1 ? post(std::true_type{}) : post(std::false_type{});
+          };
+          postTail = parts > 1 ? post(std::true_type{}) : post(std::false_type{});
+        }
       }
       __syncthreads();
     }
@@ -3167,9 +3267,11 @@ __device__ void EpDispatchAsyncLLSendTransferSeg_body(EpDispatchCombineArgs args
     // Reloaded rather than kept live across the row posting, which needs every register.
     uint64_t tailBase = 0;
     if constexpr (kReserve)
-      tailBase =
-          *reinterpret_cast<const uint64_t*>(words + asyncll::ReservePlaceSlot(config, destPe)) >>
-          32;
+      tailBase = asyncll::ReserveAwait(
+                     reinterpret_cast<uint32_t*>(words + asyncll::ReserveTagSlot(config, destPe)),
+                     reinterpret_cast<uint64_t*>(words + asyncll::ReservePlaceSlot(config, destPe)),
+                     static_cast<uint32_t>(args.crossDeviceBarrierFlag[0]) + 1u) >>
+                 32;
     // Compact reserve: own rows go out like a peer's, on the loopback queue.
     if (destPe == myPe && !kReserve) {
       if (laneId == 0) {
@@ -3690,7 +3792,9 @@ __device__ __forceinline__ void EpAsyncLLSegDrain(const EpDispatchCombineArgs& a
 
 // CombineRecvCopySeg fused, with a shorter chain. Block 0 always waits, so the kernel still ends
 // after every epoch; blocks with no work exit.
-template <EpInterNodeKernelCfg kConfig, typename T>
+// kReserve: the compact reserve receive instead (CombineRecvCopy's rows): a peer's reply at
+// [destTokId] of inter_combine_inp, this rank's own rows at [base + slot] of the expert output.
+template <EpInterNodeKernelCfg kConfig, typename T, bool kReserve = false>
 __device__ void EpCombineAsyncLLRecvCopySegTrim_body(EpDispatchCombineArgs args,
                                                      const ::mori::cco::ccoDevComm& comm) {
   EpAsyncLLSegDrain<kConfig, false>(args, comm);
@@ -3702,9 +3806,15 @@ __device__ void EpCombineAsyncLLRecvCopySegTrim_body(EpDispatchCombineArgs args,
   T** srcPtrs = reinterpret_cast<T**>(epAsyncLlShared) + warpId * kTopk;
 
   const uint64_t flag = args.crossDeviceBarrierFlag[0];
-  const int stride = asyncll::SegStrideOf(args, config);
+  const int stride = kReserve ? 0 : asyncll::SegStrideOf(args, config);
   T* peerBase = args.reg(args.offCombineInp)->template GetAs<T*>();
-  T* selfBase = args.reg(args.offDispatchStaging)->template GetAs<T*>();
+  T* selfBase = kReserve ? const_cast<T*>(static_cast<const T*>(args.inpTokenBuf))
+                         : args.reg(args.offDispatchStaging)->template GetAs<T*>();
+  size_t ownFirst = 0;
+  if constexpr (kReserve)
+    ownFirst = *reinterpret_cast<const uint64_t*>(
+        args.reg(args.offSendCount)->template GetAs<const uint8_t*>() +
+        asyncll::ReserveBaseSlot(config, myPe));
   T* outBase = args.reg(args.offCombineOut)->template GetAs<T*>();
   uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
   EpAsyncLLSegDrain<kConfig, true>(args, comm);
@@ -3746,6 +3856,12 @@ __device__ void EpCombineAsyncLLRecvCopySegTrim_body(EpDispatchCombineArgs args,
   auto row = [&](const Item& it, index_t destTokId) -> T* {
     const index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
     if (destPe >= npes) return nullptr;
+    if constexpr (kReserve)
+      return ((destPe != myPe)
+                  ? peerBase + static_cast<size_t>(destTokId) * hiddenDim
+                  : selfBase +
+                        (ownFirst + SlotIdFromSendBufSlotOffset(config, destTokId)) * hiddenDim) +
+             it.dimOffset;
     return ((destPe != myPe) ? peerBase : selfBase) +
            (static_cast<size_t>(destPe) * stride + SlotIdFromSendBufSlotOffset(config, destTokId)) *
                hiddenDim +
@@ -3810,6 +3926,13 @@ __device__ void EpDispatchAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
                                                    const ::mori::cco::ccoDevComm& comm) {
+#if MORI_ASYNCLL_RECV_TRIM
+  // Compact reserve: the segmented receive's shorter chain, at the compact rows.
+  if constexpr (asyncll::CompactReserve<kConfig>) {
+    EpCombineAsyncLLRecvCopySegTrim_body<kConfig, T, true>(args, comm);
+    return;
+  }
+#endif
   const uint64_t flag = args.crossDeviceBarrierFlag[0];
   EpAsyncLLFusedQuiet<kConfig>(args, comm);
   const int lane = threadIdx.x & (warpSize - 1);
