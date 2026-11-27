@@ -506,15 +506,40 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     uint64_t recvDirect, const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4,
     uint64_t call, size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap,
     size_t grid, size_t blk, int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId,
-    int waveSize) {
+    int waveSize, size_t copyBlocks = 0) {
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
   const size_t peers = np - 1;
   const size_t tiles = (chunk4 + MORI_CCL_TDM_A2A_TILE_ELEMS - 1) / MORI_CCL_TDM_A2A_TILE_ELEMS;
   const size_t items = tiles * peers;
   const size_t first = static_cast<size_t>(warpId) * grid + blk;
+  // copyBlocks of the grid's blocks copy the chunk this rank keeps while the others push; 0
+  // leaves every block doing both, one after the other. A block cannot do the two at once, and
+  // the push is bound more by the links than by the number of blocks, so a few blocks taken
+  // off it cost less than the copy they hide. Measured at 1 GiB a rank on 4 gfx1250 GPUs, 64
+  // blocks, into registered outputs, us a call by copyBlocks: 0 587.6, 2 999.2 (the copy is
+  // the longer of the two), 4 555.0, 6 557.5, 8 560.7, 16 587.5. Into the output transit
+  // buffer the same split is slower instead (8: 702.3 against 593.7), so the zero-copy call
+  // passes 0.
+  const size_t cb = copyBlocks < grid ? copyBlocks : 0;
+  const size_t pushBlocks = grid - cb;
+  const size_t warps = totalWarps / grid;
+  const size_t pushFirst = static_cast<size_t>(warpId) * pushBlocks + blk;
+  const size_t pushStride = pushBlocks * warps;
+  const size_t ownFirst = cb == 0 ? first : static_cast<size_t>(warpId) * cb + (blk - pushBlocks);
+  const size_t ownStride = cb == 0 ? totalWarps : cb * warps;
+  if (blk >= pushBlocks) {
+    for (size_t t = ownFirst; t < tiles; t += ownStride) {
+      const size_t off = t * MORI_CCL_TDM_A2A_TILE_ELEMS;
+      const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                           ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                           : chunk4 - off;
+      const size_t at = me * chunk4 + off;
+      CclTdmA2aWarpCopy(res4 + at, src4 + at, n, ldsTile, laneId, waveSize);
+    }
+  }
 
-  for (size_t i = first; i < items; i += totalWarps) {
+  for (size_t i = blk < pushBlocks ? pushFirst : items; i < items; i += pushStride) {
     const size_t destPe = (me + 1 + i % peers) % np;
     const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
@@ -550,7 +575,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
   }
 
   // The chunk this rank keeps, while the peers' words are on their way.
-  for (size_t t = first; t < tiles; t += totalWarps) {
+  for (size_t t = cb == 0 ? first : tiles; t < tiles; t += totalWarps) {
     const size_t off = t * MORI_CCL_TDM_A2A_TILE_ELEMS;
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
                          ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
@@ -712,6 +737,7 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
       // straight into this rank's, one bit a rank. Both stay 0 on a handle without registrations.
       uint64_t sendDirect = 0;
       uint64_t recvDirect = 0;
+      const uint64_t allPeers = ((1ULL << npes) - 1ULL) & ~(1ULL << myPe);
       if ((outputReg & 2ULL) != 0) {
         // The handle has registered outputs: the ranks tell each other, in the start token, which
         // registration their output of this call belongs to and whether peers reach it. A tile
@@ -727,12 +753,17 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
         if (outputMemObj.gpu != nullptr) sendDirect = s_reachMask;
         if ((outputReg & 1ULL) != 0) recvDirect = s_sameMask;
       }
+      // With every peer delivering directly in both directions, some blocks only copy the
+      // kept chunk (see CclTdmA2aCopyAfterPush). The kept chunk is 1 / npes of the data.
+      const size_t copyBlocks = (sendDirect & recvDirect & allPeers) == allPeers
+                                    ? grid / (3 * static_cast<size_t>(npes))
+                                    : 0;
       const size_t half = static_cast<size_t>(call & 1ULL) * halfElems;
       detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
                                      localTransit + half, localTransit, outputMemObj, sendDirect,
                                      recvDirect, outputTransitMemObj, chunk4, call, half,
                                      wordsElems, tileStride, detail::kCclTdmA2aWordGap, grid, blk,
-                                     warpId, totalWarps, ldsTile, laneId, waveSize);
+                                     warpId, totalWarps, ldsTile, laneId, waveSize, copyBlocks);
     } else {
       detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
                                       localTransit, outputTransitMemObj, chunk4, call, halfElems,
