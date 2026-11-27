@@ -25,10 +25,16 @@
 
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/core.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 #include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace shmem {
+
+// Counts one RDMA operation of `bytes` with rank `pe`; nothing when metrics are off.
+inline __device__ void CountRdmaTraffic(const GpuStates* states, int op, int pe, uint64_t bytes) {
+  application::RdmaTrafficCount(states->rdmaTxBytes, states->worldSize, op, pe, bytes);
+}
 
 #ifdef MORI_DEVICE_NIC_BNXT
 #define DISPATCH_MLX5 0
@@ -559,6 +565,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficPut, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -786,6 +793,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
   // assert(destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficInline, pe, bytes);
 
   // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
   uintptr_t raddr;
@@ -935,6 +943,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   // assert(sourceOffset + bytes <= source->size && destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficPut, pe, bytes);
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, sizeof(uint64_t));
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -1286,6 +1296,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   // assert(destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -1462,6 +1473,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
                                                          int qpId) {
   // assert(destOffset + bytes <= dest->size);
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -1687,6 +1699,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficPut, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -1897,6 +1910,7 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficInline, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -2032,6 +2046,8 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficPut, pe, bytes);
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, sizeof(uint64_t));
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -2362,6 +2378,7 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -2501,6 +2518,7 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
                                                              core::atomicType amoType, int pe,
                                                              int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficAtomic, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -2681,6 +2699,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficGet, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
@@ -2893,6 +2912,7 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  CountRdmaTraffic(globalGpuStates, application::kRdmaTrafficGet, pe, bytes);
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;

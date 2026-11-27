@@ -1,0 +1,19 @@
+# Prometheus configuration of the MORI traffic example (traffic.sh up mounts it as is).
+#
+# Every MORI process serves its own /metrics on MORI_METRICS_PORT + its local rank.
+# Two ways to find them, both active here:
+#   - /targets/*.json: the files the processes write themselves when
+#     MORI_METRICS_PORT_DIR is set (one per process, removed when it exits);
+#     traffic.sh up mounts that directory. A new job is picked up within seconds.
+#   - /targets-static/*.json: the fixed list traffic.sh up writes from TRAFFIC_TARGETS.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: mori_traffic
+    file_sd_configs:
+      - files:
+          - /targets/*.json
+          - /targets-static/*.json
+        refresh_interval: 5s

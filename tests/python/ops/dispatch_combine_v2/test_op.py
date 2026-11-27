@@ -574,6 +574,8 @@ def _run(d, comm):
                     cap is not None,
                 )
 
+        _check_traffic_stats(op, d, rank, npes)
+
 
 def _lec_ref(d, idx, ct_point):
     """This rank's expected local_expert_count: its experts' ids over every rank's
@@ -645,6 +647,86 @@ def _reroute_rounds(d, comm, op, inp, wts, sc_in, ct, ct_point, num_experts, cap
         print(
             f"# OP-REROUTE ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
             f"({REROUTE} rounds, {errs} stale reads)",
+            flush=True,
+        )
+
+
+def _check_traffic_stats(op, d, rank, npes):
+    """With metrics on (MORI_METRICS_ENABLE=1), check the per-peer token counts
+    across ranks. Prints nothing when the op has no statistics."""
+    get = getattr(op, "get_traffic_stats", None)
+    stats = get() if get is not None else None
+    if stats is None:
+        return
+
+    def world_matrix(key):
+        # Row `rank` is this rank's per-peer vector; summing over ranks fills it in.
+        m = torch.zeros(npes, npes, dtype=torch.int64)
+        m[rank] = stats[key].to(torch.int64).cpu()
+        dist.all_reduce(m, op=dist.ReduceOp.SUM)
+        return m
+
+    # MORI_METRICS_SAMPLE_EP=<n>: one dispatch in n counts, n-fold. Checked is each
+    # rank's own bookkeeping: REPLAY does not give every dispatch its combine.
+    import mori.metrics
+
+    period = mori.metrics.sampling()["ep"]
+    if period != 1:
+        calls = stats["dispatch_calls"]
+        sent = int(stats["dispatch_sent"].sum())
+        if calls == 0:
+            # With one in n, a rank may have had none of this run's dispatches taken.
+            ok = stats["combine_calls"] == 0 and sent == 0
+        elif period == 0:
+            ok = False
+        else:
+            ok = (
+                calls % period == 0
+                and sent > 0
+                and bool(
+                    (
+                        stats["combine_sent"] * calls
+                        == stats["dispatch_recv"] * stats["combine_calls"]
+                    ).all()
+                )
+                and stats["dispatch_kernel_seconds"] > 0
+                and stats["combine_kernel_seconds"] > 0
+            )
+        bad = d.allreduce_sum(0 if ok else 1)
+        if rank == 0:
+            print(
+                f"# OP-STATS ct=all: {'PASS' if bad == 0 else 'FAIL'} "
+                f"(sampled 1/{period}: calls={calls}/{stats['combine_calls']} "
+                f"tokens={sent}{'' if bad == 0 else f' bad_ranks={bad}'})",
+                flush=True,
+            )
+        return
+
+    disp_tx, disp_rx = world_matrix("dispatch_sent"), world_matrix("dispatch_recv")
+    comb_tx, comb_rx = world_matrix("combine_sent"), world_matrix("combine_recv")
+    checks = {
+        "disp_tx==rx": bool((disp_tx == disp_rx.t()).all()),
+        "comb_tx==rx": bool((comb_tx == comb_rx.t()).all()),
+        # A combine returns what ONE dispatch delivered; REPLAY runs each one twice.
+        "comb==disp": bool(
+            (
+                comb_tx * stats["dispatch_calls"] == disp_rx * stats["combine_calls"]
+            ).all()
+        ),
+        "counted": int(disp_tx.sum()) > 0,
+        "calls": stats["dispatch_calls"] > 0 and stats["combine_calls"] > 0,
+        "timed": stats["dispatch_kernel_seconds"] > 0
+        and stats["combine_kernel_seconds"] > 0,
+    }
+    if rank == 0:
+        bad = [k for k, ok in checks.items() if not ok]
+        print(
+            f"# OP-STATS ct=all: {'PASS' if not bad else 'FAIL'} "
+            f"(tokens={int(disp_tx.sum())} local={int(disp_tx.diag().sum())} "
+            f"calls={stats['dispatch_calls']}/{stats['combine_calls']} "
+            f"kernel_us={stats['dispatch_kernel_seconds'] / stats['dispatch_calls'] * 1e6:.0f}/"
+            f"{stats['combine_kernel_seconds'] / stats['combine_calls'] * 1e6:.0f}"
+            f"{' bad=' + ','.join(bad) if bad else ''})",
             flush=True,
         )
 

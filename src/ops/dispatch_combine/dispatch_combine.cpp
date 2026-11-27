@@ -29,6 +29,7 @@
 
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/core/core.hpp"
+#include "mori/metrics/metrics.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/env_utils.hpp"
@@ -201,11 +202,77 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
   InitializeBarrier();
+  InitializeTrafficStats();
 
   this->multiProcessorCount = GetCurDeviceMultiProcessorCount();
   this->maxThreads = std::min(GetCurDeviceMaxThreads(), 1024);
   MORI_OPS_INFO("Device capability: multiProcessorCount={}, maxThreads={}",
                 static_cast<int>(this->multiProcessorCount), static_cast<int>(this->maxThreads));
+}
+
+void EpDispatchCombineHandle::InitializeTrafficStats() {
+  if (!mori::metrics::TrafficEnabled()) return;
+  EpTrafficStatsConfig statsConfig;
+  statsConfig.rank = config.rank;
+  statsConfig.worldSize = config.worldSize;
+  statsConfig.gpuPerNode = config.gpuPerNode;
+  statsConfig.impl = "v1";
+  switch (config.kernelType) {
+    case KernelType::IntraNode:
+      statsConfig.kernel = "intranode";
+      break;
+    case KernelType::InterNodeV1:
+      statsConfig.kernel = "internode_v1";
+      break;
+    case KernelType::InterNodeV1LL:
+      statsConfig.kernel = "internode_v1ll";
+      break;
+    default:
+      // The other kernels do not count: no block, rather than traffic that is all zero.
+      return;
+  }
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->rdmaStates != nullptr && states->rdmaStates->commContext != nullptr) {
+    statsConfig.peers = states->rdmaStates->commContext->PeIdentities();
+  }
+  trafficStatsOwner = std::make_shared<EpTrafficStats>(std::move(statsConfig));
+  trafficStats = trafficStatsOwner->DevicePtr();
+}
+
+void EpDispatchCombineHandle::NoteLaunchForStats(int op, int hiddenDim) {
+  if (!trafficStatsOwner) return;
+  EpDispatchCombineConfig cfg = config;
+  if (hiddenDim > 0) cfg.hiddenDim = hiddenDim;
+  size_t typeSize = 0;
+  switch (inputType) {
+    case HIP_R_32F:
+      typeSize = 4;
+      break;
+    case HIP_R_16BF:
+      typeSize = 2;
+      break;
+    default:  // the 8-bit float formats; FP4 is packed and sized below
+      typeSize = 1;
+      break;
+  }
+  uint64_t bytes = 0;
+  if (op == kEpStatsDispatch) {
+    bytes = cfg.XferBytesPerToken(typeSize);
+  } else {
+    // Must match what the combine kernels move per token (combXferBytes in intranode.hpp).
+    size_t hiddenBytes = cfg.HiddenBytes(typeSize);
+    size_t scaleBytes = 0;
+    if (cfg.quantType == QuantType::Fp8BlockwiseQuant) {
+      hiddenBytes = cfg.HiddenBytes(1);
+      scaleBytes = static_cast<size_t>(fp8BlockwiseCombineScaleDim) * sizeof(float);
+    } else if (cfg.quantType == QuantType::Fp4BlockwiseQuant) {
+      hiddenBytes = (static_cast<size_t>(cfg.hiddenDim) + 1) / 2;
+      scaleBytes = static_cast<size_t>(fp8BlockwiseCombineScaleDim) * sizeof(float);
+    }
+    const size_t weightBytes = weightsBuf != nullptr ? cfg.WeightBytes() : 0;
+    bytes = hiddenBytes + scaleBytes + weightBytes;
+  }
+  trafficStatsOwner->SetBytesPerToken(op, bytes);
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
@@ -215,6 +282,9 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   }
   hipDeviceSynchronize();
   (void)hipGetLastError();
+  // After the last kernel has finished adding to it, before the buffers go.
+  trafficStats = nullptr;
+  trafficStatsOwner.reset();
   FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
@@ -600,6 +670,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.interNodeDispDestTokIdMap = handle.interNodeDispDestTokIdMap;
   args.interNodeChunkFlagCombine = handle.interNodeChunkFlagCombine;
   args.interNodeDispSendMap = handle.interNodeDispSendMap;
+  args.trafficStats = handle.trafficStats;
 #ifdef ENABLE_PROFILER
   args.profilerConfig = handle.profilerConfig;
 #endif

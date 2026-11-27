@@ -1185,6 +1185,15 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       }
     }
 
+    // Counted here: only here is it known which NIC a transfer's bytes took.
+    auto countPosted = [&](int posted) {
+      NicFlowCounters* nicStats = eps[epId].nicStats;
+      if (nicStats == nullptr || posted <= 0) return;
+      uint64_t bytes = 0;
+      for (int j = st; j < st + posted; ++j) bytes += mergedWrs[j].totalRemoteLength;
+      nicStats->Posted(isRead, bytes);
+    };
+
     struct ibv_send_wr* badWr = nullptr;
     int ret = Verbs().PostSend(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
@@ -1197,6 +1206,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
         }
       }
       postedCount = std::max(0, std::min(postedCount, batchWrNum));
+      countPosted(postedCount);
       const int unpostedCount = batchWrNum - postedCount;
       if (unpostedCount > 0) {
         ReleaseSqDepth(eps[epId], unpostedCount);
@@ -1247,6 +1257,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       return {StatusCode::ERR_RDMA_OP, std::move(message), postedCredits, std::move(cutQps)};
     }
 
+    countPosted(batchWrNum);
     if (needSignal) {
       // The whole chain is on the wire; the CQE for this record now owns the
       // sqDepth release. Releasing the guard lets a pending FailAll() proceed.

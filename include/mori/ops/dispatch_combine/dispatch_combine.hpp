@@ -25,6 +25,7 @@
 #include <hip/library_types.h>
 
 #include <cstdint>
+#include <memory>
 #include <sstream>
 #include <variant>
 #include <vector>
@@ -41,6 +42,7 @@
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/hip_compat.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 
 // data_types.hpp and hip_fp8.h contain device builtins on ROCm <=6.x;
 // the template args / variant that need them are also hipcc-only.
@@ -246,6 +248,8 @@ struct ShmemBufsInterNode {
   mori::application::SymmMemObjPtr dispatchStaging;
 };
 
+class EpTrafficStats;  // mori/metrics/metrics.hpp
+
 class EpDispatchCombineHandle {
  public:
   EpDispatchCombineHandle(EpDispatchCombineConfig config);
@@ -293,6 +297,10 @@ class EpDispatchCombineHandle {
 
   void LaunchReset(hipStream_t = 0);
 
+  // Sets the bytes per token of the launch being prepared (`op` is an EpStatsOp, `hiddenDim`
+  // <= 0 means the configured one). Called after PrepareInference.
+  void NoteLaunchForStats(int op, int hiddenDim);
+
   index_t GetCurRankNumToken() const { return curRankNumToken; }
   int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
@@ -333,6 +341,7 @@ class EpDispatchCombineHandle {
   void FinalizeOrderMapBuf();
 
   void InitializeBarrier();
+  void InitializeTrafficStats();
   void FinalizeBarrier();
 
   mori::application::SymmMemObjPtr MallocSymm(size_t size, unsigned int flags);
@@ -446,6 +455,9 @@ class EpDispatchCombineHandle {
   index_t* interNodeChunkFlagCombine{nullptr};
   // Map dispatched rdma token chunk index
   index_t* interNodeDispSendMap{nullptr};
+  // Traffic statistics: host-side owner and device counter block; null when metrics are off.
+  std::shared_ptr<EpTrafficStats> trafficStatsOwner;
+  uint64_t* trafficStats{nullptr};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
@@ -504,6 +516,8 @@ struct EpDispatchCombineArgs {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  // Traffic counter block; null = off.
+  uint64_t* trafficStats{nullptr};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif
@@ -569,6 +583,8 @@ struct EpDispatchCombineArgsRaw {
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeChunkFlagCombine{nullptr};
   index_t* interNodeDispSendMap{nullptr};
+  // Traffic counter block; null = off.
+  uint64_t* trafficStats{nullptr};
 #ifdef ENABLE_PROFILER
   mori::core::profiler::ProfilerConfig profilerConfig;
 #endif

@@ -99,6 +99,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int globalWarpNum = gridDim.x * warpNum;
   int myPe = config.rank;
   int npes = config.worldSize;
+  EpStatsLaunch statsLaunch(args.trafficStats, npes, kEpStatsDispatch, globalWarpId == 0, laneId,
+                            warpSize);
   size_t hiddenDim = config.HiddenDimSz();
   const int topk = config.numExpertPerToken;
   const int Npair = args.curRankNumToken * topk;
@@ -278,6 +280,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+      EpStatsDispatchSent(args.trafficStats, npes, destPe,
+                          static_cast<uint64_t>(numTokenSignal - 1));
     }
   }
   if (globalWarpId == 0) {
@@ -287,6 +291,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      EpStatsDispatchRecv(args.trafficStats, npes, destPe, static_cast<uint64_t>(recvTokenNum));
       args.destPeTokenCounter[destPe] = 0;
     }
     if (laneId == 0) {
@@ -331,11 +336,19 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
   int myPe = config.rank;
   int npes = config.worldSize;
+  EpStatsLaunch statsLaunch(args.trafficStats, npes, kEpStatsCombine, globalWarpId == 0, laneId,
+                            warpSize);
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::CombineStageInput);
+
+  // Combine totals come from the per-peer counts the dispatch before it left.
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < npes; pe += warpSize)
+      EpStatsCombinePeer(args.trafficStats, npes, pe);
+  }
 
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
@@ -679,6 +692,17 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                   srcWeightsPtr, nullptr, config.numExpertPerToken,
                                   config.numExpertPerToken);
       }
+    }
+  }
+
+  // Timing: every block reports in on dispatchGridBarrier (idle while a combine runs) and
+  // thread 0 of block 0 waits for all, so that it times the whole launch.
+  if (EpStatsActive(args.trafficStats, npes)) {
+    __syncthreads();
+    if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+    if (globalWarpId == 0 && laneId == 0) {
+      shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
+      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 }

@@ -41,6 +41,7 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/metrics/metrics.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -68,6 +69,56 @@ Context::Context(BootstrapNetwork& bootNet, bool deferRdma) : bootNet(bootNet) {
   // creation, no AllToAll. Modules that need the initial RDMA endpoint set must
   // explicitly call BuildInitialEndpoints() afterwards.
   InitializeTopologyAndTransports(deferRdma);
+  // Without deferRdma, EnsureRdmaTransport() already exchanged the identities, NIC included.
+  if (deferRdma) CollectPeIdentities();
+}
+
+void Context::CollectPeIdentities() {
+  // Unconditional: an allgather that only some ranks join would hang them all.
+  struct Pack {
+    char hostname[256];
+    int32_t gpuIndex;
+    char gpuPci[32];
+    char ibdev[64];
+    char netdev[64];
+  } my = {};
+  my.gpuIndex = -1;
+
+  snprintf(my.hostname, sizeof(my.hostname), "%s", mori::metrics::HostId().c_str());
+
+  int hipDev = -1;
+  char bus[32] = {0};
+  if (hipGetDevice(&hipDev) == hipSuccess && hipDev >= 0 &&
+      hipDeviceGetPCIBusId(bus, sizeof(bus), hipDev) == hipSuccess) {
+    snprintf(my.gpuPci, sizeof(my.gpuPci), "%s", mori::metrics::NormalizePciBdf(bus).c_str());
+    my.gpuIndex = mori::metrics::PhysicalGpuIndexForPciCached(bus);
+  }
+
+  if (rdmaDeviceContext != nullptr) {
+    const std::string ibdev = rdmaDeviceContext->GetRdmaDevice()->Name();
+    snprintf(my.ibdev, sizeof(my.ibdev), "%s", ibdev.c_str());
+    snprintf(my.netdev, sizeof(my.netdev), "%s", mori::metrics::NetdevForIbdev(ibdev).c_str());
+  }
+
+  std::vector<Pack> global(WorldSize());
+  bootNet.Allgather(&my, global.data(), sizeof(Pack));
+
+  peIdentities.resize(WorldSize());
+  for (int i = 0; i < WorldSize(); i++) {
+    auto str = [](const char* field, size_t size) {
+      return std::string(field, strnlen(field, size));
+    };
+    PeIdentity& id = peIdentities[i];
+    id.hostname = str(global[i].hostname, sizeof(global[i].hostname));
+    id.gpuIndex = global[i].gpuIndex;
+    id.gpuPci = str(global[i].gpuPci, sizeof(global[i].gpuPci));
+    id.ibdev = str(global[i].ibdev, sizeof(global[i].ibdev));
+    id.netdev = str(global[i].netdev, sizeof(global[i].netdev));
+  }
+  const PeIdentity& self = peIdentities[LocalRank()];
+  MORI_APP_INFO("rank {} identity: host {} gpu {} ({}) nic {} ({})", LocalRank(), self.hostname,
+                self.GpuLabel(), self.gpuPci, self.ibdev.empty() ? "none" : self.ibdev,
+                self.netdev.empty() ? "-" : self.netdev);
 }
 
 void Context::BuildInitialEndpoints() {
@@ -417,6 +468,10 @@ void Context::EnsureRdmaTransport() {
   const bool canRdma = rdmaDeviceContext != nullptr;
   for (PeerCapabilities& cap : peerCaps) cap.canRDMA = canRdma;
   rdmaInitDone = true;
+  // The NIC is open now: exchange the identities again so they carry it. All ranks get here
+  // together, as they open their NICs at the same points (constructor, ccoCommCreate, FULL
+  // DevComm).
+  CollectPeIdentities();
   if (!canRdma) return;
 
   // Endpoint config snapshot; no QP is created here.

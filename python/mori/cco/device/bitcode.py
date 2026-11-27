@@ -109,6 +109,7 @@ def _jit_compile(cov: int) -> str | None:
             wrapper,
             mori_root / "include" / "mori" / "cco",
             mori_root / "include" / "mori" / "core",
+            mori_root / "include" / "mori" / "metrics" / "traffic_counters.hpp",
         ]
         # _hipcc_device_bc adds -DIONIC_CCQE when the ionic CQs are collapsed, which
         # changes the GDA CQ poll; a bitcode cached under the other mode would

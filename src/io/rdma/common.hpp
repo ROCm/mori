@@ -463,6 +463,8 @@ struct EpPair {
   // queue really has beyond admission (kCompletionMarkerSlots, or 0 when it is too small
   // to spare them).
   int markerSlots{0};
+  // Counters of this endpoint's NIC pair; null when metrics are off.
+  NicFlowCounters* nicStats{nullptr};
 };
 
 // Which endpoints a fatal async event takes down with it. A QP event hits one

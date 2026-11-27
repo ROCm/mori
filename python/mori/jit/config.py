@@ -307,6 +307,16 @@ def is_profiler_enabled() -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
+def is_metrics_built() -> bool:
+    """Whether mori was built with BUILD_METRICS=ON (baked into the package by setup.py);
+    the JIT kernels then get -DMORI_ENABLE_METRICS, as the host libraries did."""
+    try:
+        from mori._rocm_build_info import BUILD_METRICS
+    except ImportError:
+        return True
+    return bool(BUILD_METRICS)
+
+
 def is_debuginfo_enabled() -> bool:
     """Return True if MORI_DEBUG_INFO is set to a truthy value."""
     val = os.environ.get("MORI_DEBUG_INFO", "")

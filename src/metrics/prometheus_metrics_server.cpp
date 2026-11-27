@@ -45,10 +45,14 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -66,7 +70,8 @@ namespace metrics {
 // Construction / destruction
 // ---------------------------------------------------------------------------
 
-MetricsServer::MetricsServer(int port) : port_(port) {
+MetricsServer::MetricsServer(int port, const std::string& bind_addr)
+    : port_(port), bind_addr_(bind_addr) {
   ModuleLogger::GetInstance().InitModule(modules::METRICS);
 
   server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -80,6 +85,11 @@ MetricsServer::MetricsServer(int port) : port_(port) {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
+  if (!bind_addr_.empty() && ::inet_pton(AF_INET, bind_addr_.c_str(), &addr.sin_addr) != 1) {
+    ::close(server_fd_);
+    server_fd_ = -1;
+    throw std::runtime_error("[metrics] '" + bind_addr_ + "' is not an IPv4 address");
+  }
   addr.sin_port = htons(static_cast<uint16_t>(port_));
 
   if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
@@ -95,11 +105,23 @@ MetricsServer::MetricsServer(int port) : port_(port) {
     throw std::runtime_error("[metrics] listen() failed: " + std::string(std::strerror(errno)));
   }
 
-  running_.store(true, std::memory_order_relaxed);
-  accept_thread_ = std::thread(&MetricsServer::acceptLoop, this);
+  sockaddr_in bound{};
+  socklen_t bound_len = sizeof(bound);
+  if (::getsockname(server_fd_, reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
+    port_ = ntohs(bound.sin_port);
+  }
 
-  MORI_INFO(modules::METRICS, "Prometheus metrics server listening on http://0.0.0.0:{}/metrics",
-            port_);
+  running_.store(true, std::memory_order_relaxed);
+  // The accept thread must not be the one a process-directed signal lands on.
+  // A new thread inherits its creator's mask.
+  sigset_t all_signals, old_mask;
+  sigfillset(&all_signals);
+  const bool masked = pthread_sigmask(SIG_BLOCK, &all_signals, &old_mask) == 0;
+  accept_thread_ = std::thread(&MetricsServer::acceptLoop, this);
+  if (masked) pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+
+  MORI_INFO(modules::METRICS, "Prometheus metrics server listening on http://{}:{}/metrics",
+            bind_addr_.empty() ? "0.0.0.0" : bind_addr_, port_);
 }
 
 MetricsServer::~MetricsServer() {
@@ -249,15 +271,88 @@ void MetricsServer::observeAggregated(std::string_view name, std::string_view he
   s.sum += sum;
 }
 
+std::string MetricsServer::EscapeLabelValue(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+std::string MetricsServer::EscapeHelp(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+// The formatted label string, escaped, is the series' identity in the maps below.
 static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labels) {
   if (labels.empty()) return "";
   std::string s = "{";
   for (std::size_t i = 0; i < labels.size(); ++i) {
     if (i > 0) s += ",";
-    s += labels[i].first + "=\"" + labels[i].second + "\"";
+    s += labels[i].first + "=\"" + MetricsServer::EscapeLabelValue(labels[i].second) + "\"";
   }
   s += "}";
   return s;
+}
+
+void MetricsServer::setScrapeHook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lk(scrape_hook_mutex_);
+  scrape_hook_ = std::move(hook);
+}
+
+void MetricsServer::setControlHandler(std::string path, ControlHandler handler) {
+  std::lock_guard<std::mutex> lk(scrape_hook_mutex_);
+  control_path_ = std::move(path);
+  control_handler_ = std::move(handler);
+}
+
+int MetricsServer::removeSeries(std::string_view name, const Labels& labels) {
+  const std::string key(name);
+  const std::string label_str = FormatLabels(labels);
+  int removed = 0;
+  std::lock_guard<std::mutex> lk(mutex_);
+  if (labels.empty()) {
+    removed += static_cast<int>(gauges_.erase(key));
+    removed += static_cast<int>(counters_.erase(key));
+    removed += static_cast<int>(histograms_.erase(key));
+  }
+  auto drop = [&](auto& families) {
+    auto it = families.find(key);
+    if (it == families.end()) return;
+    removed += static_cast<int>(it->second.series.erase(label_str));
+    if (it->second.series.empty()) families.erase(it);
+  };
+  drop(labeled_gauges_);
+  drop(labeled_counters_);
+  drop(labeled_histograms_);
+  return removed;
 }
 
 namespace {
@@ -313,21 +408,21 @@ std::string MetricsServer::SerializeMaps(
 
   // Gauges
   for (const auto& [name, g] : gauges) {
-    out << "# HELP " << name << " " << g.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(g.help) << "\n";
     out << "# TYPE " << name << " gauge\n";
     out << name << " " << FormatValue(g.value) << "\n\n";
   }
 
   // Counters
   for (const auto& [name, c] : counters) {
-    out << "# HELP " << name << " " << c.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(c.help) << "\n";
     out << "# TYPE " << name << " counter\n";
     out << name << " " << FormatValue(c.value) << "\n\n";
   }
 
   // Labeled gauges
   for (const auto& [name, family] : labeled_gauges) {
-    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(family.help) << "\n";
     out << "# TYPE " << name << " gauge\n";
     for (const auto& [label_str, value] : family.series) {
       out << name << label_str << " " << FormatValue(value) << "\n";
@@ -337,7 +432,7 @@ std::string MetricsServer::SerializeMaps(
 
   // Labeled counters
   for (const auto& [name, family] : labeled_counters) {
-    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(family.help) << "\n";
     out << "# TYPE " << name << " counter\n";
     for (const auto& [label_str, value] : family.series) {
       out << name << label_str << " " << FormatValue(value) << "\n";
@@ -347,7 +442,7 @@ std::string MetricsServer::SerializeMaps(
 
   // Histograms
   for (const auto& [name, h] : histograms) {
-    out << "# HELP " << name << " " << h.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(h.help) << "\n";
     out << "# TYPE " << name << " histogram\n";
 
     // Explicit upper-bound buckets (already cumulative in bucket_counts).
@@ -362,7 +457,7 @@ std::string MetricsServer::SerializeMaps(
 
   // Labeled histograms
   for (const auto& [name, family] : labeled_histograms) {
-    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# HELP " << name << " " << EscapeHelp(family.help) << "\n";
     out << "# TYPE " << name << " histogram\n";
     for (const auto& [label_str, h] : family.series) {
       // label_str is "{k=\"v\",...}" or ""; strip "}" to insert le label.
@@ -400,14 +495,55 @@ void MetricsServer::acceptLoop() {
 }
 
 void MetricsServer::handleClient(int client_fd) {
+  // One client at a time: both directions give up after kClientTimeoutMs.
+  timeval tv{};
+  tv.tv_sec = kClientTimeoutMs / 1000;
+  tv.tv_usec = (kClientTimeoutMs % 1000) * 1000;
+  ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
   char buf[4096] = {};
   // Read the request (best-effort; we only care about the first line).
-  ::read(client_fd, buf, sizeof(buf) - 1);
+  if (::recv(client_fd, buf, sizeof(buf) - 1, 0) <= 0) {
+    ::close(client_fd);
+    return;
+  }
 
   std::string body;
   std::string status;
 
-  if (std::strncmp(buf, "GET /metrics", 12) == 0) {
+  // The request line: "<method> <path>[?<query>] HTTP/1.1".
+  std::string method, path, query;
+  {
+    const std::string line(buf, std::strcspn(buf, "\r\n"));
+    const std::size_t sp1 = line.find(' ');
+    const std::size_t sp2 = sp1 == std::string::npos ? sp1 : line.find(' ', sp1 + 1);
+    if (sp2 != std::string::npos) {
+      method = line.substr(0, sp1);
+      path = line.substr(sp1 + 1, sp2 - sp1 - 1);
+      const std::size_t q = path.find('?');
+      if (q != std::string::npos) {
+        query = path.substr(q + 1);
+        path.resize(q);
+      }
+    }
+  }
+  ControlHandler control;
+  {
+    std::lock_guard<std::mutex> lk(scrape_hook_mutex_);
+    if (!control_path_.empty() && path == control_path_) control = control_handler_;
+  }
+
+  if (control && (method == "GET" || method == "POST")) {
+    status = "200 OK";
+    body = control(method, query, &status);
+  } else if (std::strncmp(buf, "GET /metrics", 12) == 0) {
+    std::function<void()> hook;
+    {
+      std::lock_guard<std::mutex> lk(scrape_hook_mutex_);
+      hook = scrape_hook_;
+    }
+    if (hook) hook();
     // Snapshot the metric maps under mutex_ then format the body without
     // holding the lock. Lock hold time is bounded by series cardinality
     // (the map copies), not by formatted body size, so addCounter /
@@ -448,7 +584,14 @@ void MetricsServer::handleClient(int client_fd) {
                          "\r\n" +
                          body;
 
-  ::write(client_fd, response.data(), response.size());
+  // MSG_NOSIGNAL: a scraper that hangs up mid-response must not SIGPIPE the process.
+  std::size_t sent = 0;
+  while (sent < response.size()) {
+    ssize_t n = ::send(client_fd, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;  // peer gone, or it stopped reading for kClientTimeoutMs
+    sent += static_cast<std::size_t>(n);
+  }
   ::close(client_fd);
 }
 

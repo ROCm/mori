@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mori/cco/cco.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 
 // GDA (RDMA) device layer pulls in the core RDMA device aggregator (provider
 // primitives + core::RdmaEndpointDevice/WorkQueueHandle/...). Device-only; no
@@ -1353,6 +1354,12 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
     uintptr_t remoteAddr = dstOffset + dstWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+    application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficPut,
+                                  worldPeer, bytes);
+    if constexpr (!std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
+      application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficAtomic,
+                                    worldPeer, sizeof(uint64_t));
+    }
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
@@ -1427,6 +1434,12 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_
     uintptr_t remoteAddr = dstOffset + dstWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+    application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficInline,
+                                  worldPeer, sizeof(T));
+    if constexpr (!std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
+      application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficAtomic,
+                                    worldPeer, sizeof(uint64_t));
+    }
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
@@ -1502,6 +1515,8 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::get(int peer, ccoWindow_t rem
     uintptr_t localAddr = localOffset + localWinDev->ibgdaWin.iovaBias;
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+    application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficGet,
+                                  worldPeer, bytes);
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
@@ -1538,6 +1553,8 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
 
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+    application::RdmaTrafficCount(ibgda->txBytes, comm.worldSize, application::kRdmaTrafficAtomic,
+                                  worldPeer, sizeof(uint64_t));
     int qpIdx = worldPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;

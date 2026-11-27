@@ -27,6 +27,7 @@ namespace mori {
 void RegisterMoriOps(pybind11::module_& m);
 void RegisterMoriShmem(pybind11::module_& m);
 void RegisterMoriIo(pybind11::module_& m);
+void RegisterMoriMetrics(pybind11::module_& m);
 #ifdef MORI_BUILD_COLLECTIVE
 void RegisterMoriCcl(pybind11::module_& m);
 #endif

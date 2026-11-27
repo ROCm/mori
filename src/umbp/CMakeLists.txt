@@ -421,7 +421,6 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
-  distributed/metrics/component_metrics.cpp
   distributed/metrics/prometheus_metric_sink.cpp
   distributed/metrics/activity_summary.cpp
   distributed/peer/backend/page_backend.cpp

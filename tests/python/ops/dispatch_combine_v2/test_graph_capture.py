@@ -186,17 +186,46 @@ def main():
 
         # Replay. Every rank replays the same number of times; the kernels' own
         # cross-device barrier keeps them together exactly as it does eagerly.
+        # With metrics on: a replay runs no host code, only device counters see it.
+        get_stats = getattr(op, "get_traffic_stats", None)
+        stats0 = get_stats() if get_stats is not None else None
+        stats_first = None
         bad = 0
         for _ in range(REPLAYS):
             comm.barrier()
             graph.replay()
             sync()
             comm.barrier()
+            if stats0 is not None and stats_first is None:
+                stats_first = get_stats()
             if not torch.allclose(captured.float().cpu(), exp.float(), **tol):
                 bad += 1
             elif LEC and not torch.equal(captured_lec.cpu(), lec_exp):
                 bad += 1
         errs = d.allreduce_sum(bad) + d.allreduce_sum(0 if ok_eager else 1)
+
+        if stats0 is not None:
+            stats1 = get_stats()
+            one = int((stats_first["dispatch_sent"] - stats0["dispatch_sent"]).sum())
+            total = int((stats1["dispatch_sent"] - stats0["dispatch_sent"]).sum())
+            back = int((stats1["combine_recv"] - stats0["combine_recv"]).sum())
+            ok_stats = (
+                stats1["dispatch_calls"] - stats0["dispatch_calls"] == REPLAYS
+                and stats1["combine_calls"] - stats0["combine_calls"] == REPLAYS
+                and one > 0
+                and total == REPLAYS * one
+                and back == total
+                and stats1["dispatch_kernel_seconds"]
+                > stats0["dispatch_kernel_seconds"]
+                and stats1["combine_kernel_seconds"] > stats0["combine_kernel_seconds"]
+            )
+            errs_stats = d.allreduce_sum(0 if ok_stats else 1)
+            if rank == 0:
+                print(
+                    f"# GRAPH-STATS: {'PASS' if errs_stats == 0 else 'FAIL'} "
+                    f"({REPLAYS} replays counted {total} tokens on rank 0, {one} a replay)",
+                    flush=True,
+                )
 
         if rank == 0:
             print(

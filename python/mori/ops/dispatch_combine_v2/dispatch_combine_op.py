@@ -1254,7 +1254,52 @@ class EpDispatchCombineOp:
             return
         self._closed = True
         self._close_backend()
+        # After the plans: their kernels add to the statistics block.
+        self._traffic_stats = None
         self.arena.close()
+
+    # -- shared: traffic statistics -----------------------------------------
+
+    def _make_traffic_stats(self, cfg, comm, kernel):
+        """The counter block this op's kernels add to; None when metrics are off."""
+        self._traffic_stats = None
+        from mori import cpp as mori_cpp
+
+        if not mori_cpp.metrics_enabled():
+            return None
+        raw = getattr(comm, "_raw", None)
+        peers = raw.pe_identities() if hasattr(raw, "pe_identities") else []
+        stats = mori_cpp.EpTrafficStats(
+            rank=cfg.rank,
+            world_size=cfg.world_size,
+            gpu_per_node=cfg.gpu_per_node,
+            impl=f"v2-{self.backend_name}",
+            kernel=kernel,
+            peers=peers,
+        )
+        if not stats.device_ptr:
+            return None
+        topk = cfg.num_experts_per_token
+        scale = cfg.scale_dim * cfg.scale_type_size
+        # dispatch: the token, its expert ids, its weights, its source slot, its scales
+        stats.set_bytes_per_token(0, cfg.token_nbytes + topk * 4 + topk * 4 + 4 + scale)
+        stats.set_bytes_per_token(1, cfg.combine_token_nbytes + cfg.combine_scale_bytes)
+        self._traffic_stats = stats
+        return stats
+
+    def get_traffic_stats(self):
+        """Cumulative per-peer token counts (int64 tensors by peer rank), call counts
+        and kernel seconds as a dict; ``None`` unless this op counts."""
+        stats = getattr(self, "_traffic_stats", None)
+        if stats is None:
+            return None
+        out = {}
+        for key, value in stats.read().items():
+            if isinstance(value, list):
+                out[key] = torch.tensor(value, dtype=torch.int64)
+            else:
+                out[key] = value if isinstance(value, float) else int(value)
+        return out
 
     def _close_backend(self):
         """Release backend-owned handles BEFORE the arena goes away. The C++

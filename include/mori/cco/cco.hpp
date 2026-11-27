@@ -66,9 +66,10 @@
 // referenced only via pointer/unique_ptr, so forward declarations suffice.
 namespace mori {
 namespace application {
-class BootstrapNetwork;  // ccoComm member (pointer)
-class Context;           // ccoComm member (pointer)
-class HeapVAManager;     // ccoComm::vaManager (unique_ptr; ccoComm dtor is out-of-line)
+class BootstrapNetwork;     // ccoComm member (pointer)
+class Context;              // ccoComm member (pointer)
+class RdmaTrafficCounters;  // ccoComm member (pointer); mori/metrics/metrics.hpp
+class HeapVAManager;        // ccoComm::vaManager (unique_ptr; ccoComm dtor is out-of-line)
 }  // namespace application
 namespace core {
 struct RdmaEndpointDevice;  // ccoIbgdaContext::endpoints (pointer)
@@ -323,6 +324,10 @@ struct ccoIbgdaContext {
   // Counter: NIC loopback writes here after source data fully transmitted.
   int counterCount;
   uint64_t* counterBuf;  // [counterCount] — sub-ptr into resourceWindow
+
+  // Traffic counters, [op][WORLD size] (not a team's); null when metrics are off.
+  // Last, so the fields before it keep their offsets.
+  uint64_t* txBytes;
 };
 
 // LSA barrier handle: a {byte-offset, count} pair pointing into the DevComm's
@@ -843,6 +848,8 @@ struct ccoComm {
   int worldSize{0};
   application::BootstrapNetwork* bootNet{nullptr};
   application::Context* ctx{nullptr};
+  // Owner of ccoIbgdaContext::txBytes, shared by this comm's DevComms.
+  application::RdmaTrafficCounters* trafficCounters{nullptr};
 
   // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
   // paths across independent comm groups in the same process tree.
@@ -955,6 +962,17 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId);
 int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
                   ccoComm** comm);
 int ccoCommDestroy(ccoComm* comm);
+
+// A rank's identity for metrics labels: gpuIndex is the physical GPU (-1 = unknown), the
+// NIC names are empty without RDMA. The getter returns 0, or -1 for a rank out of range.
+struct ccoPeIdentity {
+  char hostname[256];
+  int gpuIndex;
+  char gpuPci[32];
+  char ibdev[64];
+  char netdev[64];
+};
+int ccoCommGetPeIdentity(ccoComm* comm, int rank, ccoPeIdentity* out);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
 int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);

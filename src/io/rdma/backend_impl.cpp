@@ -37,6 +37,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/metrics/metrics.hpp"
 #include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
 #include "src/io/rdma/verbs_ops.hpp"
@@ -263,6 +264,11 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
+  // Sent in every handshake, metrics on or off: the peer labels its traffic by NIC.
+  availNetdevs_.reserve(availDevices.size());
+  for (const auto& dev : availDevices) {
+    availNetdevs_.push_back(mori::metrics::NetdevForIbdev(dev.first->Name()));
+  }
   portDown_ = std::make_unique<std::atomic<bool>[]>(availDevices.size());
   portRejected_ = std::make_unique<std::atomic<uint64_t>[]>(availDevices.size());
   for (size_t i = 0; i < availDevices.size(); ++i) {
@@ -667,7 +673,20 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
 EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         application::RdmaEndpoint local, int rdevId,
                                         application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
-                                        int weight) {
+                                        int weight, const RemoteNic& remoteNic) {
+  // Looked up before the manager's lock is taken: the metrics table has its own.
+  NicFlowCounters* nicStats = nullptr;
+  if (internal::IoMetrics* metrics = internal::IoMetrics::Get()) {
+    NicFlowIdentity id;
+    id.ibdev = DeviceName(devId);
+    id.netdev = DeviceNetdev(devId);
+    id.remoteHost = metrics->HostLabel(remoteNic.hostname);
+    // An older peer does not say which device it used; its index is all we have.
+    id.remoteIbdev = remoteNic.ibdev.empty() ? "dev" + std::to_string(rdevId) : remoteNic.ibdev;
+    id.remoteNetdev = remoteNic.netdev;
+    nicStats = metrics->NicFlow(id);
+  }
+
   std::unique_lock<std::shared_mutex> lock(mu);
 
   // Checked under the same lock FenceRemoteEngine takes, so a handshake already in
@@ -700,6 +719,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<SubmissionLedger>(config.notifPerQp),
             std::make_shared<SqAdmissionEvent>()};
   ep.markerSlots = markerSlots;
+  ep.nicStats = nicStats;
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
@@ -712,6 +732,11 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
 std::string RdmaManager::DeviceName(int devId) const {
   if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return {};
   return availDevices[devId].first->Name();
+}
+
+std::string RdmaManager::DeviceNetdev(int devId) const {
+  if (devId < 0 || devId >= static_cast<int>(availNetdevs_.size())) return {};
+  return availNetdevs_[devId];
 }
 
 bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.Pop(out); }
@@ -1487,6 +1512,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
                             " is fenced; connections are refused until it is unfenced");
   }
   application::TCPEndpointHandle tcph;
+  std::string remoteHostname;
   {
     std::lock_guard<std::mutex> lock(mu);
     auto engineIt = engines.find(ekey);
@@ -1494,6 +1520,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
       throw std::runtime_error("BuildRdmaConn: remote engine " + ekey + " is not registered");
     }
     EngineDesc& rdesc = engineIt->second;
+    remoteHostname = rdesc.MetricsHost();
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
   TcpEndpointGuard tcpGuard(ctx.get(), tcph);
@@ -1510,7 +1537,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
 
   Protocol p(tcph);
-  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
+  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId,
+                             rdma->DeviceName(devId), rdma->DeviceNetdev(devId)});
   MessageHeader hdr = p.ReadMessageHeader();
   if (hdr.type == MessageType::Fenced) {
     throw FencedByPeerError("BuildRdmaConn: engine " + ekey +
@@ -1519,7 +1547,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   ExpectMessage(hdr, MessageType::RegEndpoint, "BuildRdmaConn reply from " + ekey);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
-  EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
+  EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight,
+                                         {remoteHostname, msg.ibdev, msg.netdev});
   pendingEndpoint.Commit();
   auto ert = rdma->GetEndpointRuntime(eid);
   notif->RegisterEndpoint(ert);
@@ -1685,9 +1714,16 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
 
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
       PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
+      std::string remoteHostname;
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        auto engineIt = engines.find(msg.ekey);
+        if (engineIt != engines.end()) remoteHostname = engineIt->second.MetricsHost();
+      }
       EndpointId eid;
       try {
-        eid = rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+        eid = rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight,
+                                    {remoteHostname, msg.ibdev, msg.netdev});
       } catch (const PeerIsFencedError&) {
         // Fenced after the check above; the guard destroys the endpoint.
         p.WriteMessageFenced();
@@ -1696,8 +1732,9 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       pendingEndpoint.Commit();
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
-      p.WriteMessageRegEndpoint(
-          MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId,
+                                                   rdma->DeviceName(devId),
+                                                   rdma->DeviceNetdev(devId)});
       break;
     }
     case MessageType::Unfenced: {

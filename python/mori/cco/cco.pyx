@@ -83,6 +83,25 @@ cdef class Comm:
         """intptr_t address of the underlying ccoComm*."""
         return <intptr_t>self._ptr
 
+    def pe_identities(self):
+        """Identity of every rank, indexed by rank: a list of dicts with
+        ``hostname``, ``gpu_index`` (the physical GPU index, -1 if unknown),
+        ``gpu_pci``, ``ibdev`` and ``netdev`` (empty without RDMA). What traffic
+        metrics label the two ends of a hop with."""
+        cdef ccoPeIdentity ident
+        out = []
+        rank = 0
+        while ccoCommGetPeIdentity(self._ptr, rank, &ident) == 0:
+            out.append({
+                "hostname": (<bytes>ident.hostname).decode("utf-8", "replace"),
+                "gpu_index": ident.gpuIndex,
+                "gpu_pci": (<bytes>ident.gpuPci).decode("utf-8", "replace"),
+                "ibdev": (<bytes>ident.ibdev).decode("utf-8", "replace"),
+                "netdev": (<bytes>ident.netdev).decode("utf-8", "replace"),
+            })
+            rank += 1
+        return out
+
 
 ###############################################################################
 # DevCommRequirements

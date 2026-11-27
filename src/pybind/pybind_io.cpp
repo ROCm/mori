@@ -185,6 +185,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("key", &mori::io::EngineDesc::key)
       .def_readonly("node_id", &mori::io::EngineDesc::nodeId)
       .def_readonly("hostname", &mori::io::EngineDesc::hostname)
+      .def_readonly("metrics_host", &mori::io::EngineDesc::metricsHost)
       .def_readonly("host", &mori::io::EngineDesc::host)
       .def_readonly("port", &mori::io::EngineDesc::port)
       .def_readonly("pid", &mori::io::EngineDesc::pid)
@@ -217,6 +218,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("id", &mori::io::MemoryDesc::id)
       .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
       .def_readonly("device_bus_id", &mori::io::MemoryDesc::deviceBusId)
+      .def_readonly("gpu_index", &mori::io::MemoryDesc::gpuIndex)
       .def_readonly("numa_node", &mori::io::MemoryDesc::numaNode)
       .def_property_readonly("data",
                              [](const mori::io::MemoryDesc& desc) -> uintptr_t {

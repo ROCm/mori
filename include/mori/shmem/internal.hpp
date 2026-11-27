@@ -43,6 +43,10 @@
 #include "mori/application/bootstrap/bootstrap.hpp"
 #endif
 
+namespace mori::application {
+class RdmaTrafficCounters;  // mori/metrics/metrics.hpp
+}
+
 namespace mori {
 namespace shmem {
 
@@ -74,6 +78,8 @@ using RdmaEndpointHandleList = std::vector<application::RdmaEndpointHandle>;
 
 struct RdmaStates {
   application::Context* commContext{nullptr};
+  // Owner of GpuStates::rdmaTxBytes; null when metrics are off.
+  application::RdmaTrafficCounters* trafficCounters{nullptr};
 };
 
 struct MemoryStates {
@@ -137,6 +143,10 @@ struct GpuStates {
   int numProxyRings{0};
   int numNics{0};
   int localGpuIdx{0};
+
+  // RDMA traffic counters, [op][worldSize]; null when metrics are off. Last, so the
+  // fields before it keep their offsets.
+  uint64_t* rdmaTxBytes{nullptr};
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)

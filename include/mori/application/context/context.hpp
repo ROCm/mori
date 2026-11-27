@@ -28,6 +28,7 @@
 #include "mori/application/bootstrap/bootstrap.hpp"
 #include "mori/application/topology/topology.hpp"
 #include "mori/application/transport/transport.hpp"
+#include "mori/metrics/metrics.hpp"
 
 namespace mori {
 namespace application {
@@ -72,6 +73,8 @@ struct PeerCapabilities {
   bool canRDMA{false};      // NIC reachable for this Context (host or cross)
 };
 
+using PeIdentity = mori::metrics::PeIdentity;
+
 class Context {
  public:
   // deferRdma leaves the NICs unopened until EnsureRdmaTransport().
@@ -103,6 +106,9 @@ class Context {
   // -1 if the peer's node id could not be resolved. Populated in
   // CollectHostNames() via an allgather.
   int KfdNodeId(int destRank) const { return peerInfos[destRank].kfdNodeId; }
+
+  // Identity of every rank for metrics labels, indexed by rank.
+  const std::vector<PeIdentity>& PeIdentities() const { return peIdentities; }
   int LocalKfdNode() const { return peerInfos[LocalRank()].kfdNodeId; }
 
   // Local rank within this host (0-based index among same-host peers).
@@ -189,6 +195,8 @@ class Context {
 
  private:
   void CollectHostNames();
+  // Collective. Called at construction and again once EnsureRdmaTransport() opened the NICs.
+  void CollectPeIdentities();
   void InitializeTopologyAndTransports(bool deferRdma);
 
   // Apply Context's built-in policy to derive a single TransportType from a
@@ -215,6 +223,7 @@ class Context {
   bool railOnly{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
+  std::vector<PeIdentity> peIdentities;
   std::vector<PeerCapabilities> peerCaps;
   std::vector<TransportType> transportTypes;
 

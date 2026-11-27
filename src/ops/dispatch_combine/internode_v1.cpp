@@ -256,6 +256,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
         if (num == 0) continue;
 
+        if (laneId == 0) EpStatsDispatchSentChunk(args.trafficStats, npes, proxyPe, num);
+
         // atomicAdd runs in both paths so blockFlagCounter stays in sync with cache routing.
         index_t flag = 0;
         index_t flagSlotId = 0;
@@ -338,6 +340,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
               args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
               args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
               tokenNum + 1, ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
+          // The whole chunk is counted, whichever of its tokens are for that node.
+          EpStatsDispatchSentChunk(args.trafficStats, npes, proxyPe,
+                                   static_cast<uint64_t>(tokenNum));
         }
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -400,6 +405,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
+        EpStatsDispatchSentChunk(args.trafficStats, npes, proxyPe, static_cast<uint64_t>(tokenNum));
       }
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
@@ -471,6 +477,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
     nodeFlag = __shfl(nodeFlag, 0) - 1;
     totalChunkNum += thisChunkTokenNum;
+
+    // numRecvBlock blocks and all their warps share the chunk: one thread counts it.
+    if (laneId == 0 && warpId == 0 && (bid % numRecvBlock) == 0) {
+      EpStatsDispatchRecvChunk(args.trafficStats, npes,
+                               node * config.gpuPerNode + (config.rank % config.gpuPerNode),
+                               thisChunkTokenNum);
+    }
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
@@ -628,6 +641,12 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
       i = nextNodeStart + offset - stride;  // the loop increment adds stride back
       continue;
     }
+    // Every (token, expert) is an iteration of its own: count the chunk at its first.
+    if (laneId == 0 && expertId == 0 && tokenId == startTokenIdx) {
+      EpStatsDispatchRecvChunk(args.trafficStats, npes,
+                               node * config.gpuPerNode + (config.rank % config.gpuPerNode),
+                               thisChunkTokenNum);
+    }
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
     if (tokenId >= endTokenIdx) continue;
 
@@ -720,9 +739,14 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
+      // Same-node (XGMI) traffic: own tokens and those forwarded for other nodes.
+      EpStatsDispatchSent(args.trafficStats, npes, destPe,
+                          static_cast<uint64_t>(numTokenSignal - 1));
     }
-    if (laneId == 0)
+    if (laneId == 0) {
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      EpStatsCall(args.trafficStats, npes, kEpStatsDispatch);
+    }
 
     index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
     for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
@@ -730,6 +754,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      EpStatsDispatchRecv(args.trafficStats, npes, destPe, static_cast<uint64_t>(recvTokenNum));
       __threadfence_system();
       // reset local counter
       core::AtomicStoreSeqCstSystem(signal, 0);
@@ -755,6 +780,9 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool NoRdmaAtomics>
 __device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  // A dispatch is timed in its last launch.
+  EpStatsSpan statsSpan(args.trafficStats, npes, kEpStatsDispatch, thdId, blockId, warpSize,
+                        blockNum);
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeSend<T, true, NoRdmaAtomics>(args);
     v1::DispatchInterNodeRecv(args);
@@ -775,6 +803,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
+  if (globalThdId == 0) EpStatsSeqBegin(args.trafficStats, npes, kEpStatsDispatch);
   if (args.curRankNumToken == 0) return;
 
   // 16 B slices keep every warp's piece on the vector path
@@ -819,6 +848,8 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
 template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  EpStatsSpan statsSpan(args.trafficStats, npes, kEpStatsDispatch, thdId, blockId, warpSize,
+                        blockNum);
   if (blockId < args.rdmaBlockNum) {
     v1::DispatchInterNodeLLSend<T, NoRdmaAtomics>(args);
     v1::DispatchInterNodeLLRecv(args);
@@ -1525,6 +1556,13 @@ template <typename T, bool NoRdmaAtomics>
 __device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
+  // Combine totals come from the per-peer counts the dispatch before it left.
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < npes; pe += warpSize)
+      EpStatsCombinePeer(args.trafficStats, npes, pe);
+    if (laneId == 0) EpStatsCall(args.trafficStats, npes, kEpStatsCombine);
+  }
+
   if (blockId < args.rdmaBlockNum) {
     v1::CombineInterNode<T, NoRdmaAtomics>(args);
   } else {
@@ -1598,6 +1636,9 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
+  // A combine is timed in its last launch.
+  EpStatsSpan statsSpan(args.trafficStats, npes, kEpStatsCombine, thdId, blockId, warpSize,
+                        blockNum);
 
   if (globalWarpId == 0) {
     // routing-handle callers own this tensor hence no need to reset.
@@ -1616,6 +1657,12 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
 template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < npes; pe += warpSize)
+      EpStatsCombinePeer(args.trafficStats, npes, pe);
+    if (laneId == 0) EpStatsCall(args.trafficStats, npes, kEpStatsCombine);
+  }
 
   // If EnableStdMoE, call ConvertCombineInputDevice first to convert standard MoE format
 #ifdef ENABLE_STANDARD_MOE_ADAPT
@@ -1639,6 +1686,7 @@ __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> ar
 template <typename T>
 __device__ void EpCombineSync_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  if (globalThdId == 0) EpStatsSeqBegin(args.trafficStats, npes, kEpStatsCombine);
   v1::CombineSync(args);
 }
 

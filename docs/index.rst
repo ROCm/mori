@@ -23,6 +23,7 @@ New to MORI? :doc:`Install it <installation>`, then work through the :doc:`quick
    Choosing an API and backend <ep_backends>
    Benchmark <MORI-EP-BENCHMARK>
    V1 vs V2 inter-node performance <EPv2_PERF>
+   Performance impact of the traffic metrics <METRICS_PERF>
    RDMA bandwidth in the kernels <rdma_bandwidth_utilization>
 
 .. toctree::

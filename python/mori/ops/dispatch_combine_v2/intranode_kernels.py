@@ -87,6 +87,112 @@ _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
 _DISP_NSTREAMS = 4 if WAVE == 32 else 2
 _MAIN_STRIDE_I32 = _DISP_NSTREAMS * _LANE_STRIDE_I32
 
+# ── traffic statistics ─────────────────────────────────────────────────────
+# The slot offsets below must match the counter block layout of
+# include/mori/metrics/traffic_counters.hpp (8-byte slots, n = world size).
+
+
+def _stats_slot(addr_stats, row, pe):
+    return fx.Int64(addr_stats) + (fx.Int64(pe) + fx.Int64(row)) * fx.Int64(8)
+
+
+def _stats_weight(addr_stats, npes):
+    """Sampling weight of the launch in progress; 0 when it is passed over."""
+    return fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, 6 * npes + 4, 6)))
+
+
+def _stats_active(addr_stats, npes):
+    """Whether this launch records its end: it counts, or the next dispatch does."""
+    mark = fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, 6 * npes + 4, 8)))
+    return (_stats_weight(addr_stats, npes) + mark) != 0
+
+
+def _stats_place(row, period):
+    """EpStatsSamplePlace of traffic_counters.hpp; must stay the same arithmetic."""
+    h = row & fx.Int64(0xFFFFF)
+    h = (h * fx.Int64(40503) + fx.Int64(0x9E37)) & fx.Int64(0xFFFFF)
+    h = h ^ (h >> fx.Int64(9))
+    h = (h * fx.Int64(69621)) & fx.Int64(0xFFFFF)
+    h = h ^ (h >> fx.Int64(11))
+    return (h * period) >> fx.Int64(20)
+
+
+def _stats_decide(addr_stats, npes):
+    """Settles whether this dispatch and its combine count; ONE thread, first."""
+    state = 6 * npes + 4
+    mirror = fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, state, 2)))
+    period = fx.Int64(P.load_i64_acquire(_stats_slot(mirror, state, 5)))
+    seq = fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, state, 7)))
+    following = seq + fx.Int64(1)
+    P.store_i64_system(_stats_slot(addr_stats, state, 7), arith.constant(0), following)
+    every = period < 2
+    # Never-zero divisor; its result is unused when `every`.
+    rows = arith.select(every, fx.Int64(1), period)
+    counts = (seq % rows) == _stats_place(seq // rows, rows)
+    next_counts = (following % rows) == _stats_place(following // rows, rows)
+    weight = arith.select(every, period, arith.select(counts, period, fx.Int64(0)))
+    last_passed = arith.select(
+        counts, fx.Int64(0), arith.select(next_counts, fx.Int64(1), fx.Int64(0))
+    )
+    mark = arith.select(every, fx.Int64(0), last_passed)
+    P.store_i64_system(_stats_slot(addr_stats, state, 8), arith.constant(0), mark)
+    P.store_i64_system(_stats_slot(addr_stats, state, 6), arith.constant(0), weight)
+
+
+def _stats_dispatch(addr_stats, npes, pe, tokens, *, sent):
+    """Counts `tokens` sent to / received from `pe`; last* feeds the next combine."""
+    tokens64 = fx.Int64(tokens) * _stats_weight(addr_stats, npes)
+    P.atomic_add_global(
+        _stats_slot(addr_stats, (0 if sent else 2) * npes, pe), tokens64
+    )
+    P.store_i64_system(
+        _stats_slot(addr_stats, (4 if sent else 5) * npes, pe),
+        arith.constant(0),
+        tokens64,
+    )
+
+
+def _stats_combine_peer(addr_stats, npes, pe):
+    """Moves the counts dispatch left for `pe` into the combine totals, once."""
+    back = P.atomic_xchg_global(_stats_slot(addr_stats, 5 * npes, pe), fx.Int64(0))
+    home = P.atomic_xchg_global(_stats_slot(addr_stats, 4 * npes, pe), fx.Int64(0))
+    P.atomic_add_global(_stats_slot(addr_stats, 1 * npes, pe), back)
+    P.atomic_add_global(_stats_slot(addr_stats, 3 * npes, pe), home)
+
+
+def _stats_call(addr_stats, npes, op):
+    P.atomic_add_global(
+        _stats_slot(addr_stats, 6 * npes, op), _stats_weight(addr_stats, npes)
+    )
+
+
+def _stats_ticks(addr_stats, npes, op, entered):
+    """Adds this launch's duration in device clock ticks; one thread, on its way out."""
+    state = 6 * npes + 4
+    now = P.realtime()
+    prev = fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, state, 0)))
+    limit = fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, state, 1)))
+    seen = prev != 0
+    near = arith.select(seen, (entered - prev) < limit, seen)
+    start = arith.select(near, prev, entered)
+    P.atomic_add_global(
+        _stats_slot(addr_stats, 6 * npes, 2 + op),
+        (now - start) * _stats_weight(addr_stats, npes),
+    )
+    P.store_i64_system(_stats_slot(addr_stats, state, 0), arith.constant(0), now)
+
+
+def _stats_mirror_addr(addr_stats, npes):
+    """Host memory the counters are copied to for the host to read; 0 = none."""
+    return fx.Int64(P.load_i64_acquire(_stats_slot(addr_stats, 6 * npes + 4, 2)))
+
+
+def _stats_mirror_slot(addr_stats, addr_mirror, slot):
+    P.store_i64_system(
+        addr_mirror, slot, P.load_i64_acquire(_stats_slot(addr_stats, 0, slot))
+    )
+
+
 # ── dispatch ──────────────────────────────────────────────────────────────
 
 
@@ -114,6 +220,7 @@ def make_dispatch(
     enable_signal=True,
     replay=False,
     fp4=False,
+    enable_stats=False,
 ):
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
@@ -141,6 +248,7 @@ def make_dispatch(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        addr_stats: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -148,6 +256,11 @@ def make_dispatch(
         warp = tid >> LOG2_WAVE
         global_warp_id = bid * warp_num_per_block + warp
         global_warp_num = block_num * warp_num_per_block
+        if const_expr(enable_stats):
+            stats_start = P.realtime()
+            if global_warp_id == 0:
+                if lane == 0:
+                    _stats_decide(addr_stats, npes)
         work_limit = inp_cur_tok * experts_per_token
 
         window = cco.Window(arena)
@@ -364,6 +477,11 @@ def make_dispatch(
                     P.store_i32_system(
                         recv_num_remote_addr, arith.constant(0), signal_value
                     )
+                    if const_expr(enable_stats):
+                        if _stats_weight(addr_stats, npes) != 0:
+                            _stats_dispatch(
+                                addr_stats, npes, dest_pe, signal_value - 1, sent=True
+                            )
 
             # ── Phase 3: collect per-source counts into total_recv ──
             for src_pe in range(lane, npes, WAVE):
@@ -375,7 +493,18 @@ def make_dispatch(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)
                     )
                     P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
+                    if const_expr(enable_stats):
+                        if _stats_weight(addr_stats, npes) != 0:
+                            _stats_dispatch(
+                                addr_stats, npes, src_pe, peer_recv_count, sent=False
+                            )
                     buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
+
+            if const_expr(enable_stats):
+                if global_warp_id == 0:
+                    if lane == 0:
+                        if _stats_weight(addr_stats, npes) != 0:
+                            _stats_call(addr_stats, npes, 0)
 
             if global_warp_id == 0:
                 if lane == 0:
@@ -383,6 +512,16 @@ def make_dispatch(
                     P.store_i32_system(
                         local_tok_off, arith.constant(0), arith.constant(0)
                     )
+
+        if const_expr(enable_stats):
+            if global_warp_id == 0:
+                if lane == 0:
+                    if _stats_active(addr_stats, npes):
+                        _stats_ticks(addr_stats, npes, 0, stats_start)
+                if _stats_weight(addr_stats, npes) != 0:
+                    stats_mirror = _stats_mirror_addr(addr_stats, npes)
+                    for stats_slot in range(lane, 6 * npes + 4, WAVE):
+                        _stats_mirror_slot(addr_stats, stats_mirror, stats_slot)
 
     @flyc.jit
     def run(
@@ -397,6 +536,7 @@ def make_dispatch(
         addr_inp_scales: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
+        addr_stats: Int64,
         stream=fx.Stream(None),
     ):
         ep_dispatch(
@@ -411,6 +551,7 @@ def make_dispatch(
             addr_inp_scales,
             my_lsa_rank,
             inp_cur_tok,
+            addr_stats,
         ).launch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],
@@ -596,6 +737,7 @@ def make_combine(
     fp4=False,
     _s3_cache=2,
     _unroll=4,
+    enable_stats=False,
 ):
     assert block_num <= xdb_flag_slots, (
         f"combine block_num {block_num} exceeds xdb_flag_slots {xdb_flag_slots}: "
@@ -619,6 +761,7 @@ def make_combine(
         addr_out_wts: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
+        addr_stats: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -631,6 +774,16 @@ def make_combine(
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
+
+        if const_expr(enable_stats):
+            stats_start = P.realtime()
+            # Combine totals come from the per-peer counts dispatch left behind.
+            if global_warp_id == 0:
+                if _stats_weight(addr_stats, npes) != 0:
+                    for stats_pe in range(lane, npes, WAVE):
+                        _stats_combine_peer(addr_stats, npes, stats_pe)
+                    if lane == 0:
+                        _stats_call(addr_stats, npes, 1)
 
         # ── Stage 1: per-block cross-device entry barrier ──
         # Each block owns a PRIVATE flag counter xdb_flag[bid]; all counters stay
@@ -874,6 +1027,28 @@ def make_combine(
         # the only completion signal the host needs. This removes the former
         # (block_num-1)-way contended atomic_add on comb_bar.
 
+        if const_expr(enable_stats):
+            # Timing: every block reports in on comb_bar (unused in this kernel) and
+            # thread 0 of block 0 waits for all, so it times the whole launch.
+            if _stats_active(addr_stats, npes):
+                P.waitcnt_all()
+                fx.barrier()
+                if tid == 0:
+                    P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+                if global_warp_id == 0:
+                    if lane == 0:
+                        P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
+                        P.store_i32_system(
+                            fx.Int64(addr_comb_bar),
+                            arith.constant(0),
+                            arith.constant(0),
+                        )
+                        _stats_ticks(addr_stats, npes, 1, stats_start)
+                    if _stats_weight(addr_stats, npes) != 0:
+                        stats_mirror = _stats_mirror_addr(addr_stats, npes)
+                        for stats_slot in range(lane, 6 * npes + 4, WAVE):
+                            _stats_mirror_slot(addr_stats, stats_mirror, stats_slot)
+
     @flyc.jit
     def run(
         arena: Int64,
@@ -885,6 +1060,7 @@ def make_combine(
         addr_out_wts: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
+        addr_stats: Int64,
         stream=fx.Stream(None),
     ):
         ep_combine(
@@ -897,6 +1073,7 @@ def make_combine(
             addr_out_wts,
             my_lsa_rank,
             cur_rank_num_token,
+            addr_stats,
         ).launch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],
@@ -979,6 +1156,7 @@ def make_combine_scatter(
     fp8_blockwise=False,
     quant_group=128,
     _s3_cache=2,
+    enable_stats=False,
 ):
     """Scatter combine (mori useExternalInpBuffer / _nop2p path).
 
@@ -1035,6 +1213,7 @@ def make_combine_scatter(
         addr_out_wts: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
+        addr_stats: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1048,6 +1227,15 @@ def make_combine_scatter(
         rsrc_tok_map = create_buffer_resource_from_addr(addr_tok_map)
         rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
         rsrc_total_recv = create_buffer_resource_from_addr(addr_total_recv)
+
+        if const_expr(enable_stats):
+            stats_start = P.realtime()
+            if global_warp_id == 0:
+                if _stats_weight(addr_stats, npes) != 0:
+                    for stats_pe in range(lane, npes, WAVE):
+                        _stats_combine_peer(addr_stats, npes, stats_pe)
+                    if lane == 0:
+                        _stats_call(addr_stats, npes, 1)
         rsrc_tis = create_buffer_resource_from_addr(
             fx.Int64(window.lsa_ptr(my_lsa_rank, off_tis))
         )
@@ -1340,10 +1528,39 @@ def make_combine_scatter(
 
             _loop()
 
+        if const_expr(enable_stats):
+            # Timing: every block reports in, taking comb_bar from the 2 * block_num
+            # of stage 2 to 3 * block_num, which thread 0 of block 0 waits for below.
+            if _stats_active(addr_stats, npes):
+                P.waitcnt_all()
+                fx.barrier()
+                if tid == 0:
+                    P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+
         if global_warp_id == 0:
             if lane == 0:
-                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 2 * block_num - 1)
+                if const_expr(enable_stats):
+                    P.spin_until_gt_i32(
+                        fx.Int64(addr_comb_bar),
+                        arith.select(
+                            _stats_active(addr_stats, npes),
+                            fx.Int32(3 * block_num - 1),
+                            fx.Int32(2 * block_num - 1),
+                        ),
+                    )
+                else:
+                    P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 2 * block_num - 1)
                 buffer_store(arith.constant(0), rsrc_comb_bar, 0)
+
+        if const_expr(enable_stats):
+            if global_warp_id == 0:
+                if lane == 0:
+                    if _stats_active(addr_stats, npes):
+                        _stats_ticks(addr_stats, npes, 1, stats_start)
+                if _stats_weight(addr_stats, npes) != 0:
+                    stats_mirror = _stats_mirror_addr(addr_stats, npes)
+                    for stats_slot in range(lane, 6 * npes + 4, WAVE):
+                        _stats_mirror_slot(addr_stats, stats_mirror, stats_slot)
 
     @flyc.jit
     def run(
@@ -1356,6 +1573,7 @@ def make_combine_scatter(
         addr_out_wts: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
+        addr_stats: Int64,
         stream=fx.Stream(None),
     ):
         ep_combine_s(
@@ -1368,6 +1586,7 @@ def make_combine_scatter(
             addr_out_wts,
             my_lsa_rank,
             cur_rank_num_token,
+            addr_stats,
         ).launch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],

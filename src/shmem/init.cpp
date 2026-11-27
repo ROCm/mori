@@ -39,6 +39,7 @@
 #include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/core/transport/rdma/proxy/proxy_thread.hpp"
 #include "mori/core/utils/utils.hpp"
+#include "mori/metrics/metrics.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -598,6 +599,15 @@ void GpuStateInit(ShmemStates* states) {
   states->gpuStates.worldSize = states->bootStates->worldSize;
   states->gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
 
+  // Traffic counters: here, before any device module copies GpuStates. Not in host
+  // proxy mode, where the kernels that count are never reached.
+  if (mori::metrics::TrafficEnabled() && states->rdmaStates->commContext->RdmaTransportEnabled() &&
+      !states->rdmaStates->commContext->IsProxyEnabled()) {
+    states->rdmaStates->trafficCounters = new application::RdmaTrafficCounters(
+        "shmem", states->bootStates->rank, states->rdmaStates->commContext->PeIdentities());
+    states->gpuStates.rdmaTxBytes = states->rdmaStates->trafficCounters->DevicePtr();
+  }
+
   // Check if IBGDA proxy mode is requested
   if (states->rdmaStates->commContext->IsProxyEnabled()) {
     MORI_SHMEM_INFO("Rank {}: CPU host proxy RDMA mode enabled", states->bootStates->rank);
@@ -837,6 +847,12 @@ static void FinalizeGpuStates(ShmemStates* states) {
   (void)hipGetLastError();
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.transportTypes));
   HIP_RUNTIME_CHECK(hipFree(states->gpuStates.rdmaEndpoints));
+  // After the device is idle: nothing adds to the traffic counters any more.
+  if (states->rdmaStates != nullptr && states->rdmaStates->trafficCounters != nullptr) {
+    delete states->rdmaStates->trafficCounters;
+    states->rdmaStates->trafficCounters = nullptr;
+    states->gpuStates.rdmaTxBytes = nullptr;
+  }
   FinalizeRuntime(states);
   MORI_SHMEM_TRACE("GPU states finalized");
 }

@@ -41,6 +41,7 @@
 #pragma once
 
 #include "mori/core/core.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 // The cfg half only. ep_internode_spec.hpp is host-only -- it pulls in the
 // Compiler, which this TU is the OUTPUT of and must not depend on.
 #include "mori/ops/dispatch_combine_v2/ep_internode_cfg.hpp"
@@ -69,6 +70,11 @@ using index_t = ep_index_t;
 // v1's spelling, now a plain alias: the struct stopped depending on T when
 // inpTokenBuf became void*, matching the intranode EpArgs.
 using EpDispatchCombineArgs = EpInterNodeArgs;
+
+// The traffic counter block of this op; null when statistics are off.
+__device__ __forceinline__ uint64_t* EpInterNodeStats(const EpInterNodeArgs& args) {
+  return reinterpret_cast<uint64_t*>(args.trafficStats);
+}
 
 // v1's common.hpp macro, with the config type swapped and the runtime assert
 // promoted to a static_assert: numExpertPerToken must fit in a ballot.
@@ -394,6 +400,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
 
       if (num == 0) continue;
 
+      if (laneId == 0)
+        ::mori::moe::EpStatsDispatchSentChunk(EpInterNodeStats(args), npes, proxyPe, num);
+
       // atomicAdd runs in both paths so blockFlagCounter stays in sync with cache routing.
       index_t flag = 0;
       index_t flagSlotId = 0;
@@ -518,6 +527,9 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
                              tokenNum * xferBytes, args.reg(args.offChunkFlag),
                              (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), tokenNum + 1,
                              proxyPe, qpId);
+        // The whole chunk is counted, whichever of its tokens are for that node.
+        ::mori::moe::EpStatsDispatchSentChunk(EpInterNodeStats(args), npes, proxyPe,
+                                              static_cast<uint64_t>(tokenNum));
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -575,6 +587,13 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
       }
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
+
+    // numRecvBlock blocks and all their warps share the chunk: one thread counts it.
+    if (laneId == 0 && warpId == 0 && (bid % numRecvBlock) == 0) {
+      ::mori::moe::EpStatsDispatchRecvChunk(EpInterNodeStats(args), npes,
+                                            node * config.gpuPerNode + (myPe % config.gpuPerNode),
+                                            thisChunkTokenNum);
+    }
 
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
 
@@ -747,6 +766,12 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
       i = nextNodeStart + offset - stride;  // the loop increment adds stride back
       continue;
     }
+    // Every (token, expert) is an iteration of its own: count the chunk at its first.
+    if (laneId == 0 && expertId == 0 && tokenId == startTokenIdx) {
+      ::mori::moe::EpStatsDispatchRecvChunk(EpInterNodeStats(args), npes,
+                                            node * config.gpuPerNode + (myPe % config.gpuPerNode),
+                                            thisChunkTokenNum);
+    }
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
     if (tokenId >= endTokenIdx) continue;
 
@@ -838,9 +863,14 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
       index_t numTokenSignal = core::AtomicLoadSeqCstSystem(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>(destPe) + myPe;
       core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
+      // Same-node (XGMI) traffic: own tokens and those forwarded for other nodes.
+      ::mori::moe::EpStatsDispatchSent(EpInterNodeStats(args), npes, destPe,
+                                       static_cast<uint64_t>(numTokenSignal - 1));
     }
-    if (laneId == 0)
+    if (laneId == 0) {
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      ::mori::moe::EpStatsCall(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsDispatch);
+    }
 
     index_t* recvTokenNums = args.reg(args.offRecvTokenNum)->template GetAs<index_t*>();
     for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
@@ -848,6 +878,8 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = EpInterNodeWaitGt(signal, 0) - 1;
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+      ::mori::moe::EpStatsDispatchRecv(EpInterNodeStats(args), npes, destPe,
+                                       static_cast<uint64_t>(recvTokenNum));
       __threadfence_system();
       // reset local counter
       core::AtomicStoreSeqCstSystem(signal, 0);
@@ -879,6 +911,9 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
                                            const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  // A dispatch is timed in its last launch.
+  ::mori::moe::EpStatsSpan statsSpan(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsDispatch,
+                                     thdId, blockId, warpSize, blockNum);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeRecv<kConfig, T>(args);
@@ -891,6 +926,9 @@ __device__ void EpDispatchInterNodeV2_body(EpDispatchCombineArgs args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  if (globalThdId == 0) {
+    ::mori::moe::EpStatsSeqBegin(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsDispatch);
+  }
 
   if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
   if (args.curRankNumToken == 0) return;
@@ -935,6 +973,8 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
                                              const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
+  ::mori::moe::EpStatsSpan statsSpan(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsDispatch,
+                                     thdId, blockId, warpSize, blockNum);
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
     internode::DispatchInterNodeLLRecv<kConfig, T>(args);
@@ -1514,6 +1554,14 @@ __device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
+  // Combine totals come from the per-peer counts the dispatch before it left.
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < npes; pe += warpSize)
+      ::mori::moe::EpStatsCombinePeer(EpInterNodeStats(args), npes, pe);
+    if (laneId == 0)
+      ::mori::moe::EpStatsCall(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsCombine);
+  }
+
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNode<kConfig, T>(args, comm);
   } else {
@@ -1579,6 +1627,9 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args)
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAll_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  // A combine is timed in its last launch.
+  ::mori::moe::EpStatsSpan statsSpan(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsCombine,
+                                     thdId, blockId, warpSize, blockNum);
 
   if (globalWarpId == 0) {
     if (laneId == 0) args.totalRecvTokenNum[0] = 0;
@@ -1593,6 +1644,13 @@ __device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
                                             const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
 
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < npes; pe += warpSize)
+      ::mori::moe::EpStatsCombinePeer(EpInterNodeStats(args), npes, pe);
+    if (laneId == 0)
+      ::mori::moe::EpStatsCall(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsCombine);
+  }
+
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNodeLL<kConfig, T>(args, comm);
   } else {
@@ -1603,6 +1661,9 @@ __device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineSync_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  if (globalThdId == 0) {
+    ::mori::moe::EpStatsSeqBegin(EpInterNodeStats(args), npes, ::mori::moe::kEpStatsCombine);
+  }
   internode::CombineSync<kConfig, T>(args);
 }
 
