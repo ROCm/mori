@@ -717,7 +717,17 @@ jobs:
           #
           # sdma runs once per notification protocol: early notification is the
           # gfx950 default, so legacy and fused receive each need an explicit run.
-          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" "lsa"; do
+          # The direct-source run covers the copy engines reading the inputs in place
+          # (compact and segmented, fused receive) and the block ceilings; its 2048-token
+          # segments give the segmented dispatch receive more rows than threads. On gfx950
+          # the compact rounds run compact reserve by default (the script's compact reserve
+          # cases: receive cap, fp8 scales, out-of-order bases, a combine input aliasing the
+          # recv view); SEND_BLOCKS=32 splits each peer over four send blocks, and
+          # COMPACT_RESERVE=0 keeps the receive-copy compact path covered.
+          for run in "sdma" "sdma MORI_ASYNCLL_EARLY_NOTIFY=0" "sdma MORI_ASYNCLL_FUSED_RECV=1" \
+                     "sdma MORI_ASYNCLL_FUSED_RECV=1 MORI_ASYNCLL_SEND_BLOCKS=32" \
+                     "sdma MORI_ASYNCLL_COMPACT_RESERVE=0" \
+                     "sdma MORI_ASYNCLL_DIRECT=1 MORI_ASYNCLL_FUSED_RECV=1 MORI_ASYNCLL_SEND_BLOCKS=8 MORI_ASYNCLL_RECV_BLOCKS=16 SEG_SHAPE=7168,8,32,2048" "lsa"; do
             set -- $run
             transport=$1; shift
             envs="-e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport"

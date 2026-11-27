@@ -112,18 +112,113 @@ These options are read once when an op is constructed:
        settings do not fail.
    * - ``MORI_ASYNCLL_FUSED_RECV``
      - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
-       per CTA waits, then an acquire and CTA barrier release the copy waves.
-   * - ``MORI_ASYNCLL_FUSED_RECV_CTAS``
+       per block waits, then an acquire and block barrier release the copy waves.
+   * - ``MORI_ASYNCLL_FUSED_RECV_BLOCKS``
      - ``0``, meaning half the compute units this process may use: the
        device's, or its share under ``HSA_CU_MASK``. Grid ceiling for the
        fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
+       The former name, ``MORI_ASYNCLL_FUSED_RECV_CTAS``, is still accepted.
+   * - ``MORI_ASYNCLL_DIRECT``
+     - Unset: on for an op on gfx950 without a quantized combine (the
+       segmented layout directly, the compact one through
+       ``MORI_ASYNCLL_COMPACT_RESERVE``), off otherwise. ``1`` turns it on
+       (also on gfx942), ``0`` off, which also turns compact reserve off. Direct sources have the copy engines read the tokens where the
+       caller left them: dispatch posts each peer's rows from the input, one
+       packet per run of adjacent source tokens (and, in the segmented layout,
+       one more for the run's scale rows), and combine posts each peer's rows
+       from the expert output, so neither send phase gathers them first. The
+       dispatch input and scales and the combine input are read until the
+       matching ``dispatch_recv`` / ``combine_recv``: do not write them in between,
+       and do not pass a tensor this op returns from a receive as the dispatch
+       input. The op's arena then leaves out the send staging the engines no
+       longer read, about a third of it, so every rank must use the same
+       value. Needs early notification; ignored
+       without it. ``1`` is refused with a quantized combine (``quant_type``),
+       which is packed on the send side. gfx942 and gfx950 only.
+   * - ``MORI_ASYNCLL_FUSE_META``
+     - ``1``. With direct sources (``MORI_ASYNCLL_DIRECT``) on an op whose
+       ``async_ll_recv_layout`` resolves to ``"segmented"``, slot assignment
+       also writes the metadata rows, so a segmented round's ``dispatch_send``
+       runs two passes instead of three; compact reserve needs it. ``0`` keeps
+       the separate metadata pass, and on a compact op also turns compact
+       reserve off, which changes the arena, so every rank must use the same
+       value. Otherwise ignored without direct sources.
+   * - ``MORI_ASYNCLL_COMPACT_RESERVE``
+     - Applies to a compact op with early notification (single-node SDMA);
+       segmented, LSA and multi-node ops ignore it. Unset: on for such an op on
+       gfx950 without a ``quant_type`` unless ``MORI_ASYNCLL_DIRECT`` or
+       ``MORI_ASYNCLL_FUSE_META`` is ``0``; ``0`` turns it off; ``1`` requires
+       it, and is refused there on another arch, with a ``quant_type``, or with
+       either of those set to ``0``. Each source reserves its rows'
+       range in every receiver's recv views with one remote atomic per peer,
+       and the copy engines place rows, scales and metadata there, so
+       ``dispatch_recv`` copies nothing. Direct sources and fused metadata
+       come with it. The views keep the compact contract, a dense prefix of
+       ``total_recv`` rows located by the reverse map, but sources appear in
+       arrival order (each source's rows contiguous, in slot order), and since
+       peers write them the views are valid only until this rank's
+       ``combine_send``. A combine input inside the recv views (an expert run
+       in place on them) is first copied to ``combine_in_view()``; any other
+       tensor, or ``combine_in_view()`` itself, is sent in place. The arena
+       leaves out the dispatch landing, so every rank must use the same value.
+   * - ``MORI_ASYNCLL_SEND_BLOCKS``
+     - ``0``, meaning the whole device. Grid ceiling for the send-side copy
+       passes: slot assignment and the dispatch and combine gathers (not the
+       LSA transport's fused dispatch gather). A positive value is rounded down
+       to a multiple of the world size, and up to the world size if smaller; it
+       never widens a pass's default grid. With direct sources and
+       fused metadata (``MORI_ASYNCLL_FUSE_META``, on by default) in the
+       segmented layout, or with compact reserve, it also
+       sets the send transfer's blocks per peer,
+       ceiling / world size (one when 0), up to the device.
+   * - ``MORI_ASYNCLL_RECV_BLOCKS``
+     - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
+       passes: the dispatch and combine receive copies, in either receive
+       layout. Rounded like ``MORI_ASYNCLL_SEND_BLOCKS``. On gfx942 and gfx950
+       the segmented ``dispatch_recv``, which copies no tokens, already runs
+       on at most two rows per thread of its largest round, world size times
+       the largest segment stride (16 blocks of 1024 threads at EP8 and 4096
+       tokens per rank); the ceiling only lowers that. With
+       ``MORI_ASYNCLL_FUSED_RECV=1`` the lower of this and the fused receive
+       ceiling (``MORI_ASYNCLL_FUSED_RECV_BLOCKS``, half the usable compute units
+       by default) applies.
+   * - ``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE``,
+       ``MORI_ASYNCLL_RECV_BLOCKS_SCHEDULE``
+     - Unset: one ceiling per op, from the two variables above. Set to
+       ``tokens:blocks`` pairs, for example ``128:64,0:128``, to pick the
+       ceiling per call: the first pair with T <= ``tokens`` applies,
+       ``tokens`` 0 matches any T, and a T past every bound keeps the single
+       ceiling. The send schedule uses the call's token count; the receive
+       schedule uses the matching send's token count, or the segment stride
+       for a segmented ``dispatch_recv``. ``blocks`` follows the rounding above
+       and 0 means no ceiling. All entries share one compiled module.
 
-The first three variables accept ``0`` or ``1``. Skipping the reset or fusing
-receive requires early notification. Set all three to ``0`` for the legacy sequence.
-LSA and multi-node ops retain their existing protocol and ignore these SDMA
-options. The resolved notification mode is part of every native Plan's
+``MORI_ASYNCLL_EARLY_NOTIFY``, ``MORI_ASYNCLL_SKIP_RESET``,
+``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_DIRECT``,
+``MORI_ASYNCLL_FUSE_META`` and ``MORI_ASYNCLL_COMPACT_RESERVE`` accept ``0`` or ``1``; the ``*_BLOCKS`` variables
+accept a non-negative integer and the schedules a comma-separated list of
+``tokens:blocks`` pairs. Skipping the reset or fusing receive requires
+early notification. Set the first three to ``0`` for the legacy sequence.
+LSA and multi-node ops retain their existing protocol and ignore the SDMA
+options; ``MORI_ASYNCLL_SEND_BLOCKS`` and ``MORI_ASYNCLL_RECV_BLOCKS`` apply to
+every AsyncLL op. The resolved notification mode is part of every native Plan's
 configuration and generated source, so different ops can coexist without
 changing the protocol of an already constructed Plan.
+
+For two-batch overlap on the fewest compute units on gfx950, either receive
+layout works: the segmented one turns on direct sources by default, and the
+compact one compact reserve, which runs the same send and combine passes and
+keeps the dense compact views (on gfx942 use the segmented layout with
+``MORI_ASYNCLL_DIRECT=1``). Add ``MORI_ASYNCLL_FUSED_RECV=1`` when
+both micro-batches run on one stream (see below), with schedules such as
+``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE=1024:8,0:32`` and
+``MORI_ASYNCLL_RECV_BLOCKS_SCHEDULE=128:64,0:128``. Both send phases then run on
+eight blocks, the dispatch receive only marks the unused rows of each segment
+on its own small grid (compact reserve: one block, nothing to mark), and the
+combine receive, the one phase whose time follows
+its block count, is sized by the token count. The send schedule assumes direct
+sources: without them the send passes gather the token rows and need the whole
+device.
 
 The default targets single-node gfx950 and gfx1250 overlap. On MI355X (gfx950,
 EP8, hidden 7168, top-6), early notification beat the legacy sequence at every
@@ -132,7 +227,7 @@ overlapping streams. Receive fusion remains opt-in because its additional
 benefit depends on the token count and compute window.
 
 Receive fusion is a single-stream optimisation. A fused receive copy waits for
-its peers inside every CTA, so its whole grid stays resident for the wait. When
+its peers inside every block, so its whole grid stays resident for the wait. When
 two micro-batches overlap on two streams (two-batch overlap), that grid can
 crowd out the send pass the other stream must run before any peer's wait can
 end, and the ranks deadlock. The grid ceiling makes this unlikely but cannot

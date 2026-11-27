@@ -151,7 +151,7 @@ def internode_regions(cfg):
     return regions
 
 
-def asyncll_regions(cfg):
+def asyncll_regions(cfg, direct=False, reserve=False):
     """``[(name, nbytes)]`` for the AsyncLL family.
 
     Same names as :func:`internode_regions` so the backend's region lookups and
@@ -171,6 +171,12 @@ def asyncll_regions(cfg):
       * ``send_count`` is new -- two u64 per peer (token count, barrier epoch) to
         source the small SDMA writes from, which ccoSdma needs because it moves
         window to window and has no immediate form.
+
+    ``direct`` must be the op's resolved MORI_ASYNCLL_DIRECT (the value its
+    kernels render): the direct kernels stage metadata only, so the arena shrinks
+    (see _asyncll_direct_regions). False returns the list above unchanged.
+    ``reserve`` (MORI_ASYNCLL_COMPACT_RESERVE, implies direct) drops the landing:
+    peers place rows straight into the packed output.
     """
     regions = dict(internode_regions(cfg))
     order = [name for name, _ in internode_regions(cfg)]
@@ -240,7 +246,63 @@ def asyncll_regions(cfg):
     order.append("inter_combine_staging")
     regions["inter_combine_staging"] = send_slots * hidden_bytes
 
+    if reserve:
+        # Segmented words, then the reserve words (asyncll_reserve_words).
+        regions["send_count"] = asyncll_reserve_words(world_size)["words"] * _U64
+    if direct or reserve:
+        _asyncll_direct_regions(cfg, regions, order, per_rank, reserve)
     return [(name, regions[name]) for name in order]
+
+
+# Regions no direct AsyncLL kernel reads: v1 leftovers, and combine's send staging
+# (combine sends the expert output in place). Their offsets bind to 0.
+_ASYNCLL_DIRECT_DROPPED = (
+    "inp_weights",
+    "combine_out_weights",
+    "node_recv_token_num",
+    "disp_tok_offset",
+    "inter_node_chunk_flag",
+    "inter_combine_staging",
+)
+
+
+def _asyncll_direct_regions(cfg, regions, order, per_rank, reserve=False):
+    """Resize ``regions`` / prune ``order`` in place for direct sources.
+
+    Regions peers write keep the extent the kernels address (landing
+    ``world_size * M * (token_nbytes + meta)``, the combine landing, the
+    count/epoch/mode words), but every region after ``inter_staging`` moves and
+    the window shrinks: the layout is symmetric, so all ranks must resolve the
+    same direct flag (window registration maps each peer at this rank's size).
+    """
+    slots = cfg.world_size * cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+    # One record's metadata: index | weight | scale | source token (xferBytes - hiddenBytes).
+    meta = topk * _I32 + topk * _F32 + _I32 + cfg.scale_dim * cfg.scale_type_size
+    # Send staging: one metadata record per slot (asyncll::DirectStagingMetaOffset), or the
+    # hidden-less field blocks (asyncll::SegStagingLayoutOf).
+    regions["inter_staging"] = slots * meta
+    # Landing: per source slice, hidden rows at the dispatch width, then the records.
+    regions["inter_dispatch_inp"] = slots * (cfg.token_nbytes + meta)
+    if cfg.async_ll_segmented:
+        regions["inter_staging"] = max(
+            regions["inter_staging"], asyncll_seg_layout(cfg, hidden_nbytes=0)["bytes"]
+        )
+        regions["inter_dispatch_inp"] = max(
+            regions["inter_dispatch_inp"], asyncll_seg_layout(cfg)["bytes"]
+        )
+    # Compact receive rows at the dispatch width (RecvCopy, recv_tokens()).
+    regions["inter_dispatch_out"] = cfg.world_size * per_rank * cfg.token_nbytes
+    # Indexed by receive row; a round receives at most world_size * M rows.
+    regions["disp_tok_id_to_src_tok_id"] = slots * _I32
+    dropped = _ASYNCLL_DIRECT_DROPPED
+    if reserve:
+        # Field rows staged per destination, own rank's included; nothing lands in a landing.
+        regions["inter_staging"] = max(
+            slots * meta, asyncll_seg_layout(cfg, hidden_nbytes=0)["bytes"]
+        )
+        dropped += ("inter_dispatch_inp",)
+    order[:] = [name for name in order if name not in dropped]
 
 
 _SEG_ALIGN = 256
@@ -263,22 +325,45 @@ def asyncll_seg_words(world_size):
     }
 
 
-def asyncll_seg_layout(cfg):
+def asyncll_reserve_words(world_size):
+    """Indices (u64 words) of the compact-reserve words in ``send_count``, past the
+    segmented ones (asyncll_seg_words): each source's base this round (``base``),
+    this rank's reservation at each peer (``place``) and the round it is for
+    (``tag``), and the counter peers reserve from (``counter``, alone on a 256 B
+    line). ``words`` is the region's length. Must match the Reserve*Slot helpers in
+    ep_asyncll_kernel.hpp."""
+    w = world_size
+    counter = -(-(7 * w + 3) // 32) * 32
+    return {
+        "base": 4 * w + 3,
+        "place": 5 * w + 3,
+        "tag": 6 * w + 3,
+        "counter": counter,
+        "words": counter + 32,
+    }
+
+
+def asyncll_seg_layout(cfg, hidden_nbytes=None):
     """Byte offsets of the segmented field blocks in ``inter_dispatch_inp`` and
     ``inter_staging``, plus the bytes they span.
 
     Each block holds ``world_size * max_num_inp_token_per_rank`` rows; a segmented
     round with stride S uses rows ``[s * S, s * S + n_s)`` of each for source s.
     Must match ``asyncll::SegLayoutOf`` in ep_asyncll_kernel.hpp.
+
+    ``hidden_nbytes`` is the hidden row width (default ``cfg.token_nbytes``, the
+    landing); 0 is a direct op's send staging, which holds no hidden rows.
     """
     rows = cfg.world_size * cfg.max_num_inp_token_per_rank
     topk = cfg.num_experts_per_token
+    if hidden_nbytes is None:
+        hidden_nbytes = cfg.token_nbytes
 
     def align(x):
         return -(-x // _SEG_ALIGN) * _SEG_ALIGN
 
     layout = {"hidden": 0}
-    layout["index"] = align(rows * cfg.token_nbytes)
+    layout["index"] = align(rows * hidden_nbytes)
     layout["weight"] = align(layout["index"] + rows * topk * _I32)
     layout["scale"] = align(layout["weight"] + rows * topk * _F32)
     layout["src_tok"] = align(

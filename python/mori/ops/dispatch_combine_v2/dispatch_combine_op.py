@@ -323,6 +323,17 @@ class EpDispatchCombineConfig:
     #
     # "segmented" is refused on a config that does not support it; "auto" picks
     # it exactly when supported, and cfg.async_ll_recv_layout reads the outcome.
+    #
+    # On gfx950 a "compact" op without a quant_type runs compact reserve
+    # (MORI_ASYNCLL_COMPACT_RESERVE, on by default there): it keeps the compact
+    # contract -- the dense prefix [0, total_recv), each row's origin in the
+    # reverse map -- but each source reserves its rows' range in the receiver's
+    # views and the copy engines place them there, so nothing is copied on receive.
+    # Sources then appear in arrival order, not rank order (each one's rows stay
+    # contiguous, in its slot order), and since peers write the views, they hold
+    # until this rank's combine_send: consume or clone them before it. A combine
+    # input inside them (an expert run in place) is copied to combine_in_view()
+    # first.
     async_ll_recv_layout: str = "compact"
     low_latency: bool | None = None
 
@@ -978,6 +989,7 @@ class EpDispatchCombineOp:
     # recv without a send raises rather than hitting a missing attribute.
     _async_pending_dispatch_tokens = None
     _async_pending_dispatch_input = None
+    _async_pending_dispatch_scales = None
     _async_pending_dispatch_map = None
     _async_pending_combine = None
 
@@ -1036,6 +1048,31 @@ class EpDispatchCombineOp:
             except (ImportError, ValueError):
                 pass
         return out
+
+    @classmethod
+    def per_rank_vmm(cls, cfg, n_ops=1, arch=None) -> int:
+        """Bytes of ``Communicator.init(per_rank_vmm=...)`` that ``n_ops`` ops built
+        from ``cfg`` need on one communicator (cco rounds it up to 4 GiB).
+
+        Resolved the way the op's constructor resolves it: the backend, the
+        "auto" receive layout and the environment switches that size the arena.
+        ``arch`` defaults to the current device's.
+        """
+        backend = cls
+        if cls is EpDispatchCombineOp:
+            backend = cls._resolve_backend(
+                getattr(cfg, "kernel_backend", None)
+                or os.environ.get("MORI_V2_KERNEL_BACKEND")
+                or _default_backend()
+            )
+        return backend._per_rank_vmm(cfg, n_ops, arch)
+
+    @classmethod
+    def _per_rank_vmm(cls, cfg, n_ops, arch) -> int:
+        raise NotImplementedError(
+            f"the {cls.backend_name} backend does not size its arena from the "
+            "config alone; size per_rank_vmm from a built op's arena instead"
+        )
 
     # -- hooks a subclass must supply --------------------------------------
     #
@@ -1559,6 +1596,9 @@ class EpDispatchCombineOp:
         if kernels is not self._kernels.dispatch:
             self._async_pending_dispatch_tokens = n
             self._async_pending_dispatch_input = input
+            # With direct sources the copy engines read the scale rows in place too,
+            # until dispatch_recv drains them: keep the caller's tensor from being reused.
+            self._async_pending_dispatch_scales = scales
             self._async_pending_dispatch_map = dest_map
 
         count = self.total_recv.clone() if snapshot else self.total_recv
@@ -1679,8 +1719,8 @@ class EpDispatchCombineOp:
     # The send half returns the same tuple dispatch() does, but the output buffers
     # are NOT populated until the matching recv call has run. Reading them in the
     # seam reads stale data: the previous round's on a compact round, and on a
-    # segmented round (async_ll_recv_layout) bytes the engines are still writing,
-    # since those views are the landing region itself.
+    # segmented round (async_ll_recv_layout) or with MORI_ASYNCLL_COMPACT_RESERVE
+    # bytes the engines are still writing, since those views are where they land.
 
     # The AsyncLL protocol's call order, as a state machine. What each call is
     # allowed to see, and what it leaves behind:
@@ -1791,7 +1831,10 @@ class EpDispatchCombineOp:
         """Enqueue the send half of a dispatch and return immediately.
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
-        only valid after :meth:`dispatch_recv`.
+        only valid after :meth:`dispatch_recv`. With direct sources (MORI_ASYNCLL_DIRECT;
+        on by default on gfx950 without a quant_type, in either layout) the copy
+        engines read ``input`` and ``scales`` until then, so do not write either in
+        between.
         """
         with self._asyncll_call("dispatch_send"):
             return self._dispatch_impl(
@@ -1822,10 +1865,14 @@ class EpDispatchCombineOp:
             # caller's input alive until the next round. combine_recv already drops
             # its whole tuple the same way.
             self._async_pending_dispatch_input = None
+            self._async_pending_dispatch_scales = None
             self._async_pending_dispatch_map = None
 
     def combine_send(self, input, weights=None, indices=None, *, routing):
-        """Enqueue the send half of a combine and return immediately."""
+        """Enqueue the send half of a combine and return immediately.
+
+        With direct sources the copy engines read ``input`` until
+        :meth:`combine_recv`, so do not write it in between."""
         self._asyncll_check_weight_fold(weights)
         with self._asyncll_call("combine_send"):
             return self._combine_impl(

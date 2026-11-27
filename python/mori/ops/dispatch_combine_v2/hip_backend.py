@@ -72,11 +72,12 @@ from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelS
 from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
     asyncll_regions,
+    asyncll_reserve_words,
     asyncll_seg_layout,
     asyncll_seg_words,
     internode_regions,
 )
-from .symm_arena import SymmArena
+from .symm_arena import SymmArena, align_up
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,11 @@ SEGMENT_ERR_MISMATCH = 2
 # EpInterNodeArgs.segStride bit 63: the op has the segmented layout, so compact
 # rounds on it still exchange the mode word (asyncll::kSegCapableBit).
 SEG_CAPABLE_BIT = 1 << 63
+
+# per_rank_vmm: ccoMemAlloc rounds an allocation to the VMM granularity, and to
+# 2 MiB past 2 GiB; each op also maps its DevComm resource window.
+_VMM_ALLOC_ALIGN = 2 << 20
+_VMM_DEVCOMM_SLACK = 256 << 20
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
@@ -564,6 +570,24 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # What each intranode plan will report, per variant -- its arena regions,
         # staging, push landing -- asked before any of them is built.
         self._disp_infos, self._comb_infos = self._describe(cfg)
+        if cfg.async_ll:
+            # Resolved once, before the arena: it is sized from the direct flag, and
+            # every AsyncLL kernel renders the same two values (_asyncll_request).
+            # The second value (MORI_ASYNCLL_SKIP_RESET) selects nothing; it is
+            # parsed only so existing settings validate.
+            self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
+            self._asyncll_reserve_on = self._asyncll_reserve(
+                self._asyncll_mode, cfg, self._arch
+            )
+            # Resolved even when reserve decides it, so a bad value still raises.
+            direct = self._asyncll_direct(self._asyncll_mode, cfg, self._arch)
+            self._asyncll_direct_on = self._asyncll_reserve_on or direct
+            if self._asyncll_direct_on and not self._arch.startswith(
+                ("gfx942", "gfx950")
+            ):
+                raise ValueError(
+                    f"MORI_ASYNCLL_DIRECT=1 is supported on gfx942/gfx950, not {self._arch}"
+                )
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
             self._build(cfg, comm)
@@ -853,9 +877,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # buffer: the kernel indexes it by (token, expert), but v1 allocates the
         # worst case and the region test does not cover it, so this stays
         # conservative rather than clever.
-        self.token_dest_map = torch.zeros(
-            world_size * max_tokens_per_rank * cfg.num_experts_per_rank, **i32
+        # Direct AsyncLL: only tok * topk + j with tok < max_tokens_per_rank is read.
+        map_entries = (
+            max_tokens_per_rank * topk
+            if cfg.async_ll and self._asyncll_direct_on
+            else world_size * max_tokens_per_rank * cfg.num_experts_per_rank
         )
+        self.token_dest_map = torch.zeros(map_entries, **i32)
         self._null_flat = world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
 
@@ -870,7 +898,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             n_nodes * max_tokens_per_rank * 2, **i32
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
-        self.block_flag_counter = torch.zeros(n_nodes, **i32)
+        # Per node for the internode kernels; per peer for AsyncLL's shared send transfer.
+        self.block_flag_counter = torch.zeros(max(n_nodes, world_size), **i32)
         # AsyncLL only: recv slot -> the send-buffer slot it arrived in, written by
         # dispatch's RecvCopy and read by combine's SendCopy. One entry per slot
         # this rank can receive into.
@@ -895,10 +924,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             (max_tokens_per_rank * cfg.hidden_dim,),
             cfg.combine_dtype,
         )
-        self.combine_out_weights = from_gpu_ptr(
-            self.arena.local_ptr("combine_out_weights"),
-            (max_tokens_per_rank * topk,),
-            torch.float32,
+        # Absent from a direct AsyncLL arena; AsyncLL refuses the weight fold anyway.
+        self.combine_out_weights = (
+            from_gpu_ptr(
+                self.arena.local_ptr("combine_out_weights"),
+                (max_tokens_per_rank * topk,),
+                torch.float32,
+            )
+            if self.arena.has("combine_out_weights")
+            else None
         )
 
         # Pin everything fixed for the op's lifetime, now that every buffer it
@@ -1083,8 +1117,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _regions(self, cfg):
         if cfg.async_ll:
-            # Same names, per-rank send extents. See asyncll_regions.
-            return asyncll_regions(cfg)
+            # Same names, per-rank send extents. See asyncll_regions. The kernels are
+            # checked against the direct flag this arena was sized with.
+            self._arena_direct = self._asyncll_direct_on
+            self._arena_reserve = self._asyncll_reserve_on
+            return asyncll_regions(
+                cfg, direct=self._arena_direct, reserve=self._arena_reserve
+            )
         if cfg.is_internode:
             # Sized exactly, region by region. v1 sizes its arena with a 256 MB
             # slack term on a rough estimate; this is the exact sum, which is both
@@ -1115,6 +1154,37 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
         return regions
+
+    @classmethod
+    def _per_rank_vmm(cls, cfg, n_ops=1, arch=None):
+        """EpDispatchCombineOp.per_rank_vmm for the formula-sized arenas (AsyncLL,
+        internode); the intranode arena comes from the compiled plans."""
+        if not (cfg.async_ll or cfg.is_internode):
+            return super()._per_rank_vmm(cfg, n_ops, arch)
+        if arch is None:
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            arch = (getattr(props, "gcnArchName", "") or "").split(":")[0]
+        if cfg.async_ll:
+            # The same resolution as __init__: "auto" first, then mode and direct.
+            if cfg.async_ll_recv_layout == "auto":
+                probe = object.__new__(cls)
+                probe._arch = arch
+                supported = not probe._asyncll_segmented_unsupported(cfg)
+                cfg = dataclasses.replace(
+                    cfg, async_ll_recv_layout="segmented" if supported else "compact"
+                )
+            mode, _ = cls._asyncll_options(cfg, arch)
+            reserve = cls._asyncll_reserve(mode, cfg, arch)
+            direct = cls._asyncll_direct(mode, cfg, arch)
+            regions = asyncll_regions(cfg, direct=reserve or direct, reserve=reserve)
+        else:
+            regions = internode_regions(cfg)
+        # SymmArena's packing.
+        off = 0
+        for _, nbytes in regions:
+            off = align_up(off, SymmArena._ALIGN) + nbytes
+        arena = max(align_up(off, SymmArena._ALIGN), SymmArena._ALIGN)
+        return n_ops * (align_up(arena, _VMM_ALLOC_ALIGN) + _VMM_DEVCOMM_SLACK)
 
     def _asyncll_unsupported(self, cfg) -> tuple[str, ...]:
         """AsyncLL's own range. Checked before the arena or the communicator is
@@ -1275,6 +1345,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(
                 f"quant_type={q!r} needs hidden_dim % 128 == 0, got {cfg.hidden_dim}"
             )
+        try:
+            direct = self._asyncll_direct(
+                self._asyncll_options(cfg, self._arch)[0], cfg, self._arch
+            )
+        except ValueError:
+            direct = False  # reported when the kernels are built
+        if direct:
+            bad.append(
+                f"quant_type={q!r} with MORI_ASYNCLL_DIRECT=1: direct combine sends the "
+                "expert output in place, unquantized"
+            )
         return bad
 
     def _asyncll_segmented_unsupported(self, cfg) -> list[str]:
@@ -1302,15 +1383,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if (cfg.scale_dim * cfg.scale_type_size) % 4:
             bad.append(
                 "async_ll_recv_layout='segmented' needs a whole number of dwords per scale row"
-            )
-        try:
-            mode, _ = self._asyncll_options(cfg, self._arch)
-        except ValueError:
-            mode = 0  # reported when the kernels are built
-        if mode == 2:
-            bad.append(
-                "async_ll_recv_layout='segmented' with MORI_ASYNCLL_FUSED_RECV=1: the segmented "
-                "receive keeps the separate RecvTransfer"
             )
         return bad
 
@@ -1482,24 +1554,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         def ptr(tensor):
             return 0 if tensor is None else tensor.data_ptr()
 
+        # v1 leftovers a direct AsyncLL arena drops; only the v1 kernels read them.
+        def offset_or_0(name):
+            return offset(name) if arena.has(name) else 0
+
         self._internode_static_cache = dict(
             window=arena.handle,
-            offDispatchInp=offset("inter_dispatch_inp"),
+            offDispatchInp=offset_or_0("inter_dispatch_inp"),
             offCombineInp=offset("inter_combine_inp"),
             offStaging=offset("inter_staging"),
             offDispatchOut=offset("inter_dispatch_out"),
             offCombineOut=offset("inter_combine_out"),
             offDispatchStaging=offset("inter_dispatch_staging"),
-            offInpWeights=offset("inp_weights"),
+            offInpWeights=offset_or_0("inp_weights"),
             offDispatchOutWeights=offset("dispatch_out_weights"),
-            offCombineOutWeights=offset("combine_out_weights"),
+            offCombineOutWeights=offset_or_0("combine_out_weights"),
             offOutIndices=offset("out_indices"),
             offRecvTokenNum=offset("recv_token_num"),
-            offNodeRecvTokenNum=offset("node_recv_token_num"),
-            offDispTokOffset=offset("disp_tok_offset"),
+            offNodeRecvTokenNum=offset_or_0("node_recv_token_num"),
+            offDispTokOffset=offset_or_0("disp_tok_offset"),
             offDispTokIdToSrcTokId=offset("disp_tok_id_to_src_tok_id"),
             offCrossDeviceBarrier=offset("cross_device_barrier"),
-            offChunkFlag=offset("inter_node_chunk_flag"),
+            offChunkFlag=offset_or_0("inter_node_chunk_flag"),
             # Absent, not zero-sized, when the transport is off; the kernel gates
             # on cfg.scaleDim and never dereferences it.
             offOutScales=offset("out_scales") if has_scales else 0,
@@ -1573,8 +1649,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     @classmethod
-    def _asyncll_seg_seq(cls):
-        return dict(cls._ASYNCLL_SEG_SEQ)
+    def _asyncll_seg_seq(cls, mode, fuse_meta):
+        seq = dict(cls._ASYNCLL_SEG_SEQ)
+        # Fused metadata (_asyncll_fuse_meta): SlotAssign and SendTransferSeg do SendCopySeg's work.
+        if fuse_meta:
+            seq["dispatch_send"] = ("dispatch_slotassign", "dispatch_sendtransfer_seg")
+        if mode == 2:
+            # Fused receive: each copy pass waits for the counts itself.
+            seq["dispatch_recv"] = ("dispatch_recvfinalize_seg",)
+            seq["combine_recv"] = ("combine_recvcopy_seg",)
+        return seq
 
     @staticmethod
     def _asyncll_options(cfg, arch):
@@ -1602,39 +1686,119 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "MORI_ASYNCLL_FUSED_RECV and MORI_ASYNCLL_SKIP_RESET require "
                 "MORI_ASYNCLL_EARLY_NOTIFY=1"
             )
-        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
+        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused wait.
         return (2 if fused else int(early)), skip_reset
 
     @staticmethod
-    def _asyncll_fused_recv_ctas(mode, device_index=0, mp_count=0):
+    def _asyncll_direct(mode, cfg=None, arch=""):
+        # Direct sources: the copy engines read the caller's tokens in place (dispatch input
+        # and scales, combine input) instead of a gathered staging copy, so none may be written
+        # until the matching recv. Rides on early notification; mode 0 means this op has none
+        # (another transport, several nodes, or MORI_ASYNCLL_EARLY_NOTIFY=0). Unset, it is on
+        # for the segmented layout on gfx950 without a quantized combine (`cfg` resolved, so
+        # every rank and per_rank_vmm agree), and compact reserve turns it on for the compact
+        # one (_asyncll_reserve); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
+        value = os.environ.get("MORI_ASYNCLL_DIRECT", "")
+        if value not in ("", "0", "1"):
+            raise ValueError(f"MORI_ASYNCLL_DIRECT must be '0' or '1', got {value!r}")
+        if mode == 0:
+            return False
+        if value:
+            return value == "1"
+        return bool(
+            cfg is not None
+            and cfg.async_ll_segmented
+            and cfg.quant_type == "none"
+            and arch.startswith("gfx950")
+        )
+
+    @staticmethod
+    def _asyncll_reserve(mode, cfg, arch):
+        # Compact reserve: a compact op whose senders reserve their rows' range in each
+        # receiver's packed output (one remote fetch_add per peer) and place them there, so
+        # dispatch_recv copies nothing. Direct sources and fused metadata come with it. Only a
+        # compact op (`cfg` resolved, so every rank and per_rank_vmm agree) with early
+        # notification (mode >= 1: single-node SDMA) can run it; others ignore the variable, as
+        # they do the other SDMA options. There, MORI_ASYNCLL_COMPACT_RESERVE unset turns it on
+        # on gfx950 without a quant_type unless MORI_ASYNCLL_DIRECT or MORI_ASYNCLL_FUSE_META is
+        # 0; "0" turns it off; "1" raises where it cannot run instead of falling back.
+        value = os.environ.get("MORI_ASYNCLL_COMPACT_RESERVE", "")
+        if value not in ("", "0", "1"):
+            raise ValueError(
+                f"MORI_ASYNCLL_COMPACT_RESERVE must be '0' or '1', got {value!r}"
+            )
+        if value == "0" or mode == 0 or cfg.async_ll_segmented:
+            return False
+        bad = []
+        if cfg.quant_type != "none":
+            bad.append("quant_type 'none'")
+        if not arch.startswith("gfx950"):
+            bad.append(f"gfx950 (this is {arch or 'unknown'})")
+        for name in ("MORI_ASYNCLL_DIRECT", "MORI_ASYNCLL_FUSE_META"):
+            if os.environ.get(name) == "0":
+                bad.append(f"{name} unset or 1")
+        if bad and value == "1":
+            raise ValueError("MORI_ASYNCLL_COMPACT_RESERVE=1 needs " + ", ".join(bad))
+        return not bad
+
+    @staticmethod
+    def _asyncll_fuse_meta(direct, segmented, reserve=False):
+        # MORI_ASYNCLL_FUSE_META (default 1; direct, segmented or compact reserve): SlotAssign and
+        # SendTransferSeg do SendCopySeg's work; the result is also the kernels' define.
+        value = os.environ.get("MORI_ASYNCLL_FUSE_META", "1")
+        if value not in ("0", "1"):
+            raise ValueError(
+                f"MORI_ASYNCLL_FUSE_META must be '0' or '1', got {value!r}"
+            )
+        return value == "1" and bool(direct) and (bool(segmented) or bool(reserve))
+
+    @staticmethod
+    def _asyncll_fused_recv_blocks(mode, device_index=0, mp_count=0):
         # Grid ceiling for the fused receive copies; 0 lets the native factory
-        # pick half the device. MORI_ASYNCLL_FUSED_RECV_CTAS is only a tuning
+        # pick half the device. MORI_ASYNCLL_FUSED_RECV_BLOCKS is only a tuning
         # override: the default exists so that fusion cannot starve another
-        # stream's sends into a deadlock.
-        name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
+        # stream's sends into a deadlock. The old name, _CTAS, is still read.
+        name = "MORI_ASYNCLL_FUSED_RECV_BLOCKS"
+        if name not in os.environ and "MORI_ASYNCLL_FUSED_RECV_CTAS" in os.environ:
+            name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
         value = os.environ.get(name, "0")
         try:
-            ctas = int(value)
+            blocks = int(value)
         except ValueError:
-            ctas = -1
-        if ctas < 0:
+            blocks = -1
+        if blocks < 0:
             raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
         if mode != 2:
             return 0
-        if ctas > 0:
-            return ctas
+        if blocks > 0:
+            return blocks
         # "Half the device" has to mean half of what this process can use. The
         # native default is mpCount / 2, and mpCount is the whole device even when
         # HSA_CU_MASK leaves the process a fraction of it: at 64 of 256 CUs two
-        # 128-CTA fused grids fill every slot, and the ranks deadlock as if there
+        # 128-block fused grids fill every slot, and the ranks deadlock as if there
         # were no ceiling at all.
         usable = _hsa_cu_mask_cus(device_index, mp_count)
         if usable is not None and 0 < usable < mp_count:
             return max(usable // 2, 1)
         return 0
 
+    # Compact reserve (_asyncll_reserve): SlotAssign also reserves, SendTransferSeg places rows
+    # and fields in the receiver's packed output, and the receive is the finalize's epilogue.
+    _ASYNCLL_RESERVE_SEQ = {
+        "dispatch_send": ("dispatch_slotassign", "dispatch_sendtransfer_seg"),
+        "dispatch_recv": ("dispatch_recvtransfer", "dispatch_recvfinalize_seg"),
+        "combine_send": ("combine_sendtransfer",),
+        "combine_recv": ("combine_recvtransfer", "combine_recvcopy"),
+    }
+
     @classmethod
-    def _asyncll_seq(cls, cfg, mode=0):
+    def _asyncll_seq(cls, cfg, mode=0, direct=False, reserve=False):
+        if reserve:
+            seq = dict(cls._ASYNCLL_RESERVE_SEQ)
+            if mode == 2:
+                seq["dispatch_recv"] = ("dispatch_recvfinalize_seg",)
+                seq["combine_recv"] = ("combine_recvcopy",)
+            return seq
         lsa = cfg.async_ll_transport == "lsa"
         sfx = "_lsa" if lsa else ""
         seq = {
@@ -1651,6 +1815,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if mode == 2:
             seq["dispatch_recv"] = ("dispatch_recvcopy",)
             seq["combine_recv"] = ("combine_recvcopy",)
+        # Direct sources: combine sends the expert output in place and stages its own
+        # words, so it has no SendCopy (dispatch's SendCopy writes only the metadata).
+        if direct:
+            seq["combine_send"] = ("combine_sendtransfer",)
         return seq
 
     # Which leg's dtype each pass is compiled for, the rule
@@ -1679,8 +1847,145 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
         request["asyncLlMode"] = self._asyncll_mode
-        request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
+        request["asyncLlDirect"] = self._asyncll_direct_on
+        request["asyncLlFuseMeta"] = self._asyncll_fuse_meta_on
+        request["asyncLlCompactReserve"] = self._reserve_on()
+        # Grid ceilings for the send- and receive-side copy passes; 0 = the whole device.
+        for side, field in (
+            ("SEND", "asyncLlSendBlocks"),
+            ("RECV", "asyncLlRecvBlocks"),
+        ):
+            name = f"MORI_ASYNCLL_{side}_BLOCKS"
+            value = os.environ.get(name, "0")
+            try:
+                blocks = int(value)
+            except ValueError:
+                blocks = -1
+            if blocks < 0:
+                raise ValueError(
+                    f"{name} must be a non-negative integer, got {value!r}"
+                )
+            request[field] = blocks
+        request["asyncLlFusedRecvBlocks"] = self._asyncll_fused_blocks
         return request
+
+    @staticmethod
+    def _asyncll_blocks_schedule(side):
+        # MORI_ASYNCLL_{SEND,RECV}_BLOCKS_SCHEDULE="tokens:blocks,...": the grid cap per call by
+        # token count. A call takes the first bucket with T <= tokens (ascending); tokens 0
+        # matches any T and goes last. blocks 0 = uncapped. A T past every bound keeps
+        # MORI_ASYNCLL_{side}_BLOCKS. None when unset or empty.
+        name = f"MORI_ASYNCLL_{side}_BLOCKS_SCHEDULE"
+        buckets = {}
+        for item in (x.strip() for x in os.environ.get(name, "").split(",")):
+            if not item:
+                continue
+            try:
+                bound, blocks = (int(v) for v in item.split(":"))
+            except ValueError:
+                bound = blocks = -1
+            if bound < 0 or blocks < 0:
+                raise ValueError(
+                    f"{name} takes 'tokens:blocks' pairs of non-negative integers, got {item!r}"
+                )
+            if bound in buckets:
+                raise ValueError(f"{name} lists the token bound {bound} twice")
+            buckets[bound] = blocks
+        if not buckets:
+            return None
+        return tuple(sorted(buckets.items(), key=lambda b: (b[0] == 0, b[0])))
+
+    @staticmethod
+    def _asyncll_pick_bucket(buckets, num_tokens):
+        # buckets: ((bound, group), ...) ascending; the last bound is None (any T).
+        for bound, group in buckets:
+            if bound is None or num_tokens <= bound:
+                return group
+
+    def _build_asyncll_buckets(self, cfg, request_for, plans_by_pass, layouts):
+        """Launch groups per token bucket of the BLOCKS_SCHEDULE envs.
+
+        `layouts` is ((sequences, groups), ...); returns one dict per entry, group ->
+        ((bound or None, launch group), ...), empty when neither env is set. A group
+        whose every bucket resolves to its single-cap plans is left out. The caps
+        only change launch geometry, which is not rendered, so a bucket plan loads the
+        module its pass's single-cap plan already loaded: everything is built here, at
+        construction, and a launch (or a graph capture) only picks a group.
+        """
+        from mori.jit.v2 import plan_api
+
+        schedules = {
+            "send": self._asyncll_blocks_schedule("SEND"),
+            "recv": self._asyncll_blocks_schedule("RECV"),
+        }
+        out = [{} for _ in layouts]
+        if not any(schedules.values()):
+            return out
+        field = {"send": "asyncLlSendBlocks", "recv": "asyncLlRecvBlocks"}
+
+        def shape(info):
+            return info["gridX"], info["blockX"], info["sharedBytes"]
+
+        # One plan per (pass, launch shape): a pass the cap does not reach, or a cap
+        # that resolves to a grid already built, reuses that plan.
+        by_shape = {(n, *shape(p.info)): p for n, p in plans_by_pass.items()}
+        desc = []
+        for (sequences, groups), buckets_out in zip(layouts, out):
+            for group, names in sequences.items():
+                side = "send" if group.endswith("_send") else "recv"
+                schedule = schedules[side]
+                if not schedule:
+                    continue
+                base = request_for(group)
+                single = [plans_by_pass[n] for n in names]
+                buckets, lines = [], []
+                for bound, blocks in schedule:
+                    request = dict(base, **{field[side]: blocks})
+                    plans = []
+                    for name in names:
+                        plan_t = cb.asyncll_plan(name)
+                        key = (name, *shape(plan_t.describe(**request)))
+                        plan = by_shape.get(key)
+                        if plan is None:
+                            plan = plan_t(**request)
+                            if (
+                                plan.info["cacheDir"]
+                                != plans_by_pass[name].info["cacheDir"]
+                            ):
+                                plan.close()
+                                raise RuntimeError(
+                                    f"AsyncLL {name}: {field[side]}={blocks} built a second "
+                                    "module; the block caps must stay geometry-only"
+                                )
+                            plan.bind(rdmaBlockNum=0, replayMode=0)
+                            self._plans.append(plan)
+                            by_shape[key] = plan
+                        plans.append(plan)
+                    # Same plans as the single cap: launch the op's own group.
+                    launch = (
+                        groups[group]
+                        if plans == single
+                        else plan_api.make_launch_group(plans)
+                    )
+                    buckets.append((bound or None, launch))
+                    lines.append(
+                        f"{group} T<={bound or 'any'}: grid "
+                        + "/".join(str(p.info["gridX"]) for p in plans)
+                    )
+                if buckets[-1][0] is not None:
+                    # Past every bound: the op's single-cap group.
+                    buckets.append((None, groups[group]))
+                    lines.append(
+                        f"{group} T>{buckets[-2][0]}: MORI_ASYNCLL_{side.upper()}_BLOCKS"
+                    )
+                # Every bucket is the single-cap group: launch as without a schedule.
+                if all(launch is groups[group] for _, launch in buckets):
+                    continue
+                buckets_out[group] = tuple(buckets)
+                desc.extend(lines)
+        if cfg.rank == 0 and desc:
+            logger.info("AsyncLL block schedule: %s", "; ".join(dict.fromkeys(desc)))
+        return out
 
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
@@ -1693,32 +1998,51 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         warp_per_block = cfg.warp_num_per_block
 
         plans_by_pass = {}
-        # The second value is MORI_ASYNCLL_SKIP_RESET, which no longer selects
-        # anything: main dropped the host total_recv reset it skipped (and
-        # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
-        # always assigned the count. Still parsed so existing settings validate.
-        self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
-        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(
+        # Mode and direct were resolved in __init__, before the arena was sized; a
+        # non-direct kernel on a direct arena would overrun inter_staging.
+        if self._asyncll_direct_on != self._arena_direct:
+            raise RuntimeError(
+                f"AsyncLL direct={self._asyncll_direct_on} differs from the "
+                f"direct={self._arena_direct} the arena was sized with"
+            )
+        if self._asyncll_reserve_on != self._arena_reserve:
+            raise RuntimeError(
+                f"AsyncLL compact reserve={self._asyncll_reserve_on} differs from the "
+                f"reserve={self._arena_reserve} the arena was sized with"
+            )
+        self._asyncll_fuse_meta_on = self._asyncll_fuse_meta(
+            self._asyncll_direct_on, cfg.async_ll_segmented, self._asyncll_reserve_on
+        )
+        self._asyncll_fused_blocks = self._asyncll_fused_recv_blocks(
             self._asyncll_mode, self._device_index, self._multi_processor_count
         )
-        sequences = self._asyncll_seq(cfg, self._asyncll_mode)
-        seg_sequences = self._asyncll_seg_seq() if cfg.async_ll_segmented else {}
+        sequences = self._asyncll_seq(
+            cfg, self._asyncll_mode, self._asyncll_direct_on, self._asyncll_reserve_on
+        )
+        seg_sequences = (
+            self._asyncll_seg_seq(self._asyncll_mode, self._asyncll_fuse_meta_on)
+            if cfg.async_ll_segmented
+            else {}
+        )
+
+        def pass_request(group):
+            leg = self._asyncll_leg(group)
+            request = self._asyncll_request(
+                cfg, leg_dtype[leg], block_num, warp_per_block
+            )
+            # AsyncLL's kernels never read quantType; a quantized op tells only its
+            # combine passes the wire's group size, so the dispatch passes keep
+            # their modules.
+            request["quantType"] = "none"
+            if leg == "combine":
+                request["combineQGroup"] = _ASYNCLL_QUANT_GROUPS.get(cfg.quant_type, 0)
+            return request
+
         for group, names in [*sequences.items(), *seg_sequences.items()]:
             for name in names:
                 if name in plans_by_pass:
                     continue
-                leg = self._asyncll_leg(group)
-                request = self._asyncll_request(
-                    cfg, leg_dtype[leg], block_num, warp_per_block
-                )
-                # AsyncLL's kernels never read quantType; a quantized op tells
-                # only its combine passes the wire's group size, so the dispatch
-                # passes keep their modules.
-                request["quantType"] = "none"
-                if leg == "combine":
-                    request["combineQGroup"] = _ASYNCLL_QUANT_GROUPS.get(
-                        cfg.quant_type, 0
-                    )
+                request = pass_request(group)
                 plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the
@@ -1735,6 +2059,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
             for group, names in seg_sequences.items()
         }
+        self._asyncll_buckets, self._asyncll_buckets_seg = self._build_asyncll_buckets(
+            cfg,
+            pass_request,
+            plans_by_pass,
+            (
+                (sequences, self._asyncll_groups),
+                (seg_sequences, self._asyncll_groups_seg),
+            ),
+        )
         self._seg_layout = asyncll_seg_layout(cfg) if cfg.async_ll_segmented else None
 
         # AsyncLL compiles one geometry -- its specs derive each pass's grid from
@@ -1782,6 +2115,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             stride = self._seg_stride
             if stride and "combine_send" in groups:
                 input = self._seg_combine_input(input, stride)
+            elif phase == "combine" and self._reserve_on():
+                input = self._reserve_combine_input(input, "combine_send" in groups)
             if phase == "dispatch":
                 if groups[0] == "dispatch_recv":
                     # dispatch_recv() launches this half with only input/dest_map/
@@ -1848,9 +2183,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 # still exchange the mode word (asyncll::SegModeWord).
                 args["segStride"] = SEG_CAPABLE_BIT | stride
             table = self._asyncll_groups_seg if stride else self._asyncll_groups
+            buckets = self._asyncll_buckets_seg if stride else self._asyncll_buckets
             stream = _raw_stream(self._device_index)
             for group in groups:
-                table[group].launch(stream, **args)
+                launch = table[group]
+                schedule = buckets.get(group)
+                if schedule:
+                    # A segmented dispatch_recv walks world_size * S rows: pick by S.
+                    t = stride if stride and group == "dispatch_recv" else num_tokens
+                    launch = self._asyncll_pick_bucket(schedule, t)
+                launch.launch(stream, **args)
 
         return run
 
@@ -1912,6 +2254,39 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             view.copy_(input)
         return view
 
+    # Regions of this rank's arena that peers write during a compact-reserve dispatch: the recv
+    # views (the reverse map included).
+    _RESERVE_PEER_WRITTEN = (
+        "inter_dispatch_out",
+        "out_indices",
+        "dispatch_out_weights",
+        "out_scales",
+        "disp_tok_id_to_src_tok_id",
+    )
+
+    def _reserve_combine_input(self, input, copy):
+        """Compact reserve reads the combine input in place until combine_recv, while a peer may
+        write this rank's recv views for its next round as soon as this rank's combine_send is
+        out. An input inside those views (an expert run in place on recv_tokens()) moves to
+        combine_in_view(), which peers never write: copied on the stream ahead of combine_send,
+        before any peer can start its next round; combine_recv (copy=False) reads the copy.
+        """
+        if input.numel() == 0:
+            return input
+        span = sum((n - 1) * st for n, st in zip(input.shape, input.stride())) + 1
+        lo = input.data_ptr()
+        hi = lo + span * input.element_size()
+        for name in self._RESERVE_PEER_WRITTEN:
+            if not self.arena.has(name):
+                continue
+            base = self.arena.local_ptr(name)
+            if lo < base + self.arena.size(name) and base < hi:
+                view = self.combine_in_view()[: input.shape[0]]
+                if copy:
+                    view.copy_(input)
+                return view
+        return input
+
     def _seg_words_view(self, key, first, n):
         view = self._views.get(key)
         if view is None:
@@ -1938,8 +2313,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         Use this for totals (e.g. a periodic health check that diffs two reads);
         segment_error_flags() answers "anything new since I last looked". Reads
-        device memory, so it synchronizes."""
-        if not self.cfg.async_ll_segmented:
+        device memory, so it synchronizes.
+
+        A compact-reserve op (MORI_ASYNCLL_COMPACT_RESERVE) counts mismatches the same
+        way: a source whose word is not a reservation of this round."""
+        if not (self.cfg.async_ll_segmented or self._reserve_on()):
             return (0, 0)
         first = asyncll_seg_words(self.cfg.world_size)["errors"]
         overflow, mismatch = self._seg_words_view("seg_errors", first, 2).tolist()
@@ -1960,6 +2338,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if clear:
             self._seg_error_base = counts
         return flags
+
+    def _reserve_on(self):
+        return bool(getattr(self, "_asyncll_reserve_on", False))
+
+    def _reserve_bases(self):
+        """Compact reserve only (tests): device int64 [world_size], where source s's rows
+        start in this rank's packed output in the last round; None otherwise."""
+        if not self._reserve_on():
+            return None
+        first = asyncll_reserve_words(self.cfg.world_size)["base"]
+        return self._seg_words_view("reserve_bases", first, self.cfg.world_size)
 
     def segment_counts(self):
         """Device int64 [world_size]: n_s, the rows source s sent this rank in the

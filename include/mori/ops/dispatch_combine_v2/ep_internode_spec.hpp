@@ -62,9 +62,17 @@ struct EpInterNodeCfg {
   EpInterNodeKernelCfg kernelCfg{};
   EpInterNodeDType dtype{EpInterNodeDType::Bf16};
   // Host-only protocol selection, rendered as defines by the AsyncLL specs.
-  // 0 = legacy, 1 = early notification, 2 = early notification + fused CTA recv.
+  // 0 = legacy, 1 = early notification, 2 = early notification + fused receive.
   // Bare plans stay legacy; callers must explicitly choose a single-node SDMA mode.
   int asyncLlMode{0};
+  // Direct sources (needs asyncLlMode > 0): the engines read the caller's tokens in place.
+  bool asyncLlDirect{false};
+  // Segmented direct dispatch (needs asyncLlDirect): SlotAssign writes the field rows and
+  // SendTransferSeg stages the count and mode words, so the host drops SendCopySeg.
+  bool asyncLlFuseMeta{false};
+  // Compact layout (needs asyncLlFuseMeta): each sender reserves its rows' range in the receiver's
+  // packed output and the engines place them there, so the dispatch receive copies nothing.
+  bool asyncLlCompactReserve{false};
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -80,10 +88,17 @@ struct EpInterNodeCfg {
   int waveSize{64};
   // Grid ceiling for the fused receive copies (asyncLlMode 2), resolved by
   // MakeEpInterNodeCfg; 0 everywhere else. A fused copy waits for its peers
-  // inside every CTA, so its whole grid stays resident for the wait. Spanning
+  // inside every block, so its whole grid stays resident for the wait. Spanning
   // the device, that can leave no room for the send pass another stream must
   // run before any peer's wait can end -- a cross-rank deadlock.
-  int asyncLlFusedRecvCtas{0};
+  int asyncLlFusedRecvBlocks{0};
+  // Grid ceiling for the AsyncLL send-side copy passes (SlotAssign, SendCopy,
+  // CombineSendCopy); 0 = the whole device. With direct sources and fused metadata
+  // it also sets DispatchSendTransferSeg's grid: asyncLlSendBlocks / worldSize blocks
+  // per peer (one when 0), up to the device.
+  int asyncLlSendBlocks{0};
+  // Same for the receive-side copy passes (RecvCopy, CombineRecvCopy, their segmented forms).
+  int asyncLlRecvBlocks{0};
 };
 
 template <typename Self, typename Visit>
@@ -92,17 +107,22 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
   MORI_FIELD(kernelCfg);
   MORI_FIELD(dtype);
   MORI_FIELD(asyncLlMode);
+  MORI_FIELD(asyncLlDirect);
+  MORI_FIELD(asyncLlFuseMeta);
+  MORI_FIELD(asyncLlCompactReserve);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
   MORI_FIELD(waveSize);
-  MORI_FIELD(asyncLlFusedRecvCtas);
+  MORI_FIELD(asyncLlFusedRecvBlocks);
+  MORI_FIELD(asyncLlSendBlocks);
+  MORI_FIELD(asyncLlRecvBlocks);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 9, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 14, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
 // text: RenderSource renders the kernel specialisation (and AsyncLL mode), not
@@ -188,15 +208,24 @@ struct EpInterNodeRequest {
   bool combineLoadFirst = false;
   // AsyncLL only; the host resolves transport/env policy before constructing a plan.
   int asyncLlMode = 0;
+  // AsyncLL early notification only; see EpInterNodeCfg::asyncLlDirect.
+  bool asyncLlDirect = false;
+  // asyncLlDirect only; see EpInterNodeCfg::asyncLlFuseMeta.
+  bool asyncLlFuseMeta = false;
+  // asyncLlFuseMeta only; see EpInterNodeCfg::asyncLlCompactReserve.
+  bool asyncLlCompactReserve = false;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
   int rdmaBlockNum = 0;
   int mpCount = 0;
   // asyncLlMode 2 only; 0 = half the device (mpCount / 2).
-  int asyncLlFusedRecvCtas = 0;
+  int asyncLlFusedRecvBlocks = 0;
   // AsyncLL combine passes only; see EpInterNodeKernelCfg.
   int combineQGroup = 0;
+  // AsyncLL send-side copy passes; 0 = the whole device.
+  int asyncLlSendBlocks = 0;
+  int asyncLlRecvBlocks = 0;
 };
 
 template <typename Self, typename Visit>
@@ -218,17 +247,22 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(dtype);
   MORI_FIELD(combineLoadFirst);
   MORI_FIELD(asyncLlMode);
+  MORI_FIELD(asyncLlDirect);
+  MORI_FIELD(asyncLlFuseMeta);
+  MORI_FIELD(asyncLlCompactReserve);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
-  MORI_FIELD(asyncLlFusedRecvCtas);
+  MORI_FIELD(asyncLlFusedRecvBlocks);
   MORI_FIELD(combineQGroup);
+  MORI_FIELD(asyncLlSendBlocks);
+  MORI_FIELD(asyncLlRecvBlocks);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 22,
+    EpInterNodeRequest, 27,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

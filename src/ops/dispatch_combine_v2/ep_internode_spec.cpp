@@ -102,6 +102,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
   cfg.asyncLlMode = request.asyncLlMode;
   cfg.kernelCfg.combineQGroup = request.combineQGroup;
+  cfg.asyncLlDirect = request.asyncLlDirect;
+  cfg.asyncLlFuseMeta = request.asyncLlFuseMeta;
+  cfg.asyncLlCompactReserve = request.asyncLlCompactReserve;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -130,7 +133,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2) {
     throw std::runtime_error(
         "mori ep v2: asyncLlMode must be 0 (legacy), 1 (early), or "
-        "2 (fused CTA receive)");
+        "2 (fused receive)");
   }
   if (cfg.asyncLlMode != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: asyncLlMode is only supported by AsyncLL plans");
@@ -141,19 +144,46 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (cfg.kernelCfg.combineQGroup != 0 && family != EpInterNodeFamily::AsyncLL) {
     throw std::runtime_error("mori ep v2: combineQGroup is only supported by AsyncLL plans");
   }
-  if (request.asyncLlFusedRecvCtas < 0) {
-    throw std::runtime_error("mori ep v2: asyncLlFusedRecvCtas must be >= 0");
-  }
-  if (request.asyncLlFusedRecvCtas != 0 && cfg.asyncLlMode != 2) {
+  if (cfg.asyncLlDirect && cfg.asyncLlMode == 0) {
     throw std::runtime_error(
-        "mori ep v2: asyncLlFusedRecvCtas only applies to asyncLlMode 2 (fused receive)");
+        "mori ep v2: asyncLlDirect requires early notification (asyncLlMode > 0)");
+  }
+  if (cfg.asyncLlFuseMeta && !cfg.asyncLlDirect) {
+    throw std::runtime_error("mori ep v2: asyncLlFuseMeta requires asyncLlDirect");
+  }
+  if (cfg.asyncLlCompactReserve && !cfg.asyncLlFuseMeta) {
+    throw std::runtime_error("mori ep v2: asyncLlCompactReserve requires asyncLlFuseMeta");
+  }
+  if (cfg.asyncLlDirect && cfg.kernelCfg.combineQGroup != 0) {
+    throw std::runtime_error("mori ep v2: asyncLlDirect sends the combine input unquantized");
+  }
+  if (request.asyncLlSendBlocks < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlSendBlocks must be >= 0");
+  }
+  if (request.asyncLlSendBlocks != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: asyncLlSendBlocks is only supported by AsyncLL plans");
+  }
+  cfg.asyncLlSendBlocks = request.asyncLlSendBlocks;
+  if (request.asyncLlRecvBlocks < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlRecvBlocks must be >= 0");
+  }
+  if (request.asyncLlRecvBlocks != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: asyncLlRecvBlocks is only supported by AsyncLL plans");
+  }
+  cfg.asyncLlRecvBlocks = request.asyncLlRecvBlocks;
+  if (request.asyncLlFusedRecvBlocks < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlFusedRecvBlocks must be >= 0");
+  }
+  if (request.asyncLlFusedRecvBlocks != 0 && cfg.asyncLlMode != 2) {
+    throw std::runtime_error(
+        "mori ep v2: asyncLlFusedRecvBlocks only applies to asyncLlMode 2 (fused receive)");
   }
   // Half the device by default. On MI355X it keeps most of fusion's
   // single-stream gain and removed the deadlock measured against a second
   // stream's sends; a stream that fills most of the device can still starve it.
   if (cfg.asyncLlMode == 2) {
-    cfg.asyncLlFusedRecvCtas = request.asyncLlFusedRecvCtas > 0 ? request.asyncLlFusedRecvCtas
-                                                                : std::max(cfg.mpCount / 2, 1);
+    cfg.asyncLlFusedRecvBlocks = request.asyncLlFusedRecvBlocks > 0 ? request.asyncLlFusedRecvBlocks
+                                                                    : std::max(cfg.mpCount / 2, 1);
   }
 
   // Caught here rather than by hipModuleLaunchKernel, which reports it as a
