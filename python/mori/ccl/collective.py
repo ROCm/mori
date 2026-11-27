@@ -159,9 +159,9 @@ _TDM_A2A_BLOCKS = 64
 # only: 64 is what ships. Must equal MORI_CCL_TDM_A2A_MAX_BLOCKS.
 _TDM_A2A_MAX_BLOCKS = 128
 _TDM_A2A_SHARED_MEM = (_TDM_THREADS // _TDM_WAVE_SIZE) * _TDM_A2A_TILE_BYTES
-# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block, the go word and the
-# two masks of the registered-output handshake.
-_TDM_A2A_SYNC_WORDS = _TDM_A2A_MAX_BLOCKS + 3
+# Must equal MORI_CCL_TDM_A2A_SYNC_WORDS: a slot per block, the go word, the
+# two masks of the registered-output handshake and the counter of its push.
+_TDM_A2A_SYNC_WORDS = _TDM_A2A_MAX_BLOCKS + 4
 # With copy_output_to_user, calls of at least this many bytes a rank
 # (count * npes * 4) push every tile first, exchange one word a block and then
 # copy (CclTdmA2aCopyAfterPush in the kernel header); smaller ones raise a word

@@ -101,7 +101,10 @@ namespace collective {
 #define MORI_CCL_TDM_A2A_SYNC_GO MORI_CCL_TDM_A2A_MAX_BLOCKS
 // Two masks block 0 leaves for the other blocks before the go word, registered outputs only.
 #define MORI_CCL_TDM_A2A_SYNC_MASKS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 1)
-#define MORI_CCL_TDM_A2A_SYNC_WORDS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 3)
+// The counter from which the warps of every block take the last items of a push, under the call
+// number; block 0 resets it before the go word. Registered outputs only.
+#define MORI_CCL_TDM_A2A_SYNC_CURSOR (MORI_CCL_TDM_A2A_MAX_BLOCKS + 3)
+#define MORI_CCL_TDM_A2A_SYNC_WORDS (MORI_CCL_TDM_A2A_MAX_BLOCKS + 4)
 
 // The SDMA kernel's arguments plus what the host class does not own. MUST AGREE WITH _launch_tdm
 // in python/mori/ccl/collective.py, which copies the 72 bytes prepare_sync fills and writes the
@@ -506,7 +509,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     uint64_t recvDirect, const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4,
     uint64_t call, size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap,
     size_t grid, size_t blk, int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId,
-    int waveSize, size_t copyBlocks = 0) {
+    int waveSize, size_t copyBlocks = 0, uint64_t* cursor = nullptr) {
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
   const size_t peers = np - 1;
@@ -528,6 +531,17 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
   const size_t pushStride = pushBlocks * warps;
   const size_t ownFirst = cb == 0 ? first : static_cast<size_t>(warpId) * cb + (blk - pushBlocks);
   const size_t ownStride = cb == 0 ? totalWarps : cb * warps;
+  // The last eighth of the push is not dealt beforehand: a warp that is through with its own
+  // share, of the push or of the copy, takes those items one at a time from the counter. The
+  // push blocks then end together instead of waiting for the slowest of them, and the copy
+  // blocks push for as long as they have left. Taking an item costs a store to a word every
+  // warp writes, so the share has an optimum. Measured as above, us a call at 512 MiB and at
+  // 1 GiB a rank by the share taken from the counter: none 291.3 / 556.3, 1/32 288.5 / 548.8,
+  // 1/16 281.7 / 541.1, 1/8 279.2 / 538.7, 1/4 281.1 / 540.0, 1/2 284.3 / 548.9, all of it
+  // 294.0 / 568.5. Dealing the copy blocks a fixed 2 % of the items beforehand instead
+  // measured 297.3 / 576.1: they were done later than that.
+  const size_t tailItems = (cb != 0 && cursor != nullptr) ? items / 8 : 0;
+  const size_t headItems = items - tailItems;
   if (blk >= pushBlocks) {
     for (size_t t = ownFirst; t < tiles; t += ownStride) {
       const size_t off = t * MORI_CCL_TDM_A2A_TILE_ELEMS;
@@ -539,7 +553,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     }
   }
 
-  for (size_t i = blk < pushBlocks ? pushFirst : items; i < items; i += pushStride) {
+  for (size_t i = blk < pushBlocks ? pushFirst : headItems; i < headItems; i += pushStride) {
     const size_t destPe = (me + 1 + i % peers) % np;
     const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
@@ -553,6 +567,26 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
                  outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(destPe))) +
              peerOff;
     }
+    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * chunk4 + off, n, ldsTile, laneId,
+                         waveSize);
+  }
+
+  while (tailItems != 0) {
+    unsigned q32 = 0;
+    if (laneId == 0) {
+      q32 = static_cast<unsigned>(
+          __scoped_atomic_fetch_add(cursor, 1ULL, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+    }
+    const size_t i = headItems + __shfl(q32, 0);
+    if (i >= items) break;
+    const size_t destPe = (me + 1 + i % peers) % np;
+    const size_t off = i / peers * MORI_CCL_TDM_A2A_TILE_ELEMS;
+    const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
+                         ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
+                         : chunk4 - off;
+    // Only with every peer delivering directly: copyBlocks is 0 otherwise.
+    uint32_t* const peer =
+        reinterpret_cast<uint32_t*>(outputMemObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
     CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * chunk4 + off, n, ldsTile, laneId,
                          waveSize);
   }
@@ -650,6 +684,7 @@ __device__ __forceinline__ void CclTdmA2aStart(
                                 __MEMORY_SCOPE_DEVICE);
         __scoped_atomic_store_n(masks + 1, (call << 32) | reachBits, __ATOMIC_RELAXED,
                                 __MEMORY_SCOPE_DEVICE);
+        __scoped_atomic_store_n(masks + 2, call << 32, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
       }
     }
     __syncthreads();
@@ -759,11 +794,11 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
                                     ? grid / (3 * static_cast<size_t>(npes))
                                     : 0;
       const size_t half = static_cast<size_t>(call & 1ULL) * halfElems;
-      detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
-                                     localTransit + half, localTransit, outputMemObj, sendDirect,
-                                     recvDirect, outputTransitMemObj, chunk4, call, half,
-                                     wordsElems, tileStride, detail::kCclTdmA2aWordGap, grid, blk,
-                                     warpId, totalWarps, ldsTile, laneId, waveSize, copyBlocks);
+      detail::CclTdmA2aCopyAfterPush(
+          myPe, npes, reinterpret_cast<const uint32_t*>(input), out4, localTransit + half,
+          localTransit, outputMemObj, sendDirect, recvDirect, outputTransitMemObj, chunk4, call,
+          half, wordsElems, tileStride, detail::kCclTdmA2aWordGap, grid, blk, warpId, totalWarps,
+          ldsTile, laneId, waveSize, copyBlocks, sync + MORI_CCL_TDM_A2A_SYNC_CURSOR);
     } else {
       detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
                                       localTransit, outputTransitMemObj, chunk4, call, halfElems,
