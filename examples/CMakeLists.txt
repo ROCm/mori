@@ -178,6 +178,10 @@ target_include_directories(
                                     ${CMAKE_SOURCE_DIR})
 target_link_libraries(mori_shmem_for_siof_static PUBLIC mori_application
                                                         mori_logging hip::host)
+# Same sources as mori_shmem, so the same dependency on the metrics library.
+if(BUILD_METRICS)
+  target_link_libraries(mori_shmem_for_siof_static PUBLIC mori_metrics)
+endif()
 
 add_executable(static_link_siof_test shmem/static_link_siof_test.cpp)
 
