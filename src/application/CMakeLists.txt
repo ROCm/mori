@@ -69,6 +69,7 @@ list(
   transport/tcp/tcp.cpp
   transport/sdma/anvil.cpp
   memory/symmetric_memory.cpp
+  memory/hip_gem_allocator.cpp
   memory/va_manager.cpp
   memory/memory_region.cpp
   context/context.cpp

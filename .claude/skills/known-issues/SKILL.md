@@ -536,14 +536,34 @@ archived mails are whitespace-damaged, so take the commits.
 | Run amdgpu-dkms 30.x (downgrade from 31.10 – 31.60, or instead of in-tree amdgpu) and register through peer memory | — | Works | Same conditions as the row above |
 | A page-sized peer-memory "anchor" MR per allocation: Mooncake `MC_HIP_KFD_PIN_FIX` (kvcache-ai/Mooncake#4657, merged), mori `MORI_KFD_PIN_FIX=1` (ROCm/mori#869, not merged) | Fixes the dma-buf path; #869 also stops the over-report | Fixes only what `hipMemGetInfo` reports; allocations still fail | Needs peer memory and non-VMM memory |
 | Leave headroom: non-KV usage + 2 × registered size ≤ VRAM | Works | Works | Costs about half of the KV capacity |
-| Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584, open) | Works | Works | Register only through the BO's dma-buf (warning below). MoRI does not support it |
+| Allocate the KV cache outside KFD, as an amdgpu GEM BO imported into HIP: `mori.io.HipGemAllocator` (SGLang: `SGLANG_MORI_CUSTOM_MEM_POOL=AMD_GEM`, isytwu/sglang `feat/mori-hip-gem-mem-pool`); Mooncake `HipGemAllocator` (kvcache-ai/Mooncake#5584) | Works | Works | Needs a NIC whose dma-buf MRs pin memory (ionic, bnxt_re; not mlx5). The buffers have no HIP IPC handle, so they only move over RDMA |
+
+`mori.io.HipGemAllocator` is a torch pluggable allocator (`make_hip_gem_mem_pool(device)`
+for a `MemPool` serving that device). Each buffer is pinned at allocation through a
+one-page dma-buf MR (`MORI_HIP_GEM_PIN_DEVICE`, else the first device `MORI_RDMA_DEVICES`
+selects, mlx5 last), so `hipMemGetInfo` covers it; KFD counts it once, and registering it
+costs nothing. An mlx5 dma-buf MR attaches dynamically and pins nothing: the buffer then
+stays evictable and outside `hipMemGetInfo`, and a warning says so. Measured with
+DeepSeek-V4.1-Flash 1P1D over MoRI-IO (decode `--mem-fraction-static` 0.92): every decode
+rank fails with HIP error 209 at the first request on 6.19.14.31400000 (TP8, peer memory)
+and on 6.16.13 (Crusoe KVM guest, TP4, dma-buf only), and both work with the pool. At 0.5
+on 31.40 the largest allocation a new process gets after registration is 43 – 50 GiB
+without the pool and 125 – 134 GiB (all of `hipMemGetInfo`) with it, at the same
+throughput and GSM8K accuracy. Whether a freed buffer's VRAM comes back before the process
+exits depends on HIP and the driver (ROCm 7.2.4 on 31.40 keeps it), so use the allocator
+for long-lived buffers.
+
+`tests/cpp/application/test_kfd_vram_accounting` measures both registration paths and the
+GEM allocator on one GPU and prints which row of the table above a host is in
+(`MORI_KFD_EXPECT=30x|31x|fixed` turns that into an assertion).
 
 **Warning:** never register memory that KFD did not allocate (e.g. a GEM BO imported with
 `hipImportExternalMemory`) through `ibv_reg_mr` on a host with the amdgpu peer-memory
 client. Its `amd_acquire()` (`kfd_peerdirect.c`, untouched by the fix) dereferences the BO's
-`kfd_bo`, which is NULL for such BOs, and the kernel oopses. MoRI-IO registers through
-`ibv_reg_mr` first, and its dma-buf export cannot export these buffers, so do not hand them
-to MoRI. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
+`kfd_bo`, which is NULL for such BOs, and the kernel oopses. MoRI-IO registers buffers from
+`HipGemAllocator` through their dma-buf only, and refuses other device memory that HIP
+knows no allocation range for (memory imported elsewhere) unless it can export a dma-buf
+for it. A probe that registered a GEM BO through dma-buf and then through `ibv_reg_mr` on
 6.16.6 + ionic crashed its node.
 
 ---

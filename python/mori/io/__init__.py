@@ -26,6 +26,13 @@ from .fabric_allocator import (
     make_fabric_mem_pool,
     fabric_mem_pool,
 )
+from .hip_gem_allocator import (
+    HipGemAllocator,
+    hip_gem_torch_allocator,
+    make_hip_gem_mem_pool,
+    hip_gem_mem_pool,
+    hip_gem_lookup,
+)
 from mori.cpp import (
     IOEngineConfig,
     StatusCode,

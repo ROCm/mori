@@ -36,6 +36,7 @@
 #include <unordered_set>
 
 #include "infiniband/verbs.h"
+#include "mori/application/memory/hip_gem_allocator.hpp"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
@@ -463,10 +464,85 @@ static constexpr const char* kRegFailureHint =
     "ENOMEM usually means RLIMIT_MEMLOCK is too low (ulimit -l) or the region needs more NIC "
     "translation entries than one MR allows (back it with hugepages or shrink it)";
 
+// A HIP GEM allocator buffer (see hip_gem_allocator.hpp) can only be registered through
+// the BO's own dma-buf: HIP reports no address range for it, ROCr cannot export it, and
+// the amdgpu peer-memory client behind ibv_reg_mr dereferences its NULL kfd_bo. Takes
+// ownership of gem.dmabufFd.
+static ibv_mr* RegisterHipGemMr(ibv_pd* pd, void* ptr, size_t size, int accessFlag,
+                                const HipGemBuffer& gem) {
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+  const uintptr_t base = reinterpret_cast<uintptr_t>(gem.base);
+  if (addr + size > base + gem.size) {
+    close(gem.dmabufFd);
+    MORI_APP_ERROR("RDMA registration of [{}, +{}) runs past its HIP GEM buffer [{}, +{})", ptr,
+                   size, gem.base, gem.size);
+    std::abort();
+  }
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, addr - base, size, addr, gem.dmabufFd, accessFlag);
+  const int err = errno;
+  close(gem.dmabufFd);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "dma-buf registration of HIP GEM buffer failed (addr:{}, size:{}, accessFlag:{}, "
+        "errno:{} ({})); it cannot be registered through ibv_reg_mr",
+        ptr, size, accessFlag, err, strerror(err));
+    std::abort();
+  }
+  return mr;
+}
+
+// True for device memory HIP knows no allocation range for: memory imported with
+// hipImportExternalMemory, such as an amdgpu GEM BO of an allocator other than this
+// library's. It is not a KFD BO, so it must not reach ibv_reg_mr either.
+static bool IsImportedDeviceMemory(void* ptr) {
+  hipPointerAttribute_t attr{};
+  if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  if (attr.type != hipMemoryTypeDevice) return false;
+  hipDeviceptr_t base = 0;
+  size_t rangeSize = 0;
+  if (hipMemGetAddressRange(&base, &rangeSize, reinterpret_cast<hipDeviceptr_t>(ptr)) ==
+          hipSuccess &&
+      base != 0) {
+    return false;
+  }
+  (void)hipGetLastError();
+  return true;
+}
+
+// Registers imported device memory through a dma-buf, if one can be exported for it.
+static ibv_mr* RegisterImportedDeviceMr(ibv_pd* pd, void* ptr, size_t size, int accessFlag) {
+  uint64_t offset = 0;
+  int fd = TryExportDmabufFd(ptr, size, &offset);
+  if (fd < 0) {
+    MORI_APP_ERROR(
+        "{} is device memory HIP has no allocation range for (imported, e.g. an amdgpu GEM "
+        "BO) and no dma-buf could be exported for it; ibv_reg_mr would crash the amdgpu "
+        "peer-memory client. Allocate it with mori.io.HipGemAllocator.",
+        ptr);
+    std::abort();
+  }
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, size, reinterpret_cast<uint64_t>(ptr), fd, accessFlag);
+  const int err = errno;
+  close(fd);
+  errno = err;
+  return mr;
+}
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
+  HipGemBuffer gem;
+  ibv_mr* mr = nullptr;
+  if (HipGemLookup(ptr, &gem, /*wantFd=*/true)) {
+    mr = RegisterHipGemMr(pd, ptr, size, effectiveAccessFlag, gem);
+  } else if (IsImportedDeviceMemory(ptr)) {
+    mr = RegisterImportedDeviceMr(pd, ptr, size, effectiveAccessFlag);
+  } else {
+    mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
+  }
   if (!mr) {
     const int err = errno;
     MORI_APP_ERROR(
@@ -565,6 +641,19 @@ static bool RetainAddsReference() {
 // true byte offset, so prefer it and fall back to the hip path (offset 0, correct
 // only for whole-allocation exports) when HSA export is unavailable.
 int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
+  // A HIP GEM allocator buffer has its BO's dma-buf; neither HSA nor HIP can export it.
+  HipGemBuffer gem;
+  if (HipGemLookup(ptr, &gem, /*wantFd=*/true)) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(gem.base);
+    if (addr + size > base + gem.size) {
+      close(gem.dmabufFd);
+      return -1;
+    }
+    *offset = addr - base;
+    return gem.dmabufFd;
+  }
+
   int fd = -1;
   uint64_t off = 0;
   hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);
@@ -633,8 +722,25 @@ static bool IsHostMemory(void* ptr) {
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
                                                                               size_t size,
                                                                               int accessFlag) {
+  // A HIP GEM allocator buffer never takes the ibv_reg_mr leg; see RegisterHipGemMr.
+  HipGemBuffer gem;
+  if (HipGemLookup(ptr, &gem, /*wantFd=*/true)) {
+    ibv_mr* mr = RegisterHipGemMr(pd, ptr, size, MaybeAddRelaxedOrderingFlag(accessFlag), gem);
+    MORI_APP_TRACE("RegisterRdmaMemoryRegionAuto[hip-gem], addr:{}, size:{}, lkey:{}, rkey:{}", ptr,
+                   size, mr->lkey, mr->rkey);
+    mrPool.insert({ptr, mr});
+    application::RdmaMemoryRegion handle;
+    handle.addr = reinterpret_cast<uintptr_t>(ptr);
+    handle.lkey = mr->lkey;
+    handle.rkey = mr->rkey;
+    handle.length = mr->length;
+    return handle;
+  }
+
   // Host memory has no dma-buf exporter, so the dma-buf leg can only fail on it.
   if (IsHostMemory(ptr)) return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
+  // Neither has imported device memory an ibv_reg_mr leg; see IsImportedDeviceMemory.
+  if (IsImportedDeviceMemory(ptr)) return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
 
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
 

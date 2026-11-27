@@ -34,9 +34,11 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 
+#include "mori/application/memory/hip_gem_allocator.hpp"
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/utils/host_utils.hpp"
@@ -854,6 +856,17 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
   // Reachable even if the IPC export below fails: a peer in this process falls back to the
   // direct P2P pointer (GetRemappedAddress).
   exportedMemory_.store(true, std::memory_order_release);
+
+  // HIP has no IPC handle for a HIP GEM allocator buffer (imported memory); it is
+  // reachable through RDMA only.
+  if (application::HipGemLookup(reinterpret_cast<void*>(desc.data), nullptr, false)) {
+    static std::once_flag logged;
+    std::call_once(logged, [&] {
+      MORI_IO_INFO("XGMI: HIP GEM buffers have no IPC handle, leaving memory id={} to RDMA",
+                   desc.id);
+    });
+    return;
+  }
 
   // hipIpcGetMemHandle is keyed to the *base* of the underlying allocation, not
   // to an interior pointer. When `data` is a sub-region (e.g. a per-layer view
