@@ -49,6 +49,7 @@
 // SDMA is compiled, so cco.hpp stays self-contained and anvil-free.
 #include "mori/application/transport/sdma/anvil.hpp"
 #endif
+#include "mori/metrics/metrics.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -810,6 +811,10 @@ int ccoCommDestroy(ccoComm* comm) {
   comm->allocTable.clear();
 
   if (comm->sdmaDevHandles) HIP_RUNTIME_CHECK(hipFree(comm->sdmaDevHandles));
+
+  // The DevComms that pointed at it are gone by now.
+  delete comm->trafficCounters;
+  comm->trafficCounters = nullptr;
 
   // Release flat VA — sized to match the reservation in ccoCommCreate.
   if (comm->flatBase) {
@@ -1720,6 +1725,16 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ccoIbgdaContext& ibgda = hostShadow.ibgda;
   int numQpPerPe = reqs->gdaContextCount > 0 ? reqs->gdaContextCount : comm->defaultNumQpPerPe;
   ibgda.numQpPerPe = numQpPerPe;
+  // Traffic counters: one block per comm, sized by the world, shared by its DevComms.
+  ibgda.txBytes = nullptr;
+  if (connType != CCO_GDA_CONNECTION_NONE && mori::metrics::TrafficEnabled() &&
+      comm->ctx->RdmaTransportEnabled()) {
+    if (comm->trafficCounters == nullptr) {
+      comm->trafficCounters =
+          new application::RdmaTrafficCounters("cco", comm->rank, comm->ctx->PeIdentities());
+    }
+    ibgda.txBytes = comm->trafficCounters->DevicePtr();
+  }
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   core::RdmaEndpointDevice* epsGpu = nullptr;
@@ -2241,6 +2256,20 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
 
 int ccoBarrierAll(ccoComm* comm) {
   comm->bootNet->Barrier();
+  return 0;
+}
+
+int ccoCommGetPeIdentity(ccoComm* comm, int rank, ccoPeIdentity* out) {
+  if (comm == nullptr || comm->ctx == nullptr || out == nullptr) return -1;
+  const auto& ids = comm->ctx->PeIdentities();
+  if (rank < 0 || rank >= static_cast<int>(ids.size())) return -1;
+  const application::PeIdentity& id = ids[rank];
+  *out = ccoPeIdentity{};
+  snprintf(out->hostname, sizeof(out->hostname), "%s", id.hostname.c_str());
+  out->gpuIndex = id.gpuIndex;
+  snprintf(out->gpuPci, sizeof(out->gpuPci), "%s", id.gpuPci.c_str());
+  snprintf(out->ibdev, sizeof(out->ibdev), "%s", id.ibdev.c_str());
+  snprintf(out->netdev, sizeof(out->netdev), "%s", id.netdev.c_str());
   return 0;
 }
 

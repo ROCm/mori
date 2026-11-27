@@ -73,6 +73,23 @@ def atomic_add_global(addr_i64, val):
     ).res
 
 
+def atomic_xchg_global(addr_i64, val):
+    """Monotonic global exchange at addr_i64; returns old (i64/i32 per val)."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.xchg,
+        _gptr(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+    ).res
+
+
+def realtime():
+    """``s_memrealtime``: the device wall clock in ticks (HIP's ``wall_clock64()``)."""
+    return fx.Int64(
+        _llvm_d.call_intrinsic(_I64(), "llvm.amdgcn.s.memrealtime", [], [], [])
+    )
+
+
 def store_i32_system(addr_i64, offset, val):
     """System-release i32 store at addr + offset*4."""
     addr = _addr_plus(addr_i64, offset, 4)

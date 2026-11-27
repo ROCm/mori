@@ -43,6 +43,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -73,7 +74,9 @@ class MetricsServer {
  public:
   // Create and immediately start the server on `port`.
   // Throws std::runtime_error if the socket cannot be bound.
-  explicit MetricsServer(int port = 9091);
+  // `port` 0 asks the kernel for a free port (see port()).  `bind_addr` is a
+  // dotted IPv4 address to listen on; empty listens on every interface.
+  explicit MetricsServer(int port = 9091, const std::string& bind_addr = "");
 
   // Stop the accept loop and join the background thread.
   ~MetricsServer();
@@ -139,6 +142,26 @@ class MetricsServer {
   void observeAggregated(std::string_view name, std::string_view help, const Labels& labels,
                          const std::vector<double>& bounds,
                          const std::vector<uint64_t>& bucket_counts, uint64_t count, double sum);
+
+  // Drop the series stored under `name` with exactly these labels (same names,
+  // values and ORDER as when it was written).  Returns how many were removed.
+  int removeSeries(std::string_view name, const Labels& labels = {});
+
+  // Escape a label value / a HELP text for the text exposition format.
+  static std::string EscapeLabelValue(std::string_view s);
+  static std::string EscapeHelp(std::string_view s);
+
+  // Run `hook` on the serving thread at the start of every GET /metrics.  Empty removes it.
+  void setScrapeHook(std::function<void()> hook);
+
+  // Answer a GET or POST of exactly `path` with what `handler` returns, under the HTTP status it
+  // leaves in `status`.  Runs on the serving thread; one path at a time, empty removes it.
+  using ControlHandler = std::function<std::string(const std::string& method,
+                                                   const std::string& query, std::string* status)>;
+  void setControlHandler(std::string path, ControlHandler handler);
+
+  // How long one client may take to send its request or to accept the response.
+  static constexpr int kClientTimeoutMs = 2000;
 
   // ------------------------------------------------------------------
   // Accessors
@@ -210,12 +233,19 @@ class MetricsServer {
 
   // ---- member data --------------------------------------------------
 
-  const int port_;
+  int port_;
+  std::string bind_addr_;
   int server_fd_{-1};
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
 
   mutable std::mutex mutex_;
+  // The scrape hook, under its own lock: it is called without mutex_ held.
+  std::mutex scrape_hook_mutex_;
+  std::function<void()> scrape_hook_;
+  // Under scrape_hook_mutex_ as well.
+  std::string control_path_;
+  ControlHandler control_handler_;
   std::map<std::string, GaugeEntry> gauges_;
   std::map<std::string, CounterEntry> counters_;
   std::map<std::string, HistogramEntry> histograms_;

@@ -281,7 +281,8 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")         \
   X(dispReceiverIdxMap, "p")             \
-  X(segStride, "u64")
+  X(segStride, "u64")                    \
+  X(trafficStats, "p")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -374,6 +375,9 @@ struct EpInterNodeArgs {
   // struct still ends on an 8-byte boundary (see the tail-padding assert).
   uint64_t segStride{0};
 
+  // Traffic counter block; null = statistics off. Appended so no earlier field moves.
+  unsigned long long* trafficStats{nullptr};
+
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
   __device__ __host__ EpInterNodeRegion reg(uint64_t off) const {
@@ -399,7 +403,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 42,
+static_assert(detail::kEpInterNodeArgsFieldCount == 43,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
@@ -417,7 +421,7 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // state. Nothing else catches it -- both layouts have the SAME sizeof, so the
 // binding's size check passes, and the ascending-offset assert above is about
 // the fields, not about what follows them.
-static_assert(offsetof(EpInterNodeArgs, segStride) + sizeof(EpInterNodeArgs::segStride) ==
+static_assert(offsetof(EpInterNodeArgs, trafficStats) + sizeof(EpInterNodeArgs::trafficStats) ==
                   sizeof(EpInterNodeArgs),
               "EpInterNodeArgs has tail padding -- the binding would place devComm before "
               "C++ does. End on an 8-byte boundary (update the name here if it changes)");

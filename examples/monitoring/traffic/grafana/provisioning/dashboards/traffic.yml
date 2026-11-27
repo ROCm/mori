@@ -1,0 +1,11 @@
+# MORI traffic dashboards only (kept apart from the UMBP and netmon providers and folders).
+apiVersion: 1
+providers:
+  - name: mori-traffic
+    folder: MORI traffic
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards/mori-traffic

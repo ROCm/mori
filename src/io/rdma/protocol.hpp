@@ -58,7 +58,10 @@ struct MessageRegEndpoint {
   application::RdmaEndpointHandle eph;
   int nicRank{0};
   int railId{-1};  // index in availDevices for rail affinity; -1 = unset (backward compat)
-  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank, railId);
+  // Sender's RDMA device and netdev, for metrics. Appended: empty from an older peer.
+  std::string ibdev;
+  std::string netdev;
+  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank, railId, ibdev, netdev);
 };
 
 struct MessageAskMemoryRegion {

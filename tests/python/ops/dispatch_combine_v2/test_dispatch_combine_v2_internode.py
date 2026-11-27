@@ -912,6 +912,9 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # one instant. The first timed rounds run elevated regardless; drop them with
     # --drop-rounds rather than trying to warm them away, since warmup runs
     # BEFORE the barrier.
+    # With metrics on: the kernels' own time so far. Read here, not after the
+    # barrier: nothing may sit between the barrier and the loop.
+    stats_before = op.get_traffic_stats()
     dist.barrier()
 
     print_series = bool(os.environ.get("MORI_EP_ROUND_SERIES"))
@@ -966,11 +969,37 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     keep = slice(args.drop_rounds, None)
     dispatch_us = [
         events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3 for i in range(num_rounds)
-    ][keep]
+    ]
     combine_us = [
         events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3
         for i in range(num_rounds)
-    ][keep]
+    ]
+    if stats_before is not None:
+        # Over all the timed rounds (none dropped), so both sides time the same calls.
+        stats_after = op.get_traffic_stats()
+        row = []
+        for phase, event_us in (("dispatch", dispatch_us), ("combine", combine_us)):
+            calls = stats_after[f"{phase}_calls"] - stats_before[f"{phase}_calls"]
+            seconds = (
+                stats_after[f"{phase}_kernel_seconds"]
+                - stats_before[f"{phase}_kernel_seconds"]
+            )
+            row += [seconds * 1e6 / max(calls, 1), sum(event_us) / len(event_us), calls]
+        table = dist_handle.all_gather_rows(row)
+        if dist_handle.rank == 0:
+            mean = table.mean(dim=0)
+            ratios = table[:, 0] / table[:, 1], table[:, 3] / table[:, 4]
+            print(
+                f"# EP-TIME: over the {num_rounds} timed rounds, mean over ranks: "
+                f"dispatch kernel {mean[0]:.1f} us / events {mean[1]:.1f} us = "
+                f"{mean[0] / mean[1]:.3f} (ranks {ratios[0].min():.3f}..{ratios[0].max():.3f}), "
+                f"combine kernel {mean[3]:.1f} us / events {mean[4]:.1f} us = "
+                f"{mean[3] / mean[4]:.3f} (ranks {ratios[1].min():.3f}..{ratios[1].max():.3f}); "
+                f"calls a rank {int(mean[2])} / {int(mean[5])}",
+                flush=True,
+            )
+    dispatch_us = dispatch_us[keep]
+    combine_us = combine_us[keep]
     # The events TILE the timed region -- events[3i+3] ends round i's combine and
     # IS events[3(i+1)] -- so host time cannot hide between windows: if the host
     # falls behind, the GPU idles at the head of a segment and that idle is charged
@@ -2183,6 +2212,202 @@ def _spawn_entry(local_rank, argv, node_rank, num_nodes, ranks_per_node):
         raise SystemExit(return_code)
 
 
+def _report_traffic_metrics(comm, dist_handle, rank, npes, counted=True):
+    """With metrics on (MORI_METRICS_ENABLE=1), report and check what the cco GDA
+    facade counted for this launch; MORI_TEST_METRICS_DUMP=<directory> also leaves
+    each rank's series there as JSON. Prints nothing with metrics off.
+
+    `counted`: the verdict line is a PASS / FAIL result of the launch (the test
+    command), not only a report (bench, stress: a launcher parses their lines).
+    """
+    try:
+        import mori.metrics as mori_metrics
+    except ImportError:
+        return 0
+    if not mori_metrics.enabled():
+        return 0
+
+    identities = comm._raw.pe_identities()
+    mine = identities[rank]
+
+    def gpu_label(identity):
+        # As the series label a GPU: physical index, or PCI address when there is none.
+        if identity["gpu_index"] >= 0:
+            return str(identity["gpu_index"])
+        return "pci:" + identity["gpu_pci"]
+
+    flows = [
+        s for s in mori_metrics.series() if s["name"] == "mori_gpu_rdma_bytes_total"
+    ]
+    info = [s for s in mori_metrics.series() if s["name"] == "mori_gpu_rdma_nic_info"]
+    dump_dir = os.environ.get("MORI_TEST_METRICS_DUMP")
+    if dump_dir:
+        import json
+
+        with open(
+            os.path.join(dump_dir, f"metrics_series_{os.getpid()}_rank{rank}.json"), "w"
+        ) as f:
+            json.dump({"rank": rank, "argv": sys.argv[1:], "series": flows + info}, f)
+    by_op = {}
+    problems = []
+    for s in flows:
+        labels = s["labels"]
+        by_op[labels["op"]] = by_op.get(labels["op"], 0) + int(s["value"])
+        for end in ("src", "dst"):
+            for key in ("host", "gpu", "ibdev", "netdev"):
+                if not labels.get(f"{end}_{key}"):
+                    problems.append(f"empty {end}_{key}")
+        # The initiator is the source of everything but a get.
+        own = "dst" if labels["op"] == "get" else "src"
+        peer = "src" if own == "dst" else "dst"
+        if (
+            labels[f"{own}_host"] != mine["hostname"]
+            or labels[f"{own}_ibdev"] != mine["ibdev"]
+        ):
+            problems.append(f"{own} end is not this rank")
+        match = [
+            i
+            for i in identities
+            if i["hostname"] == labels[f"{peer}_host"]
+            and gpu_label(i) == labels[f"{peer}_gpu"]
+            and i["ibdev"] == labels[f"{peer}_ibdev"]
+            and i["netdev"] == labels[f"{peer}_netdev"]
+        ]
+        if len(match) != 1:
+            problems.append(f"{peer} end matches {len(match)} ranks")
+    if not flows:
+        problems.append("no RDMA flow was counted")
+    if len(info) != 1 or info[0]["labels"].get("ibdev") != mine["ibdev"]:
+        problems.append("nic_info does not name this rank's NIC")
+    if not mine["gpu_pci"] or not mine["ibdev"] or not mine["netdev"]:
+        problems.append(f"incomplete identity {mine}")
+
+    print(
+        f"# RDMA-STATS rank {rank}: host={mine['hostname']} gpu={mine['gpu_index']} "
+        f"({mine['gpu_pci']}) nic={mine['ibdev']}/{mine['netdev']} "
+        f"flows={len(flows)} bytes={by_op}"
+        + (f" PROBLEMS={sorted(set(problems))}" if problems else ""),
+        flush=True,
+    )
+    bad = dist_handle.allreduce_sum(1 if problems else 0)
+    total_put = dist_handle.allreduce_sum(by_op.get("put", 0))
+    distinct = len({(i["hostname"], gpu_label(i)) for i in identities})
+    no_index = sum(1 for i in identities if i["gpu_index"] < 0)
+    if rank == 0:
+        ok = bad == 0 and total_put > 0 and distinct == npes
+        verdict = ("PASS" if ok else "FAIL") if counted else ("ok" if ok else "BAD")
+        print(
+            f"# RDMA-STATS: {verdict} ({bad} of {npes} ranks with "
+            f"problems, {total_put} bytes put in total, {distinct} distinct (host, gpu), "
+            f"{no_index} ranks without a physical GPU index)",
+            flush=True,
+        )
+    return 1 if bad else 0
+
+
+def _report_ep_stats(op, cfg, comm, dist_handle, rank, npes, counted=True):
+    """With metrics on, report and check what the inter-node kernels counted for
+    themselves (mori_ep_*): hop by hop a rank's count towards a peer must be that
+    peer's count from it, and across nodes only to the proxy rank. With `counted`
+    (every dispatch had its combine) the combine must return what was delivered.
+    Prints nothing when the op has no statistics (metrics off, AsyncLL).
+    """
+    stats = op.get_traffic_stats()
+    if stats is None:
+        return 0
+    keys = ("dispatch_sent", "dispatch_recv", "combine_sent", "combine_recv")
+    row = []
+    for key in keys:
+        row += [float(v) for v in stats[key].tolist()]
+    row += [
+        float(stats["dispatch_calls"]),
+        float(stats["combine_calls"]),
+        float(stats["dispatch_kernel_seconds"]),
+        float(stats["combine_kernel_seconds"]),
+    ]
+    put_bytes = 0
+    ep_rdma_bytes = 0
+    try:
+        import mori.metrics as mori_metrics
+
+        for s in mori_metrics.series():
+            if s["name"] == "mori_gpu_rdma_bytes_total" and s["labels"]["op"] == "put":
+                put_bytes += int(s["value"])
+            if (
+                s["name"] == "mori_ep_rdma_bytes_total"
+                and s["labels"]["direction"] == "tx"
+            ):
+                ep_rdma_bytes += int(s["value"])
+    except ImportError:
+        pass
+    row += [float(put_bytes), float(ep_rdma_bytes)]
+    dump_dir = os.environ.get("MORI_TEST_METRICS_DUMP")
+    if dump_dir:
+        import json
+
+        with open(
+            os.path.join(dump_dir, f"ep_stats_{os.getpid()}_rank{rank}.json"), "w"
+        ) as f:
+            json.dump({"rank": rank, "argv": sys.argv[1:], "row": row}, f)
+    table = dist_handle.all_gather_rows(row)
+    if rank != 0:
+        return 0
+    n = npes
+    sent, recv, back, home = (table[:, i * n : (i + 1) * n] for i in range(4))
+    calls = table[:, 4 * n : 4 * n + 2]
+    seconds = table[:, 4 * n + 2 : 4 * n + 4]
+    puts, ep_bytes = table[:, 4 * n + 4], table[:, 4 * n + 5]
+    gpn = cfg.gpu_per_node
+    problems = []
+    rdma_tokens = xgmi_tokens = 0
+    for a in range(n):
+        for b in range(n):
+            if sent[a, b] != recv[b, a]:
+                problems.append(
+                    f"dispatch {a}->{b}: sent {int(sent[a, b])} != received {int(recv[b, a])}"
+                )
+            if counted and back[a, b] != recv[a, b]:
+                problems.append(
+                    f"combine {a}->{b}: returned {int(back[a, b])} of {int(recv[a, b])}"
+                )
+            if counted and home[a, b] != sent[a, b]:
+                problems.append(
+                    f"combine {b}->{a}: came back {int(home[a, b])} of {int(sent[a, b])}"
+                )
+            if a // gpn != b // gpn:
+                if b % gpn != a % gpn and sent[a, b] != 0:
+                    problems.append(
+                        f"dispatch {a}->{b}: across nodes, not to the proxy rank"
+                    )
+                rdma_tokens += int(sent[a, b])
+            elif a != b:
+                xgmi_tokens += int(sent[a, b])
+    if rdma_tokens == 0:
+        problems.append("no token was counted on the RDMA hop")
+    if xgmi_tokens == 0:
+        problems.append("no token was counted on the XGMI hop")
+    if (calls <= 0).any() or (calls != calls[0]).any():
+        problems.append(f"launch counts differ or are zero: {calls.tolist()}")
+    if (seconds <= 0).any():
+        problems.append("a rank has no kernel time")
+    per_call_us = (seconds / calls.clamp(min=1)).mean(dim=0) * 1e6
+    ratio = float(ep_bytes.sum() / puts.sum()) if puts.sum() > 0 else 0.0
+    verdict = (
+        ("PASS" if not problems else "FAIL")
+        if counted
+        else ("ok" if not problems else "BAD")
+    )
+    print(
+        f"# EP-STATS: {verdict} ({int(calls[0, 0])} dispatches, {int(calls[0, 1])} combines a rank; "
+        f"tokens dispatched over rdma {rdma_tokens}, over xgmi {xgmi_tokens}; "
+        f"kernel time a call, mean over ranks: dispatch {per_call_us[0]:.1f} us, "
+        f"combine {per_call_us[1]:.1f} us; EP payload over RDMA / bytes put by the ranks "
+        f"= {ratio:.4f})" + (f" PROBLEMS={problems[:6]}" if problems else ""),
+        flush=True,
+    )
+    return 1 if problems and counted else 0
+
+
 def main(argv):
     args = _parse_args(argv)
 
@@ -2278,12 +2503,21 @@ def main(argv):
 
         if args.cmd == "bench":
             return_code = _bench(op, cfg, dist_handle, device, args, comm)
+            return_code |= _report_traffic_metrics(
+                comm, dist_handle, rank, npes, counted=False
+            )
+            return_code |= _report_ep_stats(
+                op, cfg, comm, dist_handle, rank, npes, counted=False
+            )
             op.close()
             dist_handle.shutdown()
             return return_code
 
         if args.cmd == "stress":
             return_code = _stress(op, cfg, dist_handle, device, args, comm)
+            return_code |= _report_traffic_metrics(
+                comm, dist_handle, rank, npes, counted=False
+            )
             op.close()
             dist_handle.shutdown()
             return return_code
@@ -2445,6 +2679,8 @@ def main(argv):
                     f"({failed_ranks} of {npes} ranks disagree)",
                     flush=True,
                 )
+        failures += _report_traffic_metrics(comm, dist_handle, rank, npes)
+        failures += _report_ep_stats(op, cfg, comm, dist_handle, rank, npes)
         op.close()
 
     dist_handle.shutdown()

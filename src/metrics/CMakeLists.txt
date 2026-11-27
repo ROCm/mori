@@ -1,8 +1,9 @@
-add_library(mori_metrics SHARED prometheus_metrics_server.cpp)
+add_library(mori_metrics SHARED prometheus_metrics_server.cpp metrics.cpp)
 
 target_include_directories(mori_metrics PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(mori_metrics PUBLIC mori_logging)
-target_link_libraries(mori_metrics PRIVATE pthread)
+# hip::host: the counter blocks device code adds to are mapped / copied with HIP.
+target_link_libraries(mori_metrics PRIVATE pthread hip::host)
 
 set_target_properties(
   mori_metrics

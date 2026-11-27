@@ -181,6 +181,9 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
+        # Before the kernels: whether they count at all is a compile-time switch.
+        stats = self._make_traffic_stats(cfg, comm, "intranode")
+        self._stats_addr = stats.device_ptr if stats is not None else 0
 
         self.token_dest_map = torch.full(
             (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
@@ -248,6 +251,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             scale_dim=cfg.scale_dim,
             scale_type_size=cfg.scale_type_size,
             fp4=is_fp4,
+            enable_stats=stats is not None,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -280,6 +284,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     ),
                     fp8_blockwise=cfg.fp8_blockwise,
                     quant_group=cfg.quant_group,
+                    enable_stats=stats is not None,
                 )
                 for (b, w) in combine_specs
             }
@@ -299,6 +304,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     off_out_wts=arena.offset("out_wts"),
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                    enable_stats=stats is not None,
                 )
                 for (b, w) in combine_specs
             }
@@ -488,6 +494,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 ),
                 self.cfg.rank,
                 num_tokens,
+                self._stats_addr,
                 fx.Stream(torch.cuda.current_stream()),
             )
 
@@ -508,6 +515,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 self.combine_out_weights.data_ptr(),
                 self.cfg.rank,
                 num_tokens,
+                self._stats_addr,
                 fx.Stream(torch.cuda.current_stream()),
             )
 

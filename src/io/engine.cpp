@@ -36,6 +36,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/metrics/metrics.hpp"
 #include "mori/ras/ras.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
@@ -129,6 +130,12 @@ int DetectNumaNode(void* addr) {
 #endif
 }
 
+uint64_t SumSizes(const SizeVec& sizes) {
+  uint64_t total = 0;
+  for (size_t n : sizes) total += n;
+  return total;
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -143,6 +150,7 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session read");
+  status->StartMeter(flow, IoOp::kRead, size);
   backendSess->Read(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session read error {} message {}", status->CodeUint32(),
@@ -155,6 +163,7 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session write");
+  status->StartMeter(flow, IoOp::kWrite, size);
   backendSess->Write(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session write error {} message {}", status->CodeUint32(),
@@ -168,6 +177,7 @@ void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remo
   MORI_IO_FUNCTION_TIMER;
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch read");
+  status->StartMeter(flow, IoOp::kRead, flow != nullptr ? SumSizes(sizes) : 0);
   backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session batch read error {} message {}", status->CodeUint32(),
@@ -183,6 +193,7 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
   mori::io::MoriRoctxRange _mori_roctx_("mori.io.session_batch_write", static_cast<uint64_t>(id));
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch write");
+  status->StartMeter(flow, IoOp::kWrite, flow != nullptr ? SumSizes(sizes) : 0);
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Session batch write error {} message {}", status->CodeUint32(),
@@ -203,6 +214,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   gethostname(hostname, HOST_NAME_MAX);
   desc.nodeId = mori::ResolveNodeId(hostname);
   desc.hostname = std::string(hostname);
+  desc.metricsHost = mori::metrics::HostId();
   desc.host = config.host;
   desc.port = config.port;
   desc.pid = static_cast<int>(getpid());
@@ -214,6 +226,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
     desc.ras = RasDesc{ep.host, ep.port, ep.token, ep.uuid.hi, ep.uuid.lo};
     rt->Enqueue(ras::EngineRegistered{desc.key});
   }
+  if (internal::IoMetrics* metrics = internal::IoMetrics::Get()) metrics->EnsureRegistered();
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
@@ -485,6 +498,11 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
+  {
+    // Before the cache is cleared: the next route to this engine looks it up.
+    std::lock_guard<std::mutex> lock(remoteHostsMu);
+    remoteHosts[remote.key] = remote.MetricsHost();
+  }
   InvalidateRouteCache();
   if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
     const RasDesc& r = remote.ras;
@@ -498,6 +516,10 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   for (auto& it : backends) {
     it.second->DeregisterRemoteEngine(remote);
+  }
+  {
+    std::lock_guard<std::mutex> lock(remoteHostsMu);
+    remoteHosts.erase(remote.key);
   }
   InvalidateRouteCache();
   if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
@@ -555,6 +577,10 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   if (loc == MemoryLocationType::GPU) {
     memDesc.deviceBusId =
         sim::IsEnabled() ? "sim:" + std::to_string(device) : QueryDeviceBusId(device);
+    // Only the host that has the GPU can work this out; a simulated GPU is its ordinal.
+    memDesc.gpuIndex = sim::IsEnabled()
+                           ? device
+                           : mori::metrics::PhysicalGpuIndexForPciCached(memDesc.deviceBusId);
   }
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
@@ -587,17 +613,54 @@ TransferUniqueId IOEngine::AllocateTransferUniqueId() {
   return id;
 }
 
-Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remote) {
+IoFlowCounters* IOEngine::ResolveFlow(BackendType type, const MemoryDesc& local,
+                                      const MemoryDesc& remote) {
+  internal::IoMetrics* metrics = internal::IoMetrics::Get();
+  if (metrics == nullptr) return nullptr;
+
+  // The `gpu` label of one end: the physical GPU index, "cpu" for host memory.
+  auto gpuLabel = [](const MemoryDesc& mem) {
+    return mem.loc == MemoryLocationType::GPU
+               ? mori::metrics::GpuLabel(mem.gpuIndex, mem.deviceBusId)
+               : std::string("cpu");
+  };
+  IoFlowIdentity id;
+  id.backend = sim::BackendTypeName(type);  // "XGMI" -> "xgmi"
+  std::transform(id.backend.begin(), id.backend.end(), id.backend.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  id.localGpu = gpuLabel(local);
+  id.remoteGpu = gpuLabel(remote);
+  std::string remoteHostname;
+  if (remote.engineKey == desc.key) {
+    remoteHostname = desc.MetricsHost();
+  } else {
+    std::lock_guard<std::mutex> lock(remoteHostsMu);
+    auto it = remoteHosts.find(remote.engineKey);
+    if (it != remoteHosts.end()) remoteHostname = it->second;
+  }
+  id.remoteHost = metrics->HostLabel(remoteHostname);
+  return metrics->Flow(id);
+}
+
+Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remote,
+                                 IoFlowCounters** flow) {
+  if (flow != nullptr) *flow = nullptr;
   if (backends.empty()) {
     return nullptr;
   }
+  auto cacheRoute = [&](const RouteCacheKey& key, BackendType type) {
+    RouteEntry entry{type, ResolveFlow(type, local, remote)};
+    UpdateRouteCache(key, entry);
+    if (flow != nullptr) *flow = entry.flow;
+  };
 
   RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId,
                          remote.deviceId,  local.id,  remote.id};
 
-  if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
-    auto cachedBackend = backends.find(cachedType.value());
+  if (auto cached = QueryRouteCache(routeKey); cached.has_value()) {
+    auto cachedBackend = backends.find(cached->type);
     if (cachedBackend != backends.end() && cachedBackend->second->CanHandle(local, remote)) {
+      if (flow != nullptr) *flow = cached->flow;
       return cachedBackend->second.get();
     }
   }
@@ -606,7 +669,7 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   bool isIntraNodeCapable = xgmiIt != backends.end() && xgmiIt->second->CanHandle(local, remote);
   // For intra-node GPU transfers, prefer XGMI when it can handle this pair.
   if (isIntraNodeCapable) {
-    UpdateRouteCache(routeKey, BackendType::XGMI);
+    cacheRoute(routeKey, BackendType::XGMI);
     return xgmiIt->second.get();
   }
 
@@ -617,7 +680,7 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   if (fabricIt != backends.end()) {
     fabricReason = fabricIt->second->RejectReason(local, remote);
     if (fabricReason.empty()) {
-      UpdateRouteCache(routeKey, BackendType::FABRIC);
+      cacheRoute(routeKey, BackendType::FABRIC);
       return fabricIt->second.get();
     }
   }
@@ -625,7 +688,7 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   for (auto type : {BackendType::RDMA, BackendType::OFI, BackendType::TCP}) {
     auto it = backends.find(type);
     if (it != backends.end() && it->second->CanHandle(local, remote)) {
-      UpdateRouteCache(routeKey, type);
+      cacheRoute(routeKey, type);
       if (!fabricReason.empty()) {
         MORI_IO_INFO("FABRIC not used for local mem {} -> engine {} mem {}: {}; using {}", local.id,
                      remote.engineKey, remote.id, fabricReason, sim::BackendTypeName(type));
@@ -643,12 +706,12 @@ void IOEngine::InvalidateRouteCache() {
   routeCache.clear();
 }
 
-void IOEngine::UpdateRouteCache(const RouteCacheKey& key, BackendType backendType) {
+void IOEngine::UpdateRouteCache(const RouteCacheKey& key, RouteEntry entry) {
   std::unique_lock<std::shared_mutex> lock(routeCacheMu);
-  routeCache[key] = backendType;
+  routeCache[key] = entry;
 }
 
-std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) const {
+std::optional<IOEngine::RouteEntry> IOEngine::QueryRouteCache(const RouteCacheKey& key) const {
   std::shared_lock<std::shared_mutex> lock(routeCacheMu);
   auto it = routeCache.find(key);
   if (it == routeCache.end()) {
@@ -658,7 +721,7 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
 }
 
 #define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend) \
-  backend = SelectBackend(local, remote);                                 \
+  backend = SelectBackend(local, remote, &flow);                          \
   if (backend == nullptr) {                                               \
     const std::string reason = NoBackendReason(backends, local, remote);  \
     if (status != nullptr) {                                              \
@@ -674,7 +737,10 @@ void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const Memor
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine read");
   Backend* backend = nullptr;
+  IoFlowCounters* flow = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
+  // Before the backend sees it: a backend may finish the transfer in this call.
+  status->StartMeter(flow, IoOp::kRead, size);
   backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Engine read error {} message {}", status->CodeUint32(),
@@ -689,7 +755,9 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
   std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
   internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine write");
   Backend* backend = nullptr;
+  IoFlowCounters* flow = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
+  status->StartMeter(flow, IoOp::kWrite, size);
   backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   if (status->Failed()) {
     LogTransferFailure(diagnostics, "Engine write error {} message {}", status->CodeUint32(),
@@ -714,7 +782,9 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch read");
     Backend* backend = nullptr;
+    IoFlowCounters* flow = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
+    status[i]->StartMeter(flow, IoOp::kRead, flow != nullptr ? SumSizes(sizes[i]) : 0);
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
@@ -743,7 +813,9 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
     std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
     internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch write");
     Backend* backend = nullptr;
+    IoFlowCounters* flow = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
+    status[i]->StartMeter(flow, IoOp::kWrite, flow != nullptr ? SumSizes(sizes[i]) : 0);
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
     if (status[i]->Failed()) {
@@ -758,7 +830,7 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
   IOEngineSession sess{};
   sess.engine = this;
 
-  Backend* backend = SelectBackend(local, remote);
+  Backend* backend = SelectBackend(local, remote, &sess.flow);
   if (backend == nullptr) {
     MORI_IO_WARN("{}", NoBackendReason(backends, local, remote));
     return std::nullopt;

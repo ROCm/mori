@@ -73,6 +73,8 @@ class IOEngineSession {
 
   IOEngine* engine{nullptr};
   std::shared_ptr<BackendSession> backendSess{nullptr};
+  // Metrics flow of this session's transfers; null when metrics are off.
+  IoFlowCounters* flow{nullptr};
 };
 
 class IOEngine {
@@ -174,14 +176,22 @@ class IOEngine {
     }
   };
 
-  Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  // A cached route: the backend and its metrics flow (null when metrics are off).
+  struct RouteEntry {
+    BackendType type{BackendType::Unknown};
+    IoFlowCounters* flow{nullptr};
+  };
+
+  Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote,
+                         IoFlowCounters** flow = nullptr);
+  IoFlowCounters* ResolveFlow(BackendType type, const MemoryDesc& local, const MemoryDesc& remote);
   void CreateSimBackend(BackendType requested, const BackendConfig& beConfig);
   bool SupportsXgmiBackendByP2P() const;
   void EnsureXgmiBackendCreatedIfSupported();
   void CaptureBackendDesc(BackendType type);
   void InvalidateRouteCache();
-  void UpdateRouteCache(const RouteCacheKey& key, BackendType backendType);
-  std::optional<BackendType> QueryRouteCache(const RouteCacheKey& key) const;
+  void UpdateRouteCache(const RouteCacheKey& key, RouteEntry entry);
+  std::optional<RouteEntry> QueryRouteCache(const RouteCacheKey& key) const;
 
  public:
   IOEngineConfig config;
@@ -193,7 +203,10 @@ class IOEngine {
   std::unordered_map<MemoryUniqueId, MemoryDesc> memPool;
   std::unordered_map<BackendType, std::unique_ptr<Backend>> backends;
   mutable std::shared_mutex routeCacheMu;
-  std::unordered_map<RouteCacheKey, BackendType, RouteCacheKeyHash> routeCache;
+  std::unordered_map<RouteCacheKey, RouteEntry, RouteCacheKeyHash> routeCache;
+  // Metrics host label of each registered remote engine.
+  mutable std::mutex remoteHostsMu;
+  std::unordered_map<EngineKey, std::string> remoteHosts;
 };
 
 }  // namespace io

@@ -159,6 +159,8 @@ struct EpArgs {
   int numTokens = 0;  // tokens this rank contributes this call
   int cardPull = 0;
   unsigned long long offFwdMap = 0;
+  // Traffic counter block; null = statistics off.
+  unsigned long long* trafficStats = nullptr;
 };
 
 // The wire schema, generated from the field list rather than kept parallel to it.
@@ -196,7 +198,8 @@ struct EpArgs {
   X(recvIdx, "p")              \
   X(numTokens, "i32")          \
   X(cardPull, "i32")           \
-  X(offFwdMap, "u64")
+  X(offFwdMap, "u64")          \
+  X(trafficStats, "p")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, and a separator rule that does
@@ -219,7 +222,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 30,
+static_assert(detail::kEpArgsFieldCount == 31,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

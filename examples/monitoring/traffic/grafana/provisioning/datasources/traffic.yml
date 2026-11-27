@@ -1,0 +1,52 @@
+# The Prometheus of traffic.sh up. timeInterval is the scrape interval of prometheus.yml: Grafana
+# sizes $__rate_interval from it.
+apiVersion: 1
+datasources:
+  - name: mori-traffic
+    uid: mori-traffic
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:${TRAFFIC_PROM_PORT}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+  # VictoriaMetrics, read as a Prometheus-type data source (MetricsQL is a PromQL superset, the
+  # same dashboards work): what the processes push themselves with MORI_METRICS_PUSH_URL, every
+  # sample they take. timeInterval is the sampling interval then, a millisecond: a chart zoomed
+  # into a few seconds shows points a few milliseconds apart.
+  - name: mori-traffic-ms
+    uid: mori-traffic-ms
+    type: prometheus
+    access: proxy
+    url: ${TRAFFIC_VM_URL}
+    isDefault: false
+    editable: false
+    jsonData:
+      timeInterval: 1ms
+  # Not a database: the sampling gateway of traffic.sh up (sampling_gateway.py), which passes a
+  # sampling setting on to every running MORI process. Registered as a data source only so that
+  # the browser can reach it through Grafana (/api/datasources/proxy/uid/mori-sampling/sampling):
+  # the buttons of the overview dashboard call it. The type is one whose proxy lets a POST
+  # through to any path (the Prometheus, Loki, Graphite and Elasticsearch types allow only their
+  # own query API; tried on Grafana 13.3.1); nothing queries it.
+  - name: mori-sampling
+    uid: mori-sampling
+    type: opentsdb
+    access: proxy
+    url: ${TRAFFIC_GATEWAY_URL}
+    isDefault: false
+    editable: false
+  # The same gateway, read: it answers a Prometheus instant query with what the processes are
+  # set to at this moment, whatever time the dashboard looks at (sampling_gateway.py). The
+  # switch of the overview dashboard takes the setting in effect from here.
+  - name: mori-sampling-now
+    uid: mori-sampling-now
+    type: prometheus
+    access: proxy
+    url: ${TRAFFIC_GATEWAY_URL}
+    isDefault: false
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s

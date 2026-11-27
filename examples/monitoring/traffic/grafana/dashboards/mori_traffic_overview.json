@@ -1,0 +1,3479 @@
+{
+  "uid": "mori-traffic-overview",
+  "title": "MORI traffic overview: IO and EP",
+  "description": "IO and EP traffic together, on the same links and the same time axis: what each puts on XGMI and on RDMA over time (do they take turns or overlap, how close to what the links carry). Details per GPU, per NIC and GPU to GPU are in the IO and the EP dashboard.",
+  "tags": [
+    "mori",
+    "io",
+    "ep"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "links": [
+    {
+      "type": "link",
+      "title": "MORI IO traffic",
+      "url": "/d/mori-io-traffic",
+      "icon": "dashboard",
+      "keepTime": true,
+      "includeVars": false,
+      "targetBlank": false
+    },
+    {
+      "type": "link",
+      "title": "MORI EP traffic",
+      "url": "/d/mori-ep-traffic",
+      "icon": "dashboard",
+      "keepTime": true,
+      "includeVars": false,
+      "targetBlank": false
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "regex": "/^mori-traffic/",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "query_result(count by (h) (label_replace(last_over_time(mori_ep_calls_total[$__range]), \"h\", \"$1\", \"host\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_total[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\") or label_replace(last_over_time(mori_gpu_rdma_bytes_total[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\")))",
+          "refId": "A"
+        },
+        "definition": "query_result(count by (h) (label_replace(last_over_time(mori_ep_calls_total[$__range]), \"h\", \"$1\", \"host\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_total[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\") or label_replace(last_over_time(mori_gpu_rdma_bytes_total[$__range]), \"h\", \"$1\", \"src_host\", \"(.+)\")))",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "regex": "/h=\"([^\"]+)\"/",
+        "description": "The GPUs of these hosts: every host that ran EP or sent IO within the time range.",
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "gpu",
+        "label": "GPU",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "query_result(count by (g) (label_replace(last_over_time(mori_ep_calls_total{host=~\"$host\"}[$__range]), \"g\", \"$1\", \"gpu\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_total{src_host=~\"$host\"}[$__range]), \"g\", \"$1\", \"src_gpu\", \"(.+)\")))",
+          "refId": "A"
+        },
+        "definition": "query_result(count by (g) (label_replace(last_over_time(mori_ep_calls_total{host=~\"$host\"}[$__range]), \"g\", \"$1\", \"gpu\", \"(.+)\") or label_replace(last_over_time(mori_io_submitted_total{src_host=~\"$host\"}[$__range]), \"g\", \"$1\", \"src_gpu\", \"(.+)\")))",
+        "refresh": 2,
+        "sort": 3,
+        "multi": true,
+        "includeAll": true,
+        "regex": "/g=\"([^\"]+)\"/",
+        "description": "All, or the GPUs to look at: the charts then shows what these GPUs send (cpu = host memory, IO only).",
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "name": "res",
+        "label": "Rate window",
+        "type": "custom",
+        "description": "The time every rate on this page is averaged over. auto: what the data source suggests (20 s for scraped data). 1ms to 500ms are for the millisecond data source: the counters advance one batch at a time (an IO transfer when it is submitted or completes, an EP launch when it ends), so a window of a millisecond or two shows a train of spikes and a longer one the average over several batches. With scraped data (a sample every 5 s) a window under about 10 s finds no two samples and the charts are empty.",
+        "query": "auto : $__rate_interval,1ms,5ms,10ms,50ms,100ms,500ms,1s,5s",
+        "current": {
+          "selected": true,
+          "text": "auto",
+          "value": "$__rate_interval"
+        },
+        "options": [
+          {
+            "text": "auto",
+            "value": "$__rate_interval",
+            "selected": true
+          },
+          {
+            "text": "1ms",
+            "value": "1ms",
+            "selected": false
+          },
+          {
+            "text": "5ms",
+            "value": "5ms",
+            "selected": false
+          },
+          {
+            "text": "10ms",
+            "value": "10ms",
+            "selected": false
+          },
+          {
+            "text": "50ms",
+            "value": "50ms",
+            "selected": false
+          },
+          {
+            "text": "100ms",
+            "value": "100ms",
+            "selected": false
+          },
+          {
+            "text": "500ms",
+            "value": "500ms",
+            "selected": false
+          },
+          {
+            "text": "1s",
+            "value": "1s",
+            "selected": false
+          },
+          {
+            "text": "5s",
+            "value": "5s",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "xgmi_limit",
+        "label": "XGMI limit per GPU (GB/s)",
+        "type": "textbox",
+        "query": "291.25",
+        "description": "The dashed line in the XGMI chart: what one GPU can send over XGMI to all its peers together, times the GPUs shown. 291.25 is the payload measured on 8 x MI300X with every GPU sending to the 7 others (2.33 TB/s for the node; the line rate, 7 links x 64 GB/s, is not reachable). Set it for other hardware.",
+        "current": {
+          "selected": false,
+          "text": "291.25",
+          "value": "291.25"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "291.25",
+            "value": "291.25"
+          }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Metrics sampling: 1/N = one call in N is counted (EP: a dispatch with its combine; IO: a put / get), in every running process",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "canvas",
+      "title": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mori-sampling-now"
+      },
+      "description": "The sampling rate of the metrics, set for every MORI process Prometheus scrapes at this moment, while they run. 1/1: every EP dispatch (with its combine) and every IO transfer is counted. 1/8, 1/64, 1/100: one in so many is counted and counts so many times, so the charts keep showing the same quantities, a little noisier, and the counting costs less. off: nothing is counted and the charts of that side go to zero. The ring marks the rate in effect now (red: off), whatever time range the page shows; it moves at the next refresh after a click. Processes started later begin with their own setting (MORI_METRICS_SAMPLE_EP / _IO, default 1/1). Needs the sampling gateway of up.sh.",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 24,
+        "h": 2
+      },
+      "targets": [
+        {
+          "refId": "EP1",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"ep\",period=\"1\"}",
+          "legendFormat": "ep_is_1",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "EP2",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"ep\",period=\"8\"}",
+          "legendFormat": "ep_is_8",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "EP3",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"ep\",period=\"64\"}",
+          "legendFormat": "ep_is_64",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "EP4",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"ep\",period=\"100\"}",
+          "legendFormat": "ep_is_100",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "EP5",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"ep\",period=\"0\"}",
+          "legendFormat": "ep_is_0",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "IO1",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"io\",period=\"1\"}",
+          "legendFormat": "io_is_1",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "IO2",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"io\",period=\"8\"}",
+          "legendFormat": "io_is_8",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "IO3",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"io\",period=\"64\"}",
+          "legendFormat": "io_is_64",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "IO4",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"io\",period=\"100\"}",
+          "legendFormat": "io_is_100",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "IO5",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mori-sampling-now"
+          },
+          "expr": "mori_sampling_is{module=\"io\",period=\"0\"}",
+          "legendFormat": "io_is_0",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transparent": true,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^ep_is_[1-9]/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0
+                      },
+                      "1": {
+                        "color": "#3987e5",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^io_is_[1-9]/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0
+                      },
+                      "1": {
+                        "color": "#c98500",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/_is_0$/"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0
+                      },
+                      "1": {
+                        "color": "#d03b3b",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "inlineEditing": false,
+        "showAdvancedTypes": false,
+        "panZoom": false,
+        "infinitePan": false,
+        "root": {
+          "type": "frame",
+          "name": "sampling",
+          "elements": [
+            {
+              "type": "text",
+              "name": "EP label",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "EP calls counted:"
+                },
+                "align": "left",
+                "valign": "middle",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 8,
+                "width": 122,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "EP 1/1 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "ep_is_1",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 129,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "EP 1/1",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/1"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "ep",
+                      "1"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "EP: counting every dispatch, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 132,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "EP 1/8 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "ep_is_8",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 205,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "EP 1/8",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/8"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "ep",
+                      "8"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "EP: counting one dispatch in 8, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 208,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "EP 1/64 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "ep_is_64",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 281,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "EP 1/64",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/64"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "ep",
+                      "64"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "EP: counting one dispatch in 64, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 284,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "EP 1/100 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "ep_is_100",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 357,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "EP 1/100",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/100"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "ep",
+                      "100"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "EP: counting one dispatch in 100, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 360,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "EP off ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "ep_is_0",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 433,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "EP off",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "off"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "ep",
+                      "0"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "EP: counting no dispatch, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 436,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "text",
+              "name": "IO label",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "IO calls counted:"
+                },
+                "align": "left",
+                "valign": "middle",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 530,
+                "width": 122,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "IO 1/1 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "io_is_1",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 651,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "IO 1/1",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/1"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "io",
+                      "1"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "IO: counting every transfer, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 654,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "IO 1/8 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "io_is_8",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 727,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "IO 1/8",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/8"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "io",
+                      "8"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "IO: counting one transfer in 8, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 730,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "IO 1/64 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "io_is_64",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 803,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "IO 1/64",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/64"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "io",
+                      "64"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "IO: counting one transfer in 64, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 806,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "IO 1/100 ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "io_is_100",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 879,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "IO 1/100",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "1/100"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "io",
+                      "100"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "IO: counting one transfer in 100, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 882,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "IO off ring",
+              "config": {},
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "field": "io_is_0",
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 5,
+                "left": 955,
+                "width": 76,
+                "height": 36,
+                "rotation": 0
+              }
+            },
+            {
+              "type": "button",
+              "name": "IO off",
+              "config": {
+                "text": {
+                  "mode": "fixed",
+                  "fixed": "off"
+                },
+                "align": "center",
+                "size": 14,
+                "color": {
+                  "fixed": "text"
+                },
+                "style": {
+                  "variant": "secondary"
+                },
+                "api": {
+                  "endpoint": "/api/datasources/proxy/uid/mori-sampling/sampling",
+                  "method": "POST",
+                  "data": "{}",
+                  "contentType": "application/json",
+                  "queryParams": [
+                    [
+                      "io",
+                      "0"
+                    ]
+                  ],
+                  "headerParams": [],
+                  "successMessage": "IO: counting no transfer, in every running process. The ring moves at the next refresh."
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "top"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 8,
+                "left": 958,
+                "width": 70,
+                "height": 30,
+                "rotation": 0
+              }
+            }
+          ],
+          "background": {
+            "color": {
+              "fixed": "transparent"
+            }
+          },
+          "border": {
+            "color": {
+              "fixed": "transparent"
+            }
+          },
+          "constraint": {
+            "horizontal": "left",
+            "vertical": "top"
+          },
+          "placement": {
+            "top": 0,
+            "left": 0,
+            "width": 100,
+            "height": 100
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "row",
+      "title": "IO and EP on the same links, over time (bytes / wall time)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 3,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "XGMI: sent by IO and by EP",
+      "description": "Bytes per second the selected GPUs send over XGMI, all of them together: for the IO engines, and as EP payload (dispatch and combine). The thin grey line is the two added up: what XGMI carries in total. Dashed: what it can carry, the XGMI limit per GPU (variable at the top; 291.25 GB/s measured on MI300X, 2.33 TB/s for 8 GPUs) times the selected GPUs that send. Read the two lines against each other: peaks that alternate mean IO and EP take turns on these links; peaks at the same time mean both are on them at once.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(mori_io_submitted_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"xgmi\"}[$res])) or sum(rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",direction=\"tx\"}[$res])) * 0) + (sum(rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",direction=\"tx\"}[$res])) or sum(rate(mori_io_submitted_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"xgmi\"}[$res])) * 0)",
+          "legendFormat": "IO + EP"
+        },
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_io_submitted_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"xgmi\"}[$res]))",
+          "legendFormat": "IO"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",direction=\"tx\"}[$res]))",
+          "legendFormat": "EP"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(count by (h, g) (label_replace(label_replace(last_over_time(mori_io_submitted_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",src_gpu!=\"cpu\",backend=\"xgmi\"}[$__range] @ end()), \"h\", \"$1\", \"src_host\", \"(.*)\"), \"g\", \"$1\", \"src_gpu\", \"(.*)\") or label_replace(label_replace(last_over_time(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",direction=\"tx\"}[$__range] @ end()), \"h\", \"$1\", \"host\", \"(.*)\"), \"g\", \"$1\", \"gpu\", \"(.*)\"))) * $xgmi_limit * 1e9",
+          "legendFormat": "limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "IO"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "EP"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "IO + EP"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "RDMA: sent by IO and by EP",
+      "description": "Bytes per second the selected GPUs send over RDMA through their NICs, all of them together: for the IO engines, and what the GPUs put on RDMA themselves (EP between nodes). The thin grey line is the two added up. Read the two lines against each other: peaks that alternate mean IO and EP take turns on these links; peaks at the same time mean both are on them at once.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(sum(rate(mori_io_completed_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"rdma\"}[$res])) or sum(rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res])) * 0) + (sum(rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res])) or sum(rate(mori_io_completed_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"rdma\"}[$res])) * 0)",
+          "legendFormat": "IO + EP"
+        },
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_io_completed_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"rdma\"}[$res]))",
+          "legendFormat": "IO"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res]))",
+          "legendFormat": "EP"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "IO"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "EP"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "IO + EP"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Per GPU: XGMI by IO and by EP, RDMA by IO and by EP",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "XGMI per GPU: IO",
+      "description": "Bytes per second each selected GPU sends over XGMI for the IO engines, to all its peers together. Dashed: what one GPU can send over XGMI to all its peers together (the XGMI limit per GPU at the top); IO and EP of a GPU share it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 6,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(sum by (src_host, src_gpu) (rate(mori_io_submitted_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"xgmi\"}[$res])), \"node\", \"$1\", \"src_host\", \"(.*)\"), \"node\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\")",
+          "legendFormat": "GPU {{src_gpu}} · {{node}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "vector($xgmi_limit * 1e9)",
+          "legendFormat": "limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 0 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 1 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 2 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 3 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 4 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 5 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 6 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 7 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 8 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 9 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 10 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 11 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 12 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 13 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 14 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 15 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU cpu · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "XGMI per GPU: EP",
+      "description": "EP payload bytes per second each selected GPU sends over XGMI (dispatch and combine), to all its peers together. Dashed: what one GPU can send over XGMI to all its peers together (the XGMI limit per GPU at the top); IO and EP of a GPU share it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 15,
+        "w": 6,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(sum by (host, gpu) (rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",direction=\"tx\"}[$res])), \"node\", \"$1\", \"host\", \"(.*)\"), \"node\", \"$1\", \"host\", \"([^.]*[^.0-9][^.]*)\\\\..*\")",
+          "legendFormat": "GPU {{gpu}} · {{node}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "vector($xgmi_limit * 1e9)",
+          "legendFormat": "limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 0 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 1 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 2 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 3 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 4 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 5 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 6 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 7 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 8 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 9 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 10 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 11 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 12 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 13 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 14 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 15 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU cpu · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "RDMA per GPU: IO",
+      "description": "Bytes per second each selected GPU sends over RDMA for the IO engines, through its NIC (the RDMA backend's completed bytes, by source GPU).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 6,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(sum by (src_host, src_gpu) (rate(mori_io_completed_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\",backend=\"rdma\"}[$res])), \"node\", \"$1\", \"src_host\", \"(.*)\"), \"node\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\")",
+          "legendFormat": "GPU {{src_gpu}} · {{node}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 0 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 1 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 2 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 3 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 4 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 5 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 6 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 7 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 8 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 9 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 10 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 11 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 12 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 13 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 14 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 15 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU cpu · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "RDMA per GPU: EP",
+      "description": "Bytes per second each selected GPU puts on RDMA itself, through its NIC (EP between nodes: payload, headers and signals).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 15,
+        "w": 6,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(sum by (src_host, src_gpu) (rate(mori_gpu_rdma_bytes_total{src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res])), \"node\", \"$1\", \"src_host\", \"(.*)\"), \"node\", \"$1\", \"src_host\", \"([^.]*[^.0-9][^.]*)\\\\..*\")",
+          "legendFormat": "GPU {{src_gpu}} · {{node}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 0 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 1 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 2 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 3 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 4 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 5 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 6 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 7 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 8 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 9 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 10 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 11 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 12 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 13 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 14 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU 15 · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^GPU cpu · /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9aa0a6"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "EP kernels: how much data a dispatch / combine moves, and how long it takes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "EP bytes per call",
+      "description": "How much data one dispatch and one combine of a rank moves: the bytes of the tokens a dispatch delivers to the rank's experts, and of the tokens a combine gives back, tokens that stay on the GPU included (what an EP benchmark reports as bytes), divided by the calls; averaged over the selected GPUs. Divided by the kernel time per call on the right it is the kernel bandwidth (EP dashboard).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (op) ((sum by (host, gpu, rank, impl, op) ((rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"dispatch\",direction=\"rx\",path!=\"rdma\"}[$res]) or rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"combine\",direction=\"tx\",path!=\"rdma\"}[$res]))) * sum by (host, gpu, rank, impl, op) ((rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",op=\"dispatch\",direction=\"rx\"}[$res]) or rate(mori_ep_xgmi_bytes_total{host=~\"$host\",gpu=~\"$gpu\",op=\"combine\",direction=\"tx\"}[$res]))) / (sum by (host, gpu, rank, impl, op) ((rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"dispatch\",direction=\"rx\",path=\"xgmi\"}[$res]) or rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"combine\",direction=\"tx\",path=\"xgmi\"}[$res]))) > 0)) and on (host, gpu, rank, impl, op) sum by (host, gpu, rank, impl, op) (rate(mori_ep_calls_total{host=~\"$host\",gpu=~\"$gpu\"}[$res]))) / sum by (op) (sum by (host, gpu, rank, impl, op) (rate(mori_ep_calls_total{host=~\"$host\",gpu=~\"$gpu\"}[$res])) and on (host, gpu, rank, impl, op) (sum by (host, gpu, rank, impl, op) ((rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"dispatch\",direction=\"rx\",path=\"xgmi\"}[$res]) or rate(mori_ep_tokens_total{host=~\"$host\",gpu=~\"$gpu\",op=\"combine\",direction=\"tx\",path=\"xgmi\"}[$res]))) > 0))",
+          "legendFormat": "{{op}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dispatch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "combine"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "EP kernel time per call",
+      "description": "Time one dispatch and one combine take, measured on the device from the start of the kernel to its end (an inter-node dispatch or combine: its whole sequence of launches): kernel seconds / calls, averaged over the selected GPUs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (op) (rate(mori_ep_kernel_seconds_total{host=~\"$host\",gpu=~\"$gpu\"}[$res])) / (sum by (op) (rate(mori_ep_calls_total{host=~\"$host\",gpu=~\"$gpu\"}[$res]) and on (host, gpu, rank, impl, op, kernel) rate(mori_ep_kernel_seconds_total{host=~\"$host\",gpu=~\"$gpu\"}[$res])) > 0)",
+          "legendFormat": "{{op}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dispatch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "combine"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "IO transfers: how much a put / get carries, and how long it takes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "IO bytes per transfer",
+      "description": "How much data one put (write) and one get (read) carries: bytes submitted / transfers submitted, for the transfers the selected GPUs issue, by backend. Dashed: get.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (backend) (rate(mori_io_submitted_bytes_total{op=\"write\",src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res])) / (sum by (backend) (rate(mori_io_submitted_total{op=\"write\",src_host=~\"$host\",src_gpu=~\"$gpu\"}[$res])) > 0)",
+          "legendFormat": "{{backend}} put (write)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (backend) (rate(mori_io_submitted_bytes_total{op=\"read\",dst_host=~\"$host\",dst_gpu=~\"$gpu\"}[$res])) / (sum by (backend) (rate(mori_io_submitted_total{op=\"read\",dst_host=~\"$host\",dst_gpu=~\"$gpu\"}[$res])) > 0)",
+          "legendFormat": "{{backend}} get (read)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^xgmi /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rdma /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ get \\(read\\)$/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "IO time per transfer",
+      "description": "How long one put (write) and one get (read) takes, from its submission to its completion: the time the transfers took / the transfers that completed, for the transfers the selected GPUs issue, by backend. Dashed: get. RDMA: until the completion was processed. XGMI: until the caller looked at the transfer's status, so this is the time the caller saw.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (backend) (rate(mori_io_latency_seconds_sum{op=\"write\",host=~\"$host\",gpu=~\"$gpu\"}[$res])) / (sum by (backend) (rate(mori_io_latency_seconds_count{op=\"write\",host=~\"$host\",gpu=~\"$gpu\"}[$res])) > 0)",
+          "legendFormat": "{{backend}} put (write)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (backend) (rate(mori_io_latency_seconds_sum{op=\"read\",host=~\"$host\",gpu=~\"$gpu\"}[$res])) / (sum by (backend) (rate(mori_io_latency_seconds_count{op=\"read\",host=~\"$host\",gpu=~\"$gpu\"}[$res])) > 0)",
+          "legendFormat": "{{backend}} get (read)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^xgmi /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^rdma /"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ get \\(read\\)$/"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    8,
+                    6
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "sortBy": "Name",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

@@ -8,6 +8,9 @@ target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR})
 # libibverbs is no longer linked: mori_shmem makes no direct verbs calls and the
 # dlopen shim is embedded in mori_application.
 target_link_libraries(mori_shmem PUBLIC mori_application mori_logging hip::host)
+if(BUILD_METRICS)
+  target_link_libraries(mori_shmem PUBLIC mori_metrics)
+endif()
 
 if(MORI_MULTITHREAD_SUPPORT)
   target_compile_definitions(mori_shmem PUBLIC MORI_MULTITHREAD_SUPPORT)

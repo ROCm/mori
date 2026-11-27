@@ -39,6 +39,7 @@
 #include "mori/io/enum.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
 #include "mori/io/peer_failure.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 
 namespace mori {
 namespace io {
@@ -123,6 +124,10 @@ struct EngineDesc {
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
   RasDesc ras;
+  // Metrics `host` label of this engine's process; empty from an older peer. Not in operator==.
+  std::string metricsHost;
+
+  const std::string& MetricsHost() const { return metricsHost.empty() ? hostname : metricsHost; }
 
   bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
@@ -131,7 +136,7 @@ struct EngineDesc {
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras, metricsHost);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -176,6 +181,9 @@ struct MemoryDesc {
   BackendDescBlobMap backendDescs;
   // Why no fabric handle was exported; empty on success or without a FABRIC backend.
   std::string fabricReason;
+  // Physical GPU index on the registering host, for metrics labels; -1 = unknown. Not in
+  // operator==: derived from deviceBusId.
+  int gpuIndex{-1};
 
   // Not constexpr: comparing backendDescs (unordered_map) is not a constant expr.
   bool operator==(const MemoryDesc& rhs) const noexcept {
@@ -188,7 +196,7 @@ struct MemoryDesc {
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
                  ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize,
-                 backendDescs, fabricReason);
+                 backendDescs, fabricReason, gpuIndex);
 };
 
 using TransferUniqueId = uint64_t;
@@ -196,7 +204,7 @@ using TransferUniqueId = uint64_t;
 struct TransferStatus {
  public:
   TransferStatus() = default;
-  ~TransferStatus() = default;
+  ~TransferStatus() { meter.Abandon(); }
   TransferStatus(const TransferStatus&) = delete;
   TransferStatus& operator=(const TransferStatus&) = delete;
   TransferStatus(TransferStatus&&) = delete;
@@ -219,6 +227,7 @@ struct TransferStatus {
       msg = message;
       code.store(val, std::memory_order_release);
     }
+    FinishMeter(val);
     cv_.notify_all();
   }
 
@@ -232,6 +241,7 @@ struct TransferStatus {
       std::lock_guard<std::mutex> lock(msgMu);
       code.store(val, std::memory_order_release);
     }
+    FinishMeter(val);
     if (val != StatusCode::INIT && val != StatusCode::IN_PROGRESS) {
       cv_.notify_all();
     }
@@ -288,6 +298,9 @@ struct TransferStatus {
     return code.load(std::memory_order_acquire);
   }
 
+  // Starts metering this status's transfer; a null `flow` (metrics off) does nothing.
+  void StartMeter(IoFlowCounters* flow, IoOp op, uint64_t bytes) { meter.Start(flow, op, bytes); }
+
   void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
   void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
 
@@ -301,6 +314,14 @@ struct TransferStatus {
     if (code.load(std::memory_order_acquire) != StatusCode::IN_PROGRESS) return;
     if (progressCallback) progressCallback();
   }
+
+  void FinishMeter(StatusCode val) {
+    if (val != StatusCode::INIT && val != StatusCode::IN_PROGRESS) {
+      meter.Finish(val == StatusCode::SUCCESS);
+    }
+  }
+
+  IoPerTransferMeter meter;
 
   std::atomic<StatusCode> code{StatusCode::INIT};
   mutable std::mutex msgMu;

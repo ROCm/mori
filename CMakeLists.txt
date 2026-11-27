@@ -130,6 +130,11 @@ if(ENABLE_PROFILER)
   add_compile_definitions(ENABLE_PROFILER)
 endif()
 
+# Host and kernel metrics code is compiled only with MORI_ENABLE_METRICS.
+if(BUILD_METRICS)
+  add_compile_definitions(MORI_ENABLE_METRICS)
+endif()
+
 message(STATUS "ENABLE_DEBUG_PRINTF = ${ENABLE_DEBUG_PRINTF}")
 if(ENABLE_DEBUG_PRINTF)
   add_compile_definitions(MORI_ENABLE_DEBUG_PRINTF)

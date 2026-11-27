@@ -29,6 +29,9 @@ target_link_libraries(mori_cco PRIVATE
 target_link_options(mori_cco PRIVATE LINKER:--exclude-libs,ALL)
 
 target_link_libraries(mori_cco PUBLIC mori_logging hip::host)
+if(BUILD_METRICS)
+  target_link_libraries(mori_cco PUBLIC mori_metrics)
+endif()
 
 set_target_properties(
   mori_cco

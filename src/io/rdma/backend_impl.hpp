@@ -126,9 +126,15 @@ class RdmaManager {
   // it goes too, and a new QP given its number starts clean.
   bool DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep,
                               bool releaseFailures = false) noexcept;
+  // The remote end of an endpoint as the handshake gave it, for metrics.
+  struct RemoteNic {
+    std::string hostname;
+    std::string ibdev;  // empty from a peer that does not send it
+    std::string netdev;
+  };
   EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
                              int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
-                             int weight);
+                             int weight, const RemoteNic& remoteNic = {});
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   void SnapshotEndpointRuntimes(SnapshotVector& result);
   // Monotonic generation counter bumped whenever the endpoint set changes.
@@ -187,6 +193,7 @@ class RdmaManager {
   void RecordQpFailed(const EpPair& ep);
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
+  std::string DeviceNetdev(int devId) const;
   // Session admission only: never reject part-way through posting a transfer.
   bool RejectIfPortDown(const EpPairVec& eps, TransferStatus* status);
 
@@ -199,6 +206,7 @@ class RdmaManager {
 
   application::RdmaContext* ctx;
   application::ActiveDevicePortList availDevices;
+  std::vector<std::string> availNetdevs_;  // per availDevices entry
   std::vector<application::RdmaDeviceContext*> deviceCtxs;
 
   MemoryTable mTable;

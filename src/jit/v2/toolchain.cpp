@@ -84,6 +84,9 @@ std::vector<std::string> Toolchain::Flags() const {
   if (nic == "bnxt") f.push_back("-DMORI_DEVICE_NIC_BNXT");
   if (nic == "ionic") f.push_back("-DMORI_DEVICE_NIC_IONIC");
   if (nic == "ionic" && ionicCcqe) f.push_back("-DIONIC_CCQE");
+#ifdef MORI_ENABLE_METRICS
+  f.push_back("-DMORI_ENABLE_METRICS");  // as the host libraries were built
+#endif
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
     for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
   }

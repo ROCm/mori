@@ -655,6 +655,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 stg_bytes, dtype=torch.uint8, device=dev
             )
 
+        # Before the kernels: the plans are bound to its address. AsyncLL and the
+        # gfx125x intranode bodies do not count, so they get no block.
+        self._traffic_stats = None
+        if cfg.is_internode and not cfg.async_ll:
+            self._make_traffic_stats(cfg, comm, "internode")
+        elif not (cfg.async_ll or self._is1250):
+            self._make_traffic_stats(cfg, comm, "intranode")
         self._kernels = self._build_kernels(cfg, self.arena)
 
         if cfg.is_internode or cfg.async_ll:
@@ -1525,6 +1532,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
             dispReceiverIdxMap=ptr(self.disp_receiver_idx_map),
+            trafficStats=(
+                0 if self._traffic_stats is None else self._traffic_stats.device_ptr
+            ),
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
@@ -2164,6 +2174,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 weights_ptr = 0
             held_indices = getattr(self, "_internode_indices", None)
             indices_ptr = 0 if held_indices is None else held_indices.data_ptr()
+            # A combine that folds weights carries them with every token.
+            if phase == "combine" and self._traffic_stats is not None:
+                folded = bool(weights_ptr)
+                if folded != getattr(self, "_stats_combine_folds", False):
+                    self._stats_combine_folds = folded
+                    cfg = self.cfg
+                    self._traffic_stats.set_bytes_per_token(
+                        1,
+                        cfg.combine_token_nbytes
+                        + cfg.combine_scale_bytes
+                        + (cfg.num_experts_per_token * 4 if folded else 0),
+                    )
 
             # Static pointers, rdmaBlockNum and replayMode are already bound.
             args = dict(
@@ -2270,6 +2292,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             combine[_LL_SPEC] = self._wrap_combine(plan, ll=True)
+        stats = getattr(self, "_traffic_stats", None)
+        if stats is not None:
+            for plan in self._plans:
+                plan.bind(traffic_stats=stats.device_ptr)
 
         return KernelSet(
             dispatch=dispatch,

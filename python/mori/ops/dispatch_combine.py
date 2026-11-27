@@ -320,6 +320,7 @@ class EpDispatchCombineOp:
         )
 
         self._handle = handle_class(self._cpp_config)
+        self._traffic_stats_on = bool(mori_cpp.ep_stats_enabled(self._handle))
         self._hip_module = _load_hip_modules(config.kernel_type)
         self._handle_info = mori_cpp.get_handle_info(self._handle)
         # MORI_EP_DISABLE_RDMA_ATOMICS: the InterNodeV1/V1LL dispatch and combine kernels are
@@ -682,6 +683,20 @@ class EpDispatchCombineOp:
         stride = self.max_num_tokens_to_send()
         return int(flat_idx) // stride, int(flat_idx) % stride
 
+    def get_traffic_stats(self):
+        """Cumulative per-peer token counts (int64 tensors by peer rank), call counts
+        and kernel seconds as a dict; ``None`` unless metrics were on at creation."""
+        raw = mori_cpp.ep_stats_read(self._handle)
+        if raw is None:
+            return None
+        out = {}
+        for key, value in raw.items():
+            if isinstance(value, list):
+                out[key] = torch.tensor(value, dtype=torch.int64)
+            else:
+                out[key] = value if isinstance(value, float) else int(value)
+        return out
+
     def get_registered_combine_input_buffer(
         self, dtype: torch.dtype, hidden_dim: int = -1
     ):
@@ -846,6 +861,8 @@ class EpDispatchCombineOp:
             scale_ptr=scale_ptr,
             indices_ptr=indices.data_ptr(),
         )
+        if self._traffic_stats_on:
+            mori_cpp.ep_stats_note_launch(self._handle, 0, hidden_dim)
         if use_routing_handle:
             args_ptr = self._build_args_routing(
                 routing,
@@ -1130,6 +1147,8 @@ class EpDispatchCombineOp:
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
         )
+        if self._traffic_stats_on:
+            mori_cpp.ep_stats_note_launch(self._handle, 1, hidden_dim)
         if routing is not None:
             args_ptr = self._build_args_routing(
                 routing,
@@ -1487,6 +1506,8 @@ class EpDispatchCombineOp:
             ),
             indices_ptr=indices.data_ptr(),
         )
+        if self._traffic_stats_on:
+            mori_cpp.ep_stats_note_launch(self._handle, 0, hidden_dim)
         args_ptr = mori_cpp.build_args(
             self._handle,
             rdma_block_num=actual_rbn,
@@ -1589,6 +1610,8 @@ class EpDispatchCombineOp:
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
         )
+        if self._traffic_stats_on:
+            mori_cpp.ep_stats_note_launch(self._handle, 1, hidden_dim)
         args_ptr = mori_cpp.build_args(
             self._handle,
             rdma_block_num=actual_rbn,

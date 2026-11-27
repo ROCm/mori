@@ -44,10 +44,15 @@
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -333,6 +338,145 @@ TEST_F(PrometheusMetricsServerTest, MultipleScrapes) {
     auto body = scrape();
     EXPECT_NE(body.find("stable_gauge 7"), std::string::npos);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Labeled series, escaping, removal
+// ---------------------------------------------------------------------------
+
+TEST_F(PrometheusMetricsServerTest, LabelValueIsEscaped) {
+  server_->addCounter("esc_total", "help", {{"path", "a\"b\\c\nd"}}, 1);
+  auto body = httpBody(httpGet(port_, "/metrics"));
+  EXPECT_NE(body.find("esc_total{path=\"a\\\"b\\\\c\\nd\"} 1"), std::string::npos) << body;
+}
+
+TEST_F(PrometheusMetricsServerTest, HelpIsEscaped) {
+  server_->setGauge("esc_gauge", "line one\nline \\ two", 1.0);
+  auto body = httpBody(httpGet(port_, "/metrics"));
+  EXPECT_NE(body.find("# HELP esc_gauge line one\\nline \\\\ two\n"), std::string::npos) << body;
+}
+
+TEST_F(PrometheusMetricsServerTest, RemoveSeriesDropsOnlyThatSeries) {
+  server_->addCounter("rm_total", "help", {{"gpu", "0"}}, 3);
+  server_->addCounter("rm_total", "help", {{"gpu", "1"}}, 4);
+  EXPECT_EQ(server_->removeSeries("rm_total", {{"gpu", "0"}}), 1);
+  auto body = httpBody(httpGet(port_, "/metrics"));
+  EXPECT_EQ(body.find("rm_total{gpu=\"0\"}"), std::string::npos) << body;
+  EXPECT_NE(body.find("rm_total{gpu=\"1\"} 4"), std::string::npos) << body;
+  EXPECT_NE(body.find("# TYPE rm_total counter"), std::string::npos) << body;
+}
+
+TEST_F(PrometheusMetricsServerTest, RemoveLastSeriesDropsTheFamily) {
+  server_->setGauge("rm_gauge", "help", {{"gpu", "0"}}, 3);
+  server_->observeAggregated("rm_hist", "help", {{"gpu", "0"}}, {1.0, 2.0}, {1, 2}, 2, 2.5);
+  EXPECT_EQ(server_->removeSeries("rm_gauge", {{"gpu", "0"}}), 1);
+  EXPECT_EQ(server_->removeSeries("rm_hist", {{"gpu", "0"}}), 1);
+  EXPECT_EQ(server_->removeSeries("rm_hist", {{"gpu", "0"}}), 0);
+  auto body = httpBody(httpGet(port_, "/metrics"));
+  EXPECT_EQ(body.find("rm_gauge"), std::string::npos) << body;
+  EXPECT_EQ(body.find("rm_hist"), std::string::npos) << body;
+}
+
+TEST_F(PrometheusMetricsServerTest, RemovedCounterStartsAgainAtZero) {
+  server_->addCounter("again_total", "help", {{"gpu", "0"}}, 9);
+  server_->removeSeries("again_total", {{"gpu", "0"}});
+  server_->addCounter("again_total", "help", {{"gpu", "0"}}, 2);
+  auto body = httpBody(httpGet(port_, "/metrics"));
+  EXPECT_NE(body.find("again_total{gpu=\"0\"} 2"), std::string::npos) << body;
+}
+
+// ---------------------------------------------------------------------------
+// Bind address, port 0, misbehaving clients
+// ---------------------------------------------------------------------------
+
+TEST(PrometheusMetricsServerBind, PortZeroReportsTheChosenPort) {
+  MetricsServer server(0, "127.0.0.1");
+  EXPECT_GT(server.port(), 0);
+  server.setGauge("bind_gauge", "help", 1.0);
+  auto body = httpBody(httpGet(server.port(), "/metrics"));
+  EXPECT_NE(body.find("bind_gauge 1"), std::string::npos) << body;
+}
+
+TEST(PrometheusMetricsServerBind, BadAddressThrows) {
+  EXPECT_THROW(MetricsServer(0, "not-an-address"), std::runtime_error);
+}
+
+TEST(PrometheusMetricsServerBind, PortInUseThrows) {
+  MetricsServer first(0, "127.0.0.1");
+  EXPECT_THROW(MetricsServer(first.port(), "127.0.0.1"), std::runtime_error);
+}
+
+TEST(PrometheusMetricsServerClients, SilentClientDoesNotBlockTheNextScrape) {
+  MetricsServer server(0, "127.0.0.1");
+  server.setGauge("alive", "help", 1.0);
+
+  int silent = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(server.port()));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::connect(silent, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+  auto start = std::chrono::steady_clock::now();
+  auto body = httpBody(httpGet(server.port(), "/metrics"));
+  auto waited = std::chrono::steady_clock::now() - start;
+  EXPECT_NE(body.find("alive 1"), std::string::npos) << body;
+  EXPECT_LT(waited, std::chrono::milliseconds(MetricsServer::kClientTimeoutMs + 2000));
+  ::close(silent);
+}
+
+// Must not SIGPIPE: the body exceeds a socket buffer, so the server is still sending.
+TEST(PrometheusMetricsServerClients, ClientHangingUpMidResponseIsHarmless) {
+  MetricsServer server(0, "127.0.0.1");
+  for (int i = 0; i < 20000; ++i) {
+    server.addCounter("big_total", "help", {{"series", std::to_string(i)}}, 1);
+  }
+  for (int round = 0; round < 3; ++round) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(server.port()));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    const std::string request = "GET /metrics HTTP/1.0\r\n\r\n";
+    ASSERT_EQ(::write(fd, request.data(), request.size()), static_cast<ssize_t>(request.size()));
+    // Linger 0: close() sends a reset instead of waiting to drain.
+    linger lg{1, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ::close(fd);
+  }
+  auto body = httpBody(httpGet(server.port(), "/metrics"));
+  EXPECT_NE(body.find("big_total{series=\"19999\"} 1"), std::string::npos);
+}
+
+// With SIGUSR1 blocked in this thread it stays pending unless the accept thread takes it.
+static std::atomic<int> g_server_signal_runs{0};
+static void CountServerSignal(int) { g_server_signal_runs.fetch_add(1); }
+
+TEST(PrometheusMetricsServerClients, AcceptThreadDoesNotTakeProcessSignals) {
+  MetricsServer server(0, "127.0.0.1");
+
+  struct sigaction sa{};
+  struct sigaction old_sa{};
+  sa.sa_handler = CountServerSignal;
+  ASSERT_EQ(sigaction(SIGUSR1, &sa, &old_sa), 0);
+  sigset_t usr1, old_mask;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  ASSERT_EQ(pthread_sigmask(SIG_BLOCK, &usr1, &old_mask), 0);
+
+  g_server_signal_runs.store(0);
+  ASSERT_EQ(kill(getpid(), SIGUSR1), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(g_server_signal_runs.load(), 0) << "the accept thread handled a process signal";
+
+  ASSERT_EQ(pthread_sigmask(SIG_SETMASK, &old_mask, nullptr), 0);  // now it is ours to take
+  for (int i = 0; i < 200 && g_server_signal_runs.load() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(g_server_signal_runs.load(), 1);
+  sigaction(SIGUSR1, &old_sa, nullptr);
 }
 
 }  // namespace mori::metrics

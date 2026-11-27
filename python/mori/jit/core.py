@@ -47,6 +47,7 @@ from mori.jit.config import (
     find_mpi_include,
     get_mori_source_root,
     is_debuginfo_enabled,
+    is_metrics_built,
     is_profiler_enabled,
 )
 
@@ -528,6 +529,8 @@ def _tunable_defines() -> list[str]:
     defs: list[str] = []
     if os.environ.get("MORI_ENABLE_HOST_PROXY") == "1":
         defs.append("-DMORI_PROXY_ENABLED")
+    if is_metrics_built():
+        defs.append("-DMORI_ENABLE_METRICS")
     return defs
 
 
@@ -735,6 +738,7 @@ def ensure_bitcode(*, cov: int = 5) -> str:
         mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
+        mori_root / "include" / "mori" / "metrics" / "traffic_counters.hpp",
     ]
     cache_dir = get_cache_dir(
         cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe

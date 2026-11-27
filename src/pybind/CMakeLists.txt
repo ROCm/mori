@@ -53,7 +53,8 @@ function(mori_pybind_module tgt)
                BUILD_WITH_INSTALL_RPATH TRUE)
 endfunction()
 
-set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp)
+set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp
+                        pybind_metrics.cpp)
 if(BUILD_COLLECTIVE)
   list(APPEND MORI_PYBIND_SOURCES pybind_ccl.cpp)
 endif()

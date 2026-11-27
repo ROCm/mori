@@ -39,6 +39,7 @@
 
 #include "mori/cco/cco.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
+#include "mori/metrics/traffic_counters.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
 #include "src/ops/dispatch_combine_v2/ep_scatter_quant.hpp"
 
@@ -237,6 +238,8 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
                                  1;
       __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      ::mori::moe::EpStatsDispatchSent(reinterpret_cast<uint64_t*>(args.trafficStats), kNpes,
+                                       destPe, static_cast<uint64_t>(numTokenSignal - 1));
       // Cleared here, by the warp that just read it: the inbound loop below runs on
       // the first arriver, which may reach it before this warp has read the sum.
       args.destPeTokenCounter[destPe] = 0;
@@ -253,7 +256,12 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
     int* recvTokenNums = EpLocal<int>(win, args.offRecvNum);
     for (int srcPe = laneId; srcPe < kNpes; srcPe += kCfg.waveSize) {
       int* signal = recvTokenNums + srcPe;
-      myRecv += EpWaitGt(signal, 0) - 1;
+      const int recv = EpWaitGt(signal, 0) - 1;
+      myRecv += recv;
+      if (args.trafficStats != nullptr) {
+        reinterpret_cast<uint64_t*>(
+            args.trafficStats)[::mori::moe::EpStatsLastRecvOffset(kNpes) + srcPe] = recv;
+      }
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     // One store instead of an atomicAdd a source -- and the total no longer depends
@@ -432,6 +440,37 @@ __device__ __forceinline__ void EpDispatchRoute(const EpArgs& args, int tokenId,
   }
 }
 
+// Statistics: the last block to finish is not block 0 here, and the first arriver reads the
+// inbound counts possibly before block 0 has decided whether this dispatch counts. So every
+// block reports in once it is done, and warp 0 of block 0 waits for all of them, counts what
+// the first arriver read, and then (EpStatsLaunch's destructor) takes the end time.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpStatsDispatchLeave(const EpArgs& args, int warpId, int laneId) {
+  constexpr int kNpes = kCfg.worldSize;
+  uint64_t* stats = reinterpret_cast<uint64_t*>(args.trafficStats);
+  if (stats == nullptr) return;
+  uint64_t* arrived = stats + ::mori::moe::EpStatsArrivedOffset(kNpes);
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __hip_atomic_fetch_add(arrived, static_cast<uint64_t>(1), __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+  }
+  if (blockIdx.x != 0 || warpId != 0) return;
+  while (__hip_atomic_load(arrived, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) !=
+         static_cast<uint64_t>(gridDim.x)) {
+  }
+  if (laneId == 0) {
+    __hip_atomic_store(arrived, static_cast<uint64_t>(0), __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
+  }
+  __threadfence();
+  for (int pe = laneId; pe < kNpes; pe += kCfg.waveSize) {
+    ::mori::moe::EpStatsDispatchRecv(stats, kNpes, pe,
+                                     stats[::mori::moe::EpStatsLastRecvOffset(kNpes) + pe]);
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatchBody(EpArgs args) {
   constexpr int kTopk = kCfg.numExpertPerToken;
@@ -450,6 +489,9 @@ __device__ void EpDispatchBody(EpArgs args) {
   const int thdId = threadIdx.x;
   const int laneId = thdId & (kCfg.waveSize - 1);
   const int warpId = thdId / kCfg.waveSize;
+  ::mori::moe::EpStatsLaunch statsLaunch(reinterpret_cast<uint64_t*>(args.trafficStats),
+                                         kCfg.worldSize, ::mori::moe::kEpStatsDispatch,
+                                         blockIdx.x == 0 && warpId == 0, laneId, kCfg.waveSize);
   const unsigned long long win = args.window;
   const int numTokens = args.numTokens;
 
@@ -610,6 +652,7 @@ __device__ void EpDispatchBody(EpArgs args) {
   }
 
   EpDispatchNotify<kCfg>(args);
+  EpStatsDispatchLeave<kCfg>(args, warpId, laneId);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -677,6 +720,19 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
 /* ------------------------------------------------------------------------- */
 /*                                   Combine                                  */
 /* ------------------------------------------------------------------------- */
+// Timing: every block reports in on gridBarrier (idle while a combine runs) and
+// thread 0 of block 0 waits for all, so that it times the whole launch.
+__device__ __forceinline__ void EpStatsLeaveLast(const EpArgs& args, int npes, int globalWarpId,
+                                                 int laneId) {
+  if (!::mori::moe::EpStatsActive(reinterpret_cast<uint64_t*>(args.trafficStats), npes)) return;
+  __syncthreads();
+  if (threadIdx.x == 0) atomicAdd(args.gridBarrier, 1u);
+  if (globalWarpId == 0 && laneId == 0) {
+    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpCombineBody(EpArgs args) {
   constexpr int kNpes = kCfg.worldSize;
@@ -689,10 +745,20 @@ __device__ void EpCombineBody(EpArgs args) {
   const int warpNum = kCfg.warpPerBlock;
   const int globalWarpId = blockIdx.x * warpNum + warpId;
   const int globalWarpNum = gridDim.x * warpNum;
+  ::mori::moe::EpStatsLaunch statsLaunch(reinterpret_cast<uint64_t*>(args.trafficStats), kNpes,
+                                         ::mori::moe::kEpStatsCombine, globalWarpId == 0, laneId,
+                                         kCfg.waveSize);
 
   const unsigned long long win = args.window;
   const unsigned long long flag = args.xdbFlag[0];
   const int totalRecv = args.totalRecvTokenNum[0];
+
+  // Combine totals come from the per-peer counts the dispatch before it left.
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < kNpes; pe += kCfg.waveSize) {
+      ::mori::moe::EpStatsCombinePeer(reinterpret_cast<uint64_t*>(args.trafficStats), kNpes, pe);
+    }
+  }
 
   // Stage the post-expert tokens into the arena so peers can gather them --
   // unless the caller already produced them there, which an expert op writing
@@ -773,6 +839,7 @@ __device__ void EpCombineBody(EpArgs args) {
       }
     }
   }
+  EpStatsLeaveLast(args, kNpes, globalWarpId, laneId);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -918,6 +985,15 @@ __device__ void EpCombineScatterBody(EpArgs args) {
   const int warpId = threadIdx.x / kCfg.waveSize;
   const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + warpId;
   const int globalWarpNum = gridDim.x * kCfg.warpPerBlock;
+  ::mori::moe::EpStatsLaunch statsLaunch(reinterpret_cast<uint64_t*>(args.trafficStats), kNpes,
+                                         ::mori::moe::kEpStatsCombine, globalWarpId == 0, laneId,
+                                         kCfg.waveSize);
+
+  if (globalWarpId == 0) {
+    for (int pe = laneId; pe < kNpes; pe += kCfg.waveSize) {
+      ::mori::moe::EpStatsCombinePeer(reinterpret_cast<uint64_t*>(args.trafficStats), kNpes, pe);
+    }
+  }
 
   const unsigned long long win = args.window;
   const unsigned long long flag = args.xdbFlag[0];
@@ -1006,6 +1082,7 @@ __device__ void EpCombineScatterBody(EpArgs args) {
         args.outWeightsBuf[tok * kTopk + laneId] = wacc;
     }
   }
+  EpStatsLeaveLast(args, kNpes, globalWarpId, laneId);
 }
 
 }  // namespace v2

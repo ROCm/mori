@@ -137,6 +137,14 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
     void ccoDevCommFreeDeviceCopy(ccoDevComm* devicePtr) nogil
     int ccoBarrierAll(ccoComm* comm) nogil
 
+    cdef struct ccoPeIdentity:
+        char hostname[256]
+        int gpuIndex
+        char gpuPci[32]
+        char ibdev[64]
+        char netdev[64]
+    int ccoCommGetPeIdentity(ccoComm* comm, int rank, ccoPeIdentity* out) nogil
+
 
 cdef class UniqueId:
     cdef ccoUniqueId _uid

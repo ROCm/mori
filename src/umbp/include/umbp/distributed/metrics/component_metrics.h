@@ -21,12 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include <cstdint>
-#include <functional>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
+#include "mori/metrics/metrics.hpp"
 
 // ---------------------------------------------------------------------------
 //  The one observability seam the refactored data plane publishes through.
@@ -139,85 +134,15 @@ namespace mori::umbp {
   "direction. Divide mori_umbp_transfer_bytes_total by this for achieved bandwidth"
 
 // ---------------------------------------------------------------------------
-//  Sample types
-// ---------------------------------------------------------------------------
-
-enum class MetricKind {
-  // Value is MONOTONIC and the publisher ships `value - last`.  A decrease is
-  // read as a rebuilt source and rebases rather than shipping a negative delta.
-  kCounter,
-  // Value is the current reading and is shipped as-is every tick.
-  kGauge,
-};
-
-using MetricLabels = std::vector<std::pair<std::string, std::string>>;
-
-// One sample from a component.  `name`/`help` are the Prometheus identity and
-// MUST be string literals with static storage duration — the same metric
-// reported under different label sets shares both.
-struct MetricSample {
-  const char* name = nullptr;
-  const char* help = nullptr;
-  MetricLabels labels;
-  uint64_t value = 0;
-  MetricKind kind = MetricKind::kCounter;
-  // Applied by the publisher to the delta (counter) or the reading (gauge).
-  // Lets a component accumulate in the integer unit it can add atomically —
-  // nanoseconds, pages — while the metric keeps the unit its name promises.
-  double scale = 1.0;
-};
-
-// Anything that can be sampled once per metrics tick.  Implemented by
-// MediumBackend and TransferEngine so the publisher walks both through one
-// pointer type and neither has to know how the samples leave the process.
+//  Sample types and the publisher
 //
-// Defaulted to empty: a component with nothing of its own to say (and every
-// test double) needs no code, and still gets the generic metrics its decorator
-// emits.  Never called under a component lock — treat it as a plain read of
-// relaxed atomics.
-class MetricSource {
- public:
-  virtual ~MetricSource() = default;
-  virtual std::vector<MetricSample> SampleMetrics() const { return {}; }
-};
-
+//  Now in mori/metrics/metrics.hpp; the names are kept for UMBP code and its tests.
 // ---------------------------------------------------------------------------
-//  MetricPublisher — turns snapshots into deltas and hands them to a sink
-//
-//  One instance holds the baselines for every source it publishes, keyed by
-//  (source id, metric name, labels).  Two sources reporting the same metric
-//  name must not share a baseline or one would cancel the other's progress
-//  out, which is what `source_id` separates.
-// ---------------------------------------------------------------------------
-class MetricPublisher {
- public:
-  struct Sink {
-    // delta >= 0, already differenced.  Not called for a zero delta, except
-    // once for a series seen for the first time, so the series exists at 0
-    // before its first event (see Publish).
-    std::function<void(const char* name, const char* help, const MetricLabels&, double delta)>
-        counter;
-    // Current reading, shipped every tick.
-    std::function<void(const char* name, const char* help, const MetricLabels&, double value)>
-        gauge;
-  };
 
-  // Sample `source`, prepend `source_labels` to every sample's own labels, and
-  // emit through `sink`.  `source_id` identifies the source's baselines and
-  // must be stable across ticks for the same object.
-  void Publish(const std::string& source_id, const MetricLabels& source_labels,
-               const MetricSource& source, const Sink& sink);
-
-  // Same, for samples a caller already has in hand.
-  void Publish(const std::string& source_id, const MetricLabels& source_labels,
-               const std::vector<MetricSample>& samples, const Sink& sink);
-
-  // Drop every baseline.  The next Publish treats each sample as a fresh
-  // source, which is what a re-Init wants.
-  void Reset() { last_.clear(); }
-
- private:
-  std::unordered_map<std::string, uint64_t> last_;
-};
+using MetricKind = ::mori::metrics::MetricKind;
+using MetricLabels = ::mori::metrics::MetricLabels;
+using MetricSample = ::mori::metrics::MetricSample;
+using MetricSource = ::mori::metrics::MetricSource;
+using MetricPublisher = ::mori::metrics::MetricPublisher;
 
 }  // namespace mori::umbp
