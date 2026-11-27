@@ -523,7 +523,7 @@ PULL/QUAD gather combine。
 op 不声明这两个能力，调用时报 `NotImplementedError`）；这些在 FlyDSL 后端都有。
 
 gfx942/gfx950 的 dispatch 在 grid barrier 前让每个 block 用一次 `s_waitcnt` 排空自己的对端写（HIP 与
-FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_WINDOW=0`，或 ROCm 7.2.x 的 VMM
+FlyDSL 相同），不做 L2 写回。cco 窗口是 cached 时（`CCO_UNCACHED_WINDOW=0`，或 ROCm 7.14 之前的 VMM
 路径忽略 uncached）按内存模型应改为每 block 一次 system release；但这些对端写不经 release 也已可见
 （`FRESH=1` 在 cached 窗口下同样通过），而 release 会让 dispatch 慢 6–40%，所以只做排空。
 `local_expert_count` 与 StdMoE 的两个 convert 是三个只读写本 rank 行的本地 kernel

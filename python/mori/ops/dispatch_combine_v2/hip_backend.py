@@ -72,7 +72,7 @@ from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .quant_types import is_gfx125x_arch, resolve_quant_type
 from .internode_regions import (
-    CHUNK_TOKENS_MIN,
+    CHUNK_TOKENS,
     asyncll_regions,
     asyncll_seg_layout,
     asyncll_seg_words,
@@ -86,11 +86,11 @@ logger = logging.getLogger(__name__)
 def _check_ranks_agree(cfg, **settings):
     """Raise when ranks disagree on op-wide settings their kernels must share.
 
-    The dispatch piece count and the combine barrier slots follow
-    MORI_EP_DISABLE_RDMA_ATOMICS and the drained QP count; a rank that differs
-    reads a piece before it lands or waits on the wrong slot. Checked through
-    torch.distributed when its default group is exactly this op's ranks;
-    skipped otherwise.
+    Every rank must agree on MORI_EP_DISABLE_RDMA_ATOMICS, and atomic-free ops
+    also on the drained QP count, which their dispatch pieces and combine
+    barrier slots follow; a rank that differs reads a piece before it lands or
+    waits on the wrong slot. Checked through torch.distributed when its default
+    group is exactly this op's ranks; skipped otherwise.
     """
     import torch.distributed as dist
 
@@ -483,6 +483,13 @@ class TokOffExt:
         pass
 
 
+def _rdma_atomics_disabled():
+    """MORI_EP_DISABLE_RDMA_ATOMICS as the C++ IsEnvVarEnabled reads it: set, and
+    not 0/false/off/no."""
+    value = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
+    return value.lower() not in ("", "0", "false", "off", "no")
+
+
 def _relaxed_ordering_enabled():
     """MORI_IB_ENABLE_RELAXED_ORDERING as rdma.cpp reads it: exactly the value 1."""
     try:
@@ -524,10 +531,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
-        # MORI_EP_DISABLE_RDMA_ATOMICS as the C++ IsEnvVarEnabled reads it: set, and not
-        # 0/false/off/no. Compiled into the v2 / v2_ll plans (kConfig.noRdmaAtomics).
-        _af = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
-        self._no_rdma_atomics = _af.lower() not in ("", "0", "false", "off", "no")
+        # Compiled into the v2 / v2_ll plans (kConfig.noRdmaAtomics).
+        self._no_rdma_atomics = _rdma_atomics_disabled()
         # Whether cco allocated its windows uncached, so a combine relay's staging stores bypass
         # L2 (kConfig.windowUncached); the kernel also requires gfx942/gfx950 for that.
         from mori.cco import cco as _cco
@@ -919,11 +924,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             n_nodes
             * max(
                 max_tokens_per_rank * 2,
-                -(-max_tokens_per_rank // CHUNK_TOKENS_MIN) * cfg.num_qp_per_pe,
+                -(-max_tokens_per_rank // CHUNK_TOKENS) * cfg.num_qp_per_pe,
             ),
             **i32,
         )
-        self.dest_pe_counter = torch.zeros(world_size, **i32)
+        self.dest_pe_counter = torch.zeros(world_size, **i32) if cfg.async_ll else None
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
         # AsyncLL only: recv slot -> the send-buffer slot it arrived in, written by
         # dispatch's RecvCopy and read by combine's SendCopy. One entry per slot
@@ -1736,7 +1741,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["mpCount"] = self._multi_processor_count
         # AsyncLL has no write-signalling variant; cross-node ones are refused in the gate.
         request["noRdmaAtomics"] = False
-        request["windowUncached"] = False
         request["asyncLlMode"] = self._asyncll_mode
         request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request
@@ -2064,11 +2068,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ]
             + list(self._selectable_active_qps)
         )
-        _check_ranks_agree(
-            cfg,
-            no_rdma_atomics=bool(getattr(self, "_no_rdma_atomics", False)),
-            num_qp_to_drain=num_qp_to_drain,
-        )
+        shared = {"no_rdma_atomics": bool(getattr(self, "_no_rdma_atomics", False))}
+        if shared["no_rdma_atomics"]:
+            shared["num_qp_to_drain"] = num_qp_to_drain
+        _check_ranks_agree(cfg, **shared)
         plans = {}
         kernels = {"dispatch": {}, "combine": {}}
         for phase, dtype in (
@@ -2076,6 +2079,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("combine", cfg.combine_dtype),
         ):
             for spec in specs_by_phase[phase]:
+                seq = self._INTERNODE_SEQ[phase, spec.family]
                 request = self._internode_request(
                     cfg,
                     self._INTERNODE_DTYPE[dtype],
@@ -2086,7 +2090,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     num_qp_to_drain,
                 )
                 group_plans = []
-                for pass_name in self._INTERNODE_SEQ[phase, spec.family]:
+                for pass_name in seq:
                     # Common passes share a plan across families at one geometry.
                     # Only the ordinary combine pass compiles the load-first
                     # gather, so only its key and request carry the flag.
@@ -2108,14 +2112,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         plans[key] = plan
                     group_plans.append(plans[key])
                 group = plan_api.make_launch_group(group_plans)
-                # CombineSync only stages the input and the weights; with the input
-                # already in combine_in_view() and no weight fold it has nothing to do.
-                in_place = (
-                    plan_api.make_launch_group(group_plans[1:])
+                # CombineSync only stages the input and the weights; a zero-copy combine
+                # (input already in combine_in_view(), no weight fold) skips it.
+                zero_copy = (
+                    plan_api.make_launch_group(
+                        [
+                            plan
+                            for name, plan in zip(seq, group_plans)
+                            if name != "combinesync"
+                        ]
+                    )
                     if phase == "combine"
                     else None
                 )
-                kernels[phase][spec] = self._wrap_internode(phase, group, in_place)
+                kernels[phase][spec] = self._wrap_internode(phase, group, zero_copy)
 
         return KernelSet(
             dispatch=kernels["dispatch"],
@@ -2179,7 +2189,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self.cfg.internode_auto_ll_max_tokens
         return None
 
-    def _wrap_internode(self, phase, group, in_place=None):
+    def _wrap_internode(self, phase, group, zero_copy=None):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
@@ -2250,11 +2260,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 ),
             )
             if (
-                in_place is not None
+                zero_copy is not None
                 and weights_ptr == 0
                 and input.data_ptr() == self._combine_inp_ptr()
             ):
-                in_place.launch(_raw_stream(self._device_index), **args)
+                zero_copy.launch(_raw_stream(self._device_index), **args)
             else:
                 group.launch(_raw_stream(self._device_index), **args)
 
@@ -2558,7 +2568,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _combine_inp_ptr(self):
         ptr = getattr(self, "_combine_inp_addr", None)
         if ptr is None:
-            ptr = self._combine_inp_addr = self.arena.local_ptr("inter_combine_inp")
+            ptr = self._combine_inp_addr = self.arena.local_ptr(self._region("out_tok"))
         return ptr
 
     def combine_in_view(self):
@@ -2660,10 +2670,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         the ones compiled for every bucket geometry. Rank-local: ranks, and the
         dispatch and combine of one pair, may use different counts, because a
         combine's barrier contribution does not depend on it (see
-        kCombineBarrierMarkerTotal). What must match across ranks is the op's
-        drained count (the largest selectable one), which the atomic-free
-        dispatch pieces and barrier slots follow; it is fixed when the op is
-        built. A captured graph keeps the plans it was captured with.
+        kCombineBarrierMarkerTotal). An atomic-free op also needs every rank to
+        agree on its drained count -- the largest count any reachable bucket or
+        active_qp_counts names -- which its dispatch pieces and barrier slots
+        follow; that is fixed when the op is built. A captured graph keeps the
+        plans it was captured with.
         """
         if not self.cfg.is_internode:
             raise ValueError("active_qps requires the internode HIP backend")

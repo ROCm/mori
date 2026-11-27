@@ -773,6 +773,8 @@ IonicDeviceContext::~IonicDeviceContext() {
   }
   qpPool.clear();
 
+  // Teardown leaves the CQs to device close, as it always has, except with dmabuf rings, whose
+  // fds must be returned. DestroyRdmaEndpointNoThrow releases an endpoint's CQ early either way.
   if (dmabufRingsEnabled) {
     for (auto& it : cqPool) delete it.second;
   }

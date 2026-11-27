@@ -612,28 +612,21 @@ __device__ inline static void waitStoresComplete() {
 #endif
 }
 
-// The fences a post takes after its WQE stores. A PSD WQE ends with a system-scope release
-// store of its flags, which has already written back L2 and waited for this wave's stores, so
-// for PSD only the wait is left: a second write-back costs a round trip per post and orders
-// nothing more. The other providers' WQE stores are plain, so they keep the fence.
+// The fence a post takes after its WQE stores, at agent or system scope. A PSD WQE ends with a
+// system-scope release store of its flags, which has already written back L2 and waited for this
+// wave's stores, so for PSD only the wait is left: a second write-back costs a round trip per post
+// and orders nothing more. The other providers' WQE stores are plain, so they keep the fence.
 // This relies on every PSD post cco issues being a WRITE/inline/atomic WQE, whose flags store is
 // system scope (ionic_device_primitives.hpp). IonicPostSend's flags store is only agent scope: a
 // cco PSD SEND would need the full fence back.
-template <core::ProviderType PrvdType>
+template <core::ProviderType PrvdType, bool kSystem>
 __device__ inline static void fenceAfterWqes() {
   if constexpr (PrvdType == core::ProviderType::PSD) {
     waitStoresComplete();
+  } else if constexpr (kSystem) {
+    __threadfence_system();
   } else {
     __threadfence();
-  }
-}
-
-template <core::ProviderType PrvdType>
-__device__ inline static void fenceAfterWqesSystem() {
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    waitStoresComplete();
-  } else {
-    __threadfence_system();
   }
 }
 
@@ -660,7 +653,7 @@ __device__ inline static void markWqesReady(core::WorkQueueHandle* wq, uint32_t 
                                             uint32_t count, uint64_t dbrVal) {
   core::WqeReadyMark* mark = &wq->readyMarks[base & (wq->sqWqeNum - 1)];
   __hip_atomic_store(&mark->dbrVal, dbrVal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  fenceAfterWqesSystem<PrvdType>();
+  fenceAfterWqes<PrvdType, true>();
   __hip_atomic_store(&mark->tag, readyTag(base, count), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
@@ -728,8 +721,9 @@ __device__ inline static void ringAndPublish(core::RdmaEndpointDevice* ep, uint3
                                              uint32_t to, uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   ringDoorbellWalk<PrvdType>(wq, to, dbrVal);
-  // The doorbell must land before whoever sees the new dbTouchIdx rings a later one.
-  fenceAfterWqesSystem<PrvdType>();
+  // The doorbell must land before whoever sees the new dbTouchIdx rings a later one. PSD rings
+  // with the doorbell store alone (no DBR record), so waiting for it to complete is enough.
+  fenceAfterWqes<PrvdType, true>();
   __hip_atomic_fetch_add(&ep->cqHandle.needConsIdx, to - from, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
   __hip_atomic_store(&wq->dbTouchIdx, to, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -830,7 +824,7 @@ __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t 
   if constexpr (!DeferDoorbell) {
     if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == base) {
       retireReadyTag(wq, base);          // see "Doorbell coalescing"
-      fenceAfterWqesSystem<PrvdType>();  // our WQEs, before the doorbell
+      fenceAfterWqes<PrvdType, true>();  // our WQEs, before the doorbell
       ringAndPublish<PrvdType>(ep, base, base + count, dbrVal);
       rang = true;
     }
@@ -968,7 +962,7 @@ __device__ inline static void putImpl(
     uint64_t dbrVal =
         core::PostWrite<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn, localAddr,
                                   localKey, remoteAddr, remoteKey, bytes);
-    fenceAfterWqes<PrvdType>();
+    fenceAfterWqes<PrvdType, false>();
     if (isLeader) {
       if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(
@@ -1035,7 +1029,7 @@ __device__ inline static void putValueImpl(core::RdmaEndpointDevice* ep, uint32_
     uint64_t dbrVal =
         core::PostWriteInline<PrvdType>(*wq, mySlot, mySlot, mySlot, true /*cqeSignal*/, qpn,
                                         &value, remoteAddr, remoteKey, sizeof(T));
-    fenceAfterWqes<PrvdType>();
+    fenceAfterWqes<PrvdType, false>();
     if (isLeader) {
       if (hasSignal) {
         dbrVal = core::PostAtomic<PrvdType, uint64_t>(

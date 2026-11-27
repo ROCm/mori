@@ -119,6 +119,10 @@ class Context {
     int agreedRail = std::max(LocalRankInNode(), peerLocalGpu) % nCtx;
     return allRdmaDeviceContexts[agreedRail].get();
   }
+  // The device context that holds the additional endpoints to peerRank.
+  RdmaDeviceContext* EndpointContext(int peerRank) const {
+    return proxyEnabled ? GetRailContext(peerRank) : rdmaDeviceContext.get();
+  }
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;

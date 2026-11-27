@@ -526,7 +526,7 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
       continue;
     }
     for (int qp = 0; qp < qpPerPe; qp++) {
-      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(i) : rdmaDeviceContext.get();
+      RdmaDeviceContext* ctx = EndpointContext(i);
       RdmaEndpoint ep = ctx->CreateRdmaEndpoint(savedEpConfig);
       eps.push_back(ep);
     }
@@ -550,7 +550,7 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
     if (!ShouldCreateQpForPeer(peer, LocalRank(), peerCaps, peerMask)) continue;
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
-      RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
+      RdmaDeviceContext* ctx = EndpointContext(peer);
       ctx->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
     }
   }
@@ -562,7 +562,7 @@ void Context::DestroyAdditionalEndpoints(const std::vector<RdmaEndpoint>& endpoi
     const RdmaEndpoint& ep = endpoints[idx];
     if (ep.handle.qpn == 0) continue;
     const int peer = static_cast<int>(idx / numQpPerPe);
-    RdmaDeviceContext* ctx = proxyEnabled ? GetRailContext(peer) : rdmaDeviceContext.get();
+    RdmaDeviceContext* ctx = EndpointContext(peer);
     if (ctx == nullptr || !ctx->SupportsEndpointDestroy()) continue;
     if (!ctx->DestroyRdmaEndpointNoThrow(ep)) {
       MORI_APP_WARN("DestroyAdditionalEndpoints: qpn {} for peer {} was not released",

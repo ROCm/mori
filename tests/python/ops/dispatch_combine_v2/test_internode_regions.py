@@ -88,8 +88,9 @@ def _cfg(**over):
 
 
 # Chosen to exercise the branches the formulas actually have: scales on/off, one
-# node vs many, the max_total_recv_tokens clamp, and enough QPs that the per-QP
-# barrier slots outgrow the per-rank ones.
+# node vs many, the max_total_recv_tokens clamp, enough QPs that the per-QP
+# barrier slots outgrow the per-rank ones, and a capacity below one chunk, where
+# the piece flags outgrow the chunk flags.
 _CASES = {
     "base": _cfg(),
     "single_node": _cfg(world_size=8, gpu_per_node=8),
@@ -98,7 +99,7 @@ _CASES = {
     ),
     "recv_cap_clamped": _cfg(max_total_recv_tokens=256, num_experts_per_token=4),
     "eight_qps": _cfg(num_qp_per_pe=8),
-    "two_tokens": _cfg(max_num_inp_token_per_rank=2),
+    "one_token": _cfg(max_num_inp_token_per_rank=1),
 }
 
 
@@ -146,7 +147,7 @@ def test_staging_holds_every_slot_the_kernel_indexes(name):
 @pytest.mark.parametrize("name", sorted(_CASES))
 def test_barrier_has_a_slot_per_sender_and_qp(name):
     """The atomic-free combine barrier keeps one u64 slot per (sender, qp) after
-    the world_size per-rank slots (``EpInterNodeBarrierQpSlot``)."""
+    the world_size per-rank slots (``CombineBarrierQpSlot``)."""
     cfg = _CASES[name]
     sizes = dict(internode_regions(cfg))
     assert sizes["cross_device_barrier"] >= cfg.world_size * (1 + cfg.num_qp_per_pe) * 8
@@ -182,9 +183,9 @@ def test_gpu_per_node_must_divide_the_world():
 @pytest.mark.parametrize("name", sorted(_CASES))
 def test_chunk_flags_hold_the_piece_flags(name):
     """``inter_node_chunk_flag`` holds the ``nNodes * c`` chunk flags (c chunks of
-    64 tokens per node), then 3 piece flags per chunk (``EpInterNodePieceFlagSlot``)."""
+    64 tokens per node), then 1 piece flag per chunk (``DispatchPieceFlagSlot``)."""
     cfg = _CASES[name]
     sizes = dict(internode_regions(cfg))
     n_nodes = cfg.world_size // cfg.gpu_per_node
     chunks = -(-cfg.max_num_inp_token_per_rank // 64)
-    assert sizes["inter_node_chunk_flag"] >= n_nodes * chunks * 4 * 8
+    assert sizes["inter_node_chunk_flag"] >= n_nodes * chunks * 2 * 8

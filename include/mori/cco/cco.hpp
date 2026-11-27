@@ -958,10 +958,6 @@ int ccoCommDestroy(ccoComm* comm);
 
 // ── Phase 1.5 (optional): VMM allocation + P2P flat-space mapping ──
 int ccoMemAlloc(ccoComm* comm, size_t size, void** ptr);
-// 1 if ccoMemAlloc / ccoWindowRegister memory is uncached (the default; see CCO_UNCACHED_WINDOW),
-// so device stores to it bypass L2; 0 if it falls back to pinned memory, or if the HIP runtime
-// (before ROCm 7.14) places uncached VMM allocations in the cached pool regardless.
-int ccoWindowUncached();
 int ccoMemFree(ccoComm* comm, void* ptr);
 // Like ccoMemAlloc, but aliases an EXTERNAL HIP VMM allocation (e.g. a
 // torch.symm_mem buffer) into the flat-VA slot instead of allocating: retains its
@@ -969,6 +965,10 @@ int ccoMemFree(ccoComm* comm, void* ptr);
 // the allocation (torch >= 2.14 puts the signal pad first); *ptr then aliases the
 // same byte. Release via ccoMemFree.
 int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** ptr);
+// 1 if ccoMemAlloc memory is uncached, so device stores to it bypass L2: CCO_UNCACHED_WINDOW is
+// not 0 and the HIP runtime is 7.14 or later (earlier ones place uncached VMM allocations in the
+// cached pool). 0 otherwise.
+int ccoWindowUncached();
 
 // ── Phase 2: Window registration (P2P mapping + RDMA MR + SDMA signals + GPU structs) ──
 // Collective: all ranks must call in the same order with the same size (and, for imports, the

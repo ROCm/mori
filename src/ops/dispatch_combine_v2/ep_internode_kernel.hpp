@@ -24,8 +24,9 @@
 //
 // Two parts, in this order:
 //
-//   1. the transport shim -- one EpInterNode* function per shmem call the port
-//      replaced, on ccoGda. New code; nothing in the original corresponds to it.
+//   1. the transport shim -- the EpInterNode* functions over ccoGda: one per shmem
+//      call the port replaced, plus the RDMA WRITE forms the atomic-free mode
+//      signals with. New code; nothing in the original corresponds to it.
 //   2. EP internode v1 dispatch + combine, ported from
 //      src/ops/dispatch_combine/internode_v1.cpp.
 //
@@ -105,8 +106,8 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Transport shim (cco-GDA)                                    */
 /* ---------------------------------------------------------------------------------------------- */
-// The five cross-node operations the kernel below needs. Argument order is kept
-// identical to the shmem calls they replaced, so the call sites read the same.
+// The cross-node operations the kernel below needs. Those that replaced a shmem
+// call keep its argument order, so the call sites read the same.
 //
 // Only cross-node traffic is here. Intra-node peer access is untouched: it was
 // always a direct store through the flat LSA VA, and the arena window covers
@@ -114,11 +115,13 @@ using EpDispatchCombineArgs = EpInterNodeArgs;
 //
 // Scope, matching what the replaced shmem calls actually did:
 //
-//   EpInterNodePutSignal / EpInterNodePut / EpInterNodeAtomicAdd   thread scope: every active lane
-//       posts its own data WQE, and the flag atomic comes once from the group
-//       leader. Callers are divergent (they sit under `if (laneId == 0)` and
-//       inside the deduplication ballot), so these must not contain a group
-//       barrier.
+//   EpInterNodePutSignal / EpInterNodePut / EpInterNodeAtomicAdd /
+//   EpInterNodeWriteValue / EpInterNodePutThenWrite   thread scope: every active lane
+//       posts its own data WQE, and the flag comes once from the group leader.
+//       Callers are divergent (they sit under `if (laneId == 0)` and inside the
+//       deduplication ballot), so these must not contain a group barrier.
+//       EpInterNodeChunkPut / EpInterNodeCountSignal pick the atomic or the
+//       WRITE form at compile time (kConfig.noRdmaAtomics).
 //   EpInterNodeQuiet                                 warp-collective. Its call sites
 //       are warp-uniform, and ccoGda::flush requires at least warp scope because
 //       it takes a warp-level CQ poll lock.
@@ -283,64 +286,13 @@ __device__ __forceinline__ void EpInterNodeCountSignal(const ::mori::cco::ccoDev
   }
 }
 
-// Atomic-free v2_ll dispatch splits a chunk into pieces of at least kDispatchPieceMinTokens tokens,
-// one per QP up to numQpToDrain, the op's largest active count, so sender and receiver agree on
-// it whatever counts their buckets picked (two pieces at most for a 64-token chunk). The chunk flag
-// follows piece 0 and still carries the chunk's token count; each later piece writes its own flag
-// with the dispatch's number + 1, after the chunk flags, so it never needs clearing. Those flags
-// are WRITEs, which only the atomic-free path may use (it refuses relaxed ordering); with atomics a
-// chunk stays one piece behind its fused atomic.
-constexpr int kMaxDispatchPieces = 4;
-constexpr int kDispatchPieceMinTokens = 32;
-
+// Every QP a kernel of this op may post on: numQpToDrain, the op's largest active count (this
+// kernel's own count when the request leaves it 0). Dispatch drains them all, and the atomic-free
+// dispatch pieces and combine barrier slots follow it, so ranks agree on those whatever counts
+// their buckets picked.
 template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ int EpInterNodeDispatchPieceTokens(int chunkTokens) {
-  constexpr int kPieces = !kConfig.noRdmaAtomics || kConfig.numQpToDrain < 1 ? 1
-                          : kConfig.numQpToDrain > kMaxDispatchPieces        ? kMaxDispatchPieces
-                                                                             : kConfig.numQpToDrain;
-  int pieces = chunkTokens / kDispatchPieceMinTokens;
-  pieces = pieces < 1 ? 1 : (pieces > kPieces ? kPieces : pieces);
-  return (chunkTokens + pieces - 1) / pieces;
-}
-
-__device__ __forceinline__ size_t EpInterNodePieceFlagSlot(int nNodes, int maxChunkNum, int node,
-                                                           int chunk, int piece) {
-  return static_cast<size_t>(nNodes) * maxChunkNum +
-         (static_cast<size_t>(node) * maxChunkNum + chunk) * (kMaxDispatchPieces - 1) + (piece - 1);
-}
-
-// A received token past its chunk's piece 0 waits for its own piece's flag.
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ void EpInterNodeWaitPiece(uint64_t* chunkFlag, int nNodes,
-                                                     int maxChunkNum, int node, int chunk,
-                                                     int tokenInChunk, uint64_t chunkTokens,
-                                                     uint64_t* dispatchNumber) {
-  if (tokenInChunk < kDispatchPieceMinTokens) return;  // always in piece 0
-  const int piece =
-      tokenInChunk / EpInterNodeDispatchPieceTokens<kConfig>(static_cast<int>(chunkTokens));
-  if (piece == 0) return;
-  if ((threadIdx.x & (warpSize - 1)) == 0) {
-    const uint64_t pieceTag = core::AtomicLoadRelaxed(dispatchNumber) + 1;
-    uint64_t* flag = chunkFlag + EpInterNodePieceFlagSlot(nNodes, maxChunkNum, node, chunk, piece);
-    while (core::AtomicLoadRelaxedSystem(flag) != pieceTag) {
-      __builtin_amdgcn_s_sleep(1);
-    }
-  }
-}
-
-// Atomic-free combine barrier. Writes cannot accumulate, so each (sender, qp) gets its own slot,
-// after the worldSize per-rank slots the intra-node barrier and the atomic path use. Every rank
-// marks the op's largest active count (numQpToDrain), so peers whose buckets picked different
-// active counts still agree on which slots to wait for.
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ constexpr int EpInterNodeBarrierQps() {
+__device__ __forceinline__ constexpr int EpInterNodeOpQps() {
   return kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
-}
-
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ constexpr size_t EpInterNodeBarrierQpSlot(int senderPe, int qpId) {
-  return kConfig.worldSize + static_cast<size_t>(senderPe) * EpInterNodeBarrierQps<kConfig>() +
-         qpId;
 }
 
 // Drains one stripe: flush(peer) only polls the QP belonging to its own
@@ -351,51 +303,26 @@ __device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& 
   gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
 }
 
-// The value a combine adds on QP qpId; see kCombineBarrierMarkerTotal.
-__device__ __forceinline__ constexpr uint64_t CombineBarrierMarker(int qpId, int activeQps) {
-  return qpId == 0 ? uint64_t(kCombineBarrierMarkerTotal - (activeQps - 1)) : uint64_t{1};
-}
-
 // Spin on a local symmetric slot until a peer publishes a positive value. No
 // transport of its own: the write arrives either by intra-node store or by the
 // NIC, and ShmemInt32WaitUntilGreaterThan was the same system-scope relaxed load
 // in a loop.
-__device__ __forceinline__ int32_t EpInterNodeWaitGt(int32_t* addr, int32_t val) {
-  int32_t observed;
-  while (true) {
-    observed = core::AtomicLoadRelaxedSystem(addr);
-    if (observed > val) break;
+__device__ __forceinline__ void EpInterNodeWaitGt(int32_t* addr, int32_t val) {
+  while (core::AtomicLoadRelaxedSystem(addr) <= val) {
   }
-  return observed;
 }
 
-// Wait until this wave's stores have completed (gfx9's vmcnt counts them; gfx12 has storecnt).
-// A combine relay publishes its staging stores to the poster, whose RDMA read must see them. In an
-// uncached cco window they bypass L2, so completing them is enough; otherwise each producer
-// writes back its own XCD's L2, which the poster's cannot do for it.
-template <EpInterNodeKernelCfg kConfig>
-__device__ __forceinline__ void EpInterNodePublishStaging() {
-#if defined(__gfx942__) || defined(__gfx950__)
-  if constexpr (kConfig.windowUncached) {
-    __asm__ volatile("s_waitcnt vmcnt(0)" ::: "memory");
-    return;
-  }
-#endif
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-}
-
-__device__ __forceinline__ void EpInterNodeWaitStores() {
-#if defined(MORI_GFX125X) || defined(__GFX12__)
-  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");
-#else
-  __builtin_amdgcn_s_waitcnt(0);
-#endif
-}
-
+/* ---------------------------------------------------------------------------------------------- */
+/*                                   EpDispatchInterNodeV2                                  */
+/* ---------------------------------------------------------------------------------------------- */
 // A staged token is [hidden | indices | weights | scales], contiguous: forward it as one round of
 // 16 B loads, then the stores. Needs every part 16 B-sized and at most 8 vectors per lane.
-template <size_t kHidden, size_t kIndex, size_t kWeight, size_t kScale>
+template <EpInterNodeKernelCfg kConfig, typename T>
 struct ForwardTokenVec16 {
+  static constexpr size_t kHidden = EpInterNodeDeviceCfgOf(kConfig).HiddenBytes(sizeof(T));
+  static constexpr size_t kIndex = EpInterNodeDeviceCfgOf(kConfig).IndexBytes();
+  static constexpr size_t kWeight = EpInterNodeDeviceCfgOf(kConfig).WeightBytes();
+  static constexpr size_t kScale = EpInterNodeDeviceCfgOf(kConfig).ScaleBytes();
   static constexpr int kVecs = static_cast<int>((kHidden + kIndex + kWeight + kScale) / 16);
   static constexpr int kPerLane = (kVecs + warpSize - 1) / warpSize;
   static constexpr bool kUsable = (kHidden % 16 == 0) && (kIndex % 16 == 0) &&
@@ -463,10 +390,63 @@ struct ForwardTokenVec16 {
   }
 };
 
-/* ---------------------------------------------------------------------------------------------- */
-/*                                   EpDispatchInterNodeV2                                  */
-/* ---------------------------------------------------------------------------------------------- */
 namespace internode {
+
+// Atomic-free v2_ll dispatch splits a chunk into pieces of at least kDispatchPieceMinTokens
+// tokens: up to kMaxDispatchPieces for a full chunk (one warp's tokens), never more than the op's
+// QPs (EpInterNodeOpQps, the same on every rank). Piece p goes on this kernel's QP (chunk + p).
+// The chunk flag follows piece 0 and still carries the chunk's token count; each later piece
+// writes its own flag, after the chunk flags, with a tag that changes every dispatch, so it never
+// needs clearing. Those flags are WRITEs, which only the atomic-free path may use (it refuses
+// relaxed ordering); with atomics a chunk is one piece behind its fused atomic.
+constexpr int kDispatchPieceMinTokens = 32;
+constexpr int kMaxDispatchPieces = warpSize / kDispatchPieceMinTokens;
+
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ int DispatchPieceTokens(int chunkTokens) {
+  if constexpr (!kConfig.noRdmaAtomics) {
+    return chunkTokens;
+  } else {
+    constexpr int kPieces = EpInterNodeOpQps<kConfig>() < kMaxDispatchPieces
+                                ? EpInterNodeOpQps<kConfig>()
+                                : kMaxDispatchPieces;
+    int pieces = chunkTokens / kDispatchPieceMinTokens;
+    pieces = pieces < 1 ? 1 : (pieces > kPieces ? kPieces : pieces);
+    return (chunkTokens + pieces - 1) / pieces;
+  }
+}
+
+// The flag slot of a chunk's piece >= 1, after the nNodes * maxChunkNum chunk flags.
+__device__ __forceinline__ size_t DispatchPieceFlagSlot(int nNodes, int maxChunkNum, int node,
+                                                        int chunk, int piece) {
+  return static_cast<size_t>(nNodes) * maxChunkNum +
+         (static_cast<size_t>(node) * maxChunkNum + chunk) * (kMaxDispatchPieces - 1) + (piece - 1);
+}
+
+// A later piece's flag value: the dispatch's number + 1, never 0 and never the previous round's.
+__device__ __forceinline__ uint64_t DispatchPieceTag(uint64_t* dispatchNumber) {
+  return core::AtomicLoadRelaxed(dispatchNumber) + 1;
+}
+
+// A received token past its chunk's piece 0 waits for its own piece's flag.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ void DispatchWaitPiece(uint64_t* chunkFlag, int nNodes, int maxChunkNum,
+                                                  int node, int chunk, int tokenInChunk,
+                                                  uint64_t chunkTokens, uint64_t* dispatchNumber) {
+  if constexpr (kConfig.noRdmaAtomics) {
+    if (tokenInChunk < kDispatchPieceMinTokens) return;  // always in piece 0
+    const int piece = tokenInChunk / DispatchPieceTokens<kConfig>(static_cast<int>(chunkTokens));
+    if (piece == 0) return;
+    if ((threadIdx.x & (warpSize - 1)) == 0) {
+      const uint64_t tag = DispatchPieceTag(dispatchNumber);
+      uint64_t* flag = chunkFlag + DispatchPieceFlagSlot(nNodes, maxChunkNum, node, chunk, piece);
+      while (core::AtomicLoadRelaxedSystem(flag) != tag) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+  }
+}
+
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int tokenId, int expId,
                                               int destPe) {
@@ -520,8 +500,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs& args, int t
 }
 
 // Atomic-free v2_ll intra-node blocks wait for this rank's RDMA posts, which their XGMI stores
-// would slow; bounded (50 us at a 100 MHz wall clock), so a grid that is not fully resident cannot
-// deadlock on it.
+// would slow; bounded, so a grid that is not fully resident cannot deadlock on it.
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void WaitLLPostsIssued(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
@@ -670,7 +649,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs& args,
     // laneId == myNode would signal slot myNode on a proxy that shares our node,
     // and DispatchInterNodeRecv only ever polls slots of remote nodes, so that
     // write is dead. It is also unroutable: RAIL connects cross-node same-rail
-    // peers only, so a local peer has no QP and EpInterNodeAtomicAdd would fault.
+    // peers only, so a local peer has no QP and EpInterNodeCountSignal would fault.
     // v1 needed no guard because shmem dispatches per peer on
     // globalGpuStates->transportTypes[pe] (shmem_device_api.hpp): a same-node
     // peer is TransportType::P2P, so the atomic became a local XGMI atomic and
@@ -707,37 +686,33 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
 
     for (int tokenId = chunkStartTokenIdx + laneId; tokenId < chunkEndTokenIdx;
          tokenId += warpSize) {
-      // Every chunk goes to every node here, so slot k is chunk k and the slots are exactly
-      // 0 .. S-1 without an atomic to hand them out.
-      const index_t flagSlotId = (tokenId - laneId) / warpSize;
-      index_t destTokIdOffset = flagSlotId * warpSize;
-      index_t destTokId = destTokIdOffset + laneId;
+      // Every chunk goes to every node here, so chunk k takes slot k: the slots are exactly
+      // 0 .. S-1 without an atomic to hand them out, and a token keeps its index at the receiver.
+      const int chunk = tokenId / warpSize;
 
       // Post first: the routing bookkeeping below is read only by combine, and its dependent
       // load per expert would otherwise hold back the chunk's RDMA write.
-      size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
       if (laneId == 0) {
-        index_t tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
-        size_t stagingTokOffset = tokenId * xferBytes;
-        const int pieceTokens = EpInterNodeDispatchPieceTokens<kConfig>(tokenNum);
-        for (int first = 0, piece = 0; first < tokenNum; first += pieceTokens, piece++) {
-          const int count = std::min(pieceTokens, static_cast<int>(tokenNum) - first);
-          const int qpId = (flagSlotId + piece) % config.numQpPerPe;
-          if (piece == 0) {
-            EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
-                comm, args.reg(args.offDispatchInp), remoteIdx * xferBytes,
-                args.reg(args.offDispatchStaging), stagingTokOffset, count * xferBytes,
-                args.reg(args.offChunkFlag), (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-                tokenNum + 1, proxyPe, qpId);
-          } else {
-            const uint64_t pieceTag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+        const int tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
+        const size_t remoteOffset = SendBufSlotOffset(config, myNode, tokenId) * xferBytes;
+        const size_t stagingOffset = tokenId * xferBytes;
+        const int pieceTokens = DispatchPieceTokens<kConfig>(tokenNum);
+        // Piece 0, the whole chunk with RDMA atomics, carries the chunk flag.
+        EpInterNodeChunkPut<kConfig.noRdmaAtomics>(
+            comm, args.reg(args.offDispatchInp), remoteOffset, args.reg(args.offDispatchStaging),
+            stagingOffset, std::min(pieceTokens, tokenNum) * xferBytes, args.reg(args.offChunkFlag),
+            (myNode * maxChunkNum + chunk) * sizeof(uint64_t), tokenNum + 1, proxyPe,
+            chunk % config.numQpPerPe);
+        if constexpr (kConfig.noRdmaAtomics) {
+          const uint64_t tag = DispatchPieceTag(args.crossDeviceBarrierFlag);
+          for (int first = pieceTokens, piece = 1; first < tokenNum;
+               first += pieceTokens, piece++) {
             EpInterNodePutThenWrite(
-                comm, args.reg(args.offDispatchInp), (remoteIdx + first) * xferBytes,
-                args.reg(args.offDispatchStaging), stagingTokOffset + first * xferBytes,
-                count * xferBytes, args.reg(args.offChunkFlag),
-                EpInterNodePieceFlagSlot(nNodes, maxChunkNum, myNode, flagSlotId, piece) *
-                    sizeof(uint64_t),
-                pieceTag, proxyPe, qpId);
+                comm, args.reg(args.offDispatchInp), remoteOffset + first * xferBytes,
+                args.reg(args.offDispatchStaging), stagingOffset + first * xferBytes,
+                std::min(pieceTokens, tokenNum - first) * xferBytes, args.reg(args.offChunkFlag),
+                DispatchPieceFlagSlot(nNodes, maxChunkNum, myNode, chunk, piece) * sizeof(uint64_t),
+                tag, proxyPe, (chunk + piece) % config.numQpPerPe);
           }
         }
         // Counted once posted: WaitLLPostsIssued waits on it, and whoever posts node i's last
@@ -759,7 +734,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs& args,
           args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
         }
       }
-      if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+      if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = tokenId;
     }
   }
 
@@ -889,6 +864,51 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
   }
 }
 
+// The token count of chunk k from node, polled by lane 0 and broadcast; 0 means the chunk lies
+// past the node's last one. The node's count is checked before the chunk flag, which is only safe
+// because DispatchInterNodeLLSend numbers its slots 0 .. S-1 by chunk index and sends
+// nodeRecvTokenNum = S * warpSize + 1: a slot at or past that bound was never handed out and can
+// never get a flag. Numbering the slots any other way would make this drop tokens silently.
+// nodeRecvTokenNum[node] does not change again this round once seen non-zero, so it is cached,
+// one node at a time: a warp walks the nodes in order. kSleep spaces out the waiting warps' loads.
+template <int kSleep>
+__device__ __forceinline__ uint64_t PollLLChunk(uint64_t* chunkFlag, uint64_t* nodeRecvTokenNum,
+                                                int maxChunkNum, int node, int k, int& cachedNode,
+                                                uint64_t& cachedNodeFlag) {
+  const int startTokenIdx = k * warpSize;
+  uint64_t chunkTokenNum = 0;
+  if ((threadIdx.x & (warpSize - 1)) == 0) {
+    if (node != cachedNode) {
+      cachedNode = node;
+      cachedNodeFlag = 0;
+    }
+    while (true) {
+      if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
+        chunkTokenNum = 1;
+        break;
+      }
+      chunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+      if (chunkTokenNum > 0) break;
+      if (cachedNodeFlag == 0)
+        cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+      if constexpr (kSleep > 0) __builtin_amdgcn_s_sleep(kSleep);
+    }
+  }
+  return __shfl(chunkTokenNum, 0) - 1;
+}
+
+// After PollLLChunk returned 0: a flag the sender writes is tokenNum + 1 with tokenNum >= 1, so
+// this slot is at or past the node's last one -- and, the slots being 0 .. S-1 and k never
+// decreasing as the loop walks a node, so is every later item of this node. The loop is bounded
+// by capacity, not by what arrived, so at capacity >> load nearly all items land there. Returns
+// the loop index of this warp's first item of the next node, less the stride the loop adds back.
+__device__ __forceinline__ int LLNextNodeIndex(int nodeId, int itemsPerNode, int firstItem,
+                                               int stride) {
+  const int nextNodeStart = (nodeId + 1) * itemsPerNode;
+  const int offset = ((firstItem - nextNodeStart) % stride + stride) % stride;
+  return nextNodeStart + offset - stride;
+}
+
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
@@ -899,16 +919,13 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
   uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
 
-  // Cache nodeRecvTokenNum[node]: unchanged once observed non-zero until
-  // combine resets it. One scalar + tag, not a per-node array -- nodeId only
-  // increases across this loop, so at most one node is ever "current".
   int cachedNode = -1;
   uint64_t cachedNodeFlag = 0;
 
   // expert -> token -> node
-  for (int i = globalWarpId;
-       i < config.MaxNumTokensToSendPerRank() * config.numExpertPerToken * (nNodes - 1);
-       i += args.rdmaBlockNum * warpNum) {
+  const int itemsPerNode = config.MaxNumTokensToSendPerRank() * config.numExpertPerToken;
+  const int stride = args.rdmaBlockNum * warpNum;
+  for (int i = globalWarpId; i < itemsPerNode * (nNodes - 1); i += stride) {
     int expertId = i % config.numExpertPerToken;
     int tokenId = i / config.numExpertPerToken % config.MaxNumTokensToSendPerRank();
     int nodeId = i / config.numExpertPerToken / config.MaxNumTokensToSendPerRank();
@@ -917,51 +934,16 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
     int k = tokenId / warpSize;
     int startTokenIdx = k * warpSize;
 
-    // Poll completion flags
-    uint64_t thisChunkTokenNum = 0;
-    if (laneId == 0) {
-      if (node != cachedNode) {
-        cachedNode = node;
-        cachedNodeFlag = 0;
-      }
-      while (1) {
-        // Checked before chunkFlag, and that is only safe because both senders number their
-        // slots 0 .. S-1 (DispatchInterNodeLLSend by chunk index, DispatchInterNodeSend by
-        // atomicAdd(blockFlagCounter)) and send nodeRecvTokenNum = S * warpSize + 1. A slot at
-        // or past that bound was never handed out and can never get a flag. Numbering the
-        // slots any other way would make this drop tokens silently.
-        if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
-          thisChunkTokenNum = 1;
-          break;
-        }
-        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
-        if (thisChunkTokenNum > 0) break;
-
-        // Won't change again this round once observed; stop re-reading it.
-        if (cachedNodeFlag == 0)
-          cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
-      }
-    }
-    thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
-    // Zero only on the bound branch above: a flag the sender writes is
-    // tokenNum + 1 with tokenNum >= 1. So this slot is at or past the node's
-    // last one -- and, the slots being 0 .. S-1 and k never decreasing as i
-    // walks a node, so is every later iteration of this node. The loop is
-    // bounded by capacity, not by what arrived, so at capacity >> load nearly
-    // all iterations land here; jump to this warp's first iteration of the
-    // next node instead of walking through them one by one.
+    const uint64_t thisChunkTokenNum = PollLLChunk<0>(chunkFlag, nodeRecvTokenNum, maxChunkNum,
+                                                      node, k, cachedNode, cachedNodeFlag);
     if (thisChunkTokenNum == 0) {
-      const int stride = args.rdmaBlockNum * warpNum;
-      const int nextNodeStart =
-          (nodeId + 1) * config.numExpertPerToken * config.MaxNumTokensToSendPerRank();
-      const int offset = ((globalWarpId - nextNodeStart) % stride + stride) % stride;
-      i = nextNodeStart + offset - stride;  // the loop increment adds stride back
+      i = LLNextNodeIndex(nodeId, itemsPerNode, globalWarpId, stride);
       continue;
     }
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
     if (tokenId >= endTokenIdx) continue;
-    EpInterNodeWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
-                                  thisChunkTokenNum, args.crossDeviceBarrierFlag);
+    DispatchWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
+                               thisChunkTokenNum, args.crossDeviceBarrierFlag);
 
     int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
@@ -1030,9 +1012,9 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs& args) {
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
   DEF_COMMON_VARS;
-  constexpr size_t kH = config.HiddenBytes(sizeof(T)), kI = config.IndexBytes(),
-                   kW = config.WeightBytes(), kS = config.ScaleBytes();
-  using Forward = ForwardTokenVec16<kH, kI, kW, kS>;
+  using Forward = ForwardTokenVec16<kConfig, T>;
+  constexpr size_t kH = Forward::kHidden, kI = Forward::kIndex, kW = Forward::kWeight,
+                   kS = Forward::kScale;
   constexpr int kTopk = kConfig.numExpertPerToken;
 
   const int maxTok = config.MaxNumTokensToSendPerRank();
@@ -1041,7 +1023,6 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
   uint64_t* nodeRecvTokenNum = args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
 
-  // nodeRecvTokenNum[node] as in DispatchInterNodeLLRecv: one cached node at a time.
   int cachedNode = -1;
   uint64_t cachedNodeFlag = 0;
 
@@ -1053,37 +1034,16 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
     int k = tokenId / warpSize;
     int startTokenIdx = k * warpSize;
 
-    uint64_t thisChunkTokenNum = 0;
-    if (laneId == 0) {
-      if (node != cachedNode) {
-        cachedNode = node;
-        cachedNodeFlag = 0;
-      }
-      while (1) {
-        // Slots are 0 .. S-1 and nodeRecvTokenNum is S * warpSize + 1; see
-        // DispatchInterNodeLLRecv.
-        if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
-          thisChunkTokenNum = 1;
-          break;
-        }
-        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
-        if (thisChunkTokenNum > 0) break;
-        if (cachedNodeFlag == 0)
-          cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
-        __builtin_amdgcn_s_sleep(4);  // most of the warps wait here; space out their loads
-      }
-    }
-    thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
-    // Past the node's last slot, and so is the rest of this node: go to the next one.
+    // Most of the warps wait here.
+    const uint64_t thisChunkTokenNum = PollLLChunk<4>(chunkFlag, nodeRecvTokenNum, maxChunkNum,
+                                                      node, k, cachedNode, cachedNodeFlag);
     if (thisChunkTokenNum == 0) {
-      const int nextNodeStart = (nodeId + 1) * maxTok;
-      const int offset = ((globalWarpId - nextNodeStart) % stride + stride) % stride;
-      i = nextNodeStart + offset - stride;  // the loop increment adds stride back
+      i = LLNextNodeIndex(nodeId, maxTok, globalWarpId, stride);
       continue;
     }
     if (tokenId >= startTokenIdx + static_cast<int>(thisChunkTokenNum)) continue;
-    EpInterNodeWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
-                                  thisChunkTokenNum, args.crossDeviceBarrierFlag);
+    DispatchWaitPiece<kConfig>(chunkFlag, nNodes, maxChunkNum, node, k, tokenId - startTokenIdx,
+                               thisChunkTokenNum, args.crossDeviceBarrierFlag);
 
     const int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     const uint8_t* slot = stagingPtr + globalTokenId * xferBytes;
@@ -1134,6 +1094,15 @@ inline __device__ void DispatchInterNodeLLRecvTok(EpDispatchCombineArgs& args) {
   }
 }
 
+// Wait until this wave's stores have completed (gfx9's vmcnt counts them; gfx12 has storecnt).
+__device__ __forceinline__ void WaitStoresComplete() {
+#if defined(MORI_GFX125X) || defined(__GFX12__)
+  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  __builtin_amdgcn_s_waitcnt(0);
+#endif
+}
+
 template <EpInterNodeKernelCfg kConfig, typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
                                     const ::mori::cco::ccoDevComm& comm) {
@@ -1143,8 +1112,8 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
   // is done a PE's own counter is its received total. A warp's slot atomics have returned and
   // its forwarded stores complete here, before its block's one arrival. Completed means visible
   // at the peer on an uncached window; on a cached one (CCO_UNCACHED_WINDOW=0, or a runtime that
-  // ignores the uncached type) this relies on drained XGMI peer stores being visible, as main did.
-  EpInterNodeWaitStores();
+  // ignores the uncached type) this relies on drained XGMI peer stores being visible.
+  WaitStoresComplete();
   __syncthreads();
   if (warpId == 0) {
     int finishedBlock = 0;
@@ -1180,9 +1149,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
   // Drain every QP any kernel of this op may send on (a combine may have used more
   // than this dispatch), capped by the allocation; one (remote node, QP) per warp.
   // Skip the local node: under RAIL its endpoint is null and flush() would fault.
-  constexpr int kDrainQps =
-      kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
-  const int drainQps = min(kDrainQps, comm.ibgda.numQpPerPe);
+  const int drainQps = min(EpInterNodeOpQps<kConfig>(), comm.ibgda.numQpPerPe);
   for (int pair = globalWarpId; pair < (nNodes - 1) * drainQps; pair += globalWarpNum) {
     int node = (myNode + 1 + pair / drainQps) % nNodes;
     int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
@@ -1213,9 +1180,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs args) {
 
   // A warp per token, every part's loads in one round: the part-by-part copy below waits on
   // each load before the next. Needs 16 B-aligned inputs.
-  constexpr EpInterNodeDeviceCfg kCfg = EpInterNodeDeviceCfgOf(kConfig);
-  using Stage = ForwardTokenVec16<kCfg.HiddenBytes(sizeof(T)), kCfg.IndexBytes(),
-                                  kCfg.WeightBytes(), kCfg.ScaleBytes()>;
+  using Stage = ForwardTokenVec16<kConfig, T>;
   const uintptr_t inputBits = reinterpret_cast<uintptr_t>(args.inpTokenBuf) |
                               reinterpret_cast<uintptr_t>(args.tokenIndices) |
                               reinterpret_cast<uintptr_t>(args.weightsBuf) |
@@ -1282,15 +1247,13 @@ __device__ void EpDispatchInterNodeV2LL_body(EpDispatchCombineArgs args,
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
     internode::DispatchInterNodeLLSend<kConfig, T>(args, comm);
-    constexpr EpInterNodeDeviceCfg kCfg = EpInterNodeDeviceCfgOf(kConfig);
-    if constexpr (ForwardTokenVec16<kCfg.HiddenBytes(sizeof(T)), kCfg.IndexBytes(),
-                                    kCfg.WeightBytes(), kCfg.ScaleBytes()>::kUsable) {
+    if constexpr (ForwardTokenVec16<kConfig, T>::kUsable) {
       internode::DispatchInterNodeLLRecvTok<kConfig, T>(args);
     } else {
       internode::DispatchInterNodeLLRecv<kConfig, T>(args);
     }
   } else {
-    // Measured only atomic-free on AINIC; the atomic path keeps main's order.
+    // Atomic-free only: with RDMA atomics the intra-node blocks start at once.
     if constexpr (kConfig.noRdmaAtomics) internode::WaitLLPostsIssued<kConfig, T>(args);
     internode::DispatchIntraNode<kConfig, T>(args);
   }
@@ -1328,6 +1291,136 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
   }
 }
 
+// The combine's intra-node barrier, at the start of the combine pass: block 0 tells each
+// same-node PE that this PE's combine input is in place, and every block waits until each of them
+// has said the same, before it reads their inputs.
+template <EpInterNodeKernelCfg kConfig, typename T>
+inline __device__ void CombineIntraNodeBarrier(EpDispatchCombineArgs& args) {
+  DEF_COMMON_VARS;
+  if (warpId == 0) {
+    uint64_t barrierFlag = 0;
+    if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    barrierFlag = __shfl(barrierFlag, 0);
+    uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+    if (laneId < config.gpuPerNode) {
+      const int destPe = myNode * config.gpuPerNode + laneId;
+      if (blockId == 0) {
+        core::AtomicStoreRelaxedSystem(
+            args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>(destPe) + args.rank,
+            barrierFlag);
+      }
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
+      }
+    }
+  }
+  __syncthreads();
+}
+
+// The value a combine adds on QP qpId; see kCombineBarrierMarkerTotal.
+__device__ __forceinline__ constexpr uint64_t CombineBarrierMarker(int qpId, int activeQps) {
+  return qpId == 0 ? uint64_t(kCombineBarrierMarkerTotal - (activeQps - 1)) : uint64_t{1};
+}
+
+// Atomic-free combine barrier. Writes cannot accumulate, so each (sender, qp) gets its own slot,
+// after the worldSize per-rank slots the intra-node barrier and the atomic path use. Every rank
+// marks every QP of the op (EpInterNodeOpQps), so peers whose buckets picked different active
+// counts still agree on which slots to wait for.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ constexpr size_t CombineBarrierQpSlot(int senderPe, int qpId) {
+  return kConfig.worldSize + static_cast<size_t>(senderPe) * EpInterNodeOpQps<kConfig>() + qpId;
+}
+
+// Ends a relay pass, on every RDMA warp: the combine's cross-node barrier. The last warp to
+// arrive runs clearLast (the pass's own flag cleanup), resets the node token counts and moves
+// the epoch; then one warp per (remote node, QP) posts that QP's mark and waits for the peer's,
+// so the posts go out in parallel.
+template <EpInterNodeKernelCfg kConfig, typename T, typename ClearLast>
+inline __device__ void CombineInterNodeBarrier(EpDispatchCombineArgs& args,
+                                               const ::mori::cco::ccoDevComm& comm,
+                                               ClearLast clearLast) {
+  DEF_COMMON_VARS;
+  // This warp's flag resets reach memory before its arrival counts: the barrier lets peers write
+  // the next round's flags, which a late reset would erase.
+  __threadfence_system();
+  int finishedWarp = 0;
+  uint64_t barrierFlag = 0;
+  if (laneId == 0) {
+    finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  }
+  finishedWarp = __shfl(finishedWarp, 0);
+  barrierFlag = __shfl(barrierFlag, 0);
+  // Each dispatch bumps the flag, so it also numbers this combine's local release.
+  const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
+
+  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
+    clearLast();
+    if (laneId < nNodes) {
+      core::AtomicStoreSeqCstSystem(
+          args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
+    }
+    if (laneId == 0) {
+      args.interNodeBlocksBarrier[0] = 0;
+      __threadfence_system();  // the resets above, before any barrier post
+      __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+
+  constexpr int kQps = kConfig.noRdmaAtomics ? EpInterNodeOpQps<kConfig>() : kConfig.numQpPerPe;
+  const int pairs = (nNodes - 1) * kQps;
+  const int stride = args.rdmaBlockNum * warpNum;
+  if (laneId != 0 || globalWarpId >= pairs) return;
+  auto proxyPeOf = [&](int p) {
+    return ((myNode + 1 + p / kQps) % nNodes) * config.gpuPerNode + (myPe % config.gpuPerNode);
+  };
+  while (__hip_atomic_load(&args.interNodeBlocksBarrier[1], __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT) != epoch) {
+  }
+  // Every pair this warp owns is posted before any is waited on: a peer's mark can sit behind
+  // its own wait on a third node, so post-then-wait per pair deadlocks around the ring.
+  for (int p = globalWarpId; p < pairs; p += stride) {
+    if constexpr (kConfig.noRdmaAtomics) {
+      EpInterNodeWriteValue(comm, args.reg(args.offCrossDeviceBarrier),
+                            CombineBarrierQpSlot<kConfig>(args.rank, p % kQps) * sizeof(uint64_t),
+                            barrierFlag, proxyPeOf(p), p % kQps);
+    } else {
+      EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier), args.rank * sizeof(uint64_t),
+                           CombineBarrierMarker(p % kQps, kQps), proxyPeOf(p), p % kQps);
+    }
+  }
+  uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+  for (int p = globalWarpId; p < pairs; p += stride) {
+    if constexpr (kConfig.noRdmaAtomics) {
+      // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
+      // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr +
+                                           CombineBarrierQpSlot<kConfig>(proxyPeOf(p), p % kQps)) !=
+             barrierFlag) {
+      }
+    } else if (p % kQps == 0) {
+      // One wait per peer, for the sum of every QP's marker.
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPeOf(p)) !=
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
+      }
+    }
+  }
+}
+
+// A combine relay publishes its staging stores to the poster, whose RDMA read must see them. In an
+// uncached cco window they bypass L2, so completing them is enough; otherwise each producer
+// writes back its own XCD's L2, which the poster's cannot do for it.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ void PublishStaging() {
+#if defined(__gfx942__) || defined(__gfx950__)
+  if constexpr (kConfig.windowUncached) {
+    __asm__ volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    return;
+  }
+#endif
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+}
+
 namespace combine_impl {
 
 // The LL gather uses 16-byte loads per lane. Gathering a token from its experts
@@ -1336,7 +1429,8 @@ namespace combine_impl {
 // accumulating, and wider loads put more bytes in flight. Other topk (e.g. 9,
 // 16) go through WarpAccumDynamic, which loads 16-byte vectors one source at a
 // time, in the intra-node gather; the relays use CombineGatherRelay below for
-// every topk. The ordinary path has a separate 4-byte load-first policy below.
+// every topk, unless a v2 bucket picks the 4-byte load-first gather
+// (CombineGatherNormal).
 //
 // Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
@@ -1350,18 +1444,14 @@ namespace combine_impl {
 // CombineGather() chooses the vector width from the alignment check.
 constexpr size_t kCombineVecBytes = 16;
 
-// How many vector steps of a token's hidden dimension go into one warp's slice.
-//
-// This only sets the split -- CombineVecStep() feeds warpsPerToken below, and
-// the slice is rounded up to a whole number of steps so no warp gets less than
-// one. It does not reach inside the gather: WarpAccum advances exactly one step
-// (warpSize * kCombineVecBytes) per inner iteration regardless of what is set
-// here, so a slice of 2 steps simply means each warp runs two iterations.
-//
-// 2 measures faster than 1 at every token count tried, which is a statement
-// about how wide to spread a token, not about the gather's inner loop.
+// How many vector rounds (warpSize * kCombineVecBytes each) of a token's hidden
+// dimension go into one warp's slice, through CombineVecStep(). This only sets
+// how the LL passes split a token across warps: the gathers still advance one
+// round per inner iteration, so a slice of 2 rounds means two iterations per warp.
+// 2 measures faster than 1 at every token count tried.
 constexpr int kCombineStepsPerWarpSlice = 2;
-// The smallest piece a v2_ll relay chunk is split into across QPs.
+// A v2_ll relay chunk goes out in pieces of at least this many tokens, one per QP; a chunk's
+// last piece may be shorter.
 constexpr int kCombinePieceMinTokens = 8;
 
 inline __device__ bool CombineVecAligned(size_t tokHiddenBytes, size_t tokCombXferBytes) {
@@ -1547,56 +1637,6 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs& a
   }
 }
 
-// End of the combine's cross-node barrier: once the last local RDMA warp has moved the epoch, one
-// warp per (remote node, QP) posts that QP's mark and waits for the peer's, so the posts go out
-// in parallel rather than one after another from a single lane.
-template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineInterNodeBarrierPosts(EpDispatchCombineArgs& args,
-                                                    const ::mori::cco::ccoDevComm& comm,
-                                                    uint64_t barrierFlag, uint32_t epoch) {
-  DEF_COMMON_VARS;
-  constexpr int kQps =
-      kConfig.noRdmaAtomics ? EpInterNodeBarrierQps<kConfig>() : kConfig.numQpPerPe;
-  const int pairs = (nNodes - 1) * kQps;
-  const int stride = args.rdmaBlockNum * warpNum;
-  if (laneId != 0 || globalWarpId >= pairs) return;
-  auto proxyPeOf = [&](int p) {
-    return ((myNode + 1 + p / kQps) % nNodes) * config.gpuPerNode + (myPe % config.gpuPerNode);
-  };
-  while (__hip_atomic_load(&args.interNodeBlocksBarrier[1], __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT) != epoch) {
-  }
-  // Every pair this warp owns is posted before any is waited on: a peer's mark can sit behind
-  // its own wait on a third node, so post-then-wait per pair deadlocks around the ring.
-  for (int p = globalWarpId; p < pairs; p += stride) {
-    if constexpr (kConfig.noRdmaAtomics) {
-      EpInterNodeWriteValue(
-          comm, args.reg(args.offCrossDeviceBarrier),
-          EpInterNodeBarrierQpSlot<kConfig>(args.rank, p % kQps) * sizeof(uint64_t), barrierFlag,
-          proxyPeOf(p), p % kQps);
-    } else {
-      EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier), args.rank * sizeof(uint64_t),
-                           CombineBarrierMarker(p % kQps, kQps), proxyPeOf(p), p % kQps);
-    }
-  }
-  uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-  for (int p = globalWarpId; p < pairs; p += stride) {
-    if constexpr (kConfig.noRdmaAtomics) {
-      // A peer cannot write round r+1 before this rank leaves round r, so each slot is exactly
-      // barrierFlag; == turns a desync into a hang instead of an early, silent pass.
-      while (core::AtomicLoadRelaxedSystem(
-                 localBarrierPtr + EpInterNodeBarrierQpSlot<kConfig>(proxyPeOf(p), p % kQps)) !=
-             barrierFlag) {
-      }
-    } else if (p % kQps == 0) {
-      // One wait per peer, for the sum of every QP's marker.
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPeOf(p)) !=
-             (barrierFlag * kCombineBarrierMarkerTotal)) {
-      }
-    }
-  }
-}
-
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
 __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& args,
                                                       size_t tokHiddenBytes,
@@ -1705,9 +1745,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
               }
             }
 
-            // Join the producers before the leader's release publishes their stores.
+            // Join the lanes, then publish their staging stores to the poster.
             ::mori::cco::ccoCoopWarp{}.sync();
-            EpInterNodePublishStaging<kConfig>();
+            PublishStaging<kConfig>();
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
@@ -1742,42 +1782,15 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     batchStart += currentBatchSize;
   }
 
-  // Ensure all prior writes (in particular zeroing the chunk-flag region) are visible
-  // to other nodes before participating in the cross-device barrier, so a remote node
-  // never observes a non-zero flag that is subsequently overwritten with zero
-  __threadfence_system();
-
-  int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
-  // Each dispatch bumps the flag, so it also numbers this combine's local release.
-  const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
-
-  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    // Neither dispatch nor this combine reads the count when every slot is flagged; consume it
-    // before clearing, or a late arrival leaks into the next round.
+  // The chunk flags were cleared above. Neither dispatch nor this combine reads the node count
+  // when every slot is flagged; consume it before it is cleared, or a late arrival leaks into the
+  // next round.
+  CombineInterNodeBarrier<kConfig, T>(args, comm, [&] {
     if ((laneId < nNodes) && (laneId != myNode)) {
-      while (core::AtomicLoadRelaxedSystem(
-                 args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId) == 0) {
+      while (core::AtomicLoadRelaxedSystem(nodeRecvTokenNum + laneId) == 0) {
       }
     }
-    if (laneId < nNodes) {
-      core::AtomicStoreSeqCstSystem(
-          args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
-    }
-    if (laneId == 0) {
-      args.interNodeBlocksBarrier[0] = 0;
-      __threadfence_system();  // the count resets above, before any barrier post
-      __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-  }
-  CombineInterNodeBarrierPosts<kConfig, T>(args, comm, barrierFlag, epoch);
+  });
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
@@ -1813,8 +1826,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     nodeCount = __shfl(nodeCount, 0) - 1;
     if (nodeCount == 0) continue;
 
-    // One vector step per part, so no part falls to the gather's scalar tail and 3584 splits
-    // 1024/1024/1024/512 rather than 2048/1536 and an empty part.
+    // Parts of CombineVecStep() elements, so only a token's last part can be short and none
+    // falls to the gather's scalar tail: bf16 hidden 3584 splits 1024/1024/1024/512.
     const size_t vecStep = CombineVecStep<TokT>(warpSize);
     const int warpsPerToken = static_cast<int>(core::CeilDiv(hiddenDim, vecStep));
     const size_t hiddenDimPerWarp = vecStep;
@@ -1863,12 +1876,12 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
             srcWeightsPtr, nullptr, config.numExpertPerToken, config.numExpertPerToken);
       }
 
-      // Join the producers before the leader's release publishes their stores.
+      // Join the lanes, then publish their staging stores to the poster.
       ::mori::cco::ccoCoopWarp{}.sync();
-      EpInterNodePublishStaging<kConfig>();
+      PublishStaging<kConfig>();
       // A chunk goes out in pieces of max(kCombinePieceMinTokens, chunk / QPs) tokens, piece i on
-      // QP (k + i), each posted once its own items are done: a single post per chunk ran a whole
-      // node's tokens through one QP at that QP's rate.
+      // QP (k + i), each posted once its own items are done, so a node's tokens spread over the
+      // QPs.
       const int chunkTokens = static_cast<int>(thisChunkTokenNum);
       const int pieceTokens =
           max(kCombinePieceMinTokens, core::CeilDiv(chunkTokens, config.numQpPerPe));
@@ -1895,21 +1908,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     }
   }
 
-  __threadfence_system();
-  int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
-  if (laneId == 0) {
-    finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-  }
-  finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
-  // Each dispatch bumps the flag, so it also numbers this combine's local release.
-  const uint32_t epoch = static_cast<uint32_t>(barrierFlag);
-
-  if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
-    // Every item has read its chunk's flag: clear them all here, before the barrier posts let
-    // the next dispatch write them again.
+  // Every item has read its chunk's flag: clear them all, before the barrier posts let the next
+  // dispatch write them again.
+  CombineInterNodeBarrier<kConfig, T>(args, comm, [&] {
     for (int n = 0; n < (nNodes - 1); n++) {
       const int node = (myNode + n + 1) % nNodes;
       const int chunks =
@@ -1918,18 +1919,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
         core::AtomicStoreRelaxedSystem(chunkFlag + node * maxChunkNum + c, uint64_t{0});
       }
     }
-    if (laneId < nNodes) {
-      core::AtomicStoreSeqCstSystem(
-          args.reg(args.offNodeRecvTokenNum)->template GetAs<uint64_t*>() + laneId, uint64_t{0});
-    }
-    if (laneId == 0) {
-      args.interNodeBlocksBarrier[0] = 0;
-      __threadfence_system();  // the resets above, before any barrier post
-      __hip_atomic_store(&args.interNodeBlocksBarrier[1], epoch, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-    }
-  }
-  CombineInterNodeBarrierPosts<kConfig, T>(args, comm, barrierFlag, epoch);
+  });
 }
 
 }  // namespace combine_impl
@@ -1965,36 +1955,11 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs& args,
 }
 }  // namespace internode
 
-// The combine's intra-node barrier, at the start of the combine pass: block 0 tells each
-// same-node PE that this PE's combine input is in place, and every block waits until each of them
-// has said the same, before it reads their inputs.
-template <EpInterNodeKernelCfg kConfig, typename T>
-inline __device__ void CombineIntraNodeBarrier(EpDispatchCombineArgs& args) {
-  DEF_COMMON_VARS;
-  if (warpId == 0) {
-    uint64_t barrierFlag = 0;
-    if (laneId == 0) barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
-    barrierFlag = __shfl(barrierFlag, 0);
-    uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-    if (laneId < config.gpuPerNode) {
-      const int destPe = myNode * config.gpuPerNode + laneId;
-      if (blockId == 0) {
-        core::AtomicStoreRelaxedSystem(
-            args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>(destPe) + args.rank,
-            barrierFlag);
-      }
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + destPe) != barrierFlag) {
-      }
-    }
-  }
-  __syncthreads();
-}
-
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2_body(EpDispatchCombineArgs args,
                                           const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  CombineIntraNodeBarrier<kConfig, T>(args);
+  internode::CombineIntraNodeBarrier<kConfig, T>(args);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNode<kConfig, T>(args, comm);
@@ -2016,8 +1981,8 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs& args)
   uint8_t* stagingPtr = args.reg(args.offStaging)->template GetAs<uint8_t*>() +
                         SendBufSlotOffset(config, nNodes, 0) * combXferBytes;
 
-  // Aligned rows take 16 B loads on slices of whole vector rounds, every node's load in flight;
-  // unsnapped slices left most of each part to the gather's serial scalar tail.
+  // Aligned rows take 16 B loads on slices of whole vector rounds, every node's load in flight,
+  // so no part falls to the gather's serial scalar tail.
   const bool vecAligned = internode::combine_impl::CombineVecAligned(hiddenBytes, combXferBytes);
   MultiWarpIter mwIter(
       globalWarpNum, args.curRankNumToken, hiddenDim,
@@ -2079,7 +2044,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineInterNodeV2LL_body(EpDispatchCombineArgs args,
                                             const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  CombineIntraNodeBarrier<kConfig, T>(args);
+  internode::CombineIntraNodeBarrier<kConfig, T>(args);
 
   if (blockId < args.rdmaBlockNum) {
     internode::CombineInterNodeLL<kConfig, T>(args, comm);

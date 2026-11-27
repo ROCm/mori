@@ -1867,7 +1867,8 @@ class EpDispatchCombineOp:
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
-        self.dest_pe_counter.zero_()
+        if self.dest_pe_counter is not None:  # None on a v2 / v2_ll op
+            self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()

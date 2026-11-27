@@ -197,6 +197,7 @@ static constexpr size_t kMrPadAlign = 2ULL << 20;
 // Symmetric-window VMM allocation type. Default = uncached (fine-grained),
 // matching mori-shmem's hipDeviceMallocUncached heap: P2P remote reads/writes
 // stay coherent over the fabric without coarse-grained L2 coherence handling.
+// HIP runtimes before 7.14 still place it in the cached pool (ccoWindowUncached).
 // Opt out with CCO_UNCACHED_WINDOW=0 (reverts to coarse-grained pinned memory).
 // MUST be used for BOTH the granularity query and the actual hipMemCreate so
 // the granularity matches the allocation.
@@ -1846,6 +1847,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), epsBytes, hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
+  // Undoes the endpoints above when a later step fails.
+  auto releaseEndpoints = [&] {
+    comm->ctx->DestroyAdditionalEndpoints(newEps, numQpPerPe);
+    if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+  };
 
   // Resource window backing this DevComm's session state (IBGDA
   // signal/shadows/counter pool, LSA barrier inbox+state). signalBufOffset is
@@ -1927,8 +1933,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   if (layout.totalSize > 0) {
     if (ccoMemAlloc(comm, layout.totalSize, &resourceWindowPtr) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window MemAlloc failed");
-      if (!newEps.empty()) comm->ctx->DestroyAdditionalEndpoints(newEps, numQpPerPe);
-      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      releaseEndpoints();
       return -1;
     }
     // resourceWindowPtr is fabric-exportable (ccoMemAlloc) — avoid hipMemset,
@@ -1937,8 +1942,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     if (ccoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
       MORI_SHMEM_ERROR("ccoDevCommCreate: resource window Register failed");
       (void)ccoMemFree(comm, resourceWindowPtr);
-      if (!newEps.empty()) comm->ctx->DestroyAdditionalEndpoints(newEps, numQpPerPe);
-      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      releaseEndpoints();
       return -1;
     }
     auto* base = static_cast<uint8_t*>(resourceWindowPtr);
