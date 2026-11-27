@@ -1534,10 +1534,32 @@ SCH_TR_R0, SCH_TR_R1, SCH_TR_SRC0 = 13, 14, 24
 SCH_TR_CUR0, SCH_CURVE = 40, (28, 56, 112)
 
 
-def sched_lds_words(max_tiles):
+def sched_lds_words(max_tiles, xcd=False):
     """LDS words ``scheduler_phase`` needs: one per m-tile (expert | published << 30), the
-    published count, a counter, and one flag word per lane."""
-    return max_tiles + 2 + SCHED_WAVE_LANES
+    published count, a counter, and one flag word per lane (``xcd``: + one count per XCD list).
+    """
+    return max_tiles + 2 + SCHED_WAVE_LANES + (8 if xcd else 0)
+
+
+#: ``xcd_order``: after the ready queue, ``sched`` holds 8 per-XCD work lists. At word
+#: ``sched_xcd_base(arena)``: 8 heads (worker claim counters), 8 tails (published entries), one
+#: 128 B line each (``arm`` zeroes these ``SCH_XZERO`` words), then list y at ``SCH_XLISTS + y *
+#: cap`` (``cap = sched_xcd_cap(arena)`` words). An entry is a flat work item ``m_tile * N + n``.
+SCH_XHEAD, SCH_XTAIL, SCH_XLISTS, SCH_XZERO = 0, 256, 512, 512
+
+
+def sched_tiles_max(arena):
+    """Ready-queue words of ``Stage1SdmaPrepare.sched``: an upper bound on the m-tiles."""
+    return (arena.max_routes + 15) // 16 + arena.experts_per_rank
+
+
+def sched_xcd_base(arena):
+    return (SCH_RQ + sched_tiles_max(arena) + 31) // 32 * 32
+
+
+def sched_xcd_cap(arena):
+    """words of one XCD list: up to 4 n-tiles of one m-tile per list (N <= 32)"""
+    return 4 * sched_tiles_max(arena)
 
 
 @comm_ops.traced
@@ -1561,6 +1583,9 @@ def scheduler_phase(
     trace_base,
     full_wait,
     expected,
+    xcd_n=0,
+    xcd_base=0,
+    xcd_cap=0,
 ):
     """The tile scheduler: ONE wave (``lane`` 0..63) of the comm workgroup. The GEMM workers do
     not look at SDMA signals at all: they take tickets and read the READY QUEUE this wave
@@ -1580,12 +1605,17 @@ def scheduler_phase(
        stays ready; every tile is published exactly once (the LDS word).
     ``full_wait`` (``no_plan``): no ``need``; a tile waits for ALL of every source's chunks,
     ``level[s] >= expected[s]``.
+    ``xcd_n`` (``xcd_order``, N = GEMM1 n-tiles per m-tile; 0 = off): a published m-tile t of
+    expert e also appends its work items t * N + n to XCD list (e * N + n) mod 8 (an LDS count per
+    list), so slice (e, n) always runs on one XCD. Per round: entries, then the 8 list tails, then
+    the ready-queue tail (a worker that sees the whole queue published knows the lists are final).
     """
     npes, epr = arena.npes, arena.experts_per_rank
     OFF_NEED = arena.off_need
     PUB = 1 << 30
     W_CNT = max_tiles + 1
     W_F = max_tiles + 2
+    W_X = max_tiles + 2 + SCHED_WAVE_LANES
 
     def lw(i):
         return L + fx.Int64(i) * fx.Int64(4)
@@ -1616,6 +1646,9 @@ def scheduler_phase(
     for t in range(lane, total_q, fx.Int32(SCHED_WAVE_LANES)):
         t = fx.Int32(t)
         lst(t, expert_of(t))
+    if const_expr(xcd_n):
+        if lane < fx.Int32(8):
+            lst(fx.Int32(W_X) + lane, fx.Int32(0))
     rocdl.s_waitcnt(0)
     stamp(trace_buf, SCH_TR_INIT)
     stamp_nt(trace_buf, total_q)
@@ -1694,10 +1727,35 @@ def scheduler_phase(
                         t,
                     )
                     lst(t, w + fx.Int32(PUB))
+                    if const_expr(xcd_n):
+                        for n_ in range_constexpr(xcd_n):
+                            xy = (e * fx.Int32(xcd_n) + fx.Int32(n_)) % fx.Int32(8)
+                            xp = fx.Int32(
+                                comm_ops.atomic_add_lds(
+                                    lw(fx.Int32(W_X) + xy), fx.Int32(1)
+                                )
+                            )
+                            comm_ops.store_i32_global_system_monotonic(
+                                sched
+                                + fx.Int64(xcd_base + SCH_XLISTS) * fx.Int64(4)
+                                + fx.Int64(xy * fx.Int32(xcd_cap) + xp) * fx.Int64(4),
+                                t * fx.Int32(xcd_n) + fx.Int32(n_),
+                            )
             pos = pos + cnt
         if pos > tail:
             # the queue entries are in memory before the tail says so
             rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(xcd_n):
+                # the 8 list tails, in memory before the ready-queue tail
+                rocdl.s_waitcnt(0)
+                if lane < fx.Int32(8):
+                    comm_ops.store_i32_global_system_monotonic(
+                        sched
+                        + fx.Int64(xcd_base + SCH_XTAIL) * fx.Int64(4)
+                        + fx.Int64(lane) * fx.Int64(128),
+                        lld(fx.Int32(W_X) + lane),
+                    )
+                rocdl.s_waitcnt(vmcnt=0)
             if lane == fx.Int32(0):
                 comm_ops.store_i32_global_system_monotonic(
                     sched + fx.Int64(SCH_TAIL * 4), pos
@@ -1800,6 +1858,7 @@ class Stage1SdmaPrepare:
         head_rows=0,
         sched=False,
         no_plan=False,
+        xcd_order=False,
     ):
         import torch
         from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
@@ -1860,8 +1919,15 @@ class Stage1SdmaPrepare:
         # ``sched`` (``ready_first``): the tile scheduler's words (``SCH_*``; ``arm`` zeroes the
         # counters, the ready queue behind them needs none)
         self.sched_on = bool(sched)
-        n_tiles_max = (a.max_routes + 15) // 16 + self.epr
-        self.sched = torch.zeros(SCH_RQ + n_tiles_max, **i32)
+        # ``xcd_order`` (with ``sched``): the 8 per-XCD lists behind the ready queue
+        # (``sched_xcd_base``), and their heads and tails in ``arm``'s memset. Without it ``sched``
+        # is the ready queue only, as before.
+        self.xcd_on = bool(sched and xcd_order)
+        assert sched_tiles_max(a) == (a.max_routes + 15) // 16 + self.epr
+        n_sched = SCH_RQ + sched_tiles_max(a)
+        if self.xcd_on:
+            n_sched = sched_xcd_base(a) + SCH_XZERO + 8 * sched_xcd_cap(a)
+        self.sched = torch.zeros(n_sched, **i32)
         n_lgroups = (LAYOUT_BLOCKS + BAR_GROUP - 1) // BAR_GROUP
         self.lbar = torch.zeros(2 * (n_lgroups + 1) * BAR_STRIDE, **i32)
         # The gated GEMM1 runs the layout in its ``n_cu - 1`` compute workgroups. A barrier
@@ -2081,6 +2147,9 @@ class Stage1SdmaPrepare:
         if self.sched_on:
             # head, ready-queue tail, layout-done: a capturable memset like the rest of ``arm``
             self.sched[:SCH_ZERO].zero_()
+            if self.xcd_on:
+                xb = sched_xcd_base(self.arena)
+                self.sched[xb : xb + SCH_XZERO].zero_()  # the XCD lists' heads and tails
         # a device tensor keeps this capturable in a CUDA graph (no host copy)
         if not isinstance(chunks_from, torch.Tensor):
             chunks_from = torch.as_tensor(

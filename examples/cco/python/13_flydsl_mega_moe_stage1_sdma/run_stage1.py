@@ -34,7 +34,7 @@ Checks, then times:
 
 Phase 1c: the prepare always owns its tokens, stages the routes first, swizzles the quant
 stores through LDS and splits a token over 3 waves; the gated GEMM1 always builds the layout.
-Switches left: --ready-first, --no-plan, --fuse-prepare, --chunk-rows, --early-chunks,
+Switches left: --ready-first, --tile-opt, --no-plan, --fuse-prepare, --chunk-rows, --early-chunks,
 --head-rows, --sbm, --tile-n.
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 run_stage1.py --bs 4096
@@ -406,6 +406,10 @@ def trace_report_rf(
         ran = [b for b in worker_b if float(g[b, 3]) > 0]
 
         def dur(c):
+            if args.tile_opt:
+                # the hoisted tile loop (``--tile-opt``) stamps no queue wait or tile time: those
+                # slots are 0, not a measurement
+                return [nan] * 3
             v = (
                 torch.stack([g[b, c] for b in ran]) / 100.0
                 if ran
@@ -597,6 +601,16 @@ def main():
         "instead of gating each tile on the SDMA signals",
     )
     ap.add_argument(
+        "--tile-opt",
+        action="store_true",
+        help="GEMM1 (needs --ready-first, and aiter's stage1 with pipe_weights + async_a_copy + "
+        "mfma_amajor, so not the fixed-slot shapes or small batches; same results): the tile-loop changes that pay at this "
+        "sort_block_m (gemm1.compile_gemm1_sdma): the next tile's prologue hoisted into the current "
+        "tile, A k-step through registers and double-buffered A operand, XCD-affine tile order with "
+        "steal, opaque final-step A offset; at sbm 128 also packed A scales and rematerialised "
+        "epilogue lane constants, at sbm 64 a two-step K-loop body",
+    )
+    ap.add_argument(
         "--no-plan",
         action="store_true",
         help="prepare without the counting sort: a block reserves its rows of each run "
@@ -634,6 +648,8 @@ def main():
     args = ap.parse_args()
     if args.graph_only:
         args.graph = True
+    if args.tile_opt and not args.ready_first:
+        ap.error("--tile-opt needs --ready-first")
 
     rank, world, device = ex11._setup()
     net, moe = ex11._build_moe(args, args.bs, rank, world, device)
@@ -645,6 +661,14 @@ def main():
     ref2 = moe(x, wts, ids)[: args.bs].clone()
     torch.cuda.synchronize()
     config = moe._active_config
+    s1 = config.stage1
+    if args.tile_opt and not (s1.pipe_weights and s1.async_a_copy and s1.mfma_amajor):
+        # aiter turns these off at small batches (fixed-slot stage1, bucket <= 4)
+        ap.error(
+            "--tile-opt needs pipe_weights + async_a_copy + mfma_amajor, and aiter's stage1 here "
+            f"has pipe_weights={s1.pipe_weights} async_a_copy={s1.async_a_copy} "
+            f"mfma_amajor={s1.mfma_amajor}; run without --tile-opt"
+        )
     # ``--sbm``: the GEMM1 M tile. aiter picks it per shape; overriding it trades padding
     # (every expert's rows round up to a multiple) against weight traffic (each expert's
     # weights are re-read once per m-tile). Our layout and GEMM1 must use the SAME value.
@@ -680,6 +704,7 @@ def main():
             head_rows=args.head_rows,
             sched=args.ready_first,
             no_plan=args.no_plan,
+            xcd_order=args.tile_opt,
         )
         a = prep.arena
         window = from_gpu_ptr(prep.mem.ptr, (2 * a.n_rows, a.row_bytes), torch.uint8)
@@ -726,6 +751,19 @@ def main():
             return fz
 
         rf_kwargs = dict(ready_first=args.ready_first)
+        if args.tile_opt:
+            rf_kwargs.update(
+                hoist_prologue=True,
+                kpipe=1,
+                a_dbuf=1,
+                xcd_order=True,
+                xcd_steal=2,
+                fin_off=True,
+            )
+            if sbm == 128:
+                rf_kwargs.update(sa_pack=True, epi_remat=1)
+            elif sbm == 64:
+                rf_kwargs.update(kunroll=2)
 
         def gemm1(gated, trace=None):
             run_gemm1_sdma(
