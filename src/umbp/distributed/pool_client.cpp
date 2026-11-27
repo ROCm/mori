@@ -5331,6 +5331,11 @@ size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
   return default_pool_->BatchTouch(keys);
 }
 
+void PoolClient::LinkGroup(const std::string& group_id, const std::vector<std::string>& keys) {
+  if (!initialized_ || keys.empty() || default_pool_ == nullptr) return;
+  default_pool_->LinkGroup(group_id, keys);
+}
+
 // ---------------------------------------------------------------------------
 //  External KV
 // ---------------------------------------------------------------------------

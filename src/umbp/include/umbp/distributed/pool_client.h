@@ -219,6 +219,9 @@ class PoolClient {
   // reads reported to the master.  Never contacts another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
 
+  // Group eviction: associate keys so that evicting any one evicts all others.
+  void LinkGroup(const std::string& group_id, const std::vector<std::string>& keys);
+
   MasterClient& Master();
 
   // Every named storage backend live on this node.  Callers use them through

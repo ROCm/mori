@@ -1895,5 +1895,301 @@ TEST(PeerPoolLocalEviction, RejectsBadConfigAndLeavesAnUnorderedMediumAlone) {
   EXPECT_TRUE(registry.Get("dram")->Contains("k"));
 }
 
+// ---- Group eviction: a key that goes takes its group with it ----
+//
+// A group is either linked by the client (LinkGroup) or implied by the key's
+// name: `{namespace}/w{rank}of{world}/{digest}` is one of `world` rank copies.
+
+// One paged DRAM medium under a pool; every key is one page.
+struct OneDramPool {
+  explicit OneDramPool(uint64_t pages) {
+    RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, pages);
+    pool = std::make_unique<PeerPool>(&registry, MakeSingleBackendPolicy(), &engine);
+  }
+  bool Holds(const std::string& key) { return registry.Get("dram")->Contains(key); }
+  uint64_t Keys() { return registry.Get("dram")->OwnedKeyCount(); }
+
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  std::unique_ptr<PeerPool> pool;
+};
+
+std::string RankKey(const std::string& name_space, int rank, int world, const std::string& digest) {
+  return name_space + "/w" + std::to_string(rank) + "of" + std::to_string(world) + "/" + digest;
+}
+
+void CommitRanks(PeerPool* pool, const std::string& name_space, int world,
+                 const std::string& digest) {
+  for (int rank = 0; rank < world; ++rank) {
+    CommitKey(pool, RankKey(name_space, rank, world, digest));
+  }
+}
+
+// How many of a chunk's rank copies the medium holds.
+int RanksHeld(OneDramPool* fixture, const std::string& name_space, int world,
+              const std::string& digest) {
+  int held = 0;
+  for (int rank = 0; rank < world; ++rank) {
+    held += fixture->Holds(RankKey(name_space, rank, world, digest)) ? 1 : 0;
+  }
+  return held;
+}
+
+TEST(PeerPoolGroupEviction, EvictingOneLinkedKeyEvictsTheWholeGroup) {
+  OneDramPool fixture(8);
+  for (const char* key : {"a", "b", "c", "d", "other"}) CommitKey(fixture.pool.get(), key);
+  fixture.pool->LinkGroup("g", {"a", "b", "c"});
+
+  // One result, for the key that was asked for; the group goes with it.
+  auto evicted = fixture.pool->Evict({"b"}, PoolEvictMode::kReclaim);
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted.front().key, "b");
+  EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kFreed);
+
+  for (const char* key : {"a", "b", "c"}) EXPECT_FALSE(fixture.Holds(key)) << key;
+  for (const char* key : {"d", "other"}) EXPECT_TRUE(fixture.Holds(key)) << key;
+  EXPECT_EQ(fixture.pool->PlacementCount(), 2u);
+}
+
+TEST(PeerPoolGroupEviction, AKeyBelongsToTheGroupItWasLinkedIntoLast) {
+  OneDramPool fixture(8);
+  for (const char* key : {"a", "b", "c"}) CommitKey(fixture.pool.get(), key);
+  fixture.pool->LinkGroup("first", {"a", "b"});
+  fixture.pool->LinkGroup("second", {"b", "c"});
+
+  // 'b' left the first group, which is now 'a' alone.
+  fixture.pool->Evict({"a"}, PoolEvictMode::kReclaim);
+  EXPECT_FALSE(fixture.Holds("a"));
+  EXPECT_TRUE(fixture.Holds("b"));
+  EXPECT_TRUE(fixture.Holds("c"));
+
+  fixture.pool->Evict({"c"}, PoolEvictMode::kReclaim);
+  EXPECT_FALSE(fixture.Holds("b"));
+  EXPECT_FALSE(fixture.Holds("c"));
+}
+
+TEST(PeerPoolGroupEviction, LinkingAgainIsIdempotentAndCanExtendAGroup) {
+  OneDramPool fixture(8);
+  for (const char* key : {"a", "b", "c", "d"}) CommitKey(fixture.pool.get(), key);
+  fixture.pool->LinkGroup("g", {"a", "b"});
+  fixture.pool->LinkGroup("g", {"a", "b"});
+  fixture.pool->LinkGroup("g", {"c"});
+
+  fixture.pool->Evict({"a"}, PoolEvictMode::kReclaim);
+  for (const char* key : {"a", "b", "c"}) EXPECT_FALSE(fixture.Holds(key)) << key;
+  EXPECT_TRUE(fixture.Holds("d"));
+}
+
+// Each rank links the chunk's keys after its own put, so the other ranks'
+// copies are usually not stored yet.
+TEST(PeerPoolGroupEviction, AGroupCanBeLinkedBeforeItsKeysAreStored) {
+  OneDramPool fixture(8);
+  fixture.pool->LinkGroup("g", {"a", "b", "c"});
+  for (const char* key : {"a", "b", "c"}) CommitKey(fixture.pool.get(), key);
+
+  fixture.pool->Evict({"c"}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(fixture.Keys(), 0u);
+}
+
+TEST(PeerPoolGroupEviction, AnEvictedGroupIsDissolved) {
+  OneDramPool fixture(8);
+  for (const char* key : {"a", "b"}) CommitKey(fixture.pool.get(), key);
+  fixture.pool->LinkGroup("g", {"a", "b"});
+  fixture.pool->Evict({"a"}, PoolEvictMode::kReclaim);
+  ASSERT_EQ(fixture.Keys(), 0u);
+
+  // Stored again without a new link, the keys are on their own.
+  for (const char* key : {"a", "b"}) CommitKey(fixture.pool.get(), key);
+  fixture.pool->Evict({"a"}, PoolEvictMode::kReclaim);
+  EXPECT_FALSE(fixture.Holds("a"));
+  EXPECT_TRUE(fixture.Holds("b"));
+}
+
+TEST(PeerPoolGroupEviction, EvictingOneRankCopyEvictsItsSiblingRanks) {
+  OneDramPool fixture(16);
+  CommitRanks(fixture.pool.get(), "ns", 4, "d0");
+  CommitRanks(fixture.pool.get(), "ns", 4, "d1");
+  CommitRanks(fixture.pool.get(), "other", 4, "d0");
+
+  auto evicted = fixture.pool->Evict({RankKey("ns", 2, 4, "d0")}, PoolEvictMode::kReclaim);
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kFreed);
+
+  // The chunk's four copies and nothing else: not another chunk of the same
+  // namespace, nor the same digest under another namespace.
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d0"), 0);
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d1"), 4);
+  EXPECT_EQ(RanksHeld(&fixture, "other", 4, "d0"), 4);
+  EXPECT_EQ(fixture.pool->PlacementCount(), 8u);
+}
+
+TEST(PeerPoolGroupEviction, SeveralCopiesOfOneChunkNamedInOneCallAreEachAnswered) {
+  OneDramPool fixture(8);
+  CommitRanks(fixture.pool.get(), "ns", 4, "d0");
+
+  auto evicted = fixture.pool->Evict({RankKey("ns", 0, 4, "d0"), RankKey("ns", 3, 4, "d0")},
+                                     PoolEvictMode::kReclaim);
+  ASSERT_EQ(evicted.size(), 2u);
+  EXPECT_EQ(evicted[0].outcome, PoolEvictOutcome::kFreed);
+  EXPECT_EQ(evicted[1].outcome, PoolEvictOutcome::kFreed);
+  EXPECT_EQ(fixture.Keys(), 0u);
+  EXPECT_EQ(fixture.pool->PlacementCount(), 0u);
+}
+
+// The siblings a name implies need not exist: a rank whose put failed, or one
+// that an earlier eviction already took.
+TEST(PeerPoolGroupEviction, ACascadeOntoSiblingsThatAreNotStoredEnds) {
+  OneDramPool fixture(8);
+  CommitKey(fixture.pool.get(), RankKey("ns", 0, 4, "d0"));
+  CommitKey(fixture.pool.get(), RankKey("ns", 2, 4, "d0"));
+  CommitKey(fixture.pool.get(), "bystander");
+
+  fixture.pool->Evict({RankKey("ns", 0, 4, "d0")}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d0"), 0);
+  EXPECT_TRUE(fixture.Holds("bystander"));
+
+  // Nothing left to take: asking again frees nothing and returns.
+  auto again = fixture.pool->Evict({RankKey("ns", 0, 4, "d0")}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(again.front().outcome, PoolEvictOutcome::kNone);
+  EXPECT_TRUE(fixture.Holds("bystander"));
+}
+
+TEST(PeerPoolGroupEviction, ADiscardTakesTheGroupAndEnds) {
+  OneDramPool fixture(8);
+  CommitRanks(fixture.pool.get(), "ns", 4, "d0");
+  CommitKey(fixture.pool.get(), "bystander");
+
+  fixture.pool->Evict({RankKey("ns", 1, 4, "d0")}, PoolEvictMode::kDiscard);
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d0"), 0);
+  EXPECT_TRUE(fixture.Holds("bystander"));
+
+  // A discard of a key that is not stored names rank copies too.
+  fixture.pool->Evict({RankKey("ns", 1, 4, "never-stored")}, PoolEvictMode::kDiscard);
+  EXPECT_TRUE(fixture.Holds("bystander"));
+}
+
+TEST(PeerPoolGroupEviction, KeysThatAreNotRankCopiesAreEvictedAlone) {
+  OneDramPool fixture(32);
+  // {evicted, must survive}: each pair differs from a rank copy in one way.
+  const std::vector<std::pair<std::string, std::string>> pairs = {
+      {"ns/probe/w0/nonce", "ns/probe/w1/nonce"},  // a worker's startup probe
+      {"ns/w0of1/d", "ns/w1of1/d"},                // one rank has no siblings
+      {"ns/w4of4/d", "ns/w0of4/d"},                // rank outside the world
+      {"ns/x0of2/d", "ns/x1of2/d"},                // not the 'w' prefix
+      {"ns/w0/d", "ns/w1/d"},                      // no 'of'
+      {"ns/wof2/d", "ns/w1of2/d"},                 // no rank
+      {"ns/w0of/d", "ns/w1of/d"},                  // no world
+      {"w0of2/d", "w1of2/d"},                      // no namespace
+      {"plain", "plain2"},
+  };
+  for (const auto& [evicted, survivor] : pairs) {
+    CommitKey(fixture.pool.get(), evicted);
+    CommitKey(fixture.pool.get(), survivor);
+  }
+  for (const auto& [evicted, survivor] : pairs) {
+    fixture.pool->Evict({evicted}, PoolEvictMode::kReclaim);
+    EXPECT_FALSE(fixture.Holds(evicted)) << evicted;
+    EXPECT_TRUE(fixture.Holds(survivor)) << "evicting " << evicted << " took " << survivor;
+  }
+}
+
+// Only the spelling a client writes names a rank: plain decimal digits. A
+// looser reading would let one key evict another client's well-formed copies.
+TEST(PeerPoolGroupEviction, ARankSegmentThatIsNotPlainDecimalNamesNoGroup) {
+  OneDramPool fixture(8);
+  const std::string survivor = RankKey("ns", 1, 4, "d");
+  for (const char* odd : {"ns/w0of4x/d", "ns/w0of 4/d", "ns/w+0of4/d", "ns/w 0of4/d", "ns/w0of+4/d",
+                          "ns/w00of4/d", "ns/w0of04/d", "ns/w0of4.0/d", "ns/w-0of4/d"}) {
+    if (!fixture.Holds(survivor)) CommitKey(fixture.pool.get(), survivor);
+    CommitKey(fixture.pool.get(), odd);
+    fixture.pool->Evict({odd}, PoolEvictMode::kReclaim);
+    EXPECT_FALSE(fixture.Holds(odd)) << odd;
+    EXPECT_TRUE(fixture.Holds(survivor)) << "evicting '" << odd << "' took " << survivor;
+  }
+}
+
+// A key is client input. One that claims billions of ranks must not make the
+// pool spell out each of them.
+TEST(PeerPoolGroupEviction, AnImplausibleRankCountIsNotExpanded) {
+  OneDramPool fixture(8);
+  for (const char* world : {"2000000000", "99999999999999999999", "100000"}) {
+    const std::string evicted = std::string("ns/w0of") + world + "/d";
+    const std::string sibling = std::string("ns/w1of") + world + "/d";
+    CommitKey(fixture.pool.get(), evicted);
+    CommitKey(fixture.pool.get(), sibling);
+
+    const auto started = std::chrono::steady_clock::now();
+    fixture.pool->Evict({evicted}, PoolEvictMode::kReclaim);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2)) << world;
+    EXPECT_FALSE(fixture.Holds(evicted)) << world;
+    EXPECT_TRUE(fixture.Holds(sibling)) << world;
+    fixture.pool->Evict({sibling}, PoolEvictMode::kReclaim);
+  }
+}
+
+// A demoted copy is still stored, so its chunk is still whole.
+TEST(PeerPoolGroupEviction, ADemotedCopyKeepsItsSiblings) {
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitRanks(&pool, "ns", 4, "d0");
+
+  const std::string demoted = RankKey("ns", 0, 4, "d0");
+  auto evicted = pool.Evict({demoted}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kDemotionQueued);
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", demoted));
+  EXPECT_TRUE(registry.Get("cold")->Contains(demoted));
+  for (int rank = 1; rank < 4; ++rank) {
+    EXPECT_TRUE(registry.Get("hot")->Contains(RankKey("ns", rank, 4, "d0"))) << rank;
+  }
+  EXPECT_EQ(pool.PlacementCount(), 4u);
+}
+
+// Watermark eviction stops where the low watermark is, which is usually in
+// the middle of a chunk. The cascade takes the rest of that chunk.
+TEST(PeerPoolGroupEviction, WatermarkEvictionLeavesOnlyWholeGroups) {
+  OneDramPool fixture(12);
+  // Enabled before any commit, as PoolClient does: the medium then knows
+  // which key is coldest.
+  ASSERT_TRUE(fixture.pool->EnableLocalEviction(
+      fixture.registry.BackendId(fixture.registry.Get("dram")), 0.9, 0.5));
+
+  // Three chunks of four copies fill the tier. The round starts at 11 or 12
+  // keys and goes down to 6 pages: the oldest chunk and one or two copies of
+  // the next, whose other copies only the cascade removes.
+  for (const char* digest : {"d0", "d1", "d2"}) CommitRanks(fixture.pool.get(), "ns", 4, digest);
+  ASSERT_TRUE(WaitUntil([&] { return fixture.Keys() <= 4; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d0"), 0);
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d1"), 0) << "a chunk was left with some of its copies";
+  EXPECT_EQ(RanksHeld(&fixture, "ns", 4, "d2"), 4);
+  EXPECT_EQ(fixture.Keys(), 4u);
+  EXPECT_EQ(fixture.pool->PlacementCount(), 4u);
+  // Eight keys went, and the watermark chose fewer of them than that.
+  EXPECT_GE(fixture.pool->LocalEvictionStats().keys, 5u);
+  EXPECT_LE(fixture.pool->LocalEvictionStats().keys, 6u);
+}
+
+// The same tier and order with keys that name no group: the control for the
+// test above.
+TEST(PeerPoolGroupEviction, WatermarkEvictionOfUngroupedKeysStopsAtTheLowWatermark) {
+  OneDramPool fixture(12);
+  for (int i = 0; i < 12; ++i) CommitKey(fixture.pool.get(), "k" + std::to_string(i));
+  ASSERT_TRUE(fixture.pool->EnableLocalEviction(
+      fixture.registry.BackendId(fixture.registry.Get("dram")), 0.9, 0.5));
+  fixture.pool->RunLocalEvictionOnceForTest();
+  ASSERT_TRUE(WaitUntil([&] { return fixture.Keys() <= 6; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  EXPECT_EQ(fixture.Keys(), 6u);
+  EXPECT_EQ(fixture.pool->LocalEvictionStats().keys, 6u);
+}
+
 }  // namespace
 }  // namespace mori::umbp
