@@ -19,7 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""V2 tuning tables: the CSV format, its checks, and the tuning save.
+"""V2 tuning tables: the CSV format, its checks, the tuning save, and the Python
+dispatch rows the intranode lookup falls back to.
 
 One CSV per GPU model, kernel family and EP size holds both phases. A malformed
 table raises rather than being skipped: one that loaded wrong would run untuned
@@ -376,84 +377,72 @@ def test_schedule_description_names_the_table(table_dir):
     assert "tokens    rest: dispatch v2 B/R/W=80/40/4 qps=1" in text
 
 
-# -- HIP dispatch rows for model shapes without an IntraNodeV2 rule -------------
+# -- Python dispatch rows ----------------------------------------------------
 
-# (model, arch, CUs) -> (hidden, topk, experts a rank, dispatch dtype) the Python
-# table serves at EP8 because the shipped IntraNodeV2 table has no rule for them.
+GPUS = {"mi300x": ("gfx942", 304), "mi355x": ("gfx950", 256)}
+# EP8 (hidden, topk, experts a rank, dispatch dtype) with model-shape rows.
 MODEL_SHAPES = {
-    ("mi300x", "gfx942", 304): [
-        (2048, 8, 32, "bf16"),
-        (2048, 8, 32, "fp8"),
-        (2048, 4, 8, "bf16"),
-        (2048, 4, 8, "fp8"),
-        (2880, 4, 16, "bf16"),
-        (4096, 8, 16, "fp8"),
-        (4096, 8, 36, "fp8"),
-        (5120, 8, 20, "fp8"),
+    "mi300x": [
         (7168, 8, 48, "fp8"),
-    ],
-    ("mi355x", "gfx950", 256): [
+        (5120, 8, 20, "fp8"),
+        (4096, 8, 16, "fp8"),
+        (4096, 8, 36, "fp8"),
+        (2880, 4, 16, "bf16"),
         (2048, 8, 32, "bf16"),
         (2048, 8, 32, "fp8"),
         (2048, 4, 8, "bf16"),
         (2048, 4, 8, "fp8"),
-        (2880, 4, 16, "bf16"),
-        (4096, 8, 16, "fp8"),
-        (4096, 8, 36, "fp8"),
+    ],
+    "mi355x": [
+        (7168, 8, 48, "fp8"),
         (5120, 8, 20, "fp8"),
         (5120, 6, 48, "fp4"),
-        (7168, 8, 48, "fp8"),
+        (4096, 8, 16, "fp8"),
+        (4096, 8, 36, "fp8"),
+        (2880, 4, 16, "bf16"),
+        (2048, 8, 32, "bf16"),
+        (2048, 8, 32, "fp8"),
+        (2048, 4, 8, "bf16"),
+        (2048, 4, 8, "fp8"),
     ],
 }
-PROBES = (1, 16, 17, 32, 33, 64, 128, 129, 256, 512, 513, 1024, 4096, 16384, 65536)
 
 
-@pytest.fixture
-def shipped_gpu(monkeypatch):
-    """Look up as the given model, against the IntraNodeV2 tables mori ships."""
-
-    def use(model, arch, cus):
-        monkeypatch.delenv("MORI_EP_V2_TUNING_DIR", raising=False)
-        monkeypatch.delenv("MORI_EP_TUNING_PROFILE", raising=False)
-        monkeypatch.setattr(tuning._gpu, "detect_model", lambda: model)
-        monkeypatch.setattr(tuning._gpu, "arch_name", lambda: arch)
-        monkeypatch.setattr(tuning._gpu, "cu_count", lambda: cus)
-        tuning._V2_RULES_CACHE.clear()
-
-    yield use
+@pytest.fixture(params=sorted(GPUS))
+def shipped_gpu(request, monkeypatch):
+    """Look up as this GPU, against the IntraNodeV2 tables mori ships."""
+    arch, cus = GPUS[request.param]
+    monkeypatch.delenv("MORI_EP_V2_TUNING_DIR", raising=False)
+    monkeypatch.delenv("MORI_EP_TUNING_PROFILE", raising=False)
+    monkeypatch.setattr(tuning._gpu, "detect_model", lambda: request.param)
+    monkeypatch.setattr(tuning._gpu, "arch_name", lambda: arch)
+    monkeypatch.setattr(tuning._gpu, "cu_count", lambda: cus)
+    tuning._V2_RULES_CACHE.clear()
+    yield request.param
     tuning._V2_RULES_CACHE.clear()
 
 
-def dispatch_at(schedule, num_tokens):
-    """The (block, warp) a schedule dispatches num_tokens with."""
-    for ceiling, block, warp, *_ in schedule:
-        if ceiling is None or num_tokens <= ceiling:
-            return block, warp
-
-
-@pytest.mark.parametrize("gpu", list(MODEL_SHAPES), ids=lambda g: g[0])
-def test_model_shapes_dispatch_on_their_rows(shipped_gpu, gpu):
-    shipped_gpu(*gpu)
-    model = gpu[0]
-    for hidden, topk, epr, dtype in MODEL_SHAPES[gpu]:
-        entry = tuning._bucket_key(tuning._DISPATCH_TABLE[model], 8, hidden, topk, epr)
-        assert entry is not None, f"no {model} row for {(8, hidden, topk, epr)}"
+def test_model_shapes_dispatch_on_their_rows(shipped_gpu):
+    for hidden, topk, epr, dtype in MODEL_SHAPES[shipped_gpu]:
+        key = (8, hidden, topk, epr)
+        entry = tuning._bucket_key(tuning._DISPATCH_TABLE[shipped_gpu], *key)
+        assert entry is not None, f"no {shipped_gpu} row for {key}"
         rows = entry.get(dtype) or entry.get(None)
         schedule = tuning.lookup(8, hidden, topk, dtype=dtype, experts_per_rank=epr)[
             "schedule"
         ]
-        assert schedule, (hidden, topk, epr, dtype)
-        got = [dispatch_at(schedule, n) for n in PROBES]
-        assert got == [dispatch_at(rows, n) for n in PROBES], (hidden, topk, epr, dtype)
+        assert schedule, (key, dtype)
+        edges = {edge for edge, _, _ in rows if edge is not None}
+        for n in sorted({1, 1 << 16} | edges | {e + 1 for e in edges}):
+            got = tuning.pick_bucket(schedule, n)[1:3]
+            assert got == tuning.pick_bucket(rows, n)[1:3], (key, dtype, n)
         # A row that only restates the 64-block default is not shipped.
-        assert {block for block, _ in got} != {64}, (hidden, topk, epr, dtype)
+        assert {block for _, block, _ in rows} != {64}, (key, dtype)
 
 
-CUS = {model: cus for model, _, cus in MODEL_SHAPES}
-
-
-@pytest.mark.parametrize("model", sorted(CUS))
+@pytest.mark.parametrize("model", sorted(GPUS))
 def test_dispatch_rows_are_well_formed(model):
+    cus = GPUS[model][1]
     for key, by_dtype in tuning._DISPATCH_TABLE[model].items():
         for dtype, rows in by_dtype.items():
             edges = [edge for edge, _, _ in rows]
@@ -461,13 +450,12 @@ def test_dispatch_rows_are_well_formed(model):
             assert all(isinstance(e, int) for e in edges[:-1]), (key, dtype)
             assert edges[:-1] == sorted(set(edges[:-1])), (key, dtype)
             for _, block, warp in rows:
-                assert 1 <= block <= CUS[model] and 1 <= warp <= 16, (key, dtype)
+                assert 1 <= block <= cus and 1 <= warp <= 16, (key, dtype)
 
 
 def test_an_exact_entry_keeps_its_wildcards_other_dtypes():
-    # _bucket_key returns the exact-expert-count entry whole and never merges in
-    # the (w, h, k, None) wildcard, so a dtype the exact entry leaves out would drop
-    # to the default for that expert count.
+    # _bucket_key returns an exact entry whole, so a dtype it leaves out would fall
+    # to the default instead of the wildcard's row.
     for device, table in tuning._DISPATCH_TABLE.items():
         for (world, hidden, topk, epr), entry in table.items():
             wildcard = table.get((world, hidden, topk, None))

@@ -119,27 +119,32 @@ def _hip_default() -> dict:
 
 # Entries are the smallest geometry within ~3% of the best: fewer blocks holds fewer
 # CUs, which matters when this overlaps an expert GEMM. Those ties are policy, not
-# measurement -- a single bench point can be off 20% -- while the bucket EDGES come
-# from 10-40% effects.
+# measurement -- a single bench point can be off 20%.
 _DISPATCH_TABLE: dict = {
-    # EP8 model shapes and dtypes with no IntraNodeV2 rule, on the block-per-token
-    # dispatch (#1059). It derives its warps, so only the block count is read; the warp
-    # column is unused here. Per token count a grid is acceptable within 3% or 0.75 us
-    # (the round-to-round noise at <=64 tokens) of the best, median of 3 rounds; where
-    # that takes 32 blocks but not 64, a 200-iteration check of the two decides. Buckets
-    # are the fewest whose grid is acceptable at every token count they cover, each the
-    # smallest such grid, and no wider than 64 blocks below the first token count where
-    # 64 is not acceptable. A dtype on 64 blocks throughout has no row. A key with
-    # experts None was measured at the expert counts listed under it and holds for any
-    # expert count without its own key. Dispatch us at 2048 | 16384 tokens a rank, the
-    # row vs 64 blocks, in a separate run of the two (median of 2 rounds):
+    # EP8 model shapes and dtypes with no IntraNodeV2 rule; a dtype on 64 blocks
+    # throughout has no row. The gfx942/gfx950 dispatch derives its warps, so the warp
+    # column is unused. Dispatch us at 2048 | 16384 tokens a rank, row vs 64 blocks:
     "mi300x": {
-        # GLM-4.7-Flash, 64 experts:
-        #   bf16   105.9 vs  118.2 |  724.9 vs  821.9
-        #   fp8     87.2 vs  114.9 |  570.7 vs  818.1
-        (8, 2048, 4, 8): {
-            "bf16": ((256, 64, 16), (None, 128, 16)),
-            "fp8": ((128, 64, 16), (None, 128, 16)),
+        # Kimi-K2.6, 384 experts:
+        #   fp8    268.8 vs  275.1 | 1972.3 vs 2030.9
+        (8, 7168, 8, 48): {
+            "fp8": ((128, 64, 16), (None, 96, 16)),
+        },
+        # GLM-4.6, 160 experts:
+        #   fp8    203.6 vs  215.1 | 1527.0 vs 1620.7
+        (8, 5120, 8, 20): {
+            "fp8": ((256, 64, 16), (None, 96, 16)),
+        },
+        # Qwen3-235B-A22B (128 experts) and GLM-5.3-Flash (288 experts):
+        #   Qwen3-235B-A22B fp8    162.7 vs  176.8 | 1169.2 vs 1293.1
+        #   GLM-5.3-Flash   fp8    162.8 vs  177.1 | 1164.6 vs 1286.3
+        (8, 4096, 8, None): {
+            "fp8": ((64, 64, 16), (None, 128, 16)),
+        },
+        # gpt-oss-120b, 128 experts:
+        #   bf16   138.9 vs  144.8 |  987.1 vs 1032.0
+        (8, 2880, 4, 16): {
+            "bf16": ((128, 64, 16), (None, 96, 16)),
         },
         # Qwen3.5-35B-A3B, 256 experts:
         #   bf16   158.5 vs  166.5 | 1121.2 vs 1206.0
@@ -148,26 +153,12 @@ _DISPATCH_TABLE: dict = {
             "bf16": ((128, 64, 16), (None, 96, 16)),
             "fp8": ((128, 64, 16), (None, 96, 16)),
         },
-        # gpt-oss-120b, 128 experts:
-        #   bf16   138.9 vs  144.8 |  987.1 vs 1032.0
-        (8, 2880, 4, 16): {
-            "bf16": ((128, 64, 16), (None, 96, 16)),
-        },
-        # Qwen3-235B-A22B (128 experts) and GLM-5.3-Flash (288 experts):
-        #   Qwen3-235B-A22B fp8    162.7 vs  176.8 | 1169.2 vs 1293.1
-        #   GLM-5.3-Flash   fp8    162.8 vs  177.1 | 1164.6 vs 1286.3
-        (8, 4096, 8, None): {
-            "fp8": ((64, 64, 16), (None, 128, 16)),
-        },
-        # GLM-4.6, 160 experts:
-        #   fp8    203.6 vs  215.1 | 1527.0 vs 1620.7
-        (8, 5120, 8, 20): {
-            "fp8": ((256, 64, 16), (None, 96, 16)),
-        },
-        # Kimi-K2.6, 384 experts:
-        #   fp8    268.8 vs  275.1 | 1972.3 vs 2030.9
-        (8, 7168, 8, 48): {
-            "fp8": ((128, 64, 16), (None, 96, 16)),
+        # GLM-4.7-Flash, 64 experts:
+        #   bf16   105.9 vs  118.2 |  724.9 vs  821.9
+        #   fp8     87.2 vs  114.9 |  570.7 vs  818.1
+        (8, 2048, 4, 8): {
+            "bf16": ((256, 64, 16), (None, 128, 16)),
+            "fp8": ((128, 64, 16), (None, 128, 16)),
         },
     },
     # MI355X/gfx950 EP8 hidden 7168, 2026-08-11. No TDM here: the portable dispatch
@@ -192,30 +183,13 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((None, 128, 8),),
         },
         # Model shapes and dtypes with no IntraNodeV2 rule, as under "mi300x".
-        # GLM-4.7-Flash, 64 experts:
-        #   bf16   102.0 vs  112.4 |  676.1 vs  780.9
-        #   fp8    100.0 vs  120.2 |  673.7 vs  878.3
-        (8, 2048, 4, 8): {
-            "bf16": ((512, 64, 16), (None, 96, 16)),
-            "fp8": ((128, 64, 16), (512, 128, 16), (None, 96, 16)),
-        },
-        # Qwen3.5-35B-A3B, 256 experts:
-        #   bf16         same grid | 1060.3 vs 1098.2
-        #   fp8    148.9 vs  154.6 | 1068.4 vs 1092.9
-        (8, 2048, 8, 32): {
-            "bf16": ((4096, 64, 16), (None, 96, 16)),
-            "fp8": ((64, 64, 16), (512, 128, 16), (None, 96, 16)),
-        },
-        # gpt-oss-120b, 128 experts:
-        #   bf16   126.2 vs  130.6 |  888.2 vs  931.2
-        (8, 2880, 4, 16): {
-            "bf16": ((512, 64, 16), (None, 96, 16)),
-        },
-        # Qwen3-235B-A22B (128 experts) and GLM-5.3-Flash (288 experts):
-        #   Qwen3-235B-A22B fp8    151.6 vs  162.7 | 1063.4 vs 1176.2
-        #   GLM-5.3-Flash   fp8    152.0 vs  161.5 | 1049.3 vs 1152.9
-        (8, 4096, 8, None): {
-            "fp8": ((128, 64, 16), (None, 96, 16)),
+        # Kimi-K2.6, 384 experts:
+        #   fp8    234.1 vs  239.9 | 1729.2 vs 1763.6
+        # None / fp4 repeat (8, 7168, 8, None): an exact key hides its wildcard.
+        (8, 7168, 8, 48): {
+            None: ((None, 64, 8),),
+            "fp4": ((None, 128, 8),),
+            "fp8": ((512, 64, 8), (None, 96, 8)),
         },
         # GLM-4.6, 160 experts:
         #   fp8    182.4 vs  192.6 | 1291.0 vs 1391.3
@@ -227,13 +201,30 @@ _DISPATCH_TABLE: dict = {
         (8, 5120, 6, 48): {
             "fp4": ((128, 64, 16), (256, 128, 16), (None, 96, 16)),
         },
-        # Kimi-K2.6, 384 experts:
-        #   fp8    234.1 vs  239.9 | 1729.2 vs 1763.6
-        # None / fp4: the (8, 7168, 8, None) rows, unchanged.
-        (8, 7168, 8, 48): {
-            None: ((None, 64, 8),),
-            "fp4": ((None, 128, 8),),
-            "fp8": ((512, 64, 8), (None, 96, 8)),
+        # Qwen3-235B-A22B (128 experts) and GLM-5.3-Flash (288 experts):
+        #   Qwen3-235B-A22B fp8    151.6 vs  162.7 | 1063.4 vs 1176.2
+        #   GLM-5.3-Flash   fp8    152.0 vs  161.5 | 1049.3 vs 1152.9
+        (8, 4096, 8, None): {
+            "fp8": ((128, 64, 16), (None, 96, 16)),
+        },
+        # gpt-oss-120b, 128 experts:
+        #   bf16   126.2 vs  130.6 |  888.2 vs  931.2
+        (8, 2880, 4, 16): {
+            "bf16": ((512, 64, 16), (None, 96, 16)),
+        },
+        # Qwen3.5-35B-A3B, 256 experts:
+        #   bf16         same grid | 1060.3 vs 1098.2
+        #   fp8    148.9 vs  154.6 | 1068.4 vs 1092.9
+        (8, 2048, 8, 32): {
+            "bf16": ((4096, 64, 16), (None, 96, 16)),
+            "fp8": ((64, 64, 16), (512, 128, 16), (None, 96, 16)),
+        },
+        # GLM-4.7-Flash, 64 experts:
+        #   bf16   102.0 vs  112.4 |  676.1 vs  780.9
+        #   fp8    100.0 vs  120.2 |  673.7 vs  878.3
+        (8, 2048, 4, 8): {
+            "bf16": ((512, 64, 16), (None, 96, 16)),
+            "fp8": ((128, 64, 16), (512, 128, 16), (None, 96, 16)),
         },
     },
     # 4x gfx1250 at EP4, hidden 7168, 2026-08-11. topk moves the edges (it sets _tpi),

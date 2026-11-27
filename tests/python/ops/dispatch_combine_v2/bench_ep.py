@@ -207,15 +207,15 @@ _G = {
 
 
 def regrid(cfg, common, blocks, warp=None):
-    """cfg's op with its dispatch blocks set to `blocks`: the combine and a bucketed
-    op's edges stay, and the warps stay derived unless `warp` pins them."""
-    geom = dict(dispatch_block_num=blocks)
+    """cfg with its dispatch blocks set to `blocks` (and warps to `warp` if given);
+    the combine and the bucket edges are kept."""
+    geom = dict(
+        dispatch_block_num=blocks,
+        combine_block_num=cfg.combine_block_num,
+        combine_warp_num_per_block=cfg.combine_warp_num_per_block,
+    )
     if warp:
         geom["warp_num_per_block"] = warp
-    if not cfg.is_internode:
-        # internode tunes its combine on top of these fallback scalars
-        geom["combine_block_num"] = cfg.combine_block_num
-        geom["combine_warp_num_per_block"] = cfg.combine_warp_num_per_block
     if cfg.schedule:
         geom["schedule"] = tuple(
             (edge, blocks, warp or dw, cb, cw) for edge, _, dw, cb, cw in cfg.schedule
@@ -332,10 +332,8 @@ def main():
     geom_name = re.compile(r"([a-z]+)(?:@([1-9]\d*)(?:x([1-9]\d*))?)?")
 
     def build(name):
-        """One op per BACKENDS entry. "<backend>@<blocks>[x<warps>]" is the op the
-        plain name builds with its dispatch blocks replaced: combine and the bucket
-        edges stay, and without x<warps> the warps are the op's own (DWPB if set).
-        Not with AsyncLL or a gfx1250 LL128 plan, which set their own grid."""
+        """One op per BACKENDS entry; "<backend>@<blocks>[x<warps>]" is regrid() of
+        the plain op (x<warps> defaults to DWPB)."""
         m = geom_name.fullmatch(name)
         if not m:
             raise ValueError(
@@ -372,10 +370,7 @@ def main():
         if blocks:
             # Both set the grid themselves and would time the plain op's kernels.
             if ASYNC_LL or (
-                backend == "hip"
-                and _GFX125X
-                and cfg.low_latency is not False
-                and ll128_layout(cfg) is not None
+                backend == "hip" and _GFX125X and ll128_layout(cfg) is not None
             ):
                 raise ValueError(
                     f"BACKENDS entry {name!r}: "
