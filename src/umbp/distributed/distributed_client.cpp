@@ -354,6 +354,15 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
   return call.Result(keys.size());
 }
 
+std::vector<bool> DistributedClient::BatchLease(const std::vector<std::string>& keys,
+                                                uint32_t ttl_ms) {
+  SimCall call(sim_trace_.get(), "batch_lease", keys.size(), 0);
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+  return call.Result(pool_client_->BatchLease(keys, ttl_ms));
+}
+
 size_t DistributedClient::BatchTouch(const std::vector<std::string>& keys) {
   if (closing_ || keys.empty()) return 0;
   std::shared_lock lk(op_mutex_);

@@ -1141,9 +1141,10 @@ TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
   unlink(fd_path.c_str());
 }
 
-// The recency hint crosses the process boundary and reaches the server's
-// paged medium, whose order an embedded deployment tracks for local eviction.
-TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
+// The recency hint and the lease cross the process boundary and reach the
+// server's paged medium, whose order an embedded deployment tracks for local
+// eviction.
+TEST(StandaloneShmIpcTest, BatchTouchAndLeaseReachTheKeysTheServerHolds) {
   const std::string address =
       "unix:///tmp/umbp_standalone_touch_" + std::to_string(getpid()) + ".grpc.sock";
   const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
@@ -1178,6 +1179,9 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
 
   EXPECT_EQ(client->BatchTouch({"touch-a", "touch-missing", "touch-b"}), 2u);
   EXPECT_EQ(client->BatchTouch({}), 0u);
+  EXPECT_EQ(client->BatchLease({"touch-a", "touch-missing", "touch-b"}, 5000),
+            (std::vector<bool>{true, false, true}));
+  EXPECT_TRUE(client->BatchLease({}, 5000).empty());
   // A touch is not a read and does not change what exists.
   EXPECT_EQ(client->BatchExists({"touch-a", "touch-missing"}), (std::vector<bool>{true, false}));
 

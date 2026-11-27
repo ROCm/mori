@@ -1064,6 +1064,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  // Also a lookup to the locks: it checks keys and leases them, never moves
+  // bytes or dereferences caller memory.
+  grpc::Status BatchLease(grpc::ServerContext*, const ::umbp::BatchLeaseRequest* request,
+                          ::umbp::BatchBoolResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      FillFalse(request->keys_size(), response);
+      return grpc::Status::OK;
+    }
+    FillResults(client_->BatchLease(keys, request->ttl_ms()), response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

@@ -1675,6 +1675,105 @@ TEST(PeerPoolLocalEviction, TouchedKeysOutliveColderOnesInTheOrderGiven) {
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
 }
 
+TEST(PeerPoolLocalEviction, ALookupLeavesTheEvictionOrderAlone) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // Asked about, never read: no lease, no recency.
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(pool.BatchContains({"k0", "missing"}), (std::vector<bool>{true, false}));
+  }
+  CommitKey(&pool, "k8");
+
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  for (int i = 0; i <= 3; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i = 4; i <= 8; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+}
+
+TEST(PeerPoolLocalEviction, ALeaseKeepsTheKeysToLoadUntilItEnds) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+  auto* dram = registry.Get("dram");
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  EXPECT_EQ(pool.BatchLease({"k0", "missing", "k1"}, std::chrono::milliseconds(60000)),
+            (std::vector<bool>{true, false, true}));
+  EXPECT_TRUE(pool.BatchLease({}, std::chrono::milliseconds(60000)).empty());
+  // Leased keys are offered to no eviction, and are the most recent after it.
+  const auto offers = dram->EvictionCandidates(10);
+  for (const auto& offer : offers) EXPECT_TRUE(offer.key != "k0" && offer.key != "k1") << offer.key;
+  CommitKey(&pool, "k8");
+
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  for (int i : {0, 1, 6, 7, 8}) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i = 2; i <= 5; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+}
+
+// Force the legal interleaving between a lookup and the lease that follows it.
+class EvictBeforeLease final : public PageBackend {
+ public:
+  using PageBackend::PageBackend;
+  std::vector<bool> Lease(const std::vector<std::string>& keys,
+                          std::chrono::milliseconds ttl) override {
+    evicted = Evict(keys);
+    return PageBackend::Lease(keys, ttl);
+  }
+  std::vector<EvictResult> evicted;
+};
+
+TEST(PeerPoolLocalEviction, ALeaseReportsAKeyEvictedSinceTheLookup) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {10 * kHostPage};
+  auto backend = std::make_unique<EvictBeforeLease>(TierType::DRAM, kHostPage, ownership, kNoExpiry,
+                                                    std::chrono::milliseconds(1));
+  auto* dram = backend.get();
+  ASSERT_TRUE(backend->Init(&engine));
+  ASSERT_TRUE(registry.Register("dram", std::move(backend)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  CommitKey(&pool, "raced");
+  ASSERT_EQ(pool.BatchContains({"raced"}), (std::vector<bool>{true}));
+  // Lost between the lookup and the lease: reported missing, never leased.
+  EXPECT_EQ(pool.BatchLease({"raced"}, std::chrono::milliseconds(60000)),
+            (std::vector<bool>{false}));
+  ASSERT_FALSE(dram->evicted.empty());
+  EXPECT_GT(dram->evicted.front().bytes_freed, 0u);
+  EXPECT_FALSE(dram->Contains("raced"));
+}
+
+TEST(PeerPool, ALeaseGoesToTheMediumTheReadComesFrom) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  for (const char* name : {"first", "second"}) {
+    RegisterPageBackend(&registry, &engine, name, TierType::DRAM, kHostPage, 4,
+                        std::chrono::milliseconds(1));
+    registry.Get(name)->TrackEvictionOrder();
+  }
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  for (const char* name : {"first", "second"}) {
+    auto* backend = registry.Get(name);
+    auto slot = backend->BatchAllocate({AllocateRequest{"k", 64}}).front();
+    ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}}).front().success) << name;
+  }
+  EXPECT_EQ(pool.BatchLease({"k"}, std::chrono::milliseconds(60000)), (std::vector<bool>{true}));
+  const auto offered = [&](const char* name) { return registry.Get(name)->EvictionCandidates(4); };
+  // Exactly one copy is leased: the other is still offered.
+  EXPECT_EQ(offered("first").size() + offered("second").size(), 1u);
+}
+
 TEST(PeerPool, ATouchReachesEveryCopyInAMediumThatKeepsAnOrder) {
   LocalCopyEngine engine;
   BackendRegistry registry;

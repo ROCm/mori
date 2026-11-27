@@ -341,12 +341,28 @@ class MediumBackend : public MetricSource {
   // keys picked by recency alone can leave every segment partly live.
   virtual bool OwnsEvictionOrder() const { return false; }
 
-  // Renew these keys' recency without reading them: a client looked them up to
-  // load next, or used them from a faster cache of its own.  Recency is the
-  // only thing that moves: no lease, no read.  Keys move in the order given, so
-  // the last is the most recent.  Returns how many are held here, a duplicate
-  // counted each time; a medium that keeps no order returns 0.
+  // Renew these keys' recency without reading them: a client used them from a
+  // faster cache of its own.  Recency is the only thing that moves: no lease,
+  // no read.  Keys move in the order given, so the last is the most recent.
+  // Returns how many are held here, a duplicate counted each time; a medium
+  // that keeps no order returns 0.
   virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
+
+  // A client is about to read these keys: keep them from eviction until `ttl`
+  // from now and renew their recency, as the read will.  Returns which are
+  // held, in input order.  A medium that keeps leases must decide presence and
+  // take the lease atomically against its own eviction, so a key reported held
+  // cannot be lost before the read; one that keeps none only renews recency.
+  virtual std::vector<bool> Lease(const std::vector<std::string>& keys,
+                                  std::chrono::milliseconds /*ttl*/) {
+    auto held = BatchContains(keys);
+    std::vector<std::string> found;
+    for (size_t i = 0; i < keys.size() && i < held.size(); ++i) {
+      if (held[i]) found.push_back(keys[i]);
+    }
+    Touch(found);
+    return held;
+  }
 
   // ---- observability ----
   //

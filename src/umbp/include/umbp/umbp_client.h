@@ -149,6 +149,21 @@ class IUMBPClient {
   /// `master` mode), or from an older server.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
+  /// The keys the caller is about to read, once its lookups have decided
+  /// which.  Lookups (BatchExists*) change nothing, since a caller asks about
+  /// more than it reads; this call protects what it will read.  Returns which
+  /// keys exist, in input order.  Each one this node holds is checked and
+  /// leased in one step against its eviction: kept from eviction for `ttl_ms`
+  /// (at most 10 min; 0 leases nothing) and renewed in recency, as the read
+  /// will be.  A key reported held here cannot be evicted before the lease ends
+  /// on DRAM/HBM; SSD only renews recency.  A key held only by another node is
+  /// reported as it is to BatchExists but is not protected.  A caller that
+  /// finds a key missing here should shrink its hit to what it can read.  The
+  /// default only checks existence.
+  virtual std::vector<bool> BatchLease(const std::vector<std::string>& keys, uint32_t /*ttl_ms*/) {
+    return BatchExists(keys);
+  }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

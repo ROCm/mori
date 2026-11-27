@@ -913,8 +913,9 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   EXPECT_EQ(offers.size(), 2u);
 }
 
-// A client loads what its lookup found seconds later; evicting it in between fails the load.
-TEST_F(SsdBackendTest, PoolLookupRenewsTheKeysEvictionOrder) {
+// A lookup changes nothing; the lease a client takes on what it will load
+// renews that key's order, the only protection a medium without leases has.
+TEST_F(SsdBackendTest, PoolLeaseRenewsTheKeysEvictionOrder) {
   SsdBackend* ssd = Start();
   ASSERT_TRUE(Put(ssd, "a", Payload(1024, 1)));
   ASSERT_TRUE(Put(ssd, "b", Payload(1024, 2)));
@@ -923,7 +924,13 @@ TEST_F(SsdBackendTest, PoolLookupRenewsTheKeysEvictionOrder) {
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
   ASSERT_TRUE(pool.BatchContains({"a"})[0]);
-  const auto offers = ssd->EvictionCandidates(10);
+  auto offers = ssd->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 2u);
+  EXPECT_EQ(offers[0].key, "a");
+
+  EXPECT_EQ(pool.BatchLease({"a", "missing"}, std::chrono::milliseconds(60000)),
+            (std::vector<bool>{true, false}));
+  offers = ssd->EvictionCandidates(10);
   ASSERT_EQ(offers.size(), 2u);
   EXPECT_EQ(offers[0].key, "b");
 }
