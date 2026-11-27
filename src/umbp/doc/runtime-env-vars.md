@@ -191,6 +191,23 @@ operators can find them in one place.
 
 ---
 
+## Host memory registered for GPU access
+
+Read by any process that hosts a DRAM medium (`umbp_standalone_server`, an
+embedded client). The store's DRAM buffers, and the ranged scratch arenas, are
+registered with the GPU runtime (`hipHostRegister`) so that copies between
+them and GPU memory take the pinned path and the gather kernel. A piece that
+is not registered is still used: a copy touching it takes the pageable path,
+and the gather kernel is never pointed at it.
+
+| Env var | Default | Description |
+|---|---|---|
+| `UMBP_DRAM_HOST_REGISTER` | on | `0` / `off` / `false`: register nothing. |
+| `UMBP_DRAM_HOST_REGISTER_CHUNK_MB` | `1024` | Size of the pieces a region is registered in (a power of two of at least 2 MiB; `0`: each region whole). Pieces are cut at absolute multiples of it. |
+| `UMBP_DRAM_HOST_REGISTER_MAX_MB` | unset: no limit | The most host memory the process registers, over every region. Regions take their share in the order they are declared -- the medium's buffers in index order, then the scratch arenas -- each from its lowest address up in whole pieces: the first regions are registered whole, one region up to the last piece that fits, and the rest not at all. For a store larger than the host can register next to an engine that registers host memory of its own. The page allocator fills the lowest buffer that has room first, so the registered part is what the store uses first and reuses first; the unregistered tail takes what does not fit there. Each region still logs its `host memory registered for GPU access` line, with `N MiB left unregistered (UMBP_DRAM_HOST_REGISTER_MAX_MB)` when the limit cut it short. `0` is no limit. |
+
+---
+
 ## L1 pools over the store
 
 Read by `umbp_standalone_server`. The L1 pool manager manages HBM only. With

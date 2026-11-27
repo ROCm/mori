@@ -101,6 +101,9 @@ class HbmCopyEngine final : public TransferEngine {
   // is the only layer that sees the segment shape a copy actually decomposes
   // into, which is what decides whether a kernel beats the copy engine.
   void AddHostGatherRegion(void* base, size_t bytes);
+  // The same against `budget` instead of the process's limit on registered
+  // host memory (UMBP_DRAM_HOST_REGISTER_MAX_MB); for tests.
+  void AddHostGatherRegion(void* base, size_t bytes, HostRegistrationBudget* budget);
   void ClearHostGatherRegions();
 
   // Both endpoints addressable in this process, at least one of them GPU.
