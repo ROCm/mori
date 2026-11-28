@@ -451,6 +451,7 @@ add_library(
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp
+  standalone/l1_backing_store.cpp
   standalone/standalone_process_client.cpp
   standalone/standalone_server.cpp)
 add_dependencies(umbp_common umbp_workload_proto)

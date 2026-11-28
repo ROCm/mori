@@ -23,6 +23,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -50,8 +51,10 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
   grpc::Status Attach(grpc::ServerContext*, const pb::AttachRequest* request,
                       pb::AttachResponse* response) override {
     ExternalMemory external{request->external_handle(), request->external_offset()};
+    // A caller that knows nothing of parts sends 0 of 0: the whole pool.
+    const PartSpec part{request->part(), std::max<uint32_t>(request->num_parts(), 1)};
     AttachResult result = manager_->Attach(request->pool_id(), request->group(), request->device(),
-                                           request->bytes(), external);
+                                           request->bytes(), external, part);
     SetStatus(result.status, response);
     response->set_handle_kind(result.memory.kind);
     response->set_handle(result.memory.handle);
@@ -68,7 +71,7 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
     for (const pb::Region& region : request->regions()) {
       layout.regions.push_back(Region{region.offset(), region.unit_bytes()});
     }
-    SetStatus(manager_->BindLayout(request->pool_id(), layout), response);
+    SetStatus(manager_->BindLayout(request->pool_id(), layout, request->part()), response);
     return grpc::Status::OK;
   }
 
@@ -118,7 +121,8 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
 
   grpc::Status Commit(grpc::ServerContext*, const pb::CommitRequest* request,
                       pb::StatusResponse* response) override {
-    SetStatus(manager_->Commit(request->pool_id(), request->committed()), response);
+    SetStatus(manager_->Commit(request->pool_id(), request->committed(), request->part()),
+              response);
     return grpc::Status::OK;
   }
 
@@ -168,6 +172,12 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
       out->set_fetched_in_bytes(stats.fetched_in_bytes);
       out->set_served_out_slots(stats.served_out_slots);
       out->set_copy_micros(stats.copy_micros);
+      out->set_parts(stats.parts);
+      out->set_written_back_slots(stats.written_back_slots);
+      out->set_written_ahead_slots(stats.written_ahead_slots);
+      out->set_loaded_slots(stats.loaded_slots);
+      out->set_lost_slots(stats.lost_slots);
+      out->set_tier_micros(stats.tier_micros);
     }
     return grpc::Status::OK;
   }
@@ -235,7 +245,8 @@ L1Client::L1Client(const std::string& address) : impl_(std::make_unique<Impl>(ad
 L1Client::~L1Client() = default;
 
 AttachResult L1Client::Attach(const std::string& pool_id, const std::string& group, int device,
-                              uint64_t bytes, const ExternalMemory& external) {
+                              uint64_t bytes, const ExternalMemory& external,
+                              const PartSpec& part) {
   pb::AttachRequest request;
   request.set_pool_id(pool_id);
   request.set_group(group);
@@ -243,6 +254,8 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
   request.set_bytes(bytes);
   request.set_external_handle(external.handle);
   request.set_external_offset(external.offset);
+  request.set_part(part.index);
+  request.set_num_parts(part.count);
   pb::AttachResponse response;
   // A long deadline: the server allocates and zero-fills the whole pool.
   grpc::ClientContext context;
@@ -258,9 +271,10 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
   return result;
 }
 
-Status L1Client::BindLayout(const std::string& pool_id, const Layout& layout) {
+Status L1Client::BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part) {
   pb::BindLayoutRequest request;
   request.set_pool_id(pool_id);
+  request.set_part(part);
   request.set_num_slots(layout.num_slots);
   for (const Region& region : layout.regions) {
     pb::Region* out = request.add_regions();
@@ -301,9 +315,10 @@ AllocateResult L1Client::Allocate(const std::string& pool_id, uint32_t count, ui
   return result;
 }
 
-Status L1Client::Commit(const std::string& pool_id, uint64_t committed) {
+Status L1Client::Commit(const std::string& pool_id, uint64_t committed, uint32_t part) {
   pb::CommitRequest request;
   request.set_pool_id(pool_id);
+  request.set_part(part);
   request.set_committed(committed);
   pb::StatusResponse response;
   grpc::ClientContext context;
@@ -390,6 +405,12 @@ Status L1Client::Stats(std::vector<PoolStats>* out) {
     stats.fetched_in_bytes = in.fetched_in_bytes();
     stats.served_out_slots = in.served_out_slots();
     stats.copy_micros = in.copy_micros();
+    stats.parts = std::max<uint32_t>(in.parts(), 1);
+    stats.written_back_slots = in.written_back_slots();
+    stats.written_ahead_slots = in.written_ahead_slots();
+    stats.loaded_slots = in.loaded_slots();
+    stats.lost_slots = in.lost_slots();
+    stats.tier_micros = in.tier_micros();
     out->push_back(std::move(stats));
   }
   return Status{};

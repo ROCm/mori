@@ -22,17 +22,21 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "umbp/l1/l1_pool.h"
@@ -69,6 +73,7 @@ class RecordingApi final : public MemoryApi {
   bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
               std::string* error) override {
     if (!host_->Import(device, handle, offset, base, mapped, error)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
     bases[device] = static_cast<uint8_t*>(*base);
     return true;
   }
@@ -93,8 +98,9 @@ class RecordingApi final : public MemoryApi {
   }
 
   std::map<int, uint8_t*> bases;
-  int copies = 0;
-  int synchronizes = 0;
+  // Counted from several threads: a pool's parts copy side by side.
+  std::atomic<int> copies{0};
+  std::atomic<int> synchronizes{0};
   int frees = 0;
   int unimports = 0;
   int allocations = 0;
@@ -125,6 +131,11 @@ class L1PoolTest : public ::testing::Test {
   void SetUp() override {
     api = std::make_shared<RecordingApi>();
     manager = std::make_unique<PoolManager>(api);
+    BringPools();
+  }
+
+  // Pools p0 and p1 of group "g", attached, bound and opened.
+  void BringPools() {
     for (int device : {0, 1}) {
       const std::string id = "p" + std::to_string(device);
       ASSERT_TRUE(manager->Attach(id, "g", device, kBytes).status.ok);
@@ -807,6 +818,930 @@ TEST_F(L1PoolTest, TwoAttachesReplacingABusyPoolAllocateItOnce) {
   EXPECT_EQ(StatsOf("p1").bytes, 2 * kBytes);
 }
 
+// A pool of two parts, as an engine rank with tensor-parallel attention has:
+// slot i is on both devices, a different shard on each, in a different layout.
+constexpr uint64_t kUnitC = 8;
+constexpr uint64_t kBytesC = kSlots * kUnitC;
+
+Layout ShardLayout() {
+  Layout layout;
+  layout.num_slots = kSlots;
+  layout.regions = {Region{0, kUnitC}};
+  return layout;
+}
+
+class L1PartsTest : public L1PoolTest {
+ protected:
+  // Pool r<rank>: part 0 on device 10 * rank + 10, part 1 on the next device.
+  static int Device(int rank, uint32_t part) { return 10 * rank + 10 + static_cast<int>(part); }
+  static std::string Id(int rank) { return "r" + std::to_string(rank); }
+
+  Status AttachPart(int rank, uint32_t part) {
+    return manager
+        ->Attach(Id(rank), "tp", Device(rank, part), part == 0 ? kBytes : kBytesC, {},
+                 PartSpec{part, 2})
+        .status;
+  }
+  void Bring(int rank) {
+    for (uint32_t part : {0u, 1u}) {
+      ASSERT_TRUE(AttachPart(rank, part).ok);
+      ASSERT_TRUE(manager->BindLayout(Id(rank), part == 0 ? TestLayout() : ShardLayout(), part).ok);
+    }
+    ASSERT_EQ(manager->Open(Id(rank)).num_slots, kSlots);
+  }
+  void FillShard(int rank, uint32_t slot, uint8_t value) {
+    std::memset(api->bases[Device(rank, 1)] + slot * kUnitC, value, kUnitC);
+  }
+  bool ShardHolds(int rank, uint32_t slot, uint8_t value) {
+    const uint8_t* c = api->bases[Device(rank, 1)] + slot * kUnitC;
+    for (uint64_t i = 0; i < kUnitC; ++i) {
+      if (c[i] != value) return false;
+    }
+    return true;
+  }
+  // Allocate one slot of r<rank>, write both parts of it, publish and release.
+  uint32_t CacheOne(int rank, const std::string& key, uint8_t value, uint64_t stamp = 0) {
+    AllocateResult got = manager->Allocate(Id(rank), 1);
+    EXPECT_EQ(got.slots.size(), 1u);
+    Fill(Device(rank, 0), got.slots[0], value);
+    FillShard(rank, got.slots[0], static_cast<uint8_t>(value + 50));
+    EXPECT_TRUE(manager
+                    ->Apply(Id(rank),
+                            {Op{OpKind::kPublish, got.slots[0], key},
+                             Op{OpKind::kRelease, got.slots[0], ""}},
+                            stamp)
+                    .ok);
+    return got.slots[0];
+  }
+};
+
+TEST_F(L1PartsTest, APoolServesOnlyOnceEveryPartIsBound) {
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  EXPECT_FALSE(manager->Allocate("r0", 1).status.ok);
+  // A layout for a part that has not arrived is refused, not remembered.
+  EXPECT_FALSE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+  const PoolStats stats = StatsOf("r0");
+  EXPECT_EQ(stats.parts, 2u);
+  EXPECT_EQ(stats.bytes, kBytes + kBytesC);
+  EXPECT_EQ(stats.device, Device(0, 0));
+}
+
+TEST_F(L1PartsTest, PartsMayArriveInAnyOrder) {
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+}
+
+TEST_F(L1PartsTest, AttachRejectsAPartOutsideItsCount) {
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{2, 2}).status.ok);
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, 0}).status.ok);
+  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, PoolManager::kMaxParts + 1})
+                   .status.ok);
+}
+
+TEST_F(L1PartsTest, EveryPartDeclaresTheSameSlotCount) {
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(AttachPart(0, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  Layout fewer = ShardLayout();
+  fewer.num_slots = kSlots - 1;
+  EXPECT_FALSE(manager->BindLayout("r0", fewer, 1).ok);
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+}
+
+TEST_F(L1PartsTest, FetchCopiesEveryPartOfASlotToTheSamePart) {
+  Bring(0);
+  Bring(1);
+  CacheOne(1, "filler", 90);  // so the slot numbers of the two pools differ
+  const uint32_t src = CacheOne(0, "k", 7);
+  FetchResult fetched = manager->Fetch("r1", {"k"});
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  const uint32_t dst = fetched.slots[0];
+  EXPECT_NE(dst, src);
+  EXPECT_TRUE(Holds(Device(1, 0), dst, 7));
+  EXPECT_TRUE(ShardHolds(1, dst, 57));
+  EXPECT_EQ(fetched.copied_slots, 1u);
+  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
+  EXPECT_EQ(StatsOf("r1").fetched_in_bytes, kUnitA + kUnitB + kUnitC);
+}
+
+TEST_F(L1PartsTest, FetchIntoHeldSlotsFillsEveryPart) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "a", 3);
+  CacheOne(0, "b", 4);
+  AllocateResult held = manager->Allocate("r1", 2);
+  ASSERT_EQ(held.slots.size(), 2u);
+  FetchOptions into;
+  into.dst_slots = held.slots;
+  FetchResult fetched = manager->Fetch("r1", {"a", "b"}, into);
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_TRUE(Holds(Device(1, 0), held.slots[0], 3));
+  EXPECT_TRUE(ShardHolds(1, held.slots[0], 53));
+  EXPECT_TRUE(Holds(Device(1, 0), held.slots[1], 4));
+  EXPECT_TRUE(ShardHolds(1, held.slots[1], 54));
+}
+
+TEST_F(L1PartsTest, ASlotSettlesOnlyWhenEveryPartHasCommitted) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7, /*stamp=*/500);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 500, 0).ok);
+  // Part 1's device may still be writing its shard of the slot.
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 499, 1).ok);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
+  ASSERT_TRUE(manager->Commit("r0", 500, 1).ok);
+  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
+  EXPECT_FALSE(manager->Commit("r0", 600, 2).ok);
+}
+
+TEST_F(L1PartsTest, APartThatFailsToCopyLeavesNothingBehind) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7);
+  api->fail_copies = true;
+  FetchResult failed = manager->Fetch("r1", {"k"});
+  EXPECT_TRUE(failed.slots.empty());
+  EXPECT_EQ(failed.copied_bytes, 0u);
+  EXPECT_EQ(StatsOf("r1").vacant, kSlots);
+  api->fail_copies = false;
+  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
+}
+
+TEST_F(L1PartsTest, PoolsWithADifferentNumberOfPartsDoNotExchangeSlots) {
+  Bring(0);
+  // One part, in the same group and with part 0's layout.
+  ASSERT_TRUE(manager->Attach("single", "tp", 30, kBytes).status.ok);
+  ASSERT_TRUE(manager->BindLayout("single", TestLayout()).ok);
+  ASSERT_EQ(manager->Open("single").num_slots, kSlots);
+  CacheOne(0, "k", 7);
+  EXPECT_TRUE(manager->Fetch("single", {"k"}).slots.empty());
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("single", {"k"}, probe).available, 0u);
+}
+
+TEST_F(L1PartsTest, GroupChecksSlotSizesPartByPart) {
+  Bring(0);
+  ASSERT_TRUE(AttachPart(1, 0).ok);
+  ASSERT_TRUE(AttachPart(1, 1).ok);
+  ASSERT_TRUE(manager->BindLayout("r1", TestLayout(), 0).ok);
+  // Part 0's layout is not part 1's.
+  ASSERT_TRUE(manager->Attach("r2", "tp", 41, kBytes, {}, PartSpec{1, 2}).status.ok);
+  EXPECT_FALSE(manager->BindLayout("r2", TestLayout(), 1).ok);
+  EXPECT_TRUE(manager->BindLayout("r1", ShardLayout(), 1).ok);
+}
+
+TEST_F(L1PartsTest, APartAttachedWithAnotherShapeReplacesTheWholePool) {
+  Bring(0);
+  Bring(1);
+  CacheOne(0, "k", 7);
+  const int frees = api->frees;
+  // The rank restarted: its first part comes back larger.
+  ASSERT_TRUE(manager->Attach("r0", "tp", Device(0, 1), 2 * kBytesC, {}, PartSpec{1, 2}).status.ok);
+  EXPECT_EQ(api->frees, frees + 2);  // both parts of the old pool
+  EXPECT_FALSE(manager->Open("r0").status.ok);
+  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());  // its content went with it
+  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
+  ASSERT_TRUE(AttachPart(0, 0).ok);
+  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
+  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
+  // The same part again, unchanged: the pool stays.
+  AttachResult again = manager->Attach("r0", "tp", Device(0, 0), kBytes, {}, PartSpec{0, 2});
+  EXPECT_TRUE(again.status.ok);
+  EXPECT_FALSE(again.created);
+}
+
+TEST_F(L1PartsTest, DetachReleasesEveryPart) {
+  Bring(0);
+  const int frees = api->frees;
+  ASSERT_TRUE(manager->Detach("r0").ok);
+  EXPECT_EQ(api->frees, frees + 2);
+  EXPECT_TRUE(manager->Detach("r0").ok);  // the rank's other runner detaching the same pool
+  EXPECT_EQ(api->frees, frees + 2);
+}
+
+// A backing store over a map: what the pools ask of it is counted, and a test
+// decides what it refuses, drops and how much it holds.
+class FakeStore final : public BackingStore {
+ public:
+  bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (refuse_memory) {
+      *error = "injected";
+      return false;
+    }
+    memory_[static_cast<uint8_t*>(base)] = {bytes, device};
+    ++adds;
+    return true;
+  }
+  void RemoveMemory(void* base) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    memory_.erase(static_cast<uint8_t*>(base));
+    ++removes;
+  }
+
+  std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) override {
+    if (on_call) on_call();
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++write_calls;
+    largest_write = std::max(largest_write, blocks.size());
+    std::vector<bool> stored(blocks.size(), false);
+    for (size_t i = 0; i < blocks.size(); ++i) {
+      const Block& block = blocks[i];
+      fragments_of_last_block = block.fragments.size();
+      if (refuse_writes || !InsideMemoryLocked(block)) continue;
+      const std::string name = space + '\n' + block.key;
+      stored[i] = true;
+      if (objects_.count(name) != 0) continue;  // already there: nothing is copied
+      std::vector<uint8_t> bytes;
+      for (const Fragment& f : block.fragments) {
+        const auto* at = static_cast<const uint8_t*>(f.address);
+        bytes.insert(bytes.end(), at, at + f.bytes);
+      }
+      objects_[name] = std::move(bytes);
+      order_.push_back(name);
+      ++written;
+      // Room for `capacity` objects: the oldest goes, as a store's eviction would.
+      while (capacity != 0 && order_.size() > capacity) {
+        objects_.erase(order_.front());
+        order_.pop_front();
+      }
+    }
+    return stored;
+  }
+
+  std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) override {
+    if (on_call) on_call();
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++read_calls;
+    std::vector<bool> filled(blocks.size(), false);
+    for (size_t i = 0; i < blocks.size(); ++i) {
+      const Block& block = blocks[i];
+      const auto found = objects_.find(space + '\n' + block.key);
+      if (found == objects_.end() || !InsideMemoryLocked(block)) continue;
+      uint64_t total = 0;
+      for (const Fragment& f : block.fragments) total += f.bytes;
+      if (total != found->second.size()) continue;
+      const uint8_t* from = found->second.data();
+      for (const Fragment& f : block.fragments) {
+        std::memcpy(f.address, from, f.bytes);
+        from += f.bytes;
+      }
+      filled[i] = true;
+      ++read;
+    }
+    return filled;
+  }
+
+  std::vector<bool> Contains(const std::string& space,
+                             const std::vector<std::string>& keys) override {
+    if (on_call) on_call();
+    std::vector<bool> found(keys.size(), false);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++lookups;
+      for (size_t i = 0; i < keys.size(); ++i) {
+        found[i] = objects_.count(space + '\n' + keys[i]) != 0;
+      }
+    }
+    if (after_lookup) after_lookup();
+    return found;
+  }
+
+  // The store evicts `key`, in whichever space it is.
+  void Drop(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = objects_.begin(); it != objects_.end();) {
+      const bool match = it->first.substr(it->first.find('\n') + 1) == key;
+      if (match) order_.erase(std::find(order_.begin(), order_.end(), it->first));
+      it = match ? objects_.erase(it) : std::next(it);
+    }
+  }
+  size_t Objects() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return objects_.size();
+  }
+  size_t Spaces() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::set<std::string> spaces;
+    for (const auto& object : objects_) {
+      spaces.insert(object.first.substr(0, object.first.find('\n')));
+    }
+    return spaces.size();
+  }
+  std::vector<uint8_t> Object(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& object : objects_) {
+      if (object.first.substr(object.first.find('\n') + 1) == key) return object.second;
+    }
+    return {};
+  }
+  size_t Regions() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return memory_.size();
+  }
+
+  std::atomic<int> adds{0};
+  std::atomic<int> removes{0};
+  std::atomic<int> write_calls{0};
+  std::atomic<int> read_calls{0};
+  std::atomic<int> lookups{0};
+  std::atomic<int> written{0};  // objects copied in; a key already there is not
+  std::atomic<int> read{0};
+  size_t largest_write = 0;
+  size_t fragments_of_last_block = 0;
+  size_t capacity = 0;  // objects; 0: no bound
+  bool refuse_memory = false;
+  bool refuse_writes = false;
+  std::function<void()> on_call;       // on entry to Write, Read and Contains
+  std::function<void()> after_lookup;  // once Contains has its answer
+
+ private:
+  // Every fragment lies in memory a pool registered: the store is never
+  // handed an address it was not told about.
+  bool InsideMemoryLocked(const Block& block) const {
+    for (const Fragment& f : block.fragments) {
+      const auto* at = static_cast<const uint8_t*>(f.address);
+      auto region = memory_.upper_bound(const_cast<uint8_t*>(at));
+      if (region == memory_.begin()) return false;
+      --region;
+      if (at + f.bytes > region->first + region->second.first) return false;
+    }
+    return true;
+  }
+
+  std::mutex mutex_;
+  std::map<uint8_t*, std::pair<uint64_t, int>> memory_;
+  std::map<std::string, std::vector<uint8_t>> objects_;
+  std::deque<std::string> order_;
+};
+
+// A store under the pools: the last L1 copy of a key is written there when its
+// slot is taken, and a fetch finds it there when no pool holds it.
+class L1StoreTest : public L1PoolTest {
+ protected:
+  void SetUp() override {}  // each test brings its own store
+
+  static constexpr uint64_t kSlotBytes = kUnitA + kUnitB;
+
+  void Bring(double ahead = 0.0, bool write_at_eviction = true) {
+    api = std::make_shared<RecordingApi>();
+    store = std::make_shared<FakeStore>();
+    manager = std::make_unique<PoolManager>(api);
+    BackingStoreOptions options;
+    options.ahead = ahead;
+    options.write_at_eviction = write_at_eviction;
+    options.threads = 2;
+    manager->SetBackingStore(store, options);
+    L1PoolTest::BringPools();
+  }
+
+  template <typename Fn>
+  static bool Eventually(Fn&& done) {
+    for (int i = 0; i < 5000; ++i) {
+      if (done()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  }
+
+  // Take every slot of the pool, which evicts all it caches, and give the
+  // slots back empty.
+  void EvictAll(int device) {
+    const std::string id = "p" + std::to_string(device);
+    AllocateResult got = manager->Allocate(id, kSlots);
+    ASSERT_EQ(got.slots.size(), kSlots);
+    std::vector<Op> ops;
+    for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+    ASSERT_TRUE(manager->Apply(id, ops).ok);
+  }
+
+  uint64_t Written() { return StatsOf("p0").written_back_slots + StatsOf("p1").written_back_slots; }
+
+  std::shared_ptr<FakeStore> store;
+};
+
+TEST_F(L1StoreTest, ContentAnEngineJustComputedIsNotWrittenToTheStore) {
+  Bring();
+  Cache(0, {"a", "b", "c"}, 1);
+  EXPECT_EQ(store->write_calls, 0);
+  EXPECT_EQ(Written(), 0u);
+}
+
+TEST_F(L1StoreTest, AnEvictedLastCopyGoesToTheStoreAndComesBackOnFetch) {
+  Bring();
+  Cache(0, {"a", "b"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 2u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
+  EXPECT_EQ(store->write_calls, 1) << "the slots one call evicts go out together";
+  // One object a slot: its regions end to end.
+  std::vector<uint8_t> expected(kUnitA, 1);
+  expected.insert(expected.end(), kUnitB, 101);
+  EXPECT_EQ(store->Object("a"), expected);
+  std::memset(api->bases[0], 0xEE, kBytes);  // the engine has since reused its pool
+  FetchResult fetched = manager->Fetch("p1", {"a", "b", "missing"});
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  ASSERT_EQ(fetched.slots.size(), 2u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
+  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_EQ(fetched.copied_bytes, 2 * kSlotBytes);
+  EXPECT_EQ(StatsOf("p1").loaded_slots, 2u);
+  EXPECT_EQ(store->read_calls, 1);
+  // The pool that evicted it finds it there too.
+  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
+}
+
+TEST_F(L1StoreTest, ACopyAnotherPoolStillHoldsIsDroppedNotWritten) {
+  Bring();
+  Cache(0, {"a"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // two pools hold "a"
+  EvictAll(0);
+  EXPECT_EQ(Written(), 0u);
+  EXPECT_EQ(store->write_calls, 0);
+  // p1's is the last copy in L1 now: that one goes to the store.
+  EvictAll(1);
+  EXPECT_EQ(StatsOf("p1").written_back_slots, 1u);
+  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
+}
+
+TEST_F(L1StoreTest, WithTwoCopiesToKeepOnlyTheLastOneLeftIsWritten) {
+  Bring();
+  manager->SetEvictionPolicy(2);
+  Cache(0, {"a"}, 1);
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);
+  EvictAll(0);
+  EXPECT_EQ(Written(), 0u) << "p1 still holds it";
+  EvictAll(1);
+  EXPECT_EQ(Written(), 1u);
+  EXPECT_EQ(store->written, 1);
+}
+
+TEST_F(L1StoreTest, AKeyLoadedFromTheStoreIsNotWrittenAgain) {
+  Bring();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // back in L1, still in the store
+  EvictAll(1);
+  EXPECT_EQ(Written(), 1u);
+  EXPECT_EQ(store->write_calls, 1);
+  EXPECT_EQ(StatsOf("p1").lost_slots, 0u);
+}
+
+TEST_F(L1StoreTest, FetchIntoHeldSlotsFillsThemFromTheStore) {
+  Bring();
+  Cache(0, {"a", "b"}, 5);
+  EvictAll(0);
+  AllocateResult held = manager->Allocate("p1", 2);
+  FetchOptions into;
+  into.dst_slots = held.slots;
+  FetchResult fetched = manager->Fetch("p1", {"a", "b"}, into);
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  EXPECT_EQ(fetched.copied_slots, 2u);
+  EXPECT_TRUE(Holds(1, held.slots[0], 5));
+  EXPECT_TRUE(Holds(1, held.slots[1], 6));
+  EXPECT_EQ(StatsOf("p1").loaded_slots, 2u);
+}
+
+TEST_F(L1StoreTest, AProbeCountsWhatTheStoreHoldsAndCopiesNothing) {
+  Bring();
+  Cache(0, {"a", "b"}, 5);
+  EvictAll(0);         // "a" and "b" are in the store only
+  Cache(0, {"c"}, 7);  // "c" is in p0 only
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("p1", {"a", "b", "c", "missing", "a"}, probe).available, 3u);
+  EXPECT_EQ(store->lookups, 1) << "one lookup for the keys no pool holds";
+  EXPECT_EQ(store->read_calls, 0);
+  // Keys the pools hold are not asked about at all.
+  EXPECT_EQ(manager->Fetch("p1", {"c"}, probe).available, 1u);
+  EXPECT_EQ(store->lookups, 1);
+}
+
+TEST_F(L1StoreTest, AFetchTakesWhatPoolsHoldFromThemAndTheRestFromTheStore) {
+  Bring();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);         // "a" is in the store only
+  Cache(0, {"b"}, 2);  // "b" is in p0 only
+  FetchResult fetched = manager->Fetch("p1", {"a", "b"});
+  ASSERT_EQ(fetched.slots.size(), 2u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
+  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
+  EXPECT_EQ(fetched.copied_bytes, 2 * kSlotBytes);
+  EXPECT_EQ(StatsOf("p1").loaded_slots, 1u);
+  EXPECT_EQ(StatsOf("p0").served_out_slots, 1u);
+}
+
+TEST_F(L1StoreTest, WhatTheStoreKeepsIsTheStoresDecision) {
+  Bring();
+  store->capacity = 4;
+  Cache(0, {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 8u);
+  EXPECT_EQ(store->Objects(), 4u);
+  // The pools kept no index of their own to disagree with the store's.
+  EXPECT_TRUE(manager->Fetch("p1", {"a0"}).slots.empty());
+  FetchResult kept = manager->Fetch("p1", {"a4", "a7"});
+  ASSERT_EQ(kept.slots.size(), 2u);
+  EXPECT_TRUE(Holds(1, kept.slots[0], 5));
+  EXPECT_TRUE(Holds(1, kept.slots[1], 8));
+}
+
+TEST_F(L1StoreTest, AKeyTheStoreDropsBeforeItIsReadEndsTheFetchThere) {
+  Bring();
+  Cache(0, {"a", "b", "c", "d"}, 1);
+  EvictAll(0);
+  store->after_lookup = [&] { store->Drop("b"); };  // evicted between lookup and read
+  FetchResult fetched = manager->Fetch("p1", {"a", "b", "c"});
+  store->after_lookup = nullptr;
+  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
+  EXPECT_EQ(fetched.copied_slots, 1u);
+  EXPECT_EQ(fetched.copied_bytes, kSlotBytes);
+  // The slots taken for "b" and "c" are free again, and nothing is pinned.
+  EXPECT_EQ(StatsOf("p1").cached, 1u);
+  EXPECT_EQ(StatsOf("p1").vacant, kSlots - 1);
+  // Into held slots, the same: the leading keys that landed.
+  store->after_lookup = [&] { store->Drop("d"); };
+  AllocateResult held = manager->Allocate("p0", 2);
+  FetchOptions into;
+  into.dst_slots = held.slots;
+  FetchResult filled = manager->Fetch("p0", {"c", "d"}, into);
+  store->after_lookup = nullptr;
+  EXPECT_EQ(filled.slots.size(), 1u);
+  EXPECT_EQ(filled.copied_slots, 1u);
+  EXPECT_TRUE(Holds(0, held.slots[0], 3));
+  // What the store still has is still served.
+  EXPECT_EQ(manager->Fetch("p1", {"c"}).slots.size(), 1u);
+}
+
+TEST_F(L1StoreTest, WritingAheadLeavesTheEvictionNothingToWrite) {
+  Bring(/*ahead=*/1.0);
+  Cache(0, {"a", "b", "c"}, 1);
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 3; }));
+  const int calls = store->write_calls;
+  EvictAll(0);
+  EXPECT_EQ(store->write_calls, calls);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
+  FetchResult fetched = manager->Fetch("p1", {"a", "b", "c"});
+  ASSERT_EQ(fetched.slots.size(), 3u);
+  EXPECT_TRUE(Holds(1, fetched.slots[2], 3));
+}
+
+TEST_F(L1StoreTest, AKeyWrittenAheadIsNotWrittenAgainByThePoolThatEvictsItsLastCopy) {
+  Bring(/*ahead=*/1.0);
+  Cache(0, {"a"}, 1);
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 1; }));
+  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // p1 holds a copy as well
+  EvictAll(0);                                              // a spare copy: dropped
+  EvictAll(1);  // the last copy, of a key the store was already given
+  EXPECT_EQ(Written(), 0u);
+  EXPECT_EQ(store->written, 1);
+  EXPECT_EQ(StatsOf("p1").lost_slots, 0u);
+}
+
+TEST_F(L1StoreTest, WritingAheadSkipsWhatItsOwnerIsStillWriting) {
+  Bring(/*ahead=*/1.0);
+  AllocateResult got = manager->Allocate("p0", 1);
+  ASSERT_TRUE(manager
+                  ->Apply("p0",
+                          {Op{OpKind::kPublish, got.slots[0], "late"},
+                           Op{OpKind::kRelease, got.slots[0], ""}},
+                          /*stamp=*/900)
+                  .ok);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_EQ(StatsOf("p0").written_ahead_slots, 0u);
+  Fill(0, got.slots[0], 9);  // the forward lands
+  ASSERT_TRUE(manager->Commit("p0", 900).ok);
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 1; }));
+  EvictAll(0);
+  FetchResult fetched = manager->Fetch("p1", {"late"});
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(1, fetched.slots[0], 9));
+}
+
+TEST_F(L1StoreTest, AnEvictedSlotItsOwnerIsStillWritingIsLostNotWritten) {
+  Bring();
+  AllocateResult got = manager->Allocate("p0", 1);
+  ASSERT_TRUE(manager
+                  ->Apply("p0",
+                          {Op{OpKind::kPublish, got.slots[0], "late"},
+                           Op{OpKind::kRelease, got.slots[0], ""}},
+                          /*stamp=*/900)
+                  .ok);
+  EvictAll(0);  // before the owner's Commit reaches the stamp
+  EXPECT_EQ(store->write_calls, 0);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 1u);
+}
+
+TEST_F(L1StoreTest, AnEvictionThatMayNotWaitForTheStoreLosesWhatWasNotWrittenAhead) {
+  Bring(/*ahead=*/0.0, /*write_at_eviction=*/false);
+  Cache(0, {"a", "b"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(store->write_calls, 0);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 2u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1StoreTest, AWriteTheStoreRefusesLosesTheContentAndSaysSo) {
+  Bring();
+  Cache(0, {"a"}, 1);
+  store->refuse_writes = true;
+  EvictAll(0);
+  store->refuse_writes = false;
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 1u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1StoreTest, ClearingAPoolPutsWhatItsGroupWroteOutOfReach) {
+  Bring(/*ahead=*/1.0);
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  Cache(1, {"kept"}, 4);  // p1 has it written ahead, and still holds it
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p1").written_ahead_slots == 1; }));
+  ASSERT_EQ(store->Objects(), 2u);
+  ASSERT_TRUE(manager->Clear("p0").ok);
+  // The store cannot delete: the objects are still there, and not found.
+  EXPECT_EQ(store->Objects(), 2u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("p0", {"a"}, probe).available, 0u);
+  // What the group still holds in L1 is written again, where it now looks.
+  ASSERT_TRUE(Eventually([&] { return StatsOf("p1").written_ahead_slots == 2; }));
+  EXPECT_EQ(store->Spaces(), 2u);
+  EvictAll(1);
+  FetchResult fetched = manager->Fetch("p0", {"kept"});
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(0, fetched.slots[0], 4));
+}
+
+TEST_F(L1StoreTest, WithoutAStoreAnEvictedSlotIsGone) {
+  api = std::make_shared<RecordingApi>();
+  manager = std::make_unique<PoolManager>(api);
+  L1PoolTest::BringPools();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
+  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1StoreTest, APoolsMemoryIsMadeKnownToTheStoreWhenItAttachesAndNeverOnACopy) {
+  Bring();
+  EXPECT_EQ(store->adds, 2);  // one allocation a pool
+  EXPECT_EQ(store->Regions(), 2u);
+  Cache(0, {"a", "b"}, 1);
+  EvictAll(0);
+  ASSERT_EQ(manager->Fetch("p1", {"a", "b"}).slots.size(), 2u);
+  EXPECT_EQ(store->adds, 2);
+  EXPECT_EQ(store->removes, 0);
+  ASSERT_TRUE(manager->Detach("p0").ok);
+  EXPECT_EQ(store->removes, 1);
+  manager.reset();
+  EXPECT_EQ(store->removes, 2);
+  EXPECT_EQ(store->Regions(), 0u);
+}
+
+TEST_F(L1StoreTest, APoolTheStoreDidNotTakeKeepsNoEvictedContent) {
+  api = std::make_shared<RecordingApi>();
+  store = std::make_shared<FakeStore>();
+  store->refuse_memory = true;
+  manager = std::make_unique<PoolManager>(api);
+  manager->SetBackingStore(store);
+  L1PoolTest::BringPools();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  EXPECT_EQ(store->write_calls, 0);
+  EXPECT_EQ(store->lookups, 0);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+}
+
+TEST_F(L1StoreTest, EveryStoreCallIsMadeWithoutThePoolsLock) {
+  Bring();
+  // Anything that takes the pool manager's lock: it would never return if a
+  // store call were made with the lock held.
+  int calls = 0;
+  store->on_call = [&] {
+    ++calls;
+    (void)manager->Stats();
+  };
+  Cache(0, {"a", "b"}, 1);
+  EvictAll(0);                                                   // Write
+  ASSERT_EQ(manager->Fetch("p1", {"a", "b"}).slots.size(), 2u);  // Contains, Read
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("p0", {"a", "nope"}, probe).available, 1u);  // Contains
+  EXPECT_EQ(calls, 4);
+  store->on_call = nullptr;
+}
+
+TEST_F(L1StoreTest, AStoppedStoreIsNotWrittenOrReadButStillGetsItsMemoryBack) {
+  Bring();
+  Cache(0, {"a"}, 1);
+  EvictAll(0);
+  manager->StopBackingStore();
+  Cache(0, {"b"}, 2);
+  EvictAll(0);
+  EXPECT_EQ(store->write_calls, 1);
+  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
+  EXPECT_EQ(store->lookups, 0);
+  manager.reset();
+  EXPECT_EQ(store->removes, 2);
+}
+
+// A burst of evictions goes out as a few store calls side by side, and comes
+// back the same way.
+TEST_F(L1StoreTest, ABurstIsSplitOverSeveralStoreCalls) {
+  constexpr uint32_t kMany = 70;
+  constexpr uint64_t kUnit = 8;
+  api = std::make_shared<RecordingApi>();
+  store = std::make_shared<FakeStore>();
+  manager = std::make_unique<PoolManager>(api);
+  BackingStoreOptions options;
+  options.threads = 3;
+  manager->SetBackingStore(store, options);
+  Layout layout;
+  layout.num_slots = kMany;
+  layout.regions = {Region{0, kUnit}};
+  for (int device : {0, 1}) {
+    const std::string id = "big" + std::to_string(device);
+    ASSERT_TRUE(manager->Attach(id, "many", device, kMany * kUnit).status.ok);
+    ASSERT_TRUE(manager->BindLayout(id, layout).ok);
+    ASSERT_EQ(manager->Open(id).num_slots, kMany);
+  }
+  AllocateResult got = manager->Allocate("big0", kMany);
+  ASSERT_EQ(got.slots.size(), kMany);
+  std::vector<Op> ops;
+  std::vector<std::string> keys;
+  for (uint32_t i = 0; i < kMany; ++i) {
+    std::memset(api->bases[0] + got.slots[i] * kUnit, static_cast<int>(i + 1), kUnit);
+    keys.push_back("k" + std::to_string(i));
+    ops.push_back(Op{OpKind::kPublish, got.slots[i], keys.back()});
+  }
+  for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+  ASSERT_TRUE(manager->Apply("big0", ops).ok);
+  ASSERT_EQ(manager->Allocate("big0", kMany).slots.size(), kMany);  // evicts all 70
+  EXPECT_EQ(StatsOf("big0").written_back_slots, kMany);
+  EXPECT_EQ(store->write_calls, 3);
+  EXPECT_EQ(store->largest_write, 24u);  // 24 + 23 + 23
+  FetchResult fetched = manager->Fetch("big1", keys);
+  ASSERT_EQ(fetched.slots.size(), kMany);
+  EXPECT_EQ(store->read_calls, 3);
+  for (uint32_t i = 0; i < kMany; ++i) {
+    const uint8_t* at = api->bases[1] + fetched.slots[i] * kUnit;
+    EXPECT_EQ(at[0], static_cast<uint8_t>(i + 1)) << "key " << i;
+    EXPECT_EQ(at[kUnit - 1], static_cast<uint8_t>(i + 1)) << "key " << i;
+  }
+}
+
+// Two owners caching, evicting, fetching each other's keys and clearing, with
+// the writer ahead running beside them: whatever a fetch returns holds the
+// bytes of its key, wherever they came from, and nothing is left pinned, held
+// or registered that should not be.
+TEST_F(L1StoreTest, OwnersWorkingAtOnceGetTheRightBytesAndLeaveNothingBehind) {
+  Bring(/*ahead=*/0.5);
+  store->capacity = 24;
+  std::atomic<int> published[2] = {{0}, {0}};
+  std::atomic<int> checked{0};
+  std::atomic<int> wrong{0};
+  std::atomic<bool> stop{false};
+  const auto seed_of = [](int index) { return static_cast<uint8_t>(1 + index % 90); };
+  const auto owner = [&](int device) {
+    const std::string id = "p" + std::to_string(device);
+    const char mine = device == 0 ? 'a' : 'b';
+    const char theirs = device == 0 ? 'b' : 'a';
+    uint32_t round = 0;
+    while (!stop.load()) {
+      ++round;
+      // Two new keys of this owner's: evicts its coldest slots once it is full.
+      AllocateResult got = manager->Allocate(id, 2);
+      if (got.slots.size() == 2) {
+        std::vector<Op> ops;
+        for (uint32_t slot : got.slots) {
+          const int index = published[device].load();
+          Fill(device, slot, seed_of(index));
+          ops.push_back(Op{OpKind::kPublish, slot, mine + std::to_string(index)});
+          ops.push_back(Op{OpKind::kRelease, slot, ""});
+          if (!manager->Apply(id, {ops.end() - 2, ops.end()}).ok) ++wrong;
+          published[device].store(index + 1);
+        }
+      } else {
+        std::vector<Op> ops;
+        for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+        (void)manager->Apply(id, ops);
+      }
+      // Two of the other owner's keys, from its pool or from the store.
+      const int known = published[1 - device].load();
+      if (known >= 2) {
+        const int first = static_cast<int>((round * 7919u) % static_cast<uint32_t>(known - 1));
+        const std::vector<std::string> keys = {theirs + std::to_string(first),
+                                               theirs + std::to_string(first + 1)};
+        FetchOptions probe;
+        probe.probe_only = true;
+        (void)manager->Fetch(id, keys, probe);
+        FetchResult fetched = manager->Fetch(id, keys);
+        for (size_t i = 0; i < fetched.slots.size(); ++i) {
+          ++checked;
+          if (!Holds(device, fetched.slots[i], seed_of(first + static_cast<int>(i)))) ++wrong;
+        }
+      }
+      if (device == 0 && round % 64 == 0 && !manager->Clear(id).ok) ++wrong;
+    }
+  };
+  std::thread first(owner, 0);
+  std::thread second(owner, 1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  stop = true;
+  first.join();
+  second.join();
+  EXPECT_EQ(wrong, 0);
+  EXPECT_GT(checked, 0);
+  EXPECT_GT(store->read, 0) << "nothing came back from the store";
+  for (int device : {0, 1}) {
+    const std::string id = "p" + std::to_string(device);
+    // Wait out a write ahead in flight, which pins the slots it copies.
+    ASSERT_TRUE(Eventually([&] {
+      AllocateResult all = manager->Allocate(id, kSlots);
+      std::vector<Op> ops;
+      for (uint32_t slot : all.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
+      EXPECT_TRUE(manager->Apply(id, ops).ok);
+      return all.slots.size() == kSlots;
+    })) << id
+        << " has a slot that is neither free nor evictable";
+    const PoolStats stats = StatsOf(id);
+    EXPECT_EQ(stats.held, 0u);
+    EXPECT_EQ(stats.cached + stats.vacant, kSlots);
+  }
+  manager.reset();
+  EXPECT_EQ(store->Regions(), 0u);
+}
+
+// The store under pools of two parts: a slot is one object, a piece per part.
+TEST_F(L1PartsTest, EveryPartOfAnEvictedSlotGoesToTheStoreAndBack) {
+  api = std::make_shared<RecordingApi>();
+  auto store = std::make_shared<FakeStore>();
+  manager = std::make_unique<PoolManager>(api);
+  manager->SetBackingStore(store);
+  Bring(0);
+  Bring(1);
+  EXPECT_EQ(store->adds, 4);  // each part is an allocation of its own
+  CacheOne(0, "k", 7);
+  AllocateResult all = manager->Allocate("r0", kSlots);  // evicts "k", the last copy
+  ASSERT_EQ(all.slots.size(), kSlots);
+  EXPECT_EQ(StatsOf("r0").written_back_slots, 1u);
+  EXPECT_EQ(store->fragments_of_last_block, 3u);  // two regions of part 0, one of part 1
+  std::vector<uint8_t> expected(kUnitA, 7);
+  expected.insert(expected.end(), kUnitB, 107);
+  expected.insert(expected.end(), kUnitC, 57);
+  EXPECT_EQ(store->Object("k"), expected);
+  std::memset(api->bases[Device(0, 0)], 0xEE, kBytes);
+  std::memset(api->bases[Device(0, 1)], 0xEE, kBytesC);
+  FetchResult fetched = manager->Fetch("r1", {"k"});
+  ASSERT_EQ(fetched.slots.size(), 1u);
+  EXPECT_TRUE(Holds(Device(1, 0), fetched.slots[0], 7));
+  EXPECT_TRUE(ShardHolds(1, fetched.slots[0], 57));
+  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
+  EXPECT_EQ(StatsOf("r1").loaded_slots, 1u);
+}
+
+// A pool of one part and a pool of two do not read each other's slots out of
+// the store either: the bytes of a slot mean something else.
+TEST_F(L1PartsTest, PoolsWithADifferentNumberOfPartsDoNotShareStoreContent) {
+  api = std::make_shared<RecordingApi>();
+  auto store = std::make_shared<FakeStore>();
+  manager = std::make_unique<PoolManager>(api);
+  manager->SetBackingStore(store);
+  Bring(0);
+  ASSERT_TRUE(manager->Attach("single", "tp", 5, kBytes).status.ok);
+  ASSERT_TRUE(manager->BindLayout("single", TestLayout()).ok);
+  ASSERT_EQ(manager->Open("single").num_slots, kSlots);
+  CacheOne(0, "k", 7);
+  ASSERT_EQ(manager->Allocate("r0", kSlots).slots.size(), kSlots);
+  ASSERT_EQ(store->Objects(), 1u);
+  EXPECT_TRUE(manager->Fetch("single", {"k"}).slots.empty());
+  FetchOptions probe;
+  probe.probe_only = true;
+  EXPECT_EQ(manager->Fetch("single", {"k"}, probe).available, 0u);
+}
+
 TEST_F(L1PoolTest, AKeyHeldByManyPoolsIsTrackedThroughEveryHolderComingAndGoing) {
   // Six pools: more holders of one key than an index entry keeps in place.
   const int pools = 6;
@@ -904,6 +1839,28 @@ TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
     EXPECT_EQ(stats[1].fetched_in_slots, 3u);
     EXPECT_TRUE(client.Detach("p0").ok);
     EXPECT_FALSE(client.Open("p0").status.ok);
+    // A pool of two parts: each part attaches, binds and commits by its index.
+    for (const std::string id : {"r0", "r1"}) {
+      for (uint32_t part : {0u, 1u}) {
+        AttachResult attached =
+            client.Attach(id, "tp", 2 + static_cast<int>(part), kBytes, {}, PartSpec{part, 2});
+        ASSERT_TRUE(attached.status.ok) << attached.status.error;
+        EXPECT_EQ(client.Open(id).status.ok, false);
+        ASSERT_TRUE(client.BindLayout(id, TestLayout(), part).ok);
+      }
+      EXPECT_EQ(client.Open(id).num_slots, kSlots);
+    }
+    AllocateResult shard = client.Allocate("r0", 1, 1);
+    ASSERT_TRUE(client.Apply("r0", {Op{OpKind::kPublish, shard.slots[0], "s"}}, 700).ok);
+    ASSERT_TRUE(client.Commit("r0", 700, 0).ok);
+    EXPECT_TRUE(client.Fetch("r1", {"s"}).slots.empty());
+    ASSERT_TRUE(client.Commit("r0", 700, 1).ok);
+    FetchResult both = client.Fetch("r1", {"s"});
+    EXPECT_EQ(both.slots.size(), 1u);
+    EXPECT_EQ(both.copied_bytes, 2 * (kUnitA + kUnitB));
+    ASSERT_TRUE(client.Stats(&stats).ok);
+    ASSERT_EQ(stats.size(), 3u);
+    EXPECT_EQ(stats[1].parts, 2u);
   }
   unlink(path.c_str());
 }

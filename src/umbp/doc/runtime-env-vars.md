@@ -191,6 +191,27 @@ operators can find them in one place.
 
 ---
 
+## L1 pools over the store
+
+Read by `umbp_standalone_server`. The L1 pool manager manages HBM only; with
+the switch below, the last L1 copy of a key is written to **this server's
+store** when its slot is evicted, and read back from it when no pool holds
+the key. The pools have no DRAM of their own: how much is kept, and on which
+node, is the store's configuration (`UMBP_DRAM_CAPACITY`, the master's
+routing), and what the store evicts is gone for the pools too.
+
+| Env var | Default | Description |
+|---|---|---|
+| `UMBP_L1_DRAM_STORE` | `0` | `1`: put the store under the L1 pools. Needs the server's store on the DRAM medium. With a master, also needs the ranged scratch arenas (`UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES`, a shard at least one slot large): a slot the master routes to another node is assembled there before it is sent, and one read from another node is staged there or in this node's DRAM. |
+| `UMBP_L1_DRAM_AHEAD` | `0` | Fraction of each pool's slots (`0`..`1`) whose content -- the cached last copies an eviction takes next -- a background thread keeps already written, so the eviction does not wait for the write. |
+| `UMBP_L1_DRAM_WRITE_AT_EVICTION` | `1` | `0`: an eviction never waits for the store; a last copy not written ahead is lost and counted (`lost_slots`). |
+| `UMBP_L1_DRAM_THREADS` | `4` | Store calls one burst of evictions, or one load, is split over. |
+
+`UMBP_L1_DRAM_BYTES` and `UMBP_L1_DRAM_PINNED` are no longer read (the server
+warns about the first).
+
+---
+
 ## Pre-existing / unrelated knobs
 
 | Env var | Default | Description |

@@ -62,12 +62,14 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
       .def(
           "attach",
           [](L1Client& client, const std::string& pool_id, const std::string& group, int device,
-             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset) {
+             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset,
+             uint32_t part, uint32_t num_parts) {
             ExternalMemory external{std::string(external_handle), external_offset};
+            const PartSpec spec{part, num_parts};
             AttachResult result;
             {
               py::gil_scoped_release release;
-              result = client.Attach(pool_id, group, device, bytes, external);
+              result = client.Attach(pool_id, group, device, bytes, external, spec);
             }
             Check(result.status);
             return py::make_tuple(result.memory.kind, py::bytes(result.memory.handle), result.bytes,
@@ -75,14 +77,16 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           },
           py::arg("pool_id"), py::arg("group"), py::arg("device"), py::arg("bytes"),
           py::arg("external_handle") = py::bytes(), py::arg("external_offset") = 0,
+          py::arg("part") = 0, py::arg("num_parts") = 1,
           "Create or re-attach a pool. Returns (handle_kind, handle, bytes, created). With "
           "`external_handle` (a hip_ipc handle of the caller's allocation; on the host test "
           "server, its 8-byte address) the pool adopts that memory at `external_offset` "
-          "instead of allocating: the server neither zeroes nor frees it.")
+          "instead of allocating: the server neither zeroes nor frees it. With `num_parts` > 1 "
+          "this is part `part` of a pool over several allocations that share one slot table.")
       .def(
           "bind_layout",
           [](L1Client& client, const std::string& pool_id, uint32_t num_slots,
-             const std::vector<std::pair<uint64_t, uint64_t>>& regions) {
+             const std::vector<std::pair<uint64_t, uint64_t>>& regions, uint32_t part) {
             Layout layout;
             layout.num_slots = num_slots;
             for (const auto& region : regions) {
@@ -91,12 +95,12 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
             Status status;
             {
               py::gil_scoped_release release;
-              status = client.BindLayout(pool_id, layout);
+              status = client.BindLayout(pool_id, layout, part);
             }
             Check(status);
           },
-          py::arg("pool_id"), py::arg("num_slots"), py::arg("regions"),
-          "Declare the slot layout as (offset, unit_bytes) regions.")
+          py::arg("pool_id"), py::arg("num_slots"), py::arg("regions"), py::arg("part") = 0,
+          "Declare the slot layout of a part as (offset, unit_bytes) regions.")
       .def(
           "open",
           [](L1Client& client, const std::string& pool_id) {
@@ -157,16 +161,16 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           "Slots published or released stay unsettled until commit(stamp or later).")
       .def(
           "commit",
-          [](L1Client& client, const std::string& pool_id, uint64_t committed) {
+          [](L1Client& client, const std::string& pool_id, uint64_t committed, uint32_t part) {
             Status status;
             {
               py::gil_scoped_release release;
-              status = client.Commit(pool_id, committed);
+              status = client.Commit(pool_id, committed, part);
             }
             Check(status);
           },
-          py::arg("pool_id"), py::arg("committed"),
-          "The owner's device has finished every write issued before `committed`.")
+          py::arg("pool_id"), py::arg("committed"), py::arg("part") = 0,
+          "The device of part `part` has finished every write issued before `committed`.")
       .def(
           "fetch",
           [](L1Client& client, const std::string& pool_id, const std::vector<std::string>& keys,
@@ -226,6 +230,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           d["group"] = stats.group;
           d["device"] = stats.device;
           d["bytes"] = stats.bytes;
+          d["parts"] = stats.parts;
           d["num_slots"] = stats.num_slots;
           d["held"] = stats.held;
           d["cached"] = stats.cached;
@@ -235,6 +240,11 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
           d["fetched_in_bytes"] = stats.fetched_in_bytes;
           d["served_out_slots"] = stats.served_out_slots;
           d["copy_micros"] = stats.copy_micros;
+          d["written_back_slots"] = stats.written_back_slots;
+          d["written_ahead_slots"] = stats.written_ahead_slots;
+          d["loaded_slots"] = stats.loaded_slots;
+          d["lost_slots"] = stats.lost_slots;
+          d["tier_micros"] = stats.tier_micros;
           out.append(std::move(d));
         }
         return out;
