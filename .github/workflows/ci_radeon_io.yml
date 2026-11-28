@@ -1,0 +1,376 @@
+name: MoRI-IO Radeon R9700 (gfx1201)
+
+# MORI-IO only, on a host with 2x Radeon AI Pro R9700 from the xsj-dispatch
+# runner pool. The GPUs have no XGMI link: the xgmi backend (HIP IPC +
+# hipMemcpyPeerAsync) runs over PCIe P2P, so this lane checks correctness and
+# a PCIe-class bandwidth floor, not XGMI speed.
+#
+# The host has no RDMA NIC, so the lane runs every MORI-IO check that needs
+# none: the C++ engine and wait tests, the protocol, peer-failure, rail-affinity
+# and discrete-buffer tests, the fault catalog self-checks, the RAS tests, the
+# xgmi benchmarks, and the Python tests that use XGMI or the simulated backends.
+#
+# The pool's hosts have no container runtime and the job has no root, so the
+# toolchain is installed per job, as aiter's R9700 job does: ROCm and PyTorch
+# from the ROCm pip index into a virtual environment, and the few system
+# headers MORI needs unpacked from their .deb files into the runner's temp
+# directory.
+#
+# gfx1201 is not in MORI's supported arch list, so GPU_TARGETS is pinned and the
+# C++ builds leave ops/shmem/cco off. The Python step needs the bindings, which
+# link ops and shmem, so `pip install .` builds those for gfx1201 too. A change
+# under src/ops or src/shmem does not trigger this lane; the nightly run is what
+# shows a break of that build.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/ci_radeon_io.yml"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "include/mori/application/**"
+      - "include/mori/io/**"
+      - "include/mori/ras/**"
+      - "include/mori/utils/**"
+      - "pyproject.toml"
+      - "python/mori/io/**"
+      - "setup.py"
+      - "src/application/**"
+      - "src/io/**"
+      - "src/pybind/**"
+      - "src/ras/**"
+      - "tests/cpp/CMakeLists.txt"
+      - "tests/cpp/io/**"
+      - "tests/cpp/ras/**"
+      - "tests/python/io/**"
+      - "tests/python/utils.py"
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      min_bw_gbps:
+        description: Minimum 64 MiB write bandwidth (GB/s) each xgmi benchmark must reach
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GFX: gfx1201
+  PYTHON_VERSION: "3.12"
+  ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+  ROCM_VERSION: 10.1.0
+  TORCH_VERSION: 2.14.0+rocm10.1.0
+  # PCIe Gen4 x16 measures 23-27 GB/s at 64 MiB.
+  MIN_BW_GBPS: ${{ inputs.min_bw_gbps || '20' }}
+  # The GPUs can be shared with other users; wait this long for them to go idle.
+  GPU_IDLE_WAIT_S: "1800"
+  MORI_IO_LOG_LEVEL: error
+  # Host-side IO library and its tests only.
+  IO_CMAKE_FLAGS: >-
+    -G Ninja -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx1201
+    -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_APPLICATION=ON
+    -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_CCO_SDMA=OFF
+    -DBUILD_COLLECTIVE=OFF -DBUILD_PYBINDS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF
+    -DBUILD_METRICS=OFF -DBUILD_NETMON=OFF -DBUILD_XGMI_NETMON=OFF -DBUILD_UMBP=OFF
+    -DMORI_USE_LIBFABRIC=OFF
+
+jobs:
+  mori-io:
+    name: MORI-IO xgmi over PCIe (gfx1201, Radeon R9700)
+    # Drafts run nothing, as in ci.yml.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # xsj-dispatch opts the job into the XSJ-Dispatch runner pool; radeon-r9700
+    # picks the hardware.
+    runs-on: [self-hosted, linux, xsj-dispatch, radeon-r9700]
+    timeout-minutes: 60
+    steps:
+      - name: Host info
+        run: |
+          echo "host=$(hostname) user=$(id -un) groups=$(id -nG)"
+          . /etc/os-release && echo "os=$PRETTY_NAME kernel=$(uname -r)"
+          df -h --output=avail,target / "$RUNNER_TEMP" | sort -u
+          ls -l /dev/kfd /dev/dri 2>&1 | head -12 || true
+          amd-smi list 2>&1 | head -40 || true
+
+      # The lane tests GPU-to-GPU transfers. On a host with one GPU the XGMI
+      # cases would skip and pass, so stop here, before anything is installed.
+      - name: Check for two GPUs
+        run: |
+          n=0
+          for dev in /sys/class/drm/card[0-9]*/device; do
+            case "$(basename "$(dirname "$dev")")" in *-*) continue ;; esac
+            [ "$(cat "$dev/vendor" 2>/dev/null)" = 0x1002 ] || continue
+            n=$((n + 1))
+            echo "AMD GPU $n: $(basename "$(readlink -f "$dev")") device=$(cat "$dev/device")"
+          done
+          if [ "$n" -lt 2 ]; then
+            echo "::error::$(hostname) has $n AMD GPU(s); this lane needs 2 to test GPU-to-GPU transfers"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The system Python of a bare host has no pip and no Python.h.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Wait for idle GPUs
+        run: |
+          if ! command -v amd-smi >/dev/null; then
+            echo "::notice::amd-smi is not installed; not waiting for idle GPUs"
+            exit 0
+          fi
+          deadline=$((SECONDS + GPU_IDLE_WAIT_S))
+          while :; do
+            busy=$(amd-smi process 2>/dev/null | grep -c 'PID:' || true)
+            [ "$busy" -eq 0 ] && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::GPUs still in use after ${GPU_IDLE_WAIT_S}s"
+              amd-smi process
+              exit 1
+            fi
+            echo "GPUs busy ($busy processes), waiting..."
+            sleep 30
+          done
+
+      - name: Install ROCm, PyTorch and build tools
+        id: toolchain
+        run: |
+          venv="$RUNNER_TEMP/mori-radeon-venv"
+          rm -rf "$venv"
+          python -m venv "$venv"
+          py="$venv/bin/python"
+          $py -m pip install --upgrade pip
+          $py -m pip install cmake ninja pytest pybind11
+          $py -m pip install --index-url "$ROCM_INDEX" \
+            "torch[device-$GFX]==$TORCH_VERSION" \
+            "rocm[devel,device-$GFX]==$ROCM_VERSION"
+          # Unpacks the ROCm dev toolchain (compilers, headers, CMake configs).
+          $py -m rocm_sdk init
+          rocm="$($py -m rocm_sdk path --root)"
+          test -e "$rocm/lib/cmake/hip-lang/hip-lang-config.cmake"
+
+          echo "$venv/bin" >> $GITHUB_PATH
+          echo "$rocm/bin" >> $GITHUB_PATH
+          echo "ROCM_PATH=$rocm" >> $GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$rocm" >> $GITHUB_ENV
+          echo "ROCM_LIB_DIRS=$rocm/lib:$rocm/llvm/lib" >> $GITHUB_ENV
+
+          # The count that matters is what the ROCm runtime can use.
+          n=$($py -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null | tail -1)
+          echo "GPUs usable by ROCm: ${n:-0}"
+          if [ "${n:-0}" -lt 2 ]; then
+            echo "::error::ROCm sees ${n:-0} GPU(s) on $(hostname); this lane needs 2"
+            exit 1
+          fi
+
+      - name: Unpack system headers
+        id: sysroot
+        run: |
+          # MORI needs the headers of libibverbs, libnuma and libdrm, and links
+          # numa and drm_amdgpu through ROCm's hsakmt. Without root, download
+          # the packages and unpack them next to the build instead of installing.
+          if ! command -v apt-get >/dev/null || ! command -v dpkg >/dev/null; then
+            echo "::error::this lane unpacks .deb packages and needs apt-get and dpkg on the host"
+            exit 1
+          fi
+          sysroot="$RUNNER_TEMP/mori-sysroot"
+          rm -rf "$sysroot" && mkdir -p "$sysroot/debs" "$sysroot/link" "$sysroot/run"
+          cd "$sysroot/debs"
+          apt-get download libibverbs-dev libnuma-dev libdrm-dev \
+            libibverbs1 libnuma1 libdrm2 libdrm-amdgpu1
+          for deb in *.deb; do dpkg -x "$deb" "$sysroot"; done
+
+          # link/: one lib<name>.so per dev package, for the linker. It points at
+          # the host's own runtime library when the host has one; else at the
+          # unpacked copy, which is then also put on the loader path (run/).
+          multiarch=x86_64-linux-gnu
+          unpacked="$sysroot/usr/lib/$multiarch"
+          for so in "$unpacked"/*.so; do
+            name=$(basename "$so")
+            target=$(basename "$(readlink "$so")")
+            host=$(ls /usr/lib/$multiarch/$target /lib/$multiarch/$target 2>/dev/null | head -1)
+            if [ -n "$host" ]; then
+              ln -sf "$host" "$sysroot/link/$name"
+            elif [ -e "$unpacked/$target" ]; then
+              cp -a "$unpacked/$target"* "$sysroot/run/"
+              ln -sf "$sysroot/run/$target" "$sysroot/link/$name"
+              echo "using the unpacked $target: the host has none"
+            fi
+          done
+          ls -l "$sysroot/link"
+
+          echo "CPATH=$sysroot/usr/include" >> $GITHUB_ENV
+          echo "CMAKE_INCLUDE_PATH=$sysroot/usr/include" >> $GITHUB_ENV
+          echo "CMAKE_LIBRARY_PATH=$sysroot/link" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$sysroot/link" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$sysroot/run:$ROCM_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
+
+      - name: Build MORI-IO
+        id: build_io
+        run: |
+          cmake -S . -B build_io $IO_CMAKE_FLAGS
+          cmake --build build_io -j --target test_engine test_transfer_wait bench_engine \
+            test_protocol test_peer_failure test_rail_affinity test_discrete_buffer
+
+      - name: MORI-IO C++ (test_engine, test_transfer_wait)
+        id: cpp_core
+        run: |
+          # The XGMI hidden-device cases re-launch the binary under a narrower
+          # HIP_VISIBLE_DEVICES, so the parent must see both GPUs.
+          timeout 300 ./build_io/tests/cpp/test_engine
+          timeout 120 ./build_io/tests/cpp/test_transfer_wait
+
+      - name: MORI-IO xgmi benchmark (single process, GPU0 -> GPU1)
+        id: bench_single
+        run: |
+          mkdir -p io-logs
+          timeout 300 ./build_io/tests/cpp/bench_engine --backend xgmi --xgmi-single-process \
+            --src-gpu 0 --dst-gpu 1 --op write --all --sweep-start 8 --sweep-max 67108864 \
+            --iters 100 --warmup-iters 10 2>&1 | tee io-logs/xgmi_single.log
+          exit ${PIPESTATUS[0]}
+
+      - name: MORI-IO xgmi benchmark (two processes, hipIpc)
+        id: bench_mp
+        run: |
+          B=./build_io/tests/cpp/bench_engine
+          ARGS="--backend xgmi --master-ip 127.0.0.1 --port 18515 --op write --all --sweep-start 8 --sweep-max 67108864 --iters 100 --warmup-iters 10"
+          set +e
+          timeout 300 $B --rank 1 --gpu 1 $ARGS > io-logs/xgmi_mp_rank1.log 2>&1 &
+          target_pid=$!
+          sleep 2
+          timeout 300 $B --rank 0 --gpu 0 --dst-gpu 1 $ARGS > io-logs/xgmi_mp_rank0.log 2>&1
+          initiator=$?
+          wait $target_pid
+          target=$?
+          cat io-logs/xgmi_mp_rank0.log
+          echo "initiator exit=$initiator target exit=$target"
+          [ $initiator -eq 0 ] && [ $target -eq 0 ]
+
+      - name: Check validation and bandwidth floor
+        id: bw_check
+        run: |
+          status=0
+          for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
+            if ! grep -q "validation: OK" "$f"; then
+              echo "::error file=$f::data validation did not report OK"
+              status=1
+            fi
+            bw=$(awk '$1=="67108864" {print $4}' "$f" | tail -1)
+            if ! awk -v b="${bw:-0}" -v m="$MIN_BW_GBPS" 'BEGIN { exit !(b >= m) }'; then
+              echo "::error file=$f::64 MiB write bandwidth ${bw:-n/a} GB/s is below ${MIN_BW_GBPS} GB/s"
+              status=1
+            fi
+            echo "$f: 64 MiB write ${bw:-n/a} GB/s"
+          done
+          exit $status
+
+      # The groups below run even when an earlier group failed, so that one
+      # failure does not hide the results of the others.
+      - name: MORI-IO C++ (protocol, peer failure, rail affinity, discrete buffer)
+        id: cpp_extra
+        if: ${{ !cancelled() && steps.build_io.outcome == 'success' }}
+        run: |
+          # ci.yml does not run these four. test_rail_affinity skips itself
+          # without an RDMA device.
+          timeout 120 ./build_io/tests/cpp/test_protocol
+          timeout 120 ./build_io/tests/cpp/test_peer_failure
+          timeout 120 ./build_io/tests/cpp/test_rail_affinity
+          timeout 300 ./build_io/tests/cpp/test_discrete_buffer
+
+      - name: MORI-IO fault catalog self-checks
+        id: fault
+        if: ${{ !cancelled() && steps.sysroot.outcome == 'success' }}
+        run: |
+          # The checks of ci.yml's fault catalog step that need no GPU or NIC. The
+          # catalog entries themselves inject NIC faults, so every one of them
+          # skips on this host and they are not run.
+          cmake -S . -B build_fault $IO_CMAKE_FLAGS -DENABLE_IO_FAULT_INJECTION=ON
+          cmake --build build_fault -j --target test_fault_injection test_fault_injector test_flat_yaml
+          timeout 60 ./build_fault/tests/cpp/test_flat_yaml
+          ./build_fault/tests/cpp/test_fault_injection --check-catalog
+          MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection --check-catalog
+          ./build_fault/tests/cpp/test_fault_injection --check-async-sources
+          timeout 60 ./build_fault/tests/cpp/test_fault_injector
+
+      - name: MORI-RAS C++
+        id: ras
+        if: ${{ !cancelled() && steps.sysroot.outcome == 'success' }}
+        run: |
+          cmake -S . -B build_ras $IO_CMAKE_FLAGS -DBUILD_RAS=ON
+          cmake --build build_ras -j --target ras_tests
+          cd build_ras && timeout 300 ctest -R '^ras_' --output-on-failure
+
+      - name: Install MORI (Python bindings)
+        id: pip
+        if: ${{ !cancelled() && steps.sysroot.outcome == 'success' }}
+        run: |
+          MORI_GPU_ARCHS=$GFX python -m pip install .
+
+      - name: MORI-IO Python (XGMI and simulated backends)
+        id: python
+        if: ${{ !cancelled() && steps.pip.outcome == 'success' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          # ci.yml runs all of tests/python/io. Here the tests that need an RDMA
+          # device are left out: test_engine_multi_session_batch.py, and the
+          # tests of test_engine.py that create an RDMA backend. The XGMI fence
+          # test is one of those: its last check needs an RDMA backend to
+          # report the fence as supported.
+          timeout 600 pytest -v tests/python/io/test_engine.py -k 'xgmi and not rdma and not fence'
+          timeout 600 pytest -v tests/python/io/test_discrete_buffer.py \
+            tests/python/io/test_xgmi_suballocation.py tests/python/io/test_transfer_wait.py \
+            tests/python/io/test_sim_backend.py
+          MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+            timeout 300 pytest -v tests/python/io/test_discrete_buffer.py -k 'not performance'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## MORI-IO on Radeon R9700 (gfx1201, no RDMA NIC)"
+            echo "Host: $(hostname)"
+            echo
+            echo '| Group | Result |'
+            echo '| --- | --- |'
+            echo '| C++ engine and wait tests | ${{ steps.cpp_core.outcome }} |'
+            echo '| xgmi benchmark, single process | ${{ steps.bench_single.outcome }} |'
+            echo '| xgmi benchmark, two processes | ${{ steps.bench_mp.outcome }} |'
+            echo '| Validation and bandwidth floor | ${{ steps.bw_check.outcome }} |'
+            echo '| C++ protocol, peer failure, rail affinity, discrete buffer | ${{ steps.cpp_extra.outcome }} |'
+            echo '| Fault catalog self-checks | ${{ steps.fault.outcome }} |'
+            echo '| RAS C++ | ${{ steps.ras.outcome }} |'
+            echo '| Python bindings install | ${{ steps.pip.outcome }} |'
+            echo '| Python XGMI and simulated backends | ${{ steps.python.outcome }} |'
+            echo
+            echo "## xgmi over PCIe P2P"
+            for f in io-logs/xgmi_single.log io-logs/xgmi_mp_rank0.log; do
+              [ -f "$f" ] || continue
+              echo "### $(basename $f .log)"
+              echo '| MsgSize (B) | AvgBW (GB/s) | AvgLat (us) |'
+              echo '| ---: | ---: | ---: |'
+              awk '$1 ~ /^[0-9]+$/ && NF >= 6 {printf "| %s | %s | %s |\n", $1, $4, $5}' "$f"
+              grep -h "validation:" "$f" || true
+            done
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mori-io-radeon-logs-${{ github.run_id }}
+          path: io-logs/
+          if-no-files-found: ignore

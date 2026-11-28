@@ -233,6 +233,8 @@ def test_intra_node_prefers_xgmi_after_rdma_creation(monkeypatch):
 
     src = torch.arange(0, 4096, dtype=torch.float32, device=torch.device("cuda", 0))
     dst = torch.zeros_like(src, device=torch.device("cuda", 1))
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
     src_mem = engine.register_torch_tensor(src)
     dst_mem = engine.register_torch_tensor(dst)
 
@@ -1087,6 +1089,9 @@ def alloc_xgmi_mem(engine, src_gpu, dst_gpu, shape):
     dst_tensor = torch.zeros(
         shape, device=torch.device("cuda", dst_gpu), dtype=torch.float32
     )
+    # XGMI copies run on backend streams that are not ordered after torch's.
+    torch.cuda.synchronize(src_gpu)
+    torch.cuda.synchronize(dst_gpu)
     src_mem = engine.register_torch_tensor(src_tensor)
     dst_mem = engine.register_torch_tensor(dst_tensor)
     return src_tensor, dst_tensor, src_mem, dst_mem
@@ -1210,6 +1215,8 @@ def test_xgmi_cross_engine_transfer():
 
     src_tensor = torch.randn(1024, device=torch.device("cuda", 0), dtype=torch.float32)
     dst_tensor = torch.zeros(1024, device=torch.device("cuda", 1), dtype=torch.float32)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
 
     src_mem = engine_a.register_torch_tensor(src_tensor)
     dst_mem = engine_b.register_torch_tensor(dst_tensor)
@@ -1241,6 +1248,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     assert not torch.equal(src_tensor.cpu(), dst_tensor.cpu())
     transfer_uid = engine_a.allocate_transfer_uid()
     status = engine_a.write(src_mem, 0, remote_dst_mem, 0, 1024 * 4, transfer_uid)
@@ -1249,6 +1257,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     sess = engine_b.create_session(dst_mem, remote_src_mem)
     assert sess is not None
     transfer_uid = sess.allocate_transfer_uid()
@@ -1258,6 +1267,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     sess = engine_a.create_session(src_mem, remote_dst_mem)
     assert sess is not None
     transfer_uid = sess.allocate_transfer_uid()
@@ -1267,6 +1277,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     offsets = [0 * 4, 256 * 4, 512 * 4, 768 * 4]
     sizes = [256 * 4, 256 * 4, 256 * 4, 256 * 4]
     transfer_uid = engine_b.allocate_transfer_uid()
@@ -1278,6 +1289,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     transfer_uid = engine_a.allocate_transfer_uid()
     status = engine_a.batch_write(
         [src_mem], [offsets], [remote_dst_mem], [offsets], [sizes], [transfer_uid]
@@ -1287,6 +1299,7 @@ def test_xgmi_cross_engine_transfer():
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
     dst_tensor.zero_()
+    torch.cuda.synchronize(1)
     sess = engine_b.create_session(dst_mem, remote_src_mem)
     transfer_uid = sess.allocate_transfer_uid()
     status = sess.batch_read(offsets, offsets, sizes, transfer_uid)

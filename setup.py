@@ -106,8 +106,21 @@ def _check_system_deps() -> None:
         if not shutil.which(binary):
             missing.append((pkgs, desc))
 
+    # A header unpacked outside /usr/include (a host without root) is named to the
+    # compiler through CPATH or CMAKE_INCLUDE_PATH, so look there too.
+    extra_include_dirs = [
+        d
+        for var in ("CPATH", "CMAKE_INCLUDE_PATH")
+        for d in os.environ.get(var, "").split(os.pathsep)
+        if d
+    ]
     for paths, pkgs, desc in _REQUIRED_HEADERS:
-        if not any(os.path.isfile(p) for p in paths):
+        candidates = list(paths)
+        for p in paths:
+            if p.startswith("/usr/include/"):
+                rel = p[len("/usr/include/") :]
+                candidates += [os.path.join(d, rel) for d in extra_include_dirs]
+        if not any(os.path.isfile(p) for p in candidates):
             missing.append((pkgs, desc))
 
     if not missing:
