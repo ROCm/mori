@@ -1638,6 +1638,167 @@ class IntraNodeSubGroupBroadcastSdma:
 # AllreduceSdma
 # ---------------------------------------------------------------------------
 
+
+def _sdma_env_enabled() -> bool:
+    raw = os.environ.get("MORI_ENABLE_SDMA", "").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+class _AllreduceTdm:
+    """AllReduce on gfx125x without SDMA, on the TDM All2all kernel.
+
+    On the links an all-reduce is an all-to-all followed by an all-gather: every
+    rank sends chunk j of its input to rank j, each rank sums the npes chunks it
+    then holds, and sends that sum to all the others. So the handle is two
+    All2allSdma handles and a sum between them, three kernels on the caller's
+    stream and no host synchronization, which a graph can capture:
+
+    * reduce-scatter: an all-to-all whose result stays in memory of the handle;
+    * the sum of its npes chunks, written into this rank's chunk of the output;
+    * all-gather of that chunk into the output of every rank.
+
+    Buffers of at most _ONESHOT_MAX_BYTES take one transfer instead of two:
+    every rank sends its whole buffer to all the others and each sums locally.
+
+    A count that does not split into npes chunks of whole 4-byte words goes
+    through padded copies in memory of the handle.
+    """
+
+    _ONESHOT_MAX_BYTES = 1 << 20
+
+    def __init__(
+        self,
+        my_pe: int,
+        npes: int,
+        input_buffer_size: Optional[int],
+        output_buffer_size: Optional[int],
+        transit_buffer_size: Optional[int],
+        dtype: torch.dtype,
+    ):
+        self.my_pe = my_pe
+        self.npes = npes
+        self.dtype = dtype
+        # torch has no arithmetic on uint32; the sum of the bits is the same.
+        self._sum_dtype = torch.int32 if dtype == torch.uint32 else dtype
+        self._element_size = torch.empty((), dtype=dtype).element_size()
+        if input_buffer_size is not None:
+            room = input_buffer_size
+        elif transit_buffer_size is not None:
+            room = transit_buffer_size // 2
+        else:
+            room = 512 * 1024 * 1024 // 2
+        # Whole pages a rank: the TDM kernel wants its halves on 128 B.
+        chunk = -(-room // (npes * 4096)) * 4096
+        room = chunk * npes
+        self._room = room
+        one = min(room, self._ONESHOT_MAX_BYTES)
+        one = -(-one // 4096) * 4096
+        self._one_room = one
+        # One-shot: an all-gather of the whole buffer; the result holds npes of them.
+        self._one = All2allSdma(
+            my_pe,
+            npes,
+            input_buffer_size=one,
+            output_buffer_size=npes * one,
+            copy_output_to_user=False,
+            _gather=True,
+        )
+        self._rs = None
+        self._ag = None
+        if room > self._ONESHOT_MAX_BYTES:
+            self._rs = All2allSdma(
+                my_pe,
+                npes,
+                input_buffer_size=room,
+                output_buffer_size=room,
+                copy_output_to_user=False,
+            )
+            # Into the caller's output, so two halves of the largest buffer.
+            self._ag = All2allSdma(
+                my_pe,
+                npes,
+                input_buffer_size=chunk,
+                output_buffer_size=2 * room,
+                copy_output_to_user=True,
+                _gather=True,
+            )
+        self._pad_in = None
+        self._pad_out = None
+
+    def _typed(self, tensor):
+        return (
+            tensor if tensor.dtype == self._sum_dtype else tensor.view(self._sum_dtype)
+        )
+
+    def _reduce(self, parts, rows: int, cols: int, out) -> None:
+        torch.sum(self._typed(parts)[: rows * cols].view(rows, cols), dim=0, out=out)
+
+    def _run(self, input_data, output_data, count: int, stream) -> None:
+        n = self.npes
+        es = self._element_size
+        nbytes = count * es
+        out = self._typed(output_data)
+        if nbytes <= self._ONESHOT_MAX_BYTES or self._rs is None:
+            if nbytes > self._one_room:
+                raise ValueError(
+                    f"count={count} needs {nbytes} bytes a rank, the handle has "
+                    f"{self._one_room}"
+                )
+            self._one(input_data, None, nbytes // 4, stream)
+            parts = self._one.get_output_transit_buffer(dtype=self._sum_dtype)
+            self._reduce(parts, n, count, out[:count])
+            return
+        if nbytes > self._room:
+            raise ValueError(
+                f"count={count} needs {nbytes} bytes a rank, the handle has {self._room}"
+            )
+        chunk = count // n
+        u32 = chunk * es // 4
+        self._rs(input_data, None, u32, stream)
+        parts = self._rs.get_output_transit_buffer(dtype=self._sum_dtype)
+        own = out[self.my_pe * chunk : (self.my_pe + 1) * chunk]
+        self._reduce(parts, n, chunk, own)
+        self._ag(own, output_data, u32, stream)
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        n = self.npes
+        es = self._element_size
+        # Elements a chunk must hold whole 4-byte words; a one-shot call only whole words.
+        step = 4 // es
+        one_shot = count * es <= self._ONESHOT_MAX_BYTES or self._rs is None
+        unit = step if one_shot else n * step
+        padded = -(-count // unit) * unit
+        ctx = torch.cuda.stream(stream) if stream is not None else None
+        if ctx is not None:
+            ctx.__enter__()
+        try:
+            if padded == count:
+                self._run(input_data, output_data, count, stream)
+                return True
+            if self._pad_in is None or self._pad_in.numel() < padded:
+                dev = input_data.device
+                self._pad_in = torch.zeros(padded, dtype=self._sum_dtype, device=dev)
+                self._pad_out = torch.zeros(padded, dtype=self._sum_dtype, device=dev)
+            self._pad_in[:count].copy_(self._typed(input_data)[:count])
+            self._pad_in[count:padded].zero_()
+            self._run(self._pad_in, self._pad_out, padded, stream)
+            self._typed(output_data)[:count].copy_(self._pad_out[:count])
+            return True
+        finally:
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+
+    def register_output_buffer(self, tensor) -> None:
+        """Let the peers write the result straight into ``tensor``; collective,
+        like All2allSdma.register_output_buffer, whose rules apply."""
+        if self._ag is not None:
+            self._ag.register_output_buffer(tensor)
+
+    def deregister_output_buffer(self, tensor) -> None:
+        if self._ag is not None:
+            self._ag.deregister_output_buffer(tensor)
+
+
 _DTYPE_TO_SUFFIX = {
     torch.uint32: "u32",
     torch.int32: "i32",
@@ -1669,6 +1830,47 @@ class AllreduceSdma:
         dtype: torch.dtype = torch.uint32,
         mode: str = "eager",
     ):
+        # gfx125x without SDMA: the TDM All2all kernels carry the all-reduce at every
+        # size (_AllreduceTdm), and nothing below is built. With MORI_ENABLE_SDMA=1
+        # the handle is the SDMA one, whose large calls MORI_CCL_ALLREDUCE_BACKEND=tdm
+        # moves to the older two-kernel TDM path.
+        self._tdm_impl = None
+        if _detect_arch_str().startswith("gfx125") and not _sdma_env_enabled():
+            self.my_pe = my_pe
+            self.npes = npes
+            self.dtype = dtype
+            self.mode = mode
+            self._backend = "tdm"
+            if dtype not in _DTYPE_TO_SUFFIX:
+                raise ValueError(
+                    f"Unsupported dtype {dtype}. Supported: {list(_DTYPE_TO_SUFFIX.keys())}"
+                )
+            impl = _AllreduceTdm(
+                my_pe,
+                npes,
+                input_buffer_size,
+                output_buffer_size,
+                transit_buffer_size,
+                dtype,
+            )
+            self._tdm_impl = impl
+
+            def run_sync(
+                input_data, output_data, count, stream=None, force_copy_output=False
+            ):
+                return impl(input_data, output_data, count, stream)
+
+            # Instance attributes, so they take the place of the SDMA methods below. The
+            # kernels wait for every peer themselves, so the async pair is the call.
+            self._run_sync = run_sync
+            self.start_async = run_sync
+            self.wait_async = lambda stream=None: 0.0
+            self.is_async_in_progress = lambda: False
+            self.cancel_async = lambda: None
+            self.reset_flags = lambda: None
+            self.register_output_buffer = impl.register_output_buffer
+            self.deregister_output_buffer = impl.deregister_output_buffer
+            return
         _require_sdma_env("AllreduceSdma")
         _ensure_ccl_jit()
         self.my_pe = my_pe
