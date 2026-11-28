@@ -383,6 +383,8 @@ class All2allSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
         _gather: bool = False,
+        _reduce: int = 0,
+        _ll_max: Optional[int] = None,
     ):
         # Resolved once, like AllreduceSdma's: the two transports read the same
         # flags differently, so ranks must agree on it for the life of the handle.
@@ -391,6 +393,11 @@ class All2allSdma:
         # elements of the input instead of the chunk the input holds for it
         # (AllgatherSdma on gfx125x).
         self._gather = _gather
+        # With _gather, calls small enough for LL128 lines are an all-reduce:
+        # each rank adds what the others send to its own input (1 = 32-bit
+        # integers, 2 = float32). _ll_max is the LL128 limit of this handle.
+        self._reduce = _reduce
+        self._ll_max_arg = _ll_max
         # The TDM kernel carries every size itself and never touches an SDMA
         # queue, unlike AllreduceSdma's TDM backend, which keeps small messages
         # on SDMA.
@@ -420,7 +427,9 @@ class All2allSdma:
         extra = 0
         ll_half = 0
         if self._backend == "tdm":
-            self._tdm_ll_max = _resolve_all2all_ll128_max_bytes()
+            self._tdm_ll_max = (
+                _resolve_all2all_ll128_max_bytes() if _ll_max is None else _ll_max
+            )
             self._tdm_blocks = _resolve_all2all_blocks()
             ll_half = _tdm_ll128_half_bytes(npes, self._tdm_ll_max)
             # The room the caller asked for, split as below.
@@ -603,6 +612,10 @@ class All2allSdma:
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 56
         ).value = (reg[1] if reg else 0)
         word = 2 if self._tdm_reg_count else 0
+        if self._reduce:
+            if not ll:
+                raise ValueError("an all-reduce handle takes LL128 calls only")
+            word |= self._reduce << 60
         if self._gather:
             word |= 1 << 63
         if reg:
@@ -1664,7 +1677,10 @@ class _AllreduceTdm:
     through padded copies in memory of the handle.
     """
 
-    _ONESHOT_MAX_BYTES = 1 << 20
+    _ONESHOT_MAX_BYTES = 4 << 20
+    # Buffers of at most this many bytes go as LL128 lines, the sum taken while
+    # the lines are read (32-bit integers and float32).
+    _LL_MAX_BYTES = 128 * 1024
 
     def __init__(
         self,
@@ -1681,6 +1697,14 @@ class _AllreduceTdm:
         # torch has no arithmetic on uint32; the sum of the bits is the same.
         self._sum_dtype = torch.int32 if dtype == torch.uint32 else dtype
         self._element_size = torch.empty((), dtype=dtype).element_size()
+        # For measurements: MORI_CCL_ALLREDUCE_ONESHOT_MAX_BYTES and
+        # MORI_CCL_ALLREDUCE_LL128_MAX_BYTES move the two thresholds of a handle.
+        raw = os.environ.get("MORI_CCL_ALLREDUCE_ONESHOT_MAX_BYTES", "").strip()
+        if raw:
+            self._ONESHOT_MAX_BYTES = int(raw, 0)
+        raw = os.environ.get("MORI_CCL_ALLREDUCE_LL128_MAX_BYTES", "").strip()
+        if raw:
+            self._LL_MAX_BYTES = int(raw, 0)
         if input_buffer_size is not None:
             room = input_buffer_size
         elif transit_buffer_size is not None:
@@ -1703,6 +1727,21 @@ class _AllreduceTdm:
             copy_output_to_user=False,
             _gather=True,
         )
+        kind = {torch.int32: 1, torch.uint32: 1, torch.float32: 2}.get(dtype, 0)
+        self._ll = None
+        self._ll_bytes = 0
+        if kind and self._LL_MAX_BYTES > 0:
+            self._ll_bytes = min(one, self._LL_MAX_BYTES) // 4096 * 4096
+            self._ll = All2allSdma(
+                my_pe,
+                npes,
+                input_buffer_size=self._ll_bytes,
+                output_buffer_size=2 * npes * self._ll_bytes,
+                copy_output_to_user=True,
+                _gather=True,
+                _reduce=kind,
+                _ll_max=npes * self._ll_bytes,
+            )
         self._rs = None
         self._ag = None
         if room > self._ONESHOT_MAX_BYTES:
@@ -1737,6 +1776,14 @@ class _AllreduceTdm:
         n = self.npes
         es = self._element_size
         nbytes = count * es
+        # Not in place: a warp may store the sum of a unit another warp has yet to send.
+        if (
+            self._ll is not None
+            and nbytes <= self._ll_bytes
+            and input_data.data_ptr() != output_data.data_ptr()
+        ):
+            self._ll(input_data, output_data, nbytes // 4, stream)
+            return
         out = self._typed(output_data)
         if nbytes <= self._ONESHOT_MAX_BYTES or self._rs is None:
             if nbytes > self._one_room:

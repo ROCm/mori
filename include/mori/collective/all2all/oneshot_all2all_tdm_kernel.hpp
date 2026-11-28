@@ -462,6 +462,88 @@ __device__ __forceinline__ void CclTdmA2aCopyOverlapped(
   }
 }
 
+// One word of an all-reduce: kind 1 adds 32-bit integers, kind 2 float32.
+__device__ __forceinline__ uint32_t CclArAdd(uint32_t x, uint32_t y, int kind) {
+  return kind == 2 ? __float_as_uint(__uint_as_float(x) + __uint_as_float(y)) : x + y;
+}
+
+// The all-reduce of a small buffer as LL128 lines, in one kernel and with no buffer in between:
+// every rank sends its whole buffer to all the others, as an all-gather through CclTdmA2aLl128
+// does, and each rank adds the lines of the others to its own input as it reads them and
+// stores the sum in result. The lines, their halves and what orders one call after another are
+// those of CclTdmA2aLl128; warp `warp` sends every totalWarps-th (rank, unit) pair and then
+// sums every totalWarps-th unit.
+__device__ __forceinline__ void CclTdmArLl128(int myPe, int npes, const void* input, void* result,
+                                              const application::SymmMemObjPtr& outputTransitMemObj,
+                                              size_t bytes, uint64_t call, size_t llOffBytes,
+                                              size_t warp, size_t totalWarps, int laneId,
+                                              int kind) {
+  const size_t units = (bytes + kCclLlUnitPayload - 1) / kCclLlUnitPayload;
+  const size_t np = static_cast<size_t>(npes);
+  const size_t me = static_cast<size_t>(myPe);
+  const size_t pairs = (np - 1) * units;
+  const int lp = laneId & 7;
+  const size_t laneOff =
+      static_cast<size_t>(laneId >> 3) * kCclLlLinePayload + static_cast<size_t>(lp) * 16;
+  const char* const in8 = static_cast<const char*>(input);
+  char* const out8 = static_cast<char*>(result);
+  const bool inAl8 = ((reinterpret_cast<uintptr_t>(input) | bytes) & 7) == 0;
+  const bool outAl8 = ((reinterpret_cast<uintptr_t>(result) | bytes) & 7) == 0;
+
+  for (size_t i = warp; i < pairs; i += totalWarps) {
+    const size_t k = i / units;
+    const size_t u = i - k * units;
+    const size_t dest = (me + 1 + k) % np;
+    const size_t h = u * kCclLlUnitPayload + laneOff;
+    const uint2 a = CclLlLoad8(in8, h, bytes, inAl8);
+    const uint2 b = lp == 7
+                        ? make_uint2(static_cast<uint32_t>(call), static_cast<uint32_t>(call >> 32))
+                        : CclLlLoad8(in8, h + 8, bytes, inAl8);
+    char* const dst =
+        reinterpret_cast<char*>(outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(dest))) +
+        llOffBytes + (me * units + u) * kCclLlUnitBytes + static_cast<size_t>(laneId) * 16;
+    *reinterpret_cast<uint4*>(dst) = make_uint4(a.x, a.y, b.x, b.y);
+  }
+
+  const char* const land =
+      reinterpret_cast<const char*>(outputTransitMemObj->localPtr) + llOffBytes;
+  for (size_t u = warp; u < units; u += totalWarps) {
+    const size_t h = u * kCclLlUnitPayload + laneOff;
+    uint2 a = CclLlLoad8(in8, h, bytes, inAl8);
+    uint2 b = lp == 7 ? make_uint2(0u, 0u) : CclLlLoad8(in8, h + 8, bytes, inAl8);
+    for (size_t k = 0; k + 1 < np; ++k) {
+      const size_t srcPe = (me + np - 1 - k) % np;
+      const CclLlV4i* const p = reinterpret_cast<const CclLlV4i*>(
+          land + (srcPe * units + u) * kCclLlUnitBytes + static_cast<size_t>(laneId) * 16);
+      CclLlV4i x;
+      int spin = 0;
+      bool warned = false;
+      while (true) {
+        asm volatile("" ::: "memory");
+        x = __builtin_nontemporal_load(p);
+        const uint64_t seen =
+            (static_cast<uint64_t>(static_cast<uint32_t>(x.w)) << 32) | static_cast<uint32_t>(x.z);
+        if (__ballot(lp == 7 && seen != call) == 0ull) break;
+        if (++spin > 100000000 && !warned) {
+          if (laneId == 0) {
+            printf("PE %d: TdmAll2all timeout waiting for LL128 lines from peer %d (call %llu)\n",
+                   myPe, static_cast<int>(srcPe), static_cast<unsigned long long>(call));
+          }
+          warned = true;
+        }
+      }
+      a.x = CclArAdd(a.x, static_cast<uint32_t>(x.x), kind);
+      a.y = CclArAdd(a.y, static_cast<uint32_t>(x.y), kind);
+      if (lp != 7) {
+        b.x = CclArAdd(b.x, static_cast<uint32_t>(x.z), kind);
+        b.y = CclArAdd(b.y, static_cast<uint32_t>(x.w), kind);
+      }
+    }
+    CclLlStore8(out8, h, a, bytes, outAl8);
+    if (lp != 7) CclLlStore8(out8, h + 8, b, bytes, outAl8);
+  }
+}
+
 // Calls of at least this many bytes a rank (count * npes * 4) with output set go through
 // CclTdmA2aCopyAfterPush instead of CclTdmA2aCopyOverlapped. MUST AGREE WITH
 // _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES in python/mori/ccl/collective.py, which only documents and
@@ -752,6 +834,18 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
   const size_t srcStride = (outputReg >> 63) != 0 ? 0 : chunk4;
 
   if (llElems != 0) {
+    // Bits 60-61 of outputReg: an all-reduce of the kind they name (CclArAdd), LL128 calls only.
+    const int reduceKind = static_cast<int>((outputReg >> 60) & 3ULL);
+    if (reduceKind != 0) {
+      detail::CclTdmArLl128(myPe, npes, input, out4, outputTransitMemObj, chunk4 * 4, call,
+                            (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
+                            static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId,
+                            reduceKind);
+      if (threadIdx.x == 0) {
+        __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+      }
+      return;
+    }
     detail::CclTdmA2aLl128(
         myPe, npes, input, out4 != nullptr ? out4 : localTransit, outputTransitMemObj, chunk4 * 4,
         call, (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,

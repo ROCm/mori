@@ -50,10 +50,13 @@ _CHECK_COUNTS = (
     64,
     1000,
     4096,
-    (1 << 18) - 4,
-    1 << 18,  # 1 MiB of int32: the largest one-shot call
-    (1 << 18) + 4,  # the smallest two-shot call
-    (1 << 18) + 7,  # not a multiple of the ranks
+    (1 << 15) - 4,
+    1 << 15,  # 128 KiB of int32: the largest call that goes as LL128 lines
+    (1 << 15) + 4,
+    (1 << 20) - 4,
+    1 << 20,  # 4 MiB of int32: the largest one-shot call
+    (1 << 20) + 4,  # the smallest two-shot call
+    (1 << 20) + 7,  # not a multiple of the ranks
     3 * (1 << 20) + 12,
     1 << 24,  # 64 MiB: the peers write the output directly when it is registered
 )
