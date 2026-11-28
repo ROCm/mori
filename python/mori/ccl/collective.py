@@ -382,10 +382,15 @@ class All2allSdma:
         output_buffer_size: Optional[int] = None,
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
+        _gather: bool = False,
     ):
         # Resolved once, like AllreduceSdma's: the two transports read the same
         # flags differently, so ranks must agree on it for the life of the handle.
         self._backend = _resolve_all2all_backend()
+        # An all-gather on the same kernel: every rank is sent the first count
+        # elements of the input instead of the chunk the input holds for it
+        # (AllgatherSdma on gfx125x).
+        self._gather = _gather
         # The TDM kernel carries every size itself and never touches an SDMA
         # queue, unlike AllreduceSdma's TDM backend, which keeps small messages
         # on SDMA.
@@ -598,6 +603,8 @@ class All2allSdma:
             self._tdm_args, _TDM_A2A_BASE_ARGS_BYTES + 56
         ).value = (reg[1] if reg else 0)
         word = 2 if self._tdm_reg_count else 0
+        if self._gather:
+            word |= 1 << 63
         if reg:
             word |= (reg[4] << 2) | int(reg[5])
         ctypes.c_uint64.from_buffer(
@@ -773,6 +780,53 @@ class AllgatherSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
+        # gfx125x has no SDMA all-gather: the TDM all-to-all kernel carries it,
+        # every rank sending the same chunk to all the others. The handle is an
+        # All2allSdma in that mode, and what this class does not define itself
+        # (register_output_buffer, start_async, get_output_transit_buffer, ...)
+        # is that handle's.
+        self._a2a = None
+        if _detect_arch_str().startswith("gfx125"):
+            self.my_pe = my_pe
+            self.npes = npes
+            self._a2a = All2allSdma(
+                my_pe,
+                npes,
+                input_buffer_size,
+                output_buffer_size,
+                transit_buffer_size,
+                copy_output_to_user,
+                _gather=True,
+            )
+            a2a = self._a2a
+
+            def start_async(input_data, output_data, count, stream=None):
+                u32_count = (count * input_data.element_size() + 3) // 4
+                return a2a.start_async(input_data, output_data, u32_count, stream)
+
+            def wait_async(stream=None, capturing=False):
+                return a2a.wait_async(stream)
+
+            def unsupported(*args, **kwargs):
+                raise NotImplementedError(
+                    "AllgatherSdma on gfx125x (TDM) has no param-contiguous form"
+                )
+
+            # Instance attributes, so they take the place of the SDMA methods below.
+            self.start_async = start_async
+            self.wait_async = wait_async
+            self.enqueue_param_contiguous = unsupported
+            self.start_async_param_contiguous = unsupported
+            for name in (
+                "is_async_in_progress",
+                "cancel_async",
+                "reset_flags",
+                "get_output_transit_buffer",
+                "register_output_buffer",
+                "deregister_output_buffer",
+            ):
+                setattr(self, name, getattr(a2a, name))
+            return
         _require_sdma_env("AllgatherSdma")
         _ensure_ccl_jit()
         self.my_pe = my_pe
@@ -803,6 +857,9 @@ class AllgatherSdma:
         """
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
+        if self._a2a is not None:
+            self._a2a(input_data, output_data, u32_count, stream)
+            return True
         s = _stream_to_int(stream)
         args = self._handle.prepare_sync(
             input_data.data_ptr(), output_data.data_ptr(), u32_count, s
@@ -814,6 +871,12 @@ class AllgatherSdma:
             output_data.data_ptr(), u32_count, s, capturing=capturing
         )
         return True
+
+    def __getattr__(self, name):
+        a2a = self.__dict__.get("_a2a")
+        if a2a is None:
+            raise AttributeError(name)
+        return getattr(a2a, name)
 
     def enqueue_param_contiguous(
         self,

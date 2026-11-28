@@ -71,9 +71,8 @@ _CHECK_COUNTS = (
     1 << 19,
 )
 _CHECK_CALLS = 3
-_BENCH_BYTES_PER_GPU = tuple(k << 10 for k in (64, 128, 256, 512)) + tuple(
-    m << 20 for m in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
-)
+# Every power of two from the smallest call 4 ranks can make (one element a rank) to 1 GiB.
+_BENCH_BYTES_PER_GPU = tuple(1 << k for k in range(4, 31))
 # Sizes above this are checked once instead of _CHECK_CALLS times.
 _CHECK_ONCE_BYTES = 32 << 20
 
@@ -85,7 +84,9 @@ def _chunk(src_pe, dest_pe, npes, call, count, device):
 
 
 def _fmt_bytes(n):
-    return f"{n >> 20} MiB" if n >= (1 << 20) else f"{n >> 10} KiB"
+    if n >= (1 << 20):
+        return f"{n >> 20} MiB"
+    return f"{n >> 10} KiB" if n >= (1 << 10) else f"{n} B"
 
 
 def _worker(rank, world_size, port, bench, rounds, iters, warmup):
@@ -97,12 +98,16 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
     shmem.shmem_torch_process_group_init("default")
 
-    from mori.ccl import All2allSdma
+    from mori.ccl import All2allSdma, AllgatherSdma
     from mori.ccl.collective import (
         _TDM_A2A_COPY_AFTER_PUSH_MIN_BYTES,
         _TDM_A2A_LL128_MAX_BYTES,
     )
 
+    # A2A_TEST_OP=allgather runs the same checks and bench on AllgatherSdma, which on gfx125x
+    # is this kernel with every rank sending one chunk to all the others.
+    gather = os.environ.get("A2A_TEST_OP", "alltoall") == "allgather"
+    Handle = AllgatherSdma if gather else All2allSdma
     my_pe, npes = shmem.shmem_mype(), shmem.shmem_npes()
     assert (my_pe, npes) == (rank, world_size)
     dev = torch.device("cuda", rank)
@@ -135,14 +140,14 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     nbytes = -(-max_count * npes * 4 // 4096) * 4096
     handles = {
         # Calls alternate between the halves of the output transit buffer.
-        "into output": All2allSdma(
+        "into output": Handle(
             my_pe,
             npes,
             input_buffer_size=nbytes,
             output_buffer_size=2 * nbytes,
             copy_output_to_user=True,
         ),
-        "in transit": All2allSdma(
+        "in transit": Handle(
             my_pe,
             npes,
             input_buffer_size=nbytes,
@@ -152,7 +157,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     }
     ll_env = os.environ.pop("MORI_CCL_ALL2ALL_LL128_MAX_BYTES", None)
     os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"] = "0"
-    handles["TDM only"] = All2allSdma(
+    handles["TDM only"] = Handle(
         my_pe,
         npes,
         input_buffer_size=nbytes,
@@ -163,7 +168,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
     if ll_env is not None:
         os.environ["MORI_CCL_ALL2ALL_LL128_MAX_BYTES"] = ll_env
     # Its outputs are registered on every rank, so large calls land in them directly.
-    handles["registered"] = All2allSdma(
+    handles["registered"] = Handle(
         my_pe,
         npes,
         input_buffer_size=nbytes,
@@ -178,7 +183,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         ("registered, 1 without", "MORI_CCL_ALL2ALL_TEST_NO_REG", str(npes - 1)),
     ):
         os.environ[env] = ranks
-        handles[mode] = All2allSdma(
+        handles[mode] = Handle(
             my_pe,
             npes,
             input_buffer_size=nbytes,
@@ -188,7 +193,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         del os.environ[env]
     # Registers by itself every output a large call is given.
     os.environ["MORI_CCL_ALL2ALL_AUTO_REGISTER"] = "1"
-    handles["auto"] = All2allSdma(
+    handles["auto"] = Handle(
         my_pe,
         npes,
         input_buffer_size=nbytes,
@@ -207,7 +212,12 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
         h = handles[mode]
         calls[mode] += 1
         call = calls[mode]
-        inp = torch.cat([_chunk(my_pe, d, npes, call, count, dev) for d in range(npes)])
+        if gather:
+            inp = _chunk(my_pe, 0, npes, call, count, dev)
+        else:
+            inp = torch.cat(
+                [_chunk(my_pe, d, npes, call, count, dev) for d in range(npes)]
+            )
         out = torch.full((npes * count,), -1, dtype=torch.int32, device=dev)
         if mode.startswith("registered"):
             h.register_output_buffer(out)
@@ -225,7 +235,7 @@ def _worker(rank, world_size, port, bench, rounds, iters, warmup):
             out = h.get_output_transit_buffer(dtype=torch.int32)[: npes * count]
         bad = 0
         for s in range(npes):
-            want = _chunk(s, my_pe, npes, call, count, dev)
+            want = _chunk(s, 0 if gather else my_pe, npes, call, count, dev)
             got = out[s * count : (s + 1) * count]
             wrong = got != want
             n = int(wrong.sum().item())

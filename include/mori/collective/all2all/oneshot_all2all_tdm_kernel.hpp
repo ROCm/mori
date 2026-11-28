@@ -278,7 +278,8 @@ __device__ __forceinline__ void CclLlStore8(char* dst, size_t h, uint2 v, size_t
 __device__ __forceinline__ void CclTdmA2aLl128(
     int myPe, int npes, const void* input, void* result,
     const application::SymmMemObjPtr& outputTransitMemObj, size_t chunkBytes, uint64_t call,
-    size_t llOffBytes, size_t warp, size_t totalWarps, int laneId, int waveSize) {
+    size_t llOffBytes, size_t warp, size_t totalWarps, int laneId, int waveSize,
+    size_t srcStrideBytes) {
   const size_t units = (chunkBytes + kCclLlUnitPayload - 1) / kCclLlUnitPayload;
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
@@ -295,7 +296,7 @@ __device__ __forceinline__ void CclTdmA2aLl128(
     const size_t k = i / units;
     const size_t u = i - k * units;
     const size_t dest = (me + 1 + k) % np;
-    const char* const src = in8 + dest * chunkBytes;
+    const char* const src = in8 + dest * srcStrideBytes;
     const size_t h = u * kCclLlUnitPayload + laneOff;
     const uint2 a = CclLlLoad8(src, h, chunkBytes, inAl8);
     const uint2 b = lp == 7
@@ -309,7 +310,7 @@ __device__ __forceinline__ void CclTdmA2aLl128(
 
   {
     const size_t chunk4 = chunkBytes / 4;
-    const uint32_t* const s4 = reinterpret_cast<const uint32_t*>(in8 + me * chunkBytes);
+    const uint32_t* const s4 = reinterpret_cast<const uint32_t*>(in8 + me * srcStrideBytes);
     uint32_t* const d4 = reinterpret_cast<uint32_t*>(out8 + me * chunkBytes);
     const bool al16 =
         ((reinterpret_cast<uintptr_t>(s4) | reinterpret_cast<uintptr_t>(d4)) & 15) == 0;
@@ -379,7 +380,7 @@ __device__ __forceinline__ void CclTdmA2aCopyOverlapped(
     int myPe, int npes, const uint32_t* src4, uint32_t* out4, uint32_t* localTransit,
     const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4, uint64_t call,
     size_t halfElems, size_t wordsElems, size_t grid, size_t blk, int warpId, size_t totalWarps,
-    unsigned* next, uint32_t* ldsTile, int laneId, int waveSize) {
+    unsigned* next, uint32_t* ldsTile, int laneId, int waveSize, size_t srcStride) {
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
   const size_t items =
@@ -396,7 +397,7 @@ __device__ __forceinline__ void CclTdmA2aCopyOverlapped(
     const size_t n = (off + MORI_CCL_TDM_A2A_TILE_ELEMS <= chunk4)
                          ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
                          : chunk4 - off;
-    const uint32_t* const src = src4 + destPe * chunk4 + off;
+    const uint32_t* const src = src4 + destPe * srcStride + off;
     if (destPe == me) {
       CclTdmA2aWarpCopy(out4 + me * chunk4 + off, src, n, ldsTile, laneId, waveSize);
       continue;
@@ -509,7 +510,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     uint64_t recvDirect, const application::SymmMemObjPtr& outputTransitMemObj, size_t chunk4,
     uint64_t call, size_t peerOff, size_t wordsElems, size_t wordStride, size_t wordGap,
     size_t grid, size_t blk, int warpId, size_t totalWarps, uint32_t* ldsTile, int laneId,
-    int waveSize, size_t copyBlocks = 0, uint64_t* cursor = nullptr) {
+    int waveSize, size_t copyBlocks, uint64_t* cursor, size_t srcStride) {
   const size_t np = static_cast<size_t>(npes);
   const size_t me = static_cast<size_t>(myPe);
   const size_t peers = np - 1;
@@ -549,7 +550,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
                            ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
                            : chunk4 - off;
       const size_t at = me * chunk4 + off;
-      CclTdmA2aWarpCopy(res4 + at, src4 + at, n, ldsTile, laneId, waveSize);
+      CclTdmA2aWarpCopy(res4 + at, src4 + me * srcStride + off, n, ldsTile, laneId, waveSize);
     }
   }
 
@@ -567,8 +568,8 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
                  outputTransitMemObj->GetAs<uint8_t*>(static_cast<int>(destPe))) +
              peerOff;
     }
-    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * chunk4 + off, n, ldsTile, laneId,
-                         waveSize);
+    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * srcStride + off, n, ldsTile,
+                         laneId, waveSize);
   }
 
   while (tailItems != 0) {
@@ -587,8 +588,8 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
     // Only with every peer delivering directly: copyBlocks is 0 otherwise.
     uint32_t* const peer =
         reinterpret_cast<uint32_t*>(outputMemObj->GetAs<uint8_t*>(static_cast<int>(destPe)));
-    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * chunk4 + off, n, ldsTile, laneId,
-                         waveSize);
+    CclTdmA2aWarpCopySys(peer + me * chunk4 + off, src4 + destPe * srcStride + off, n, ldsTile,
+                         laneId, waveSize);
   }
 
   // One lane per peer, all in warp 0, as in the zero-copy path. s_wait_tensorcnt(0) retired the
@@ -615,7 +616,7 @@ __device__ __forceinline__ void CclTdmA2aCopyAfterPush(
                          ? static_cast<size_t>(MORI_CCL_TDM_A2A_TILE_ELEMS)
                          : chunk4 - off;
     const size_t at = me * chunk4 + off;
-    CclTdmA2aWarpCopy(res4 + at, src4 + at, n, ldsTile, laneId, waveSize);
+    CclTdmA2aWarpCopy(res4 + at, src4 + me * srcStride + off, n, ldsTile, laneId, waveSize);
   }
 
   if (peerLane) {
@@ -746,12 +747,15 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
   }
   __syncthreads();
   const uint64_t call = s_call;
+  // Bit 63 of outputReg: an all-gather. Every rank gets the same chunk4 elements, the first of
+  // input, instead of the chunk input holds for it; everything else is the all-to-all.
+  const size_t srcStride = (outputReg >> 63) != 0 ? 0 : chunk4;
 
   if (llElems != 0) {
-    detail::CclTdmA2aLl128(myPe, npes, input, out4 != nullptr ? out4 : localTransit,
-                           outputTransitMemObj, chunk4 * 4, call,
-                           (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
-                           static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId, waveSize);
+    detail::CclTdmA2aLl128(
+        myPe, npes, input, out4 != nullptr ? out4 : localTransit, outputTransitMemObj, chunk4 * 4,
+        call, (llElems + static_cast<size_t>(call & 1ULL) * llHalfElems) * 4,
+        static_cast<size_t>(warpId) * grid + blk, totalWarps, laneId, waveSize, srcStride * 4);
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
@@ -779,7 +783,7 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
         // lands in the receiver's output when sender and receiver hold the same registration and
         // the receiver's buffer could be exported, and in its transit half otherwise; both sides
         // decide from the two tokens, so ranks need not agree beforehand.
-        const uint64_t myId = outputReg >> 2;
+        const uint64_t myId = (outputReg >> 2) & 0x7FFFFFFFULL;
         const uint64_t token = (call << 32) | ((myId << 1) & 0xFFFFFFFEULL) | (outputReg & 1ULL);
         detail::CclTdmA2aStart(myPe, npes, flagsMemObj, sync + MORI_CCL_TDM_A2A_SYNC_GO, call,
                                token, call << 32, blk, warpId, laneId,
@@ -798,12 +802,12 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
           myPe, npes, reinterpret_cast<const uint32_t*>(input), out4, localTransit + half,
           localTransit, outputMemObj, sendDirect, recvDirect, outputTransitMemObj, chunk4, call,
           half, wordsElems, tileStride, detail::kCclTdmA2aWordGap, grid, blk, warpId, totalWarps,
-          ldsTile, laneId, waveSize, copyBlocks, sync + MORI_CCL_TDM_A2A_SYNC_CURSOR);
+          ldsTile, laneId, waveSize, copyBlocks, sync + MORI_CCL_TDM_A2A_SYNC_CURSOR, srcStride);
     } else {
       detail::CclTdmA2aCopyOverlapped(myPe, npes, reinterpret_cast<const uint32_t*>(input), out4,
                                       localTransit, outputTransitMemObj, chunk4, call, halfElems,
                                       wordsElems, grid, blk, warpId, totalWarps, &s_nextPair,
-                                      ldsTile, laneId, waveSize);
+                                      ldsTile, laneId, waveSize, srcStride);
     }
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
@@ -836,10 +840,10 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
   // Large calls: push, one word per (peer, block), and nothing to copy. The words are the same
   // ones the loop below raises, word (rank, block) at u64 rank * grid + block.
   if (npes >= 2 && chunk4 * 4 * static_cast<size_t>(npes) >= detail::kCclTdmA2aPushFirstMinBytes) {
-    detail::CclTdmA2aCopyAfterPush(myPe, npes, reinterpret_cast<const uint32_t*>(input),
-                                   localTransit, nullptr, localTransit, outputTransitMemObj, 0, 0,
-                                   outputTransitMemObj, chunk4, call, 0, wordsElems, grid, 1, grid,
-                                   blk, warpId, totalWarps, ldsTile, laneId, waveSize);
+    detail::CclTdmA2aCopyAfterPush(
+        myPe, npes, reinterpret_cast<const uint32_t*>(input), localTransit, nullptr, localTransit,
+        outputTransitMemObj, 0, 0, outputTransitMemObj, chunk4, call, 0, wordsElems, grid, 1, grid,
+        blk, warpId, totalWarps, ldsTile, laneId, waveSize, 0, nullptr, srcStride);
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(sync + blk, call, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
@@ -866,7 +870,7 @@ __device__ __forceinline__ void TdmAll2allKernel_body(
               ? localTransit
               : reinterpret_cast<uint32_t*>(outputTransitMemObj->GetAs<uint8_t*>(destPe));
       detail::CclTdmA2aWarpCopy(dstRoot + static_cast<size_t>(myPe) * chunk4 + off,
-                                src4 + static_cast<size_t>(destPe) * chunk4 + off, n, ldsTile,
+                                src4 + static_cast<size_t>(destPe) * srcStride + off, n, ldsTile,
                                 laneId, waveSize);
     }
   }
