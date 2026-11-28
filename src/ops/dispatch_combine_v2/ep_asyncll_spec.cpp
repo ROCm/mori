@@ -268,9 +268,12 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
                                 kind == EpAsyncLLKernel::DispatchSendTransferSeg))
         geometry.blockX = static_cast<unsigned>(cfg.waveSize) * 16;
       // With fused metadata the send ceiling also splits each peer's rows over ceiling /
-      // worldSize blocks (the kernel posts their shared tail once all have reserved).
+      // worldSize blocks (the kernel posts their shared tail once all have reserved). Not on
+      // wave32 (gfx1250): there the split is slower at every size, so the ceiling only caps
+      // slot assignment.
       if (cfg.asyncLlDirect && cfg.asyncLlFuseMeta &&
-          kind == EpAsyncLLKernel::DispatchSendTransferSeg && cfg.asyncLlSendBlocks > 0)
+          kind == EpAsyncLLKernel::DispatchSendTransferSeg && cfg.asyncLlSendBlocks > 0 &&
+          cfg.waveSize == 64)
         geometry.gridX = static_cast<unsigned>(
             EpAsyncLLAlignGrid(std::min(cfg.asyncLlSendBlocks, cfg.mpCount), worldSize));
       geometry.sharedBytes = 0;

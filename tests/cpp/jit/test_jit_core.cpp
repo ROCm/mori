@@ -790,6 +790,13 @@ TEST(AsyncLLMode, DirectSendTransferSplitsPeersByTheSendCeiling) {
   EXPECT_EQ(grid(true, 32), 32u);  // four per peer
   EXPECT_EQ(grid(true, 36), 32u);  // rounded down to the world size
   EXPECT_EQ(grid(false, 32), 8u);  // only the fused-metadata transfer shares its peers
+  // gfx1250 (wave32): the ceiling caps slot assignment only.
+  request.asyncLlFuseMeta = true;
+  request.asyncLlSendBlocks = 32;
+  const auto cfg1250 = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                          EpInterNodeFamily::AsyncLL);
+  EXPECT_EQ(EpAsyncLLGeometry(cfg1250, EpAsyncLLKernel::DispatchSendTransferSeg).gridX, 8u);
+  EXPECT_EQ(EpAsyncLLGeometry(cfg1250, EpAsyncLLKernel::DispatchSlotAssign).gridX, 32u);
 }
 
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {

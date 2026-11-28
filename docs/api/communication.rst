@@ -178,7 +178,8 @@ These options are read once when an op is constructed:
        fused metadata (``MORI_ASYNCLL_FUSE_META``, on by default) in the
        segmented layout, or with compact reserve, it also
        sets the send transfer's blocks per peer,
-       ceiling / world size (one when 0), up to the device.
+       ceiling / world size (one when 0), up to the device; on gfx1250 the
+       transfer keeps one block per peer.
    * - ``MORI_ASYNCLL_RECV_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
        passes: the dispatch and combine receive copies, in either receive
@@ -231,12 +232,12 @@ sources: without them the send passes gather the token rows and need the whole
 device.
 
 On gfx1250 use the segmented layout, which turns on direct sources, with
-``MORI_ASYNCLL_FUSED_RECV=1``, ``MORI_ASYNCLL_FUSED_COMBINE_RECV=0``,
-``MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS=256`` and
-``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE=128:4``. Past a few hundred tokens the combine
-receive needs the whole device there, its reduce running at the memory rate on
-every compute unit, so it stays unfused; below that one pass is faster. The send
-transfer is fastest with one block per peer.
+``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE=128:4,1024:32,4096:64,0:0``: slot assignment
+needs the whole device only past 4096 tokens. When both micro-batches run on one
+stream, add ``MORI_ASYNCLL_FUSED_RECV=1``, ``MORI_ASYNCLL_FUSED_COMBINE_RECV=0`` and
+``MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS=256``. Past a few hundred tokens the
+combine receive needs the whole device there, its reduce running at the memory rate
+on every compute unit, so it stays unfused; below that one pass is faster.
 
 The default targets single-node gfx950 and gfx1250 overlap. On MI355X (gfx950,
 EP8, hidden 7168, top-6), early notification beat the legacy sequence at every
