@@ -104,6 +104,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.combineQGroup = request.combineQGroup;
   cfg.asyncLlDirect = request.asyncLlDirect;
   cfg.asyncLlFuseMeta = request.asyncLlFuseMeta;
+  cfg.asyncLlFusedCombineRecv = request.asyncLlFusedCombineRecv;
   cfg.asyncLlCompactReserve = request.asyncLlCompactReserve;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);

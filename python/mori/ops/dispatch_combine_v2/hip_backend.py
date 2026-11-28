@@ -583,10 +583,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             direct = self._asyncll_direct(self._asyncll_mode, cfg, self._arch)
             self._asyncll_direct_on = self._asyncll_reserve_on or direct
             if self._asyncll_direct_on and not self._arch.startswith(
-                ("gfx942", "gfx950")
+                ("gfx942", "gfx950", "gfx1250")
             ):
                 raise ValueError(
-                    f"MORI_ASYNCLL_DIRECT=1 is supported on gfx942/gfx950, not {self._arch}"
+                    f"MORI_ASYNCLL_DIRECT=1 is supported on gfx942/gfx950/gfx1250, not {self._arch}"
                 )
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
@@ -1649,7 +1649,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     @classmethod
-    def _asyncll_seg_seq(cls, mode, fuse_meta):
+    def _asyncll_seg_seq(cls, mode, fuse_meta, fused_combine=True):
         seq = dict(cls._ASYNCLL_SEG_SEQ)
         # Fused metadata (_asyncll_fuse_meta): SlotAssign and SendTransferSeg do SendCopySeg's work.
         if fuse_meta:
@@ -1657,7 +1657,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if mode == 2:
             # Fused receive: each copy pass waits for the counts itself.
             seq["dispatch_recv"] = ("dispatch_recvfinalize_seg",)
-            seq["combine_recv"] = ("combine_recvcopy_seg",)
+            if fused_combine:
+                seq["combine_recv"] = ("combine_recvcopy_seg",)
         return seq
 
     @staticmethod
@@ -1695,9 +1696,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # and scales, combine input) instead of a gathered staging copy, so none may be written
         # until the matching recv. Rides on early notification; mode 0 means this op has none
         # (another transport, several nodes, or MORI_ASYNCLL_EARLY_NOTIFY=0). Unset, it is on
-        # for the segmented layout on gfx950 without a quantized combine (`cfg` resolved, so
-        # every rank and per_rank_vmm agree), and compact reserve turns it on for the compact
-        # one (_asyncll_reserve); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
+        # for the segmented layout on gfx950 and gfx1250 without a quantized combine (`cfg`
+        # resolved, so every rank and per_rank_vmm agree), and compact reserve turns it on for the
+        # compact one (_asyncll_reserve); MORI_ASYNCLL_DIRECT=0 / 1 decides otherwise.
         value = os.environ.get("MORI_ASYNCLL_DIRECT", "")
         if value not in ("", "0", "1"):
             raise ValueError(f"MORI_ASYNCLL_DIRECT must be '0' or '1', got {value!r}")
@@ -1709,7 +1710,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             cfg is not None
             and cfg.async_ll_segmented
             and cfg.quant_type == "none"
-            and arch.startswith("gfx950")
+            and arch.startswith(("gfx950", "gfx1250"))
         )
 
     @staticmethod
@@ -1753,6 +1754,31 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return value == "1" and bool(direct) and (bool(segmented) or bool(reserve))
 
     @staticmethod
+    def _asyncll_fused_combine(mode):
+        # MORI_ASYNCLL_FUSED_COMBINE_RECV=0 with the fused receive: combine's receive stays two
+        # passes (RecvTransfer waits; the copy then takes the whole device), dispatch's is fused.
+        value = os.environ.get("MORI_ASYNCLL_FUSED_COMBINE_RECV", "1")
+        if value not in ("0", "1"):
+            raise ValueError(
+                f"MORI_ASYNCLL_FUSED_COMBINE_RECV must be '0' or '1', got {value!r}"
+            )
+        return mode != 2 or value == "1"
+
+    @staticmethod
+    def _asyncll_fused_combine_tokens(fused_combine):
+        # MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS=N with MORI_ASYNCLL_FUSED_COMBINE_RECV=0: calls of
+        # at most N tokens still take the fused combine receive. 0 (default) = none.
+        name = "MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS"
+        value = os.environ.get(name, "0")
+        try:
+            tokens = int(value)
+        except ValueError:
+            tokens = -1
+        if tokens < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        return 0 if fused_combine else tokens
+
+    @staticmethod
     def _asyncll_fused_recv_blocks(mode, device_index=0, mp_count=0):
         # Grid ceiling for the fused receive copies; 0 lets the native factory
         # pick half the device. MORI_ASYNCLL_FUSED_RECV_BLOCKS is only a tuning
@@ -1792,12 +1818,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     @classmethod
-    def _asyncll_seq(cls, cfg, mode=0, direct=False, reserve=False):
+    def _asyncll_seq(cls, cfg, mode=0, direct=False, reserve=False, fused_combine=True):
         if reserve:
             seq = dict(cls._ASYNCLL_RESERVE_SEQ)
             if mode == 2:
                 seq["dispatch_recv"] = ("dispatch_recvfinalize_seg",)
-                seq["combine_recv"] = ("combine_recvcopy",)
+                if fused_combine:
+                    seq["combine_recv"] = ("combine_recvcopy",)
             return seq
         lsa = cfg.async_ll_transport == "lsa"
         sfx = "_lsa" if lsa else ""
@@ -1814,7 +1841,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             seq["dispatch_send"] = cls._ASYNCLL_SEQ_DISPATCH_SEND_LSA
         if mode == 2:
             seq["dispatch_recv"] = ("dispatch_recvcopy",)
-            seq["combine_recv"] = ("combine_recvcopy",)
+            if fused_combine:
+                seq["combine_recv"] = ("combine_recvcopy",)
         # Direct sources: combine sends the expert output in place and stages its own
         # words, so it has no SendCopy (dispatch's SendCopy writes only the metadata).
         if direct:
@@ -1850,6 +1878,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         request["asyncLlDirect"] = self._asyncll_direct_on
         request["asyncLlFuseMeta"] = self._asyncll_fuse_meta_on
         request["asyncLlCompactReserve"] = self._reserve_on()
+        request["asyncLlFusedCombineRecv"] = getattr(
+            self, "_asyncll_fused_combine_on", True
+        )
         # Grid ceilings for the send- and receive-side copy passes; 0 = the whole device.
         for side, field in (
             ("SEND", "asyncLlSendBlocks"),
@@ -2013,14 +2044,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._asyncll_fuse_meta_on = self._asyncll_fuse_meta(
             self._asyncll_direct_on, cfg.async_ll_segmented, self._asyncll_reserve_on
         )
+        self._asyncll_fused_combine_on = self._asyncll_fused_combine(self._asyncll_mode)
         self._asyncll_fused_blocks = self._asyncll_fused_recv_blocks(
             self._asyncll_mode, self._device_index, self._multi_processor_count
         )
         sequences = self._asyncll_seq(
-            cfg, self._asyncll_mode, self._asyncll_direct_on, self._asyncll_reserve_on
+            cfg,
+            self._asyncll_mode,
+            self._asyncll_direct_on,
+            self._asyncll_reserve_on,
+            self._asyncll_fused_combine_on,
         )
         seg_sequences = (
-            self._asyncll_seg_seq(self._asyncll_mode, self._asyncll_fuse_meta_on)
+            self._asyncll_seg_seq(
+                self._asyncll_mode,
+                self._asyncll_fuse_meta_on,
+                self._asyncll_fused_combine_on,
+            )
             if cfg.async_ll_segmented
             else {}
         )
@@ -2068,6 +2108,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 (seg_sequences, self._asyncll_groups_seg),
             ),
         )
+        # Small calls keep the fused combine receive (one pass) even when larger ones split it.
+        fused_max = self._asyncll_fused_combine_tokens(self._asyncll_fused_combine_on)
+        if self._asyncll_mode == 2 and fused_max:
+            request = dict(pass_request("combine_recv"), asyncLlFusedCombineRecv=True)
+            for seqs, groups, buckets in (
+                (sequences, self._asyncll_groups, self._asyncll_buckets),
+                (seg_sequences, self._asyncll_groups_seg, self._asyncll_buckets_seg),
+            ):
+                if "combine_recv" not in seqs:
+                    continue
+                plan = cb.asyncll_plan(seqs["combine_recv"][-1])(**request)
+                plan.bind(rdmaBlockNum=0, replayMode=0)
+                self._plans.append(plan)
+                rest = buckets.get("combine_recv") or ((None, groups["combine_recv"]),)
+                buckets["combine_recv"] = (
+                    (fused_max, plan_api.make_launch_group([plan])),
+                ) + tuple(b for b in rest if b[0] is None or b[0] > fused_max)
         self._seg_layout = asyncll_seg_layout(cfg) if cfg.async_ll_segmented else None
 
         # AsyncLL compiles one geometry -- its specs derive each pass's grid from

@@ -112,6 +112,15 @@ bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
   }
 }
 
+// Whether `kind` is compiled for the fused receive: asyncLlMode 2, unless it is combine's receive
+// copy and asyncLlFusedCombineRecv is off.
+static bool EpAsyncLLFusedFor(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind) {
+  if (cfg.asyncLlMode != 2) return false;
+  const bool combineRecv =
+      kind == EpAsyncLLKernel::CombineRecvCopy || kind == EpAsyncLLKernel::CombineRecvCopySeg;
+  return !combineRecv || cfg.asyncLlFusedCombineRecv;
+}
+
 std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind) {
   std::string name = "mori_ep_asyncll_";
   if (cfg.asyncLlDirect) name += "direct_";
@@ -153,7 +162,7 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2)
     throw std::runtime_error("AsyncLL mode must be 0 (legacy), 1 (early), or 2 (fused receive)");
   const bool early = cfg.asyncLlMode != 0;
-  const bool fused = cfg.asyncLlMode == 2;
+  const bool fused = EpAsyncLLFusedFor(cfg, kind);
   if (early && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode)
     throw std::runtime_error("AsyncLL early notification requires a single node");
   if (cfg.asyncLlDirect && !early)
@@ -295,9 +304,9 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     geometry.gridX = 1;
 
   // The segmented dispatch receive copies no tokens: it fills the rows past each count, a few
-  // words each. On gfx942/gfx950 (wave64, the RECV_TRIM body) two rows per thread of the largest
-  // round run as fast as the whole device, so the grid covers that and no more.
-  if (kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg && cfg.waveSize == 64) {
+  // words each. Two rows per thread of the largest round run as fast as the whole device, so the
+  // grid covers that and no more.
+  if (kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg) {
     // The largest round: worldSize segments of the largest stride the op accepts.
     const long long rows = EpInterNodeDeviceCfgOf(cfg.kernelCfg).MaxNumTokensToRecv();
     const long long perBlock = 2LL * geometry.blockX;
@@ -311,7 +320,7 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
   // (see EpInterNodeCfg::asyncLlFusedRecvBlocks). RecvCopy strides over its
   // tokens, so a narrower grid only does the same work in fewer blocks.
   const bool fusedCopy =
-      cfg.asyncLlMode == 2 &&
+      EpAsyncLLFusedFor(cfg, kind) &&
       (kind == EpAsyncLLKernel::DispatchRecvCopy || kind == EpAsyncLLKernel::CombineRecvCopy ||
        kind == EpAsyncLLKernel::DispatchRecvFinalizeSeg ||
        kind == EpAsyncLLKernel::CombineRecvCopySeg);

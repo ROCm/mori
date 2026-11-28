@@ -763,11 +763,11 @@ TEST(AsyncLLMode, SegmentedDispatchReceiveGridCoversTwoRowsPerThread) {
   // A receive ceiling still applies on top.
   request.asyncLlRecvBlocks = 16;
   EXPECT_EQ(EpAsyncLLGeometry(make("gfx950"), EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX, 16u);
-  // gfx1250 (wave32) runs the untrimmed body and keeps the whole device.
+  // gfx1250 (wave32) follows the same rule with its 512-thread blocks.
   request.asyncLlRecvBlocks = 0;
-  request.maxNumInpTokenPerRank = 128;
+  request.maxNumInpTokenPerRank = 4096;
   EXPECT_EQ(EpAsyncLLGeometry(make("gfx1250"), EpAsyncLLKernel::DispatchRecvFinalizeSeg).gridX,
-            256u);
+            32u);
 }
 
 TEST(AsyncLLMode, DirectSendTransferSplitsPeersByTheSendCeiling) {

@@ -1358,8 +1358,8 @@ static_assert(sizeof(CCO_SDMA_PKT_COPY_BROADCAST) == 9 * sizeof(uint32_t),
               "SDMA copy-broadcast packet must be exactly 9 dwords");
 
 // Immediate writes: the value rides in the packet, so nothing has to be in memory before the
-// doorbell. gfx9 layouts (sdma_pkt_struct.h SDMA_PKT_WRITE_UNTILED / SDMA_PKT_FENCE); not
-// validated on gfx12.5.
+// doorbell. gfx9 layouts (sdma_pkt_struct.h SDMA_PKT_WRITE_UNTILED / SDMA_PKT_FENCE); SDMA 7.1
+// (gfx12.5) keeps both and adds an mtype field to the FENCE header.
 //
 // WRITE_LINEAR with N data dwords at a dword-aligned dst. count is N - 1, as the amdgpu driver's
 // SDMA ring test (one dword, COUNT(0)) and PTE writes (ndw - 1) use it.
@@ -1869,6 +1869,10 @@ inline __device__ void ccoSdmaWriteFence(uint32_t* queueBuf, uint64_t at, void* 
                                          uint32_t value) {
   CCO_SDMA_PKT_FENCE pkt = {};
   pkt.HEADER_UNION.op = CCO_SDMA_OP_FENCE;
+#if defined(CCO_GFX125X)
+  // SDMA 7.1 has an mtype field at bits 16-18; uncached (3), as the amdgpu driver's fence uses.
+  pkt.HEADER_UNION.reserved_0 = 3;
+#endif
   pkt.ADDR_LO = (uint32_t)(uintptr_t)dstPtr;
   pkt.ADDR_HI = (uint32_t)((uintptr_t)dstPtr >> 32);
   pkt.DATA = value;
@@ -2750,7 +2754,7 @@ struct ccoSdma {
     ccoSdmaQueueDeviceHandle h = *impl::global(q);
     h.submitPacket(base, end);
   }
-  // Immediate packets for the same reserved range; any lane, `dst` dword aligned, gfx9 only.
+  // Immediate packets for the same reserved range; any lane, `dst` dword aligned.
   //   placeWrite32/64: WRITE_LINEAR of `value` (CCO_SDMA_WRITE32/64_BYTES); executed in ring
   //                    order like a COPY, but nothing waits for earlier writes to complete.
   //   placeFence:      FENCE of the 32-bit `value` (CCO_SDMA_FENCE_BYTES); written only once

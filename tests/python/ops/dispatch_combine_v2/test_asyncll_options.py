@@ -130,7 +130,7 @@ class AsyncLLOptionsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve(1)
 
-    def test_direct_sources_default_on_for_segmented_gfx950(self):
+    def test_direct_sources_default_on_for_segmented_gfx950_gfx1250(self):
         resolve = EpDispatchCombineOpHip._asyncll_direct
         seg = SimpleNamespace(async_ll_segmented=True, quant_type="none")
         compact = SimpleNamespace(async_ll_segmented=False, quant_type="none")
@@ -144,7 +144,8 @@ class AsyncLLOptionsTest(unittest.TestCase):
             ({}, 1, compact, "gfx950", False),
             ({}, 1, quant, "gfx950", False),
             ({}, 1, seg, "gfx942", False),
-            ({}, 1, seg, "gfx1250", False),
+            ({}, 1, seg, "gfx1250", True),
+            ({}, 1, compact, "gfx1250", False),
             ({"MORI_ASYNCLL_DIRECT": ""}, 1, seg, "gfx950", True),
             ({"MORI_ASYNCLL_DIRECT": "0"}, 1, seg, "gfx950", False),
             ({"MORI_ASYNCLL_DIRECT": "1"}, 1, compact, "gfx942", True),
@@ -161,6 +162,50 @@ class AsyncLLOptionsTest(unittest.TestCase):
             ("dispatch_slotassign", "dispatch_sendcopy", "dispatch_sendtransfer"),
         )
         self.assertEqual(seq["combine_send"], ("combine_sendtransfer",))
+
+    def test_fused_receive_can_leave_combine_unfused(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_combine
+        off = {"MORI_ASYNCLL_FUSED_COMBINE_RECV": "0"}
+        for env, mode, expected in [({}, 2, True), (off, 2, False), (off, 1, True)]:
+            with (
+                self.subTest(env=env, mode=mode),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(mode), expected)
+        with patch.dict(
+            os.environ, {"MORI_ASYNCLL_FUSED_COMBINE_RECV": "2"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                resolve(2)
+        seg = EpDispatchCombineOpHip._asyncll_seg_seq(2, True, fused_combine=False)
+        self.assertEqual(seg["dispatch_recv"], ("dispatch_recvfinalize_seg",))
+        self.assertEqual(
+            seg["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_seg")
+        )
+        cfg = SimpleNamespace(async_ll_transport="sdma", nodes=1)
+        seq = EpDispatchCombineOpHip._asyncll_seq(cfg, 2, fused_combine=False)
+        self.assertEqual(seq["dispatch_recv"], ("dispatch_recvcopy",))
+        self.assertEqual(
+            seq["combine_recv"], ("combine_recvtransfer", "combine_recvcopy")
+        )
+
+    def test_fused_combine_receive_token_bound(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_combine_tokens
+        name = "MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS"
+        for env, fused_combine, expected in [
+            ({}, False, 0),
+            ({name: "128"}, False, 128),
+            ({name: "128"}, True, 0),  # already fused at every size
+        ]:
+            with (
+                self.subTest(env=env, fused_combine=fused_combine),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(fused_combine), expected)
+        for value in ("-1", "x"):
+            with patch.dict(os.environ, {name: value}, clear=True):
+                with self.assertRaises(ValueError):
+                    resolve(False)
 
     def test_fused_receive_grid_ceiling_reaches_only_the_fused_mode(self):
         resolve = EpDispatchCombineOpHip._asyncll_fused_recv_blocks

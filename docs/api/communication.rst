@@ -113,6 +113,13 @@ These options are read once when an op is constructed:
    * - ``MORI_ASYNCLL_FUSED_RECV``
      - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
        per block waits, then an acquire and block barrier release the copy waves.
+   * - ``MORI_ASYNCLL_FUSED_COMBINE_RECV``
+     - ``1``. With ``MORI_ASYNCLL_FUSED_RECV=1``, ``0`` keeps combine's receive
+       in two passes, a small wait pass and then the copy on the whole device,
+       while dispatch's receive stays fused.
+   * - ``MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS``
+     - ``0``. With ``MORI_ASYNCLL_FUSED_COMBINE_RECV=0``, combine calls of at
+       most this many tokens still take the fused receive.
    * - ``MORI_ASYNCLL_FUSED_RECV_BLOCKS``
      - ``0``, meaning half the compute units this process may use: the
        device's, or its share under ``HSA_CU_MASK``. Grid ceiling for the
@@ -121,7 +128,8 @@ These options are read once when an op is constructed:
    * - ``MORI_ASYNCLL_DIRECT``
      - Unset: on for an op on gfx950 without a quantized combine (the
        segmented layout directly, the compact one through
-       ``MORI_ASYNCLL_COMPACT_RESERVE``), off otherwise. ``1`` turns it on
+       ``MORI_ASYNCLL_COMPACT_RESERVE``) and for a segmented op on gfx1250, off
+       otherwise. ``1`` turns it on
        (also on gfx942), ``0`` off, which also turns compact reserve off. Direct sources have the copy engines read the tokens where the
        caller left them: dispatch posts each peer's rows from the input, one
        packet per run of adjacent source tokens (and, in the segmented layout,
@@ -134,7 +142,7 @@ These options are read once when an op is constructed:
        longer read, about a third of it, so every rank must use the same
        value. Needs early notification; ignored
        without it. ``1`` is refused with a quantized combine (``quant_type``),
-       which is packed on the send side. gfx942 and gfx950 only.
+       which is packed on the send side. gfx942, gfx950 and gfx1250 only.
    * - ``MORI_ASYNCLL_FUSE_META``
      - ``1``. With direct sources (``MORI_ASYNCLL_DIRECT``) on an op whose
        ``async_ll_recv_layout`` resolves to ``"segmented"``, slot assignment
@@ -174,8 +182,8 @@ These options are read once when an op is constructed:
    * - ``MORI_ASYNCLL_RECV_BLOCKS``
      - ``0``, meaning the whole device. Grid ceiling for the receive-side copy
        passes: the dispatch and combine receive copies, in either receive
-       layout. Rounded like ``MORI_ASYNCLL_SEND_BLOCKS``. On gfx942 and gfx950
-       the segmented ``dispatch_recv``, which copies no tokens, already runs
+       layout. Rounded like ``MORI_ASYNCLL_SEND_BLOCKS``. The segmented
+       ``dispatch_recv``, which copies no tokens, already runs
        on at most two rows per thread of its largest round, world size times
        the largest segment stride (16 blocks of 1024 threads at EP8 and 4096
        tokens per rank); the ceiling only lowers that. With
@@ -194,11 +202,13 @@ These options are read once when an op is constructed:
        and 0 means no ceiling. All entries share one compiled module.
 
 ``MORI_ASYNCLL_EARLY_NOTIFY``, ``MORI_ASYNCLL_SKIP_RESET``,
-``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_DIRECT``,
-``MORI_ASYNCLL_FUSE_META`` and ``MORI_ASYNCLL_COMPACT_RESERVE`` accept ``0`` or ``1``; the ``*_BLOCKS`` variables
-accept a non-negative integer and the schedules a comma-separated list of
-``tokens:blocks`` pairs. Skipping the reset or fusing receive requires
-early notification. Set the first three to ``0`` for the legacy sequence.
+``MORI_ASYNCLL_FUSED_RECV``, ``MORI_ASYNCLL_FUSED_COMBINE_RECV``,
+``MORI_ASYNCLL_DIRECT``, ``MORI_ASYNCLL_FUSE_META`` and
+``MORI_ASYNCLL_COMPACT_RESERVE`` accept ``0`` or ``1``; the ``*_BLOCKS``
+variables and ``MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS`` accept a non-negative
+integer and the schedules a comma-separated list of ``tokens:blocks`` pairs.
+Skipping the reset or fusing receive requires early notification. Set the first
+three to ``0`` for the legacy sequence.
 LSA and multi-node ops retain their existing protocol and ignore the SDMA
 options; ``MORI_ASYNCLL_SEND_BLOCKS`` and ``MORI_ASYNCLL_RECV_BLOCKS`` apply to
 every AsyncLL op. The resolved notification mode is part of every native Plan's
@@ -219,6 +229,14 @@ combine receive, the one phase whose time follows
 its block count, is sized by the token count. The send schedule assumes direct
 sources: without them the send passes gather the token rows and need the whole
 device.
+
+On gfx1250 use the segmented layout, which turns on direct sources, with
+``MORI_ASYNCLL_FUSED_RECV=1``, ``MORI_ASYNCLL_FUSED_COMBINE_RECV=0``,
+``MORI_ASYNCLL_FUSED_COMBINE_RECV_TOKENS=256`` and
+``MORI_ASYNCLL_SEND_BLOCKS_SCHEDULE=128:4``. Past a few hundred tokens the combine
+receive needs the whole device there, its reduce running at the memory rate on
+every compute unit, so it stays unfused; below that one pass is faster. The send
+transfer is fastest with one block per peer.
 
 The default targets single-node gfx950 and gfx1250 overlap. On MI355X (gfx950,
 EP8, hidden 7168, top-6), early notification beat the legacy sequence at every
