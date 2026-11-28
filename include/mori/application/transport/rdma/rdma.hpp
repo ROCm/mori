@@ -224,7 +224,8 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset);
 /* -------------------------------------------------------------------------- */
 class RdmaDeviceContext {
  public:
-  RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd);
+  // ownsPd=false: the PD belongs to another context; the destructor leaves it alone.
+  RdmaDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd, bool ownsPd = true);
   virtual ~RdmaDeviceContext();
 
   // ibv_reg_mr only; aborts on failure.
@@ -290,6 +291,7 @@ class RdmaDeviceContext {
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
   bool preferDmabufReg{false};
+  bool ownsPd{true};
 };
 
 /* -------------------------------------------------------------------------- */

@@ -210,6 +210,8 @@ static void launch_ibgda(PutScope scope, dim3 grid, dim3 block, ccoWindow_t send
       hipLaunchKernelGGL((ibgda_get_bw<PrvdType, ccoCoopThread, ccoGdaThreadAggregate>), grid,
                          block, 0, 0, sendWin, recvWin, len_doubles, devComm, count);
       break;
+    case PutScope::kLane:  // proxy put_bw only; PerfInit rejects it here
+      break;
   }
 }
 

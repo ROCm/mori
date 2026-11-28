@@ -10,7 +10,7 @@ independent communicators and drive them concurrently from multiple threads.
 The fused GEMM + collective operators built on CCO have their own section,
 [MORI-FUSED](MORI-CCO-FUSED-OPS-GUIDE.md).
 
-CCO exposes GPU-initiated one-sided communication over three transports:
+CCO exposes GPU-initiated one-sided communication over four transports:
 
 - **LSA** (Local Symmetric Access) — intra-node peer-to-peer over a flat
   symmetric virtual address space (XGMI). The kernel gets a peer's
@@ -18,6 +18,9 @@ CCO exposes GPU-initiated one-sided communication over three transports:
 - **GDA** (GPU-Direct Async) — cross-node one-sided RDMA (put / get / signal /
   counter) issued from the device.
 - **SDMA** — copy-engine transfers with a device-visible signal pool.
+- **ccoProxy** — cross-node RDMA with the GDA window API, where the kernel
+  queues each op and a host thread posts it
+  (see [ccoProxy](#10-ccoproxy-host-proxy-rdma)).
 
 CCO is built for compute-communication fusion: a GEMM kernel can issue the
 transfer itself, on symmetric memory, and overlap it with its own math. The
@@ -27,16 +30,17 @@ fused GEMM + collective operators (`mori.ops.gemm_ar`, `gemm_a2a`, `gemm_ag`,
 
 ## Table of Contents
 
-1. [Quick Reference](#quick-reference)
-2. [Concepts](#1-concepts)
-3. [Initialization](#2-initialization)
-4. [Memory and Windows](#3-memory-and-windows)
-5. [Device Communicator](#4-device-communicator)
-6. [Host Barrier](#5-host-barrier)
-7. [Device-Side Programming](#6-device-side-programming)
-8. [Examples](#7-examples)
-9. [C++ API](#8-c-api)
-10. [Environment Variables](#9-environment-variables)
+- [Quick Reference](#quick-reference)
+- [1. Concepts](#1-concepts)
+- [2. Initialization](#2-initialization)
+- [3. Memory and Windows](#3-memory-and-windows)
+- [4. Device Communicator](#4-device-communicator)
+- [5. Host Barrier](#5-host-barrier)
+- [6. Device-Side Programming](#6-device-side-programming)
+- [7. Examples](#7-examples)
+- [8. C++ API](#8-c-api)
+- [9. Environment Variables](#9-environment-variables)
+- [10. ccoProxy (host-proxy RDMA)](#10-ccoproxy-host-proxy-rdma)
 
 ## Quick Reference
 
@@ -136,7 +140,8 @@ win = comm.register_window(mem.ptr, mem.size)   # RegisteredWindow: .handle, .lo
 ## 4. Device Communicator
 
 `create_dev_comm` allocates the per-session device resources described by a
-`CCODevCommRequirements`. Common fields:
+`CCODevCommRequirements`. It is collective, as is C++ `ccoDevCommCreate`:
+every rank calls it, in the same order. Common fields:
 
 | Field | Meaning |
 |---|---|
@@ -147,10 +152,11 @@ win = comm.register_window(mem.ptr, mem.size)   # RegisteredWindow: .handle, .lo
 | `sdma_queue_count` | # of SDMA queues per peer. 0 (the default) creates none; SDMA also needs `MORI_ENABLE_SDMA=1`. The first device communicator on a communicator that asks for queues fixes the count |
 
 The NICs are opened only when a peer needs RDMA. That happens at communicator
-creation when some peers are outside the LSA team, or at the first `FULL` device
-communicator (NIC loopback to LSA peers). A job whose ranks all share one LSA
-team, such as a single node or a scale-up fabric spanning hosts, never touches a
-NIC under `NONE`, `CROSSNODE` or `RAIL`.
+creation when some peers are outside the LSA team, or at the first device
+communicator with a `FULL` GDA or ccoProxy connection (NIC loopback to LSA
+peers). A job whose ranks all share one LSA team, such as a single node or a
+scale-up fabric spanning hosts, never touches a NIC under `NONE`, `CROSSNODE` or
+`RAIL`.
 
 ```python
 reqs = CCODevCommRequirements()          # safe defaults
@@ -345,11 +351,12 @@ Runnable examples live in [`examples/cco/`](https://github.com/ROCm/mori/blob/ma
 | `python/06_flydsl_gda_modes` | py | FlyDSL GDA (thread_mode, coop) × signal matrix, plus DEFERRED / CALLER_ORDERED handles |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (`cco_scale_out.hpp`) |
+| `cpp/03_proxy_put.cpp` | c++ | ccoProxy put + SignalSet/wait on a proxy-only DevComm, with timeouts |
 
 ## 8. C++ API
 
 The host control plane and device layer are a self-contained header pair;
-include `cco.hpp` for host + LSA, or `cco_scale_out.hpp` for GDA.
+include `cco.hpp` for host + LSA, or `cco_scale_out.hpp` for GDA and ccoProxy.
 
 ```cpp
 #include "mori/cco/cco.hpp"
@@ -388,6 +395,7 @@ ccoCommDestroy(comm);
 | `MORI_RDMA_SL` | RDMA service level (GDA) |
 | `MORI_IGNORE_CPU_AFFINITY` | `1` skips the CPU bind done at communicator creation, leaving placement to an outer `numactl`/`torchrun` |
 | `MORI_CPU_AFFINITY_NO_SPLIT` | `1` binds to the whole NUMA node instead of this rank's own slice of it |
+| `MORI_CCO_DISABLE_PROXY`, `MORI_CCO_PROXY_CPUS` | ccoProxy; see [§10](#10-ccoproxy-host-proxy-rdma) |
 
 Communicator creation (`ccoCommCreate`) pins the calling thread to the CPUs
 local to its current HIP device before the bootstrap and any worker thread, so
@@ -402,3 +410,305 @@ otherwise it falls back to binding the whole node.
 
 Supported GPUs: MI308X / MI300X / MI325X / MI355X. Supported NICs: AMD Pollara
 (AINIC), Mellanox ConnectX-7, Broadcom Thor2.
+
+## 10. ccoProxy (host-proxy RDMA)
+
+`ccoProxy` (in `mori/cco/cco_scale_out.hpp`) is a cross-node transport with the
+same window and signal model as GDA, but the GPU does not drive the NIC. A
+kernel pushes each op as a small descriptor into a device-to-host queue (KIWI);
+host proxy threads pop it and post the RDMA work request on host-created RC
+QPs. Keys and remote offsets are resolved on the GPU exactly as for GDA, so the
+same windows and signal slots work for both.
+
+Use it where GPU-initiated RDMA is unavailable or slow, or where NIC atomics
+into GPU memory fail (e.g. ionic VFs in VMs; signal with the atomic-free
+`ccoGda_SignalSet`). The cost is host CPU: each DevComm with proxy queues runs
+busy-polling proxy threads.
+
+### Enabling it
+
+- **Build:** `BUILD_CCO_PROXY` (CMake option and `setup.py` env var) is `ON` by
+  default. The host engine is built when `GPU_TARGETS` contains gfx942 or
+  gfx950, and at run time `ccoDevCommCreate` accepts proxy queues only on those
+  GPUs. Targets in mori's own CMake build that link `mori_cco` see
+  `MORI_CCO_PROXY` when the engine is built in. Code built against the installed
+  headers or the wheel can only find out at run time: without the engine,
+  `ccoDevCommCreate` rejects proxy queues.
+- **Requirements:** request proxy queues per DevComm. Pass the same queue,
+  thread and QP counts, connection type and `gdaSignalCount` on every rank (0
+  takes the default; negative values are rejected). If the ranks disagree, a
+  rank cannot run the proxy, or the proxy engine fails to set up,
+  `ccoDevCommCreate` fails on every rank; the communicator stays usable and you
+  can retry with other requirements.
+- **Versions:** the layout of `ccoDevComm` and of the proxy descriptors can
+  change between mori versions, so compile kernels against the headers of the
+  mori they run with.
+
+| Field | Meaning |
+|---|---|
+| `proxySpscQueueCount` | SPSC queues (one wavefront at a time per queue) |
+| `proxyMpscQueueCount` | MPSC queues (any number of wavefronts, and `ccoCoopThread`) |
+| `proxyThreadCount` | host proxy threads (0 = 4), capped at the queue count |
+| `proxyQueueCapacity` | ring size in 64-byte lines, power of two (0 = 4096). A lane-masked or thread call takes up to 2 lines per calling lane; a call that cannot fit in the ring traps |
+| `proxyQpsPerPeer` | RC QPs per (proxy thread, peer) (0 = 4). A thread creates at most one per queue it polls, and each queue uses one of them per peer (round robin over the thread's queues) |
+| `proxyConnectionType` | peers that get proxy QPs: a `CCO_GDA_CONNECTION_*` value, or `CCO_PROXY_CONNECTION_FOLLOW_GDA` (-1, the default) to follow `gdaConnectionType` |
+
+- `proxyConnectionType` chooses the proxy's peers independently of the GDA QPs
+  and resolves like `gdaConnectionType`: CROSSNODE on a single node, no RDMA,
+  or no matching peer give NONE, and proxy queues on a NONE connection fail
+  creation.
+- For a proxy-only DevComm, set `gdaConnectionType = CCO_GDA_CONNECTION_NONE`
+  and `proxyConnectionType` to the peers you need. No GDA QPs are created.
+- Signals use the GDA signal slots, so set `gdaSignalCount`. The other `gda*`
+  fields do not affect ccoProxy: `gdaContextCount` sizes the GDA QPs, and
+  `gdaCounterCount` the counter slots, which exist only with GDA QPs.
+- The GPU's VRAM must be host-mapped (large BAR).
+- Create one DevComm with proxy queues per communicator: each one starts its
+  own threads, and the CPU choice below puts thread t of every one on the same
+  core.
+- For full bandwidth, use large messages (at least a few hundred KB) and set
+  `proxyQpsPerPeer` / `proxyThreadCount`. On NICs that serve each QP serially
+  (e.g. ionic), use several QPs per peer so a thread's queues run in parallel.
+
+| Variable | Purpose |
+|---|---|
+| `MORI_CCO_DISABLE_PROXY` | `1` makes `ccoDevCommCreate` reject proxy queues |
+| `MORI_CCO_PROXY_CPUS` | cpulist for the proxy threads (thread t on entry t mod size). Default: GPU-local cores in the affinity mask, one physical core per thread, from the top, skipping the core of CPU 0. It applies to the whole process tree: with several ranks per node, set it per rank to disjoint CPUs, or the ranks' threads share cores |
+
+### Device API
+
+Construct `ccoProxy<Queue>` in the kernel from the DevComm and a queue index.
+`Queue` is `ccoProxySpsc` (the default) or `ccoProxyMpsc`.
+
+Differences from `ccoGda`:
+
+| `ccoGda` | `ccoProxy` |
+|---|---|
+| `get` | none |
+| counters (`counter`, `readCounter`, `waitCounter`, `resetCounter`) | none |
+| `flushAsync` / `wait` | none |
+| `ccoGdaBarrier` / `ccoGdaBarrierSession` | none; build a barrier from signals |
+| `flush(peer, coop)` waits for that peer | waits for every peer, as `flush(coop)` |
+| `put` / `putValue` / `signal` default the Coop to `ccoCoopThread`, and `put` / `putValue` the action to `ccoGda_NoSignal` | no defaults: pass the action and the Coop |
+| `waitSignal(..., bits)` | no `bits` argument; ends with a system-scope acquire |
+| a signal to a slot id past `gdaSignalCount` is posted | fails the DevComm with `BAD_REQUEST`, before anything is posted |
+| no failure state | the first proxy error fails the DevComm: `flush()` and `waitSignal()` trap, their timeout overloads return 2 |
+| rejects `ccoGda_SignalSet` / `WindowSignalSet` and the lane-masked Coops | takes them |
+
+| Call | Does |
+|---|---|
+| `ccoProxy<>(dc, i)` / `ccoProxy<ccoProxyMpsc>(dc, i)` | SPSC queue `i` (out of range traps); MPSC queue `i` mod the pool size. An empty pool traps |
+| `put<CCO_TEAM_GDA>(peer, ...)` etc. | `peer` indexes the team of the proxy's connection type (`dc.proxy.connType`), as `ccoGda` does for `gdaConnectionType`; the default `CCO_TEAM_WORLD` takes world ranks |
+| `put(peer, dstWin, dstOff, srcWin, srcOff, bytes, action, coop)` | RDMA write, optionally followed by a signal on the same QP. Larger transfers are split into pieces of at most `dc.proxy.maxPutBytes` (the smallest port `max_msg_sz` of any rank, capped at 1 GiB), with the signal on the last piece |
+| `putValue(peer, dstWin, dstOff, value, action, coop)` | inline write of a 1–8 byte value, optionally followed by a signal |
+| `signal(peer, action, coop)` | signal only |
+| action | `ccoGda_NoSignal`, `ccoGda_SignalInc` / `SignalAdd` / `WindowSignalAdd` (NIC atomics), `ccoGda_SignalSet` / `WindowSignalSet` (8-byte write, no atomic). Window offsets must be 8-byte aligned |
+| `flush(coop)` | waits until every op pushed to this queue before the flush has completed remotely; then the sources can be reused. It does not notify the peer: send a signal to publish the data |
+| `int flush(coop, timeoutCycles)` | 0 done, 1 timed out (earlier ops may still be in flight; a later flush covers them), 2 DevComm failed. It does not trap on a timeout or a failed DevComm; usage errors still trap. `timeoutCycles` counts `clock64` cycles, whose rate follows the shader clock |
+| `int waitSignal(id, least, coop, timeoutCycles)` | 0 consumed, 1 timed out, 2 DevComm failed; consumes only on 0. It does not trap on a timeout or a failed DevComm |
+| `readSignal` / `waitSignal` / `resetSignal` | local signal slots, shared with GDA (see [Signal slots](#signal-slots)) |
+| `failed()` | whether the DevComm has failed |
+
+**Fences.** Every put, putValue and signal does a system-scope release fence
+before it pushes, so stores made earlier are visible to the NIC. `waitSignal`
+and `flush` end with a system-scope acquire; after `readSignal`, or after
+polling a window yourself, issue one.
+
+**SPSC queues.** Use an SPSC queue from one wavefront at a time. The handle
+saves its state in its destructor (or `release()`).
+- To hand a queue to another wavefront in the same kernel, call `release()` (or
+  let the handle go out of scope) in the old owner, then publish with an
+  agent-scope release (e.g. a flag store); the new owner does an agent-scope
+  acquire of it before constructing its handle. `__syncthreads()` does both
+  within a block.
+- Across launches on one stream, stream order is enough. Give kernels that may
+  run concurrently (on other streams) different SPSC queues.
+- If you only call `readSignal`, `waitSignal`, `resetSignal` or `failed` on a
+  handle, you may construct it with any valid queue index (SPSC: below
+  `proxySpscQueueCount`), even one another wavefront is pushing to.
+
+### Choosing a Coop
+
+`put`, `putValue` and `signal` take no default Coop, so pick one of these:
+
+| Coop | Who calls | Ops per call | Queues | Signals |
+|---|---|---|---|---|
+| `ccoCoopWarp` | all 64 lanes of the wavefront, converged, same arguments | one | SPSC, MPSC | one |
+| `ccoCoopBlock` | the whole block, converged, same arguments; wavefront 0 issues | one | SPSC, MPSC | one |
+| `ccoCoopLaneMasked{active}` | all 64 lanes, converged | one per lane with `active`, in one push, in lane order | SPSC, MPSC | one per lane |
+| `ccoCoopLaneMaskedGroup{active}` | all 64 lanes, converged | as `ccoCoopLaneMasked` | SPSC, MPSC | `put` / `putValue`: one per peer group; `signal`: one per lane |
+| `ccoCoopThread` | any lanes: from divergent code, or a single lane | one per calling lane | MPSC only | `put` / `putValue`: one per peer group; `signal`: one per lane |
+
+- Builds without `NDEBUG` check that the lanes of the issuing wavefront pass the
+  same arguments with `ccoCoopWarp` / `ccoCoopBlock`. For `ccoCoopBlock` that
+  is wavefront 0 (linear thread ids 0–63, also in 2-D and 3-D blocks); the
+  other wavefronts' arguments are not read. A partial wavefront traps with
+  every Coop but `ccoCoopThread`.
+- The calling lanes of one `ccoCoopThread` call enter the queue together, in
+  lane order, as in `ccoGda`. A peer group is the lanes of one call with the
+  same peer: its signal comes after the group's data and carries the group's
+  highest lane's arguments, so count expected signals per group.
+- `ccoGdaThreadAggregate` (`put<CCO_TEAM_WORLD, ccoGdaThreadAggregate>(...)`)
+  needs `ccoCoopThread` or `ccoCoopLaneMaskedGroup` and only changes a `put` /
+  `putValue` carrying a signal: it promises that all calling lanes target one
+  peer, so they send one signal, from the highest lane. Builds without
+  `NDEBUG` check the single peer.
+- SPSC queues reject `ccoCoopThread`, and `ccoGda` rejects the lane-masked Coops,
+  at compile time.
+- Call `flush()` with `ccoCoopWarp` or `ccoCoopBlock`, as in `ccoGda`: after
+  lane-masked or thread ops, flush from the converged wavefront.
+  `flush(ccoCoopBlock)` flushes each wavefront of the block that pushed through
+  its own handle since its last completed flush; on an MPSC queue, also
+  wavefront 0.
+
+How to choose:
+
+| You want | Use |
+|---|---|
+| the lowest cost per op, with a queue per wavefront or block | SPSC with `ccoCoopWarp` / `ccoCoopBlock` |
+| many wavefronts sharing a few queues | MPSC |
+| a different peer, offset or size per thread, from a full wavefront | `ccoCoopLaneMasked`, or `ccoCoopLaneMaskedGroup` for one signal per peer group |
+| `ccoGda` thread code as is (divergent calls, single lanes) | `ccoCoopThread` on MPSC |
+| one signal for calling lanes that all go to one peer | add `ccoGdaThreadAggregate` |
+
+Prefer SPSC queues and one push per wavefront: an SPSC push needs no atomic,
+while each MPSC push claims its lines with a device-memory atomic, and each
+`ccoCoopThread` call pushes on its own, so calls on both sides of a branch
+claim twice. Compute the per-lane arguments and call once from converged code,
+e.g. `put(c ? p1 : p2, ...)` or a lane-masked Coop.
+
+### Signal slots
+
+A slot is a 64-bit word that remote signals add to (`SignalInc` /
+`SignalAdd`) or overwrite (`SignalSet`), plus a count of what local waits have
+consumed. The semantics are the same as `ccoGda`'s:
+
+- `readSignal(id)` returns the unconsumed amount: the slot's value minus what
+  was consumed.
+- `waitSignal(id, least, coop)` waits until at least `least` is unconsumed,
+  then consumes `least`. It is not an absolute target: a second
+  `waitSignal(id, n)` waits for `n` more. (`ccoSdma::waitSignal` does take an
+  absolute value.)
+- Have one waiter per slot at a time: two concurrent waiters on one slot can
+  both take the same arrival. `waitSignal` does not take the lane-masked Coops.
+- Call `resetSignal(id)` only when no signal to the slot is in flight. It zeroes
+  the slot and its consumed count.
+- Use slot ids from 0 to `gdaSignalCount - 1`, and 8-byte aligned offsets for
+  `WindowSignalAdd` / `WindowSignalSet`. `ccoProxy` rejects a signal to a
+  larger id or an unaligned offset: the DevComm fails with `BAD_REQUEST`
+  before anything is posted. The local `readSignal` / `waitSignal` /
+  `resetSignal` do not check the id, in either transport.
+
+With `SignalSet`, the sender sets 1, 2, 3, ... (one per round) and the receiver
+calls `waitSignal(slot, 1)` once per round.
+
+### Ordering and failure
+
+- Ops one wavefront pushes to one queue reach each peer in program order on one
+  QP, so a put followed by a signal (or a put carrying a signal) to the same
+  peer is delivered data first. Different queues are unordered, as different
+  GDA contexts are, and so are `ccoGda` and `ccoProxy` ops, even to the same
+  peer. On an MPSC queue, the ops of different wavefronts interleave.
+- For `SignalSet` / `WindowSignalSet`, send every set of a slot through one
+  queue (sets through two queues can land out of order and move the slot back),
+  use increasing values, and don't also use `SignalInc` / `SignalAdd` on that
+  slot. A set is a plain RDMA write (as is a `putValue` used as a flag), so
+  the data before it is visible first only if writes reach GPU memory in the
+  order the NIC issued them:
+  - don't use relaxed ordering on the window MRs (`ccoDevCommCreate` warns when
+    `MORI_IB_ENABLE_RELAXED_ORDERING=1` applies it);
+  - run on a NIC-to-GPU path that keeps PCIe write order, including under
+    SR-IOV VFs and device passthrough.
+- The first proxy error fails the DevComm for good: later ops are dropped,
+  `failed()` returns true, and `flush(coop, timeoutCycles)` and
+  `waitSignal(id, least, coop, timeoutCycles)` return 2. The proxy keeps
+  draining the queues, so pushes still return, except on a queue it found
+  corrupted (an `INTERNAL` error): it stops reading that one, and an MPSC push
+  to it blocks once the ring is full.
+- On the host, `ccoDevCommGetError(comm, &dc, &err)` returns 1 and the first
+  error (code, peer, queue, op, completion status, message). You can call it
+  while kernels run. It reports ccoProxy errors only; GDA errors on the same
+  DevComm do not show up there.
+- A trap ends the process: `flush()` and `waitSignal()` without a timeout trap
+  on a failed DevComm, every call traps on a usage error, and HIP then reports
+  the queue error and aborts. Builds without `NDEBUG` print the reason first.
+  To keep the process on a failure, use the timeout overloads or `failed()`.
+- Only the rank that hit the error sees it; peers are not notified. A rank that
+  only receives keeps waiting for data that will not come, so give receivers
+  their own timeout (`waitSignal(..., timeoutCycles)`).
+- To recover, detect the failure (a 2, `failed()`, or `ccoDevCommGetError`),
+  agree on it across ranks out of band, then have every rank call
+  `ccoDevCommDestroy` and create a new DevComm. Other DevComms are unaffected.
+- Teardown is local, as for GDA: `ccoDevCommDestroy` and `ccoCommDestroy` never
+  wait for other ranks. Before destroying, make sure no peer still pushes to
+  this rank: end the last kernels with `flush()`, synchronize, then call
+  `ccoBarrierAll`. An op still in flight to a rank that has destroyed fails on
+  the sender once the QP's retries run out (by default 8 tries with a 67 ms ACK
+  timeout each, about 0.5 s; `MORI_IO_QP_TIMEOUT` and `MORI_IO_QP_RETRY_CNT`
+  change them) and is reported as a teardown error.
+- Destroy each DevComm once, on the struct `ccoDevCommCreate` filled. After
+  `ccoCommDestroy`, the only valid call on it is `ccoDevCommDestroy(nullptr,
+  &dc)`.
+
+### Example
+
+```cpp
+#include "mori/cco/cco_scale_out.hpp"
+
+using namespace mori::cco;
+
+// Host: reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;  // no GDA QPs
+//       reqs.proxyConnectionType = CCO_GDA_CONNECTION_FULL;
+//       reqs.proxySpscQueueCount = nBlocks; reqs.gdaSignalCount >= nBlocks.
+// Round r = 1, 2, ...: block b sends chunk b and sets slot b to r (no NIC atomics).
+__global__ void send(ccoDevComm dc, ccoWindow_t dst, ccoWindow_t src, size_t chunk, int peer,
+                     uint64_t round) {
+  ccoProxy<> proxy{dc, static_cast<int>(blockIdx.x)};
+  const size_t off = blockIdx.x * chunk;
+  proxy.put(peer, dst, off, src, off, chunk, ccoGda_SignalSet{blockIdx.x, round},
+            ccoCoopBlock{});
+  proxy.flush(ccoCoopBlock{});  // src may be overwritten now
+}
+
+// Once per round: consumes one, so chunk blockIdx.x of this round has landed.
+__global__ void recv(ccoDevComm dc) {
+  ccoProxy<> proxy{dc, static_cast<int>(blockIdx.x)};
+  proxy.waitSignal(blockIdx.x, 1, ccoCoopBlock{});
+}
+```
+
+A complete program (host setup, data check, timeouts, `ccoDevCommGetError`) is
+[`examples/cco/cpp/03_proxy_put.cpp`](https://github.com/ROCm/mori/blob/main/examples/cco/cpp/03_proxy_put.cpp).
+
+### Checking it on your platform
+
+Run `tests/cpp/cco/test_proxy_put` (built with `BUILD_TESTS=ON`) before relying
+on ccoProxy on a new platform, with one rank on each of two nodes. Both ranks
+must use GPUs whose NICs are on the same rail (here GPU 0 on both nodes):
+
+```bash
+# both nodes
+export MORI_SOCKET_IFNAME=<iface> HIP_VISIBLE_DEVICES=0
+# node A: write the bootstrap id, copy it to node B, then start rank 0
+./test_proxy_put --gen-uid <iface> 0 uid.bin
+MORI_CCO_PROXY_TEST_CASES=atomic_free ./test_proxy_put --rank 0 --world 2 --uid-file uid.bin
+# node B
+MORI_CCO_PROXY_TEST_CASES=atomic_free ./test_proxy_put --rank 1 --world 2 --uid-file uid.bin
+```
+
+1. Run the atomic-free cases first (as above), then the full suite (without
+   `MORI_CCO_PROXY_TEST_CASES`). `MORI_CCO_PROXY_TEST_NEGATIVE=all` adds the
+   failure-path cases. Each rank prints `PASSED` at the end; a case name in
+   either variable that matches no case fails the run. A build with MPI also
+   runs under `mpirun -np 2`.
+2. If the atomic-free cases pass but the full suite aborts at the first case
+   that uses `SignalInc` / `SignalAdd`, after the proxy prints a `COMPLETION`
+   error on stderr, NIC atomics into GPU memory do not work on this platform:
+   use `SignalSet` / `WindowSignalSet`.
+3. `MORI_SHMEM_LOG_LEVEL=info` prints the engine's setup at `ccoDevCommCreate`:
+   queues, threads, QPs per peer (summed over the threads) and the CPUs the proxy
+   threads run on.
+4. `cco_p2p_put_bw -t proxy` and `cco_p2p_put_latency -t proxy`
+   ([benchmark/cco](https://github.com/ROCm/mori/blob/main/benchmark/cco/README.md))
+   measure bandwidth and latency but do not check the data; they are no
+   substitute for the test.

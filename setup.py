@@ -722,6 +722,7 @@ class CMakeBuild(build_ext):
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_cco_proxy_enabled = _env_flag("BUILD_CCO_PROXY", "ON")
         build_ops_kiwi_enabled = _env_flag("BUILD_OPS_KIWI", "OFF")
         with_mpi = (
             "ON"
@@ -787,6 +788,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DBUILD_CCO_PROXY={'ON' if build_cco_proxy_enabled else 'OFF'}",
             f"-DBUILD_OPS_KIWI={'ON' if build_ops_kiwi_enabled else 'OFF'}",
             f"-DBUILD_CCO_SDMA={BUILD_CCO_SDMA}",
             f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
@@ -963,7 +965,7 @@ class CMakeBuild(build_ext):
         # carry an $ORIGIN/../.. rpath (set in examples/CMakeLists.txt) so they
         # resolve libmori_*.so from site-packages/mori/ once installed here.
         cco_examples_dst = root_dir / "python/mori/examples/cco"
-        for _exe in ("cco_lsa_put", "cco_gda_put"):
+        for _exe in ("cco_lsa_put", "cco_gda_put", "cco_proxy_put"):
             src = build_dir / "examples" / _exe
             dst = cco_examples_dst / _exe
             if build_examples.upper() == "ON" and src.exists():

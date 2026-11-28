@@ -36,10 +36,11 @@ namespace mori::cco::benchmark {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
-               "  -t transport   lsa | sdma | ibgda (default ibgda)\n"
+               "  -t transport   lsa | sdma | ibgda | proxy (default ibgda)\n"
                "                 sets the required env internally:\n"
                "                   sdma  -> MORI_ENABLE_SDMA=1\n"
                "                   ibgda -> MORI_DISABLE_P2P=1\n"
+               "                   proxy -> MORI_DISABLE_P2P=1 (ccoProxy, BUILD_CCO_PROXY)\n"
                "                   lsa   -> MORI_DISABLE_P2P=0\n"
                "                 when -t is omitted the transport falls back to env:\n"
                "                   MORI_ENABLE_SDMA=1 -> sdma  [highest priority]\n"
@@ -54,8 +55,10 @@ void PrintUsage(const char* program) {
                "  -T threads     threads per block\n"
                "                 for sdma bw, -c/-T set the number of issue units\n"
                "                 (grid x units-per-block); omit both for one block\n"
-               "  -s scope       thread | warp | block | thread_agg (default block)\n"
+               "  -s scope       thread | warp | block | thread_agg | lane (default block)\n"
                "                 thread_agg = thread scope + ThreadAggregate (bw only)\n"
+               "                 proxy: warp | block, and in put_bw also thread (with\n"
+               "                 -q mpsc) and lane = ccoCoopLaneMasked; no thread_agg\n"
                "  -C comp        SDMA latency completion: quiet | signal (default quiet)\n"
                "                 quiet  = quietQueue(), engine read pointer drain\n"
                "                 signal = put carries a local-signal ATOMIC, then\n"
@@ -64,6 +67,15 @@ void PrintUsage(const char* program) {
                "                 without ringing, then one commit() (bw only)\n"
                "  -A depth       SDMA: sub-copies per queue per iter (default 1);\n"
                "                 baseline rings each, -a rings once for all\n"
+               "  -P             latency: ping-pong put + SignalInc, both PEs run,\n"
+               "                 latency = round trip / 2 (ibgda, proxy)\n"
+               "  -S             latency: signal-only ping-pong (ibgda, proxy)\n"
+               "  -Q threads     proxy: host proxy threads (default 0: the engine's, 4)\n"
+               "  -K qps         proxy: RC QPs per (proxy thread, peer) (default 0: the\n"
+               "                 engine's, 4)\n"
+               "  -q kind        proxy, put_bw: spsc (default; one queue per block, or\n"
+               "                 per wavefront with -s warp|lane) | mpsc (one queue per\n"
+               "                 block)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -95,7 +107,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   };
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:")) != -1) {
+  while ((opt = getopt(argc, argv, "hb:e:f:n:w:c:T:t:s:aA:C:PSQ:q:K:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -104,6 +116,28 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         break;
       case 'A':
         out_args->agg_depth = std::atoi(optarg);
+        break;
+      case 'P':
+        out_args->pingpong = true;
+        break;
+      case 'S':
+        out_args->pingpong = true;
+        out_args->signal_only = true;
+        break;
+      case 'Q':
+        out_args->proxy_threads = std::atoi(optarg);
+        break;
+      case 'K':
+        out_args->proxy_qps_per_peer = std::atoi(optarg);
+        break;
+      case 'q':
+        if (std::strcmp(optarg, "spsc") == 0) {
+          out_args->proxy_mpsc = false;
+        } else if (std::strcmp(optarg, "mpsc") == 0) {
+          out_args->proxy_mpsc = true;
+        } else {
+          return 1;
+        }
         break;
       case 'b':
         out_args->min_size = parse_size(optarg);
@@ -135,6 +169,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->transport = Transport::kSdma;
         } else if (std::strcmp(optarg, "ibgda") == 0) {
           out_args->transport = Transport::kIbgda;
+        } else if (std::strcmp(optarg, "proxy") == 0) {
+          out_args->transport = Transport::kProxy;
         } else {
           return 1;
         }
@@ -149,6 +185,8 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           out_args->put_scope = PutScope::kBlock;
         } else if (std::strcmp(optarg, "thread_agg") == 0) {
           out_args->put_scope = PutScope::kThreadAgg;
+        } else if (std::strcmp(optarg, "lane") == 0) {
+          out_args->put_scope = PutScope::kLane;
         } else {
           return 1;
         }
@@ -200,12 +238,14 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : "p2p";
 
   // Units the total size is split across (one WQE/message each): block=one per
-  // block, warp=one per wavefront, thread=one per thread. Each message is size/units.
+  // block, warp=one per wavefront, thread / thread_agg / lane=one per thread.
+  // Each message is size/units.
   int units = grid_x;
   if (scope_name != nullptr && std::strcmp(scope_name, "warp") == 0) {
     units = grid_x * (warp_size > 0 ? block_threads / warp_size : 1);
-  } else if (scope_name != nullptr && (std::strcmp(scope_name, "thread") == 0 ||
-                                       std::strcmp(scope_name, "thread_agg") == 0)) {
+  } else if (scope_name != nullptr &&
+             (std::strcmp(scope_name, "thread") == 0 ||
+              std::strcmp(scope_name, "thread_agg") == 0 || std::strcmp(scope_name, "lane") == 0)) {
     units = grid_x * block_threads;
   }
   if (units < 1) units = 1;
@@ -254,7 +294,41 @@ void PrintPerfTable(const char* test_name, const char* transport_name, const cha
   std::fflush(stdout);
 }
 
-int PerfInit(int argc, char** argv, PerfContext* ctx) {
+// The first option given that this benchmark does not take, as a message, or
+// nullptr.
+static const char* UnsupportedOption(const PerfArgs& args, const PerfFeatures& features,
+                                     int warp_size) {
+  const bool proxy = args.transport == Transport::kProxy;
+  const bool per_thread = proxy && features.proxy_per_thread;
+  const bool warp_or_block =
+      args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
+  if (proxy && !features.proxy) return "-t proxy: this benchmark has no ccoProxy variant";
+  if (!proxy && (args.proxy_threads != 0 || args.proxy_qps_per_peer != 0)) {
+    return "-Q / -K need -t proxy";
+  }
+  if (args.put_scope == PutScope::kLane && !per_thread) {
+    return "-s lane needs cco_p2p_put_bw -t proxy";
+  }
+  if (args.proxy_mpsc && !per_thread) return "-q mpsc needs cco_p2p_put_bw -t proxy";
+  if (proxy && args.put_scope == PutScope::kThreadAgg) {
+    return "-t proxy takes no -s thread_agg: ccoGdaThreadAggregate only changes a put carrying a "
+           "signal";
+  }
+  if (proxy && !per_thread && !warp_or_block) return "-t proxy needs -s warp|block";
+  if (per_thread && args.put_scope == PutScope::kThread && !args.proxy_mpsc) {
+    return "-t proxy -s thread needs -q mpsc (or -s lane for SPSC queues)";
+  }
+  if (per_thread && args.put_scope == PutScope::kLane && args.threads_per_block % warp_size != 0) {
+    return "-t proxy -s lane needs -T whole wavefronts";
+  }
+  if (args.pingpong && !features.pingpong) return "-P / -S need cco_p2p_put_latency";
+  if (args.pingpong && (!(proxy || args.transport == Transport::kIbgda) || !warp_or_block)) {
+    return "-P / -S need -t ibgda|proxy and -s warp|block";
+  }
+  return nullptr;
+}
+
+int PerfInit(int argc, char** argv, PerfContext* ctx, const PerfFeatures& features) {
   std::memset(&ctx->devComm, 0, sizeof(ctx->devComm));
   ctx->comm = nullptr;
   ctx->send_win = nullptr;
@@ -276,11 +350,12 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
-      args.threads_per_block < 1 || args.agg_depth < 1) {
+      args.threads_per_block < 1 || args.agg_depth < 1 || args.proxy_threads < 0 ||
+      args.proxy_qps_per_peer < 0) {
     if (ctx->world_rank == 0) {
       std::fprintf(stderr,
                    "Invalid arguments (need iters >= 1, nblocks/threads >= 1, step >= 2, "
-                   "agg_depth >= 1).\n");
+                   "agg_depth >= 1, proxy threads / QPs >= 0).\n");
     }
     MPI_Finalize();
     return 1;
@@ -300,6 +375,7 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
         setenv("MORI_ENABLE_SDMA", "1", 1);
         break;
       case Transport::kIbgda:
+      case Transport::kProxy:
         setenv("MORI_ENABLE_SDMA", "0", 1);
         setenv("MORI_DISABLE_P2P", "1", 1);
         break;
@@ -336,6 +412,12 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
   HIP_RUNTIME_CHECK(hipSetDevice(device_id));
   HIP_RUNTIME_CHECK(
       hipDeviceGetAttribute(&ctx->device_warp_size, hipDeviceAttributeWarpSize, device_id));
+
+  if (const char* unsupported = UnsupportedOption(args, features, ctx->device_warp_size)) {
+    if (ctx->world_rank == 0) std::fprintf(stderr, "%s\n", unsupported);
+    PerfFinalize(ctx);
+    return 1;
+  }
 
   // Enable peer access for LSA flat-VA loopback / import where available.
   for (int i = 0; i < ctx->device_count; i++) {
@@ -402,9 +484,32 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // QP, so blocks are independent — no cross-block barrier, and each block
     // flushes its own QP. gdaContextCount must cover the largest block count.
     reqs.gdaContextCount = args.nblocks;
-    reqs.gdaSignalCount = 0;
+    // proxy: the same peers over proxy QPs only, no GDA QPs.
+    if (args.transport == Transport::kProxy) {
+      reqs.proxyConnectionType = reqs.gdaConnectionType;
+      reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
+    }
+    reqs.gdaSignalCount = kSlotPing + 1;
     reqs.gdaCounterCount = 0;
     reqs.lsaBarrierCount = 0;
+    if (args.transport == Transport::kProxy) {
+#ifndef MORI_CCO_PROXY
+      if (ctx->my_pe == 0) {
+        std::fprintf(stderr, "-t proxy needs a mori build with BUILD_CCO_PROXY=ON\n");
+      }
+      PerfFinalize(ctx);
+      return 1;
+#endif
+      if (args.proxy_mpsc) {
+        reqs.proxyMpscQueueCount = args.nblocks;
+      } else {
+        reqs.proxySpscQueueCount =
+            args.nblocks *
+            ProxyUnitsPerBlock(args.put_scope, args.threads_per_block, ctx->device_warp_size);
+      }
+      reqs.proxyThreadCount = args.proxy_threads;
+      reqs.proxyQpsPerPeer = args.proxy_qps_per_peer;
+    }
   }
 
   if (ccoDevCommCreate(ctx->comm, &reqs, &ctx->devComm) != 0) {
@@ -435,7 +540,14 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     // The other PE's index within the LSA team.
     ctx->peer_lsa_rank = ctx->devComm.lsaRank ^ 1;
   } else {
-    if (ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
+    if (args.transport == Transport::kProxy &&
+        ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues == 0) {
+      if (ctx->my_pe == 0) std::fprintf(stderr, "ccoProxy queues were not created\n");
+      PerfFinalize(ctx);
+      return 1;
+    }
+    if (args.transport == Transport::kIbgda &&
+        ctx->devComm.gdaConnType == CCO_GDA_CONNECTION_NONE) {
       if (ctx->my_pe == 0) {
         std::fprintf(stderr,
                      "IBGDA transport collapsed to NONE — RDMA loopback unsupported on a single "
@@ -458,6 +570,17 @@ int PerfInit(int argc, char** argv, PerfContext* ctx) {
     } else if (args.transport == Transport::kLsa) {
       std::printf("[cco-bench] transport = LSA  (intra-node P2P, flat-VA load/store; lsaSize=%d)\n",
                   ctx->devComm.lsaSize);
+    } else if (args.transport == Transport::kProxy) {
+      // Requested values: the engine caps threads at the queue count and QPs at
+      // a thread's queue count; its INFO log shows what it runs.
+      auto requested = [](int n) { return n > 0 ? std::to_string(n) : std::string("default"); };
+      std::printf(
+          "[cco-bench] transport = PROXY (RDMA via ccoProxy: %d %s KIWI queues; requested %s "
+          "host proxy threads and %s QPs per (thread, peer), capped by the queue count; proxy "
+          "connType=%d)\n",
+          ctx->devComm.proxy.numSpscQueues + ctx->devComm.proxy.numMpscQueues,
+          args.proxy_mpsc ? "MPSC" : "SPSC", requested(args.proxy_threads).c_str(),
+          requested(args.proxy_qps_per_peer).c_str(), ctx->devComm.proxy.connType);
     } else {
       std::printf(
           "[cco-bench] transport = IBGDA (cross-node RDMA via ccoGda; gdaConnType=%d)\n"
@@ -514,13 +637,15 @@ void PerfResFree(PerfRes* res) {
   if (res->counter_d) HIP_RUNTIME_CHECK(hipFree(res->counter_d));
 }
 
-float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch) {
+float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch,
+                        const std::function<void()>& pre_timed) {
   if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
   launch(static_cast<int>(warmup));
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   if (res.counter_d) HIP_RUNTIME_CHECK(hipMemset(res.counter_d, 0, 2 * sizeof(unsigned int)));
+  if (pre_timed) pre_timed();
   HIP_RUNTIME_CHECK(hipEventRecord(res.start, nullptr));
   launch(static_cast<int>(iters));
   HIP_RUNTIME_CHECK(hipGetLastError());

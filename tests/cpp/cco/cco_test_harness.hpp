@@ -107,11 +107,15 @@ static inline int ccoTestForkMode(int nranks, const char* name, const char* uidP
   for (int r = 0; r < nranks; r++) {
     pid_t pid = fork();
     if (pid == 0) {
+      // Line-buffered, so output survives _exit, traps and kills when piped.
+      setvbuf(stdout, nullptr, _IOLBF, 0);
       mori::cco::ccoUniqueId childUid;
       while (!ccoTestReadFile(uidPath, &childUid, sizeof(childUid))) {
         usleep(10000);
       }
-      _exit(run_test(r, nranks, childUid));
+      const int rc = run_test(r, nranks, childUid);
+      fflush(nullptr);  // _exit skips stdio flushing
+      _exit(rc);
     }
     children.push_back(pid);
   }
@@ -192,6 +196,27 @@ static inline int ccoTestGenUidMode(int argc, char** argv) {
   return 0;
 }
 
+// Whether MPI is up or the process was started by an MPI / Slurm launcher.
+static inline bool ccoTestUnderMpi() {
+#ifdef MORI_WITH_MPI
+  int mpiInitialized = 0;
+  MPI_Initialized(&mpiInitialized);
+  return mpiInitialized || getenv("OMPI_COMM_WORLD_SIZE") || getenv("PMI_SIZE") ||
+         getenv("PMI_RANK") || getenv("SLURM_PROCID");
+#else
+  return false;
+#endif
+}
+
+// Whether ccoTestMain picks fork mode for these arguments: every rank on this node.
+static inline bool ccoTestIsForkLaunch(int argc, char** argv) {
+  if (argc >= 2 && !strcmp(argv[1], "--gen-uid")) return false;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--rank")) return false;
+  }
+  return !ccoTestUnderMpi();
+}
+
 // ── unified entry point: MPI > single-rank > fork ────────────────────────────
 //
 // name      — human label printed in headers (e.g. "CCO GDA flushAsync")
@@ -205,13 +230,9 @@ static inline int ccoTestMain(int argc, char** argv, const char* name, const cha
   }
 
 #ifdef MORI_WITH_MPI
-  int mpiInitialized = 0;
-  MPI_Initialized(&mpiInitialized);
-
-  bool underMpi = mpiInitialized || getenv("OMPI_COMM_WORLD_SIZE") || getenv("PMI_SIZE") ||
-                  getenv("PMI_RANK") || getenv("SLURM_PROCID");
-
-  if (underMpi) {
+  if (ccoTestUnderMpi()) {
+    int mpiInitialized = 0;
+    MPI_Initialized(&mpiInitialized);
     if (!mpiInitialized) MPI_Init(&argc, &argv);
     int rank, nranks;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);

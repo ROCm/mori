@@ -44,7 +44,9 @@ namespace mori::cco::benchmark {
 // Cooperation granularity of the kernel transfer loop / RDMA op.
 // kThreadAgg: thread scope with ccoGdaThreadAggregate (same-peer lanes post as one
 // batch instead of per-peer grouping). Bandwidth kernels only; latency uses thread.
-enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
+// kLane: ccoProxy's ccoCoopLaneMasked, per-thread puts pushed by whole
+// wavefronts (proxy put_bw only).
+enum class PutScope { kThread, kWarp, kBlock, kThreadAgg, kLane };
 
 // How an SDMA op waits for local completion (latency kernels). Named after the
 // API the kernel calls; both give the same sender-side guarantee at different cost.
@@ -63,7 +65,12 @@ inline const char* SdmaCompToChar(SdmaComp comp) {
 //   kLsa   — intra-node flat-VA load/store (no NIC), requires same-node peer.
 //   kIbgda — cross-node one-sided RDMA via ccoGda<PrvdType>.
 //   kSdma  — intra-node SDMA copy-engine via ccoSdma; selected by MORI_ENABLE_SDMA.
-enum class Transport { kLsa, kIbgda, kSdma };
+//   kProxy — one-sided RDMA via ccoProxy (KIWI queue + host proxy threads);
+//            -t proxy only, needs a BUILD_CCO_PROXY build.
+enum class Transport { kLsa, kIbgda, kSdma, kProxy };
+
+// GDA/proxy signal slot used by the ping-pong latency kernels.
+inline constexpr uint32_t kSlotPing = 0;
 
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
@@ -108,7 +115,29 @@ struct PerfArgs {
   // bytes/iter either way, so the two runs isolate the doorbell cost.
   bool aggregate = false;
   int agg_depth = 1;
+  // -P / -S (latency): ping-pong, both PEs run.
+  bool pingpong = false;
+  bool signal_only = false;
+  // proxy: -Q threads and -K QPs per peer (0 = the engine's default), -q mpsc.
+  int proxy_threads = 0;
+  bool proxy_mpsc = false;
+  int proxy_qps_per_peer = 0;
 };
+
+// The options a benchmark takes beyond the common ones; PerfInit rejects the
+// others, so no option is silently ignored.
+struct PerfFeatures {
+  bool proxy = false;             // -t proxy, -Q, -K
+  bool proxy_per_thread = false;  // with -t proxy: -q, -s lane, -s thread (put_bw)
+  bool pingpong = false;          // -P, -S
+};
+
+// SPSC queues per block: one per wavefront for -s warp|lane, else one.
+inline int ProxyUnitsPerBlock(PutScope scope, int threads_per_block, int warp_size) {
+  return scope == PutScope::kWarp || scope == PutScope::kLane
+             ? (threads_per_block + warp_size - 1) / warp_size
+             : 1;
+}
 
 // Holds MPI + CCO state for the lifetime of a benchmark run. PerfInit registers
 // two windows (send/recv) of max_size and a DevComm matching the transport.
@@ -138,7 +167,7 @@ struct PerfContext {
 
 // Returns 0 on success, 1 on bad args / setup failure, 2 when help was shown
 // (caller should exit 0 without calling PerfFinalize).
-int PerfInit(int argc, char** argv, PerfContext* ctx);
+int PerfInit(int argc, char** argv, PerfContext* ctx, const PerfFeatures& features = {});
 void PerfFinalize(PerfContext* ctx);
 
 using LaunchFn = std::function<void(int /*count*/)>;
@@ -153,7 +182,10 @@ struct PerfRes {
 
 void PerfResAlloc(PerfRes* res);
 void PerfResFree(PerfRes* res);
-float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch);
+// pre_timed (optional) runs between the warmup and the timed launch, e.g. a
+// cross-rank barrier when both PEs run kernels that wait on each other.
+float RunWarmupAndTimed(PerfRes& res, std::size_t warmup, std::size_t iters, LaunchFn launch,
+                        const std::function<void()>& pre_timed = nullptr);
 
 int ParseArgs(int argc, char** argv, PerfArgs* out_args);
 void PrintUsage(const char* program);
@@ -181,6 +213,8 @@ inline const char* ScopeToChar(PutScope scope) {
       return "block";
     case PutScope::kThreadAgg:
       return "thread_agg";
+    case PutScope::kLane:
+      return "lane";
   }
   return "none";
 }
@@ -193,6 +227,8 @@ inline const char* TransportToChar(Transport t) {
       return "ibgda";
     case Transport::kSdma:
       return "sdma";
+    case Transport::kProxy:
+      return "proxy";
   }
   return "none";
 }
@@ -210,7 +246,7 @@ inline bool size_ok(PutScope scope, std::size_t size_bytes, int nblocks, int thr
     return false;
   }
   const std::size_t per_block = len / static_cast<std::size_t>(nblocks);
-  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg) {
+  if (scope == PutScope::kThread || scope == PutScope::kThreadAgg || scope == PutScope::kLane) {
     return per_block % static_cast<std::size_t>(threads_per_block) == 0;
   }
   if (scope == PutScope::kWarp) {

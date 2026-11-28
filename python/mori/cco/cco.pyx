@@ -74,9 +74,11 @@ cdef class Comm:
     """Opaque communicator handle. Owns the underlying ccoComm*."""
 
     def __dealloc__(self):
-        if self._ptr != NULL:
-            ccoCommDestroy(self._ptr)
+        cdef ccoComm* ptr = self._ptr
+        if ptr != NULL:
             self._ptr = NULL
+            with nogil:
+                ccoCommDestroy(ptr)
 
     @property
     def ptr(self):

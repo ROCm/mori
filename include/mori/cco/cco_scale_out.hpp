@@ -25,8 +25,9 @@
 // The sole consumer of the RDMA core, split from cco.hpp so host-only and
 // LSA-only TUs can include cco.hpp without the heavy provider RDMA headers.
 // Includes cco.hpp and adds the GDA device layer (ccoGda<PrvdType> + the
-// provider-specialized primitives in mori::cco::impl). Include this (not
-// cco.hpp) when you need GDA.
+// provider-specialized primitives in mori::cco::impl) and ccoProxy, the
+// host-proxy RDMA transport with the same window API (section 6). Include this
+// (not cco.hpp) when you need GDA or ccoProxy.
 #pragma once
 
 #include "mori/cco/cco.hpp"
@@ -36,6 +37,12 @@
 // application headers — cco's GDA path depends only on core.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include "mori/core/transport/rdma/rdma_device.hpp"
+#endif
+
+// ccoProxy pushes its ops through the KIWI device-to-host queues (vendored in
+// mori/cco/proxy); device-only.
+#if defined(__HIPCC__)
+#include "mori/cco/proxy/invoke/device_context.hip.hpp"
 #endif
 
 namespace mori {
@@ -153,6 +160,24 @@ struct ccoGda_WindowSignalAdd {
       : win(w), offset(off), value(val) {}
 };
 
+// Atomic-free signal (ccoProxy only): an 8-byte RDMA write of `value` into the
+// slot, after the data on the same QP. Contract: MORI-CCO-GUIDE.md §10.
+struct ccoGda_SignalSet {
+  ccoGdaSignal_t signalId;
+  uint64_t value;
+  __device__ inline ccoGda_SignalSet(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
+};
+
+// ccoGda_SignalSet into a caller window at a window-relative offset (as
+// ccoGda_WindowSignalAdd); the caller polls it.
+struct ccoGda_WindowSignalSet {
+  ccoWindow_t win;
+  size_t offset;
+  uint64_t value;
+  __device__ inline ccoGda_WindowSignalSet(ccoWindow_t w, size_t off, uint64_t val)
+      : win(w), offset(off), value(val) {}
+};
+
 struct ccoGda_CounterInc {
   ccoGdaCounter_t counterId;
   __device__ inline ccoGda_CounterInc(ccoGdaCounter_t id) : counterId(id) {}
@@ -217,10 +242,13 @@ struct ccoGda {
             typename Coop = ccoCoopThread>
   __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
 
-  // readSignal: read the local value of one signal slot.
+  // readSignal: the unconsumed amount of one local signal slot (its value minus
+  // what waitSignal consumed).
   __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64);
 
-  // waitSignal: block until the local signal slot reaches `least`.
+  // waitSignal: block until `least` more than already consumed have arrived in
+  // the local signal slot, then consume them (not an absolute target). One
+  // waiter per slot at a time.
   template <typename Coop = ccoCoopThread>
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
                                     int bits = 64);
@@ -321,6 +349,40 @@ __device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda, ccoGdaBar
 // dedicated `impl` namespace so the public surface stays clean and these
 // helpers don't leak into ADL or autocomplete.
 namespace impl {
+
+// Signal RemoteActions by target: a slot of the resource window, or an offset
+// in a caller window; kSignalSet: the atomic-free sets (ccoProxy only).
+template <typename RemoteAction>
+inline constexpr bool kSlotSignal = std::is_same_v<RemoteAction, ccoGda_SignalInc> ||
+                                    std::is_same_v<RemoteAction, ccoGda_SignalAdd> ||
+                                    std::is_same_v<RemoteAction, ccoGda_SignalSet>;
+template <typename RemoteAction>
+inline constexpr bool kWindowSignal = std::is_same_v<RemoteAction, ccoGda_WindowSignalAdd> ||
+                                      std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>;
+template <typename RemoteAction>
+inline constexpr bool kSignalSet = std::is_same_v<RemoteAction, ccoGda_SignalSet> ||
+                                   std::is_same_v<RemoteAction, ccoGda_WindowSignalSet>;
+
+// RemoteActions ccoGda resolves. Any other type would post an atomic to address
+// 0, as would signal() with ccoGda_NoSignal (rejected there).
+template <typename RemoteAction>
+__device__ inline void checkGdaRemoteAction() {
+  static_assert(!kSignalSet<RemoteAction>,
+                "ccoGda does not take ccoGda_SignalSet / ccoGda_WindowSignalSet (ccoProxy only): "
+                "use ccoGda_SignalAdd / ccoGda_WindowSignalAdd");
+  static_assert(std::is_same_v<RemoteAction, ccoGda_NoSignal> || kSlotSignal<RemoteAction> ||
+                    kWindowSignal<RemoteAction>,
+                "ccoGda RemoteAction must be ccoGda_NoSignal, ccoGda_SignalInc, ccoGda_SignalAdd "
+                "or ccoGda_WindowSignalAdd");
+}
+
+template <typename Coop>
+__device__ inline void checkGdaCoop() {
+  static_assert(!kLaneMaskedCoop<Coop>,
+                "ccoGda does not take ccoCoopLaneMasked / ccoCoopLaneMaskedGroup (ccoProxy only): "
+                "it ignores `active`, so every lane would issue its op. Call with ccoCoopThread "
+                "from the active lanes");
+}
 
 // Poll the CQ until wq.doneIdx reaches targetIdx. Collapsed-CQ model:
 // reconstruct the completed WQE count directly from the CQE counter (no
@@ -1246,8 +1308,9 @@ __device__ inline static void resetCounterImpl(volatile uint64_t* counterBuf,
 // RAIL:      teamPeer is node_id; global = teamPeer * lsaSize + lsaRank
 // CROSSNODE: team = [0,nodeStart) ∪ {self at nodeStart} ∪ [nodeStart+lsaSize,worldSize)
 // NONE:      returns -1
-__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
-  switch (comm.gdaConnType) {
+// connType: the team's ccoGdaConnectionType (ccoProxy passes its own).
+__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int connType, int teamPeer) {
+  switch (connType) {
     case CCO_GDA_CONNECTION_FULL:
       return teamPeer;
     case CCO_GDA_CONNECTION_RAIL:
@@ -1260,6 +1323,47 @@ __device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
     }
     default:
       return -1;
+  }
+}
+
+__device__ inline int GdaPeerToWorld(ccoDevComm const& comm, int teamPeer) {
+  return GdaPeerToWorld(comm, comm.gdaConnType, teamPeer);
+}
+
+// A put / signal `peer` as a world rank: CCO_TEAM_WORLD takes world ranks,
+// CCO_TEAM_GDA indexes the GDA team of connType.
+template <ccoTeamMode TeamMode>
+__device__ inline int ResolveWorldPeer(ccoDevComm const& comm, int connType, int peer) {
+  static_assert(TeamMode != CCO_TEAM_LSA,
+                "GDA / ccoProxy peers are world ranks (CCO_TEAM_WORLD) or GDA-team indices "
+                "(CCO_TEAM_GDA)");
+  if constexpr (TeamMode == CCO_TEAM_WORLD) {
+    return peer;
+  } else {
+    return GdaPeerToWorld(comm, connType, peer);
+  }
+}
+
+// My index and the size of the GDA team of connType; 0 and 0 for NONE.
+__device__ inline void GdaTeamRankSize(ccoDevComm const& comm, int connType, int& rank,
+                                       int& nRanks) {
+  switch (connType) {
+    case CCO_GDA_CONNECTION_FULL:
+      rank = comm.rank;
+      nRanks = comm.worldSize;
+      break;
+    case CCO_GDA_CONNECTION_RAIL:
+      rank = comm.rank / comm.lsaSize;
+      nRanks = comm.worldSize / comm.lsaSize;
+      break;
+    case CCO_GDA_CONNECTION_CROSSNODE:
+      rank = (comm.rank / comm.lsaSize) * comm.lsaSize;
+      nRanks = comm.worldSize - comm.lsaSize + 1;
+      break;
+    default:  // CCO_GDA_CONNECTION_NONE
+      rank = 0;
+      nRanks = 0;
+      break;
   }
 }
 
@@ -1293,37 +1397,14 @@ __device__ inline int WorldPeerToGda(ccoDevComm const& comm, int globalPeer) {
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode>
 __device__ inline int ccoGda<PrvdType, Doorbell>::resolveWorldPeer(int peer) const {
-  if constexpr (TeamMode == CCO_TEAM_WORLD) {
-    return peer;
-  } else {
-    return impl::GdaPeerToWorld(comm, peer);
-  }
+  return impl::ResolveWorldPeer<TeamMode>(comm, comm.gdaConnType, peer);
 }
 
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline ccoGda<PrvdType, Doorbell>::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
   this->_gdaHandle = (void*)&comm.ibgda;
-  switch (comm.gdaConnType) {
-    case CCO_GDA_CONNECTION_FULL:
-      this->rank = comm.rank;
-      this->nRanks = comm.worldSize;
-      break;
-    case CCO_GDA_CONNECTION_RAIL:
-      this->rank = comm.rank / comm.lsaSize;
-      this->nRanks = comm.worldSize / comm.lsaSize;
-      break;
-    case CCO_GDA_CONNECTION_CROSSNODE: {
-      int nodeStart = (comm.rank / comm.lsaSize) * comm.lsaSize;
-      this->rank = nodeStart;
-      this->nRanks = comm.worldSize - comm.lsaSize + 1;
-      break;
-    }
-    default:  // CCO_GDA_CONNECTION_NONE
-      this->rank = 0;
-      this->nRanks = 0;
-      break;
-  }
+  impl::GdaTeamRankSize(comm, comm.gdaConnType, this->rank, this->nRanks);
 }
 
 // put: RDMA write with optional signal
@@ -1333,6 +1414,8 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::put(int peer, ccoWindow_t dst
                                                        size_t dstOffset, ccoWindow_t srcWin,
                                                        size_t srcOffset, size_t bytes,
                                                        RemoteAction remoteAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
+  impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1411,7 +1494,9 @@ template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typenam
 __device__ inline void ccoGda<PrvdType, Doorbell>::putValue(int peer, ccoWindow_t dstWin,
                                                             size_t dstOffset, T value,
                                                             RemoteAction remoteAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
+  impl::checkGdaRemoteAction<RemoteAction>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1483,6 +1568,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::get(int peer, ccoWindow_t rem
                                                        size_t remoteOffset, ccoWindow_t localWin,
                                                        size_t localOffset, size_t bytes,
                                                        Coop coop) {
+  impl::checkGdaCoop<Coop>();
   if constexpr (ThreadMode == ccoGdaThreadAggregate) {
     static_assert(
         std::is_same_v<Coop, ccoCoopThread>,
@@ -1529,10 +1615,13 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction remoteAction,
                                                           Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(Doorbell != ccoGdaDoorbellCallerOrdered,
                 "signal() rings on its own, which a CallerOrdered QP does not allow: use put / "
                 "putValue with a RemoteAction signal, or flush this handle first and then "
                 "signal through an Immediate handle");
+  impl::checkGdaRemoteAction<RemoteAction>();
+  static_assert(!std::is_same_v<RemoteAction, ccoGda_NoSignal>, "signal() needs a remote action");
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1576,6 +1665,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::signal(int peer, RemoteAction
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flush(Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1, so every thread walks every peer and "
@@ -1600,6 +1690,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::flush(Coop coop) {
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flush(int peer, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "flush(peer) requires at least ccoCoopWarp. "
                 "With ccoCoopThread every thread runs the body, so two threads passing the "
@@ -1623,6 +1714,7 @@ template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <ccoTeamMode TeamMode, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::flushAsync(int peer, ccoGdaRequest_t* outRequest,
                                                               Coop coop) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     int worldPeer = resolveWorldPeer<TeamMode>(peer);
@@ -1643,6 +1735,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::flushAsync(int peer, ccoGdaRe
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::wait(ccoGdaRequest_t& request, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   // ccoCoopThread: each lane passes its own request; lanes on one CQ wait for the furthest.
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -1657,6 +1750,7 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::wait(ccoGdaRequest_t& request
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename LocalAction, typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localAction, Coop coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "counter() requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1 and makes thread_rank()==0 true for every "
@@ -1688,7 +1782,6 @@ __device__ inline void ccoGda<PrvdType, Doorbell>::counter(LocalAction localActi
   coop.sync();
 }
 
-// readSignal: read local signal value
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t signalId,
                                                                   int bits) {
@@ -1696,11 +1789,11 @@ __device__ inline uint64_t ccoGda<PrvdType, Doorbell>::readSignal(ccoGdaSignal_t
   return impl::readSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows, signalId, bits);
 }
 
-// waitSignal: wait until local signal reaches specified value
 template <core::ProviderType PrvdType, ccoGdaDoorbellMode Doorbell>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitSignal(ccoGdaSignal_t signalId,
                                                               uint64_t least, Coop coop, int bits) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1730,6 +1823,7 @@ template <typename Coop>
 __device__ inline void ccoGda<PrvdType, Doorbell>::waitCounter(ccoGdaCounter_t counterId,
                                                                uint64_t least, Coop coop,
                                                                int bits) {
+  impl::checkGdaCoop<Coop>();
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
@@ -1754,6 +1848,7 @@ __device__ inline ccoGdaBarrierSession<PrvdType, Coop>::ccoGdaBarrierSession(
 
 template <core::ProviderType PrvdType, typename Coop>
 __device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
+  impl::checkGdaCoop<Coop>();
   static_assert(!std::is_same_v<Coop, ccoCoopThread>,
                 "GDA barrier requires at least ccoCoopWarp. "
                 "ccoCoopThread reports size()==1, so every thread signals every peer and the "
@@ -1820,6 +1915,893 @@ __device__ inline void ccoGdaBarrier(Coop, ccoGda<PrvdType, Doorbell>&, ccoGdaBa
 }
 
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)
+
+/* ════════════════════════════════════════════════════════════════════════════
+ *  6. ccoProxy: host-proxy RDMA transport with the ccoGda window API.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+// Kernels push each op as a descriptor message into a KIWI device-to-host
+// queue; host proxy threads post it as ibverbs WRs on host-created RC QPs (a
+// put and its signal: two WRs on one QP). Keys and remote addresses are
+// resolved on the GPU as in ccoGda (window offset + iovaBias), so the proxy
+// needs no key tables. ccoProxy<> (ccoProxySpsc) uses the DevComm's SPSC pool,
+// ccoProxy<ccoProxyMpsc> its MPSC pool. mori::cco::proxy (KIWI) is internal.
+// Caller rules: docs/MORI-CCO-GUIDE.md §10.
+// Requires a BUILD_CCO_PROXY build and a gfx942/gfx950 target.
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  Wire format (shared by the device API and the host proxy engine)
+ *
+ *  The op is the KIWI callback id (the message metadata) and the descriptor
+ *  its single argument (FLUSH has none). The host engine registers the
+ *  callbacks in enum order, so the ids match. A put / putValue descriptor is
+ *  the prefix of its *SignalDesc, so one struct can carry either.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+enum ccoProxyOp : uint8_t {
+  ccoProxyOpPut = 0,             // ccoProxyPutDesc: RDMA write
+  ccoProxyOpPutSignal = 1,       // ccoProxyPutSignalDesc: RDMA write + signal, same QP
+  ccoProxyOpSignal = 2,          // ccoProxySignalDesc: signal
+  ccoProxyOpFlush = 3,           // no arguments: flushDone += 1 once satisfied
+  ccoProxyOpPutValue = 4,        // ccoProxyPutValueDesc: inline RDMA write
+  ccoProxyOpPutValueSignal = 5,  // ccoProxyPutValueSignalDesc: inline RDMA write + signal
+  ccoProxyOpCount
+};
+
+namespace impl {
+
+struct ccoProxyPutDesc {
+  uint64_t laddr;  // local MR address: window offset + iovaBias
+  uint64_t raddr;  // remote MR address: window offset + iovaBias
+  uint32_t lkey;
+  uint32_t rkey;
+  uint32_t bytes;
+  uint32_t peer;  // world rank
+};
+
+struct ccoProxySignalDesc {
+  uint64_t raddr;  // remote signal slot, as ccoProxyPutDesc::raddr
+  uint64_t value;  // atomic add operand, or the value written (set)
+  uint32_t rkey;
+  uint32_t peer;  // world rank
+  uint32_t set;   // 0: atomic fetch-add; 1: 8-byte inline write of value
+  uint32_t slot;  // 1: raddr = slot id * 8; the engine checks id < gdaSignalCount
+};
+
+struct ccoProxyPutSignalDesc {
+  ccoProxyPutDesc put;
+  ccoProxySignalDesc signal;  // signal.peer == put.peer
+};
+
+struct ccoProxyPutValueDesc {
+  uint64_t raddr;  // as ccoProxyPutDesc::raddr
+  uint64_t value;  // the low `bytes` bytes are written (little endian)
+  uint32_t rkey;
+  uint32_t bytes;  // 1..8
+  uint32_t peer;   // world rank
+  uint32_t pad;
+};
+
+struct ccoProxyPutValueSignalDesc {
+  ccoProxyPutValueDesc put;
+  ccoProxySignalDesc signal;  // signal.peer == put.peer
+};
+
+// Ring lines per descriptor: a 64-byte LL8 line carries 32 payload bytes.
+static_assert(sizeof(ccoProxyPutDesc) == 32, "one ring line");
+static_assert(sizeof(ccoProxySignalDesc) == 32, "one ring line");
+static_assert(sizeof(ccoProxyPutSignalDesc) == 64, "two ring lines");
+static_assert(sizeof(ccoProxyPutValueDesc) == 32, "one ring line");
+static_assert(sizeof(ccoProxyPutValueSignalDesc) == 64, "two ring lines");
+
+// Cap on one RDMA write; see ccoProxyContext::maxPutBytes.
+inline constexpr uint64_t ccoProxyMaxPutBytes = 1ull << 30;
+static_assert(ccoProxyMaxPutBytes <= UINT32_MAX, "ccoProxyContext::maxPutBytes is 32-bit");
+
+// Set in every flushDone word once the DevComm has failed (see
+// ccoDevCommGetError); the low bits keep the satisfied-FLUSH count.
+inline constexpr uint64_t ccoProxyFailedBit = 1ull << 63;
+
+}  // namespace impl
+
+#if defined(__HIPCC__)
+
+// Queue types for ccoProxy<Queue>.
+using ccoProxySpsc = mori::cco::proxy::queue::SPSCD2HQueue;
+using ccoProxyMpsc = mori::cco::proxy::queue::MPSCD2HQueue;
+
+// Usage error or failed DevComm: print the message from the lanes where `who`
+// holds (builds without NDEBUG only: a device printf adds registers to every
+// kernel), then trap.
+#ifndef NDEBUG
+#define CCO_PROXY_TRAP(who, ...)  \
+  do {                            \
+    if (who) printf(__VA_ARGS__); \
+    __builtin_trap();             \
+  } while (0)
+#else
+#define CCO_PROXY_TRAP(who, ...) __builtin_trap()
+#endif
+
+namespace impl {
+
+// Linear thread id in the block (x fastest): wavefront w holds ids
+// [64w, 64w + 64) in 1-D, 2-D and 3-D blocks alike.
+__device__ inline unsigned proxyLinearTid() {
+  return __builtin_amdgcn_workitem_id_x() +
+         __builtin_amdgcn_workgroup_size_x() *
+             (__builtin_amdgcn_workitem_id_y() +
+              __builtin_amdgcn_workgroup_size_y() * __builtin_amdgcn_workitem_id_z());
+}
+
+// Whether this is the lowest lane in `lanes` (default: the executing lanes):
+// the one lane that reports.
+__device__ inline bool proxyFirstLane(uint64_t lanes = __builtin_amdgcn_read_exec()) {
+  return __lane_id() == static_cast<unsigned>(__builtin_ctzll(lanes));
+}
+
+// Traps on device targets that cannot push (not gfx942/gfx950);
+// ccoDevCommCreate rejects proxy queues on such GPUs.
+__device__ inline void proxyCheckTarget() {
+#ifdef MORI_CCO_PROXY_PUSH_UNSUPPORTED
+  CCO_PROXY_TRAP(proxyFirstLane(),
+                 "ccoProxy: unsupported GPU target; ccoProxy needs a gfx942/gfx950 GPU\n");
+#endif
+}
+
+// Resolve a remote action to a signal descriptor, as ccoGda::put does.
+template <typename RemoteAction>
+__device__ inline ccoProxySignalDesc proxyResolveSignal(ccoDevComm const& comm, int worldPeer,
+                                                        const RemoteAction& action) {
+  static_assert(std::is_same_v<RemoteAction, ccoGda_NoSignal> || kSlotSignal<RemoteAction> ||
+                    kWindowSignal<RemoteAction>,
+                "ccoProxy supports ccoGda_NoSignal / SignalInc / SignalAdd / WindowSignalAdd / "
+                "SignalSet / WindowSignalSet");
+  ccoProxySignalDesc s{};
+  s.peer = static_cast<uint32_t>(worldPeer);
+  if constexpr (kSlotSignal<RemoteAction>) {
+    s.raddr = static_cast<uint64_t>(action.signalId) * sizeof(uint64_t);
+    s.rkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[worldPeer];
+    s.slot = 1;
+  } else if constexpr (kWindowSignal<RemoteAction>) {
+    const ccoWindowDevice* w = reinterpret_cast<ccoWindowDevice*>(action.win);
+    s.raddr = action.offset + w->ibgdaWin.iovaBias;
+    s.rkey = w->ibgdaWin.peerRkeys[worldPeer];
+  }
+  if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
+    s.value = 1;
+  } else if constexpr (kSlotSignal<RemoteAction> || kWindowSignal<RemoteAction>) {
+    s.value = action.value;
+  }
+  if constexpr (kSignalSet<RemoteAction>) s.set = 1;
+  return s;
+}
+
+// Put descriptor from window offsets (bytes left 0).
+__device__ inline ccoProxyPutDesc proxyPutDesc(int worldPeer, ccoWindow_t dstWin, size_t dstOffset,
+                                               ccoWindow_t srcWin, size_t srcOffset) {
+  const ccoWindowDevice* sw = reinterpret_cast<ccoWindowDevice*>(srcWin);
+  const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
+  ccoProxyPutDesc d{};
+  d.lkey = sw->ibgdaWin.lkey;
+  d.rkey = dw->ibgdaWin.peerRkeys[worldPeer];
+  d.laddr = srcOffset + sw->ibgdaWin.iovaBias;
+  d.raddr = dstOffset + dw->ibgdaWin.iovaBias;
+  d.peer = static_cast<uint32_t>(worldPeer);
+  return d;
+}
+
+// putValue descriptor: the low sizeof(T) bytes of value.
+template <typename T>
+__device__ inline ccoProxyPutValueDesc proxyPutValueDesc(int worldPeer, ccoWindow_t dstWin,
+                                                         size_t dstOffset, const T& value) {
+  const ccoWindowDevice* dw = reinterpret_cast<ccoWindowDevice*>(dstWin);
+  ccoProxyPutValueDesc d{};
+  d.raddr = dstOffset + dw->ibgdaWin.iovaBias;
+  d.rkey = dw->ibgdaWin.peerRkeys[worldPeer];
+  __builtin_memcpy(&d.value, &value, sizeof(T));
+  d.bytes = sizeof(T);
+  d.peer = static_cast<uint32_t>(worldPeer);
+  return d;
+}
+
+}  // namespace impl
+
+// Device-side transport handle. Construct per thread; call put / signal /
+// flush from the whole Coop group. Not copyable: two copies of an SPSC handle
+// would push from, and save, the same producer state.
+template <typename Queue = ccoProxySpsc>
+struct ccoProxy {
+  static constexpr bool kSpsc = std::is_same_v<Queue, ccoProxySpsc>;
+  static_assert(kSpsc || std::is_same_v<Queue, ccoProxyMpsc>,
+                "ccoProxy queue must be ccoProxySpsc or ccoProxyMpsc");
+
+  ccoDevComm const& comm;
+  int rank;             // my index in the proxy's GDA team (comm.proxy.connType) [0, nRanks)
+  int nRanks;           // that team's size
+  uint32_t queueId;     // queue index in this handle's pool
+  uint64_t* flushDone;  // this queue's satisfied-FLUSH count (fine-grained device memory)
+
+  // Traps if the pool is empty or an SPSC queueIndex is out of range; MPSC wraps.
+  __device__ inline ccoProxy(ccoDevComm const& comm_, int queueIndex);
+  __device__ inline ~ccoProxy() { release(); }
+  ccoProxy(const ccoProxy&) = delete;
+  ccoProxy& operator=(const ccoProxy&) = delete;
+
+  // SPSC: save the producer state for the queue's next owner; called by the
+  // destructor, no-op for MPSC or if nothing was pushed.
+  __device__ inline void release() {
+    if constexpr (kSpsc) {
+      if (dirty) ctx->save_device_handle(queueId, handle);
+      dirty = false;
+    }
+  }
+
+  // As ccoGda::put, but Coop has no default: ccoCoopWarp, ccoCoopBlock,
+  // ccoCoopLaneMasked, ccoCoopLaneMaskedGroup or (MPSC) ccoCoopThread.
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename RemoteAction,
+            typename Coop>
+  __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
+                             size_t srcOffset, size_t bytes, RemoteAction remoteAction, Coop coop);
+
+  // As ccoGda::putValue (T: 1..8 bytes, no padding); Coop as in put().
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD,
+            ccoGdaThreadMode ThreadMode = ccoGdaThreadIndependent, typename T,
+            typename RemoteAction, typename Coop>
+  __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
+                                  RemoteAction remoteAction, Coop coop);
+
+  // Remote signal only. Coop as in put().
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename RemoteAction, typename Coop>
+  __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop);
+
+  // Wait until every op pushed to this queue earlier has completed on every
+  // peer (sources reusable). ccoCoopBlock: every wavefront that pushed since
+  // its last completed flush, plus wavefront 0 on MPSC. Traps if the DevComm
+  // failed before this flush completed.
+  template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
+  __device__ inline void flush(Coop coop = Coop{});
+
+  // flush() that never traps: 0 = done, 1 = timed out after timeoutCycles
+  // (impl::clock64 cycles; earlier puts may still be in flight, and a later
+  // flush covers them), 2 = the DevComm failed. Every thread of the Coop gets
+  // the same value (ccoCoopBlock: 2 if any flushing wavefront got 2, else 1 if
+  // any got 1).
+  template <typename Coop = ccoCoopWarp, std::enable_if_t<!std::is_integral_v<Coop>, int> = 0>
+  [[nodiscard]] __device__ inline int flush(Coop coop, uint64_t timeoutCycles);
+
+  // Whether the DevComm has failed (one load).
+  __device__ inline bool failed() const {
+    return (__hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) &
+            impl::ccoProxyFailedBit) != 0;
+  }
+
+  // Waits for every peer, as flush(); `peer` keeps ccoGda's signature.
+  template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopWarp>
+  __device__ inline void flush(int peer, Coop coop = Coop{}) {
+    static_assert(!std::is_integral_v<Coop>,
+                  "flush(peer, coop) takes a Coop; for a timeout use flush(coop, timeoutCycles)");
+    (void)peer;
+    flush(coop);  // rejects ccoCoopThread, as ccoGda::flush(peer)
+  }
+
+  // Local signal slots: identical to ccoGda (remote signals land there).
+  __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64) {
+    return impl::readSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf,
+                                                        comm.ibgda.signalShadows, signalId, bits);
+  }
+  // As ccoGda::waitSignal (64-bit slots, no `bits`), ending with an acquire;
+  // traps once the DevComm failed.
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{}) {
+    checkWaitCoop<Coop>();
+    syncGroup(coop);
+    if (groupLeader(coop) && waitSignalLeader</*kTimeout=*/false>(signalId, least, 0) != 0) {
+      CCO_PROXY_TRAP(true,
+                     "ccoProxy: waitSignal: the DevComm failed; see the host's stderr or "
+                     "ccoDevCommGetError\n");
+    }
+    syncGroup(coop);
+  }
+
+  // waitSignal() that never traps: 0 = consumed, 1 = timed out after
+  // timeoutCycles (impl::clock64 cycles), 2 = the DevComm failed; nothing is
+  // consumed unless it returns 0. Every thread of a ccoCoopWarp / ccoCoopBlock
+  // group gets the same value.
+  template <typename Coop>
+  [[nodiscard]] __device__ inline int waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop,
+                                                 uint64_t timeoutCycles);
+  __device__ inline void resetSignal(ccoGdaSignal_t signalId) {
+    impl::resetSignalImpl<CCO_GDA_BUILD_PROVIDER>(comm.ibgda.signalBuf, comm.ibgda.signalShadows,
+                                                  signalId);
+  }
+
+ private:
+  using DeviceContext = mori::cco::proxy::invoke::DeviceContext<Queue>;
+
+  uint64_t maxPutBytes;   // largest RDMA write one descriptor carries
+  DeviceContext* ctx;     // this pool's invoke context
+  uint64_t* flushTicket;  // this queue's flush ticket counter (device memory)
+  bool dirty;             // SPSC: pushed since the handle was loaded / saved
+  bool unflushed;         // pushed since the last completed flush (or construction)
+  typename DeviceContext::DeviceHandle handle;
+
+  // ── Coop checks and selection ──
+
+  template <typename Coop>
+  __device__ static inline void checkOpCoop() {
+    static_assert(!std::is_same_v<Coop, ccoCoopThread> || !kSpsc,
+                  "ccoProxy<> (SPSC) does not take ccoCoopThread: an SPSC push is "
+                  "wavefront-collective. Use an MPSC queue (ccoProxy<ccoProxyMpsc>), or call "
+                  "from all 64 lanes (converged) with ccoCoopLaneMasked{active}.");
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
+                      std::is_same_v<Coop, ccoCoopBlock> || impl::kLaneMaskedCoop<Coop>,
+                  "ccoProxy supports ccoCoopWarp, ccoCoopBlock, ccoCoopLaneMasked, "
+                  "ccoCoopLaneMaskedGroup and (MPSC) ccoCoopThread");
+  }
+
+  template <typename Coop>
+  __device__ static inline void checkFlushCoop() {
+    static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                  "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock, as ccoGda::flush: after "
+                  "ccoCoopThread ops, call flush() (ccoCoopWarp) from the converged wavefront");
+    static_assert(
+        !impl::kLaneMaskedCoop<Coop>,
+        "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock: after lane-masked put/signal, "
+        "call flush() (ccoCoopWarp) from all 64 lanes");
+    static_assert(std::is_same_v<Coop, ccoCoopThread> || impl::kLaneMaskedCoop<Coop> ||
+                      std::is_same_v<Coop, ccoCoopWarp> || std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoProxy::flush takes ccoCoopWarp or ccoCoopBlock");
+  }
+
+  template <typename Coop>
+  __device__ static inline void checkWaitCoop() {
+    static_assert(!impl::kLaneMaskedCoop<Coop>,
+                  "ccoProxy::waitSignal takes ccoCoopThread, ccoCoopWarp or ccoCoopBlock: one "
+                  "waiter per slot, so not every lane of a ccoCoopLaneMasked group");
+    static_assert(impl::kLaneMaskedCoop<Coop> || std::is_same_v<Coop, ccoCoopThread> ||
+                      std::is_same_v<Coop, ccoCoopWarp> || std::is_same_v<Coop, ccoCoopBlock>,
+                  "ccoProxy::waitSignal takes ccoCoopThread, ccoCoopWarp or ccoCoopBlock");
+  }
+
+  // ccoGdaThreadAggregate promises one peer, which only per-lane Coops need.
+  template <ccoGdaThreadMode ThreadMode, typename Coop>
+  __device__ static inline void checkThreadMode() {
+    static_assert(ThreadMode == ccoGdaThreadIndependent || std::is_same_v<Coop, ccoCoopThread> ||
+                      std::is_same_v<Coop, ccoCoopLaneMaskedGroup>,
+                  "ccoGdaThreadAggregate requires ccoCoopThread or ccoCoopLaneMaskedGroup");
+  }
+
+  // The Coop's group barrier (lane-masked: none; the wavefront is converged).
+  template <typename Coop>
+  __device__ static inline void syncGroup(Coop& coop) {
+    if constexpr (!impl::kLaneMaskedCoop<Coop>) coop.sync();
+  }
+
+  // Whether this wavefront issues a put / putValue / signal: for ccoCoopBlock
+  // wavefront 0 by linear id (wave64 only), else the calling wavefront.
+  template <typename Coop>
+  __device__ static inline bool issuingWave() {
+    return !std::is_same_v<Coop, ccoCoopBlock> || impl::proxyLinearTid() < 64u;
+  }
+
+  // Whether this wavefront flushes for flush(Coop): the calling one, or for
+  // ccoCoopBlock each wavefront that pushed since its last completed flush,
+  // plus wavefront 0 on MPSC. On SPSC, wavefront 0 may not own the queue, and
+  // a second producer would corrupt it.
+  template <typename Coop>
+  __device__ inline bool flushingWave() const {
+    if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+      // Any lane: ccoCoopThread pushes set `unflushed` in the pushing lanes only.
+      const bool pushed = __ballot(unflushed) != 0;
+      if constexpr (kSpsc) {
+        return pushed;
+      } else {
+        return issuingWave<Coop>() || pushed;
+      }
+    } else {
+      return true;
+    }
+  }
+
+  // The one thread of the group that waits: ccoCoopWarp and ccoCoopBlock
+  // count lanes / threads by threadIdx.x only, wrong in 2-D blocks.
+  template <typename Coop>
+  __device__ static inline bool groupLeader(const Coop&) {
+    if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+      return impl::proxyLinearTid() == 0;
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      return __lane_id() == 0;
+    } else {
+      return true;  // ccoCoopThread: each caller waits for itself
+    }
+  }
+
+  template <typename Coop>
+  __device__ static inline bool laneActive(const Coop& coop) {
+    if constexpr (impl::kLaneMaskedCoop<Coop>) {
+      return coop.active;
+    } else {
+      return true;
+    }
+  }
+
+  // Loop condition of put()'s split. ccoCoopThread: this lane's `more`;
+  // lane-masked: whether any lane has `more`; otherwise every lane must agree
+  // (they pass the same `bytes`), and lanes that do not trap.
+  template <typename Coop>
+  __device__ static inline bool morePieces(bool more) {
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      return more;
+    } else {
+      const uint64_t lanes = __ballot(more);
+      if constexpr (!impl::kLaneMaskedCoop<Coop>) {
+        const uint64_t exec = __builtin_amdgcn_read_exec();
+        if (__builtin_expect(lanes != 0 && lanes != exec, 0)) {
+          CCO_PROXY_TRAP(impl::proxyFirstLane(exec),
+                         "ccoProxy: put: lanes 0x%llx of 0x%llx have another piece left; every "
+                         "issuing lane must pass identical arguments\n",
+                         static_cast<unsigned long long>(lanes),
+                         static_cast<unsigned long long>(exec));
+        }
+      }
+      return lanes != 0;
+    }
+  }
+
+  // ── Push layer ──
+
+  // Push `op` after a system-scope release (the proxy may post the WR as soon
+  // as the descriptor lands). ccoCoopThread: pushThread(). Otherwise from the
+  // full issuing wavefront: one descriptor, or (lane-masked) one per lane with
+  // `active`, each the first `bytes` of `desc`.
+  template <typename Coop, typename Desc>
+  __device__ inline void pushOp([[maybe_unused]] bool active, ccoProxyOp op, const Desc& desc,
+                                [[maybe_unused]] uint32_t bytes = sizeof(Desc)) {
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      pushThread(op, desc, bytes);
+    } else {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      checkFullWave();
+#ifndef NDEBUG
+      if constexpr (!impl::kLaneMaskedCoop<Coop>) checkUniformDesc(op, desc);
+#endif
+      pushRetried([&] {
+        if constexpr (impl::kLaneMaskedCoop<Coop>) {
+          return handle.queue.push_lane_masked(desc, bytes, static_cast<uint32_t>(op), active);
+        } else {
+          return handle.queue.push_reg(desc, static_cast<uint32_t>(op));
+        }
+      });
+      unflushed = true;
+    }
+  }
+
+  // ccoCoopThread (MPSC): every executing lane, from any subset of the
+  // wavefront, pushes op with the first `bytes` of `desc`, after a system-scope
+  // release. flushPush() relies on push_active_lanes() returning only after
+  // its claim, so a later flush ticket follows it.
+  template <typename Desc>
+  __device__ inline void pushThread(ccoProxyOp op, const Desc& desc, uint32_t bytes) {
+    if constexpr (!kSpsc) {  // SPSC: rejected by checkOpCoop
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      handle.queue.push_active_lanes(desc, bytes, static_cast<uint32_t>(op));
+      unflushed = true;
+    }
+  }
+
+  // Header-only FLUSH push (issuing wavefront, all 64 lanes).
+  __device__ inline void pushFlush() {
+    checkFullWave();
+    pushRetried([&] { return handle.queue.push_lanes(0, 0, ccoProxyOpFlush); });
+  }
+
+  // Retries a full SPSC ring, and drops the op once the DevComm failed. MPSC
+  // waits inside KIWI; a failure does not end that wait, but the proxy keeps
+  // draining, so only a corrupted ring stalls it.
+  template <typename Push>
+  __device__ inline void pushRetried(Push push) {
+    if constexpr (kSpsc) {
+      while (!push()) {
+        if (__builtin_amdgcn_readfirstlane(failed() ? 1 : 0)) return;
+        __builtin_amdgcn_s_sleep(1);
+      }
+      dirty = true;
+    } else {
+      push();
+    }
+  }
+
+  __device__ static inline void checkFullWave() {
+    const uint64_t exec = __builtin_amdgcn_read_exec();
+    if (__builtin_expect(exec != ~uint64_t{0}, 0)) {
+      CCO_PROXY_TRAP(impl::proxyFirstLane(exec),
+                     "ccoProxy: put/signal/flush called with a partial wavefront (exec 0x%llx); "
+                     "all 64 lanes of the issuing wavefront must call it\n",
+                     static_cast<unsigned long long>(exec));
+    }
+  }
+
+#ifndef NDEBUG
+  // Trap unless every lane of the (full) issuing wavefront passes lane 0's
+  // descriptor: lane i pushes 8-byte word i, so a mismatch would mix lanes.
+  template <typename Desc>
+  __device__ static inline void checkUniformDesc(ccoProxyOp op, const Desc& desc) {
+    static_assert(
+        sizeof(Desc) % sizeof(uint64_t) == 0 && std::has_unique_object_representations_v<Desc>,
+        "descriptor must be whole 8-byte words without padding");
+    constexpr int kWords = sizeof(Desc) / sizeof(uint64_t);
+    uint64_t w[kWords];
+    __builtin_memcpy(w, &desc, sizeof(Desc));
+    int badWord = -1;  // first descriptor word differing from lane 0's
+    for (int i = 0; i < kWords && badWord < 0; ++i) {
+      const uint32_t lo = static_cast<uint32_t>(w[i]);
+      const uint32_t hi = static_cast<uint32_t>(w[i] >> 32);
+      if (lo != __builtin_amdgcn_readfirstlane(lo) || hi != __builtin_amdgcn_readfirstlane(hi)) {
+        badWord = i;
+      }
+    }
+    const uint64_t badLanes = __ballot(badWord >= 0);
+    if (__builtin_expect(badLanes != 0, 0)) {
+      CCO_PROXY_TRAP(impl::proxyFirstLane(badLanes),
+                     "ccoProxy: op %u: lane %u passed arguments that differ from lane 0's "
+                     "(descriptor word %d); every issuing lane must pass identical arguments\n",
+                     static_cast<unsigned>(op), __lane_id(), badWord);
+    }
+  }
+#endif
+
+  // put / putValue's last descriptor `d` with the remote action. ccoCoopThread
+  // and ccoCoopLaneMaskedGroup signal once per peer group, on the put of its
+  // highest lane taking part (`on`), as ccoGda's putImpl; the call's puts enter
+  // the queue in lane order, so the signal follows the group's data. Other
+  // Coops signal per lane.
+  template <ccoGdaThreadMode ThreadMode, typename Coop, typename SignalDesc, typename RemoteAction>
+  __device__ inline void pushLast(bool on, int worldPeer, ccoProxyOp op, ccoProxyOp opSignal,
+                                  const decltype(SignalDesc::put)& d,
+                                  const RemoteAction& remoteAction) {
+    if constexpr (std::is_same_v<RemoteAction, ccoGda_NoSignal>) {
+      pushOp<Coop>(on, op, d);
+    } else if constexpr (std::is_same_v<Coop, ccoCoopThread> ||
+                         std::is_same_v<Coop, ccoCoopLaneMaskedGroup>) {
+      const bool leader = threadSignalLeader<ThreadMode>(worldPeer, on);
+      SignalDesc ds{};
+      ds.put = d;
+      if (leader) ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
+      pushOp<Coop>(on, leader ? opSignal : op, ds,
+                   static_cast<uint32_t>(leader ? sizeof(ds) : sizeof(d)));
+    } else {
+      SignalDesc ds{};
+      ds.put = d;
+      if (on) ds.signal = impl::proxyResolveSignal(comm, worldPeer, remoteAction);
+      pushOp<Coop>(on, opSignal, ds);
+    }
+  }
+
+  // Whether this lane signals for its group: the highest lane taking part
+  // (`on`) of those with its peer (Independent), or of all of them (Aggregate,
+  // which promises a single peer).
+  template <ccoGdaThreadMode ThreadMode>
+  __device__ static inline bool threadSignalLeader(int worldPeer, bool on) {
+    const uint64_t lanes = __ballot(on);
+    if constexpr (ThreadMode == ccoGdaThreadAggregate) {
+#ifndef NDEBUG
+      const int first = lanes ? __builtin_ctzll(lanes) : 0;
+      const int firstPeer = __shfl(worldPeer, first);
+      if (on && worldPeer != firstPeer) {
+        CCO_PROXY_TRAP(true,
+                       "ccoProxy: ccoGdaThreadAggregate: lane %u targets peer %d, lane %d peer "
+                       "%d; Aggregate needs one peer for all calling lanes\n",
+                       __lane_id(), worldPeer, first, firstPeer);
+      }
+#endif
+      return on && __lane_id() == 63u - static_cast<unsigned>(__builtin_clzll(lanes));
+    } else {
+      bool leader = false;
+      bool need = on;  // not yet in a peer group
+      for (uint64_t turns = __ballot(need); turns != 0; turns = __ballot(need)) {
+        const bool same = need && worldPeer == __shfl(worldPeer, __builtin_ctzll(turns));
+        const uint64_t group = __ballot(same);
+        if (same) {
+          need = false;
+          leader = __lane_id() == 63u - static_cast<unsigned>(__builtin_clzll(group));
+        }
+      }
+      return leader;
+    }
+  }
+
+  // ── Flush and wait ──
+
+  // Take ticket t and push a FLUSH (issuing wavefront, all 64 lanes); returns t
+  // in lane 0. flushDone >= t means this flush is covered (proof below).
+  __device__ inline uint64_t flushPush();
+
+  // Push a FLUSH, then lane 0 waits for flushDone to reach its ticket and the
+  // wavefront acquires. Returns 0 done, 1 timed out (kTimeout only), 2 failed;
+  // the same in every lane.
+  template <bool kTimeout>
+  __device__ inline int flushIssue(uint64_t timeoutCycles);
+
+  // flush(Coop) between its group barriers: each flushing wavefront runs
+  // flushIssue(). Returns this wavefront's result (0 if it did not flush).
+  template <bool kTimeout, typename Coop>
+  __device__ inline int flushWaves(uint64_t timeoutCycles) {
+    int result = 0;
+    if (flushingWave<Coop>()) {
+      result = flushIssue<kTimeout>(timeoutCycles);
+      if (result == 0) unflushed = false;  // else a later flush must still cover it
+    }
+    return result;
+  }
+
+  // A timeout overload's result to the whole group: ccoCoopBlock gets the worst
+  // (2 over 1), ccoCoopWarp lane 0's.
+  template <typename Coop>
+  __device__ static inline int groupResult(int result) {
+    if constexpr (std::is_same_v<Coop, ccoCoopBlock>) {
+      if (__syncthreads_or(result != 0)) result = __syncthreads_or(result == 2) ? 2 : 1;
+    } else if constexpr (std::is_same_v<Coop, ccoCoopWarp>) {
+      result = __shfl(result, 0);
+    }
+    return result;
+  }
+
+  // The group leader's wait. Returns 0 consumed, 1 timed out (kTimeout only),
+  // 2 failed.
+  template <bool kTimeout>
+  __device__ inline int waitSignalLeader(ccoGdaSignal_t signalId, uint64_t least,
+                                         uint64_t timeoutCycles);
+};
+
+template <typename Queue>
+__device__ inline ccoProxy<Queue>::ccoProxy(ccoDevComm const& comm_, int queueIndex)
+    : comm(comm_),
+      flushDone(nullptr),
+      maxPutBytes(comm_.proxy.maxPutBytes),
+      ctx(nullptr),
+      flushTicket(nullptr),
+      dirty(false),
+      unflushed(false) {
+  impl::proxyCheckTarget();
+  impl::GdaTeamRankSize(comm, comm.proxy.connType, rank, nRanks);
+  const int poolSize = kSpsc ? comm.proxy.numSpscQueues : comm.proxy.numMpscQueues;
+  if (__builtin_expect(poolSize <= 0, 0)) {
+    CCO_PROXY_TRAP(impl::proxyFirstLane(),
+                   "ccoProxy: the DevComm has no %s proxy queues (set %s in "
+                   "ccoDevCommRequirements)\n",
+                   kSpsc ? "SPSC" : "MPSC", kSpsc ? "proxySpscQueueCount" : "proxyMpscQueueCount");
+  }
+  if constexpr (kSpsc) {
+    // No wrap: two wavefronts sharing an SPSC queue would write the same ring
+    // lines and corrupt it. One unsigned compare also catches a negative index.
+    if (__builtin_expect(static_cast<uint32_t>(queueIndex) >= static_cast<uint32_t>(poolSize), 0)) {
+      CCO_PROXY_TRAP(impl::proxyFirstLane(),
+                     "ccoProxy: SPSC queueIndex %d out of range [0, %d) (proxySpscQueueCount)\n",
+                     queueIndex, poolSize);
+    }
+    queueId = static_cast<uint32_t>(queueIndex);
+  } else {
+    queueId = static_cast<uint32_t>(queueIndex) % static_cast<uint32_t>(poolSize);
+  }
+  ctx = static_cast<DeviceContext*>(kSpsc ? comm.proxy.spscContext : comm.proxy.mpscContext);
+  handle = ctx->get_device_handle(queueId);
+  // flushDone and flushTicket: SPSC pool, then MPSC pool.
+  const int pool = kSpsc ? 0 : comm.proxy.numSpscQueues;
+  flushDone = comm.proxy.flushDone + pool + queueId;
+  flushTicket = comm.proxy.flushTicket + pool + queueId;
+}
+
+template <typename Queue>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename RemoteAction, typename Coop>
+__device__ inline void ccoProxy<Queue>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
+                                            ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
+                                            RemoteAction remoteAction, Coop coop) {
+  checkOpCoop<Coop>();
+  checkThreadMode<ThreadMode, Coop>();
+  syncGroup(coop);
+  const bool on = laneActive(coop);
+  if (issuingWave<Coop>()) {
+    int worldPeer = 0;
+    impl::ccoProxyPutDesc d{};
+    if (on) {  // an inactive lane's arguments are not read
+      worldPeer = impl::ResolveWorldPeer<TeamMode>(comm, comm.proxy.connType, peer);
+      d = impl::proxyPutDesc(worldPeer, dstWin, dstOffset, srcWin, srcOffset);
+    } else {
+      bytes = 0;
+    }
+    // Split transfers one WR cannot carry; the signal rides the last piece.
+    // Lane-masked: the wavefront pushes while any lane has more than a piece
+    // left, and only those lanes take part; ccoCoopThread lanes loop alone.
+    while (morePieces<Coop>(bytes > maxPutBytes)) {
+      const bool piece = !impl::kLaneMaskedCoop<Coop> || bytes > maxPutBytes;
+      d.bytes = static_cast<uint32_t>(maxPutBytes);
+      pushOp<Coop>(piece, ccoProxyOpPut, d);
+      if (piece) {
+        d.laddr += maxPutBytes;
+        d.raddr += maxPutBytes;
+        bytes -= maxPutBytes;
+      }
+    }
+    d.bytes = static_cast<uint32_t>(bytes);
+    pushLast<ThreadMode, Coop, impl::ccoProxyPutSignalDesc>(on, worldPeer, ccoProxyOpPut,
+                                                            ccoProxyOpPutSignal, d, remoteAction);
+  }
+  syncGroup(coop);
+}
+
+template <typename Queue>
+template <ccoTeamMode TeamMode, ccoGdaThreadMode ThreadMode, typename T, typename RemoteAction,
+          typename Coop>
+__device__ inline void ccoProxy<Queue>::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset,
+                                                 T value, RemoteAction remoteAction, Coop coop) {
+  static_assert(sizeof(T) >= 1 && sizeof(T) <= 8 && std::is_trivially_copyable_v<T>,
+                "putValue only supports trivially copyable types of 1..8 bytes");
+  // Padding bytes would be sent, and fail the uniform-argument check.
+  static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T> || std::is_pointer_v<T> ||
+                    std::has_unique_object_representations_v<T>,
+                "putValue does not take types with padding bytes");
+  checkOpCoop<Coop>();
+  checkThreadMode<ThreadMode, Coop>();
+  syncGroup(coop);
+  const bool on = laneActive(coop);
+  if (issuingWave<Coop>()) {
+    int worldPeer = 0;
+    impl::ccoProxyPutValueDesc d{};
+    if (on) {  // an inactive lane's arguments are not read
+      worldPeer = impl::ResolveWorldPeer<TeamMode>(comm, comm.proxy.connType, peer);
+      d = impl::proxyPutValueDesc(worldPeer, dstWin, dstOffset, value);
+    }
+    pushLast<ThreadMode, Coop, impl::ccoProxyPutValueSignalDesc>(
+        on, worldPeer, ccoProxyOpPutValue, ccoProxyOpPutValueSignal, d, remoteAction);
+  }
+  syncGroup(coop);
+}
+
+template <typename Queue>
+template <ccoTeamMode TeamMode, typename RemoteAction, typename Coop>
+__device__ inline void ccoProxy<Queue>::signal(int peer, RemoteAction remoteAction, Coop coop) {
+  static_assert(!std::is_same_v<RemoteAction, ccoGda_NoSignal>, "signal() needs a remote action");
+  checkOpCoop<Coop>();
+  syncGroup(coop);
+  const bool on = laneActive(coop);
+  if (issuingWave<Coop>()) {
+    impl::ccoProxySignalDesc s{};
+    if (on) {
+      s = impl::proxyResolveSignal(
+          comm, impl::ResolveWorldPeer<TeamMode>(comm, comm.proxy.connType, peer), remoteAction);
+    }
+    pushOp<Coop>(on, ccoProxyOpSignal, s);
+  }
+  syncGroup(coop);
+}
+
+template <typename Queue>
+__device__ inline uint64_t ccoProxy<Queue>::flushPush() {
+  uint64_t target = 0;
+  if (__lane_id() == 0) {
+    if constexpr (kSpsc) {
+      // Tickets follow FLUSH order in the ring: one producer at a time, and a
+      // handoff's release/acquire orders the old owner's tickets first.
+      target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_AGENT) +
+               1;
+    } else {
+      // Of the first t FLUSHes, one holds a ticket >= t, so it was claimed after
+      // our puts and covers them: acq_rel (agent scope; all producers are on
+      // this GPU) orders our put claims before any later caller's ticket and
+      // FLUSH claim.
+      target = __hip_atomic_fetch_add(flushTicket, uint64_t{1}, __ATOMIC_ACQ_REL,
+                                      __HIP_MEMORY_SCOPE_AGENT) +
+               1;
+    }
+  }
+  pushFlush();
+  return target;
+}
+
+template <typename Queue>
+template <bool kTimeout>
+__device__ inline int ccoProxy<Queue>::flushIssue(uint64_t timeoutCycles) {
+  const uint64_t target = flushPush();
+  int result = 0;
+  if (__lane_id() == 0) {
+    impl::TimeoutClock clk;
+    if constexpr (kTimeout) clk.start();
+    // The failed bit is above any target, so it also ends the wait.
+    uint64_t v;
+    while ((v = __hip_atomic_load(flushDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) <
+           target) {
+      if constexpr (kTimeout) {
+        if (clk.expired(timeoutCycles)) {
+          result = 1;
+          break;
+        }
+      }
+      __builtin_amdgcn_s_sleep(1);
+    }
+    // Exact: a FLUSH satisfied before the failure still succeeds.
+    if (result == 0 && (v & ~impl::ccoProxyFailedBit) < target) result = 2;
+  }
+  // Later stores (e.g. overwriting a source buffer) stay after the wait.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  return __builtin_amdgcn_readfirstlane(result);
+}
+
+template <typename Queue>
+template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
+__device__ inline void ccoProxy<Queue>::flush(Coop coop) {
+  checkFlushCoop<Coop>();
+  syncGroup(coop);
+  if (__builtin_expect(flushWaves</*kTimeout=*/false, Coop>(0) != 0, 0)) {
+    CCO_PROXY_TRAP(__lane_id() == 0,
+                   "ccoProxy: flush: the DevComm failed; see the host's stderr or "
+                   "ccoDevCommGetError\n");
+  }
+  syncGroup(coop);
+}
+
+template <typename Queue>
+template <typename Coop, std::enable_if_t<!std::is_integral_v<Coop>, int>>
+__device__ inline int ccoProxy<Queue>::flush(Coop coop, uint64_t timeoutCycles) {
+  checkFlushCoop<Coop>();
+  syncGroup(coop);
+  const int result = flushWaves</*kTimeout=*/true, Coop>(timeoutCycles);
+  syncGroup(coop);
+  return groupResult<Coop>(result);
+}
+
+template <typename Queue>
+template <bool kTimeout>
+__device__ inline int ccoProxy<Queue>::waitSignalLeader(ccoGdaSignal_t signalId, uint64_t least,
+                                                        uint64_t timeoutCycles) {
+  volatile uint64_t* signalBuf = comm.ibgda.signalBuf;
+  volatile uint64_t* signalShadows = comm.ibgda.signalShadows;
+  const uint64_t shadow = signalShadows[signalId];
+  impl::TimeoutClock clk;
+  if constexpr (kTimeout) clk.start();
+  int result = 0;
+  for (uint32_t polls = 1;; polls++) {
+    const uint64_t val =
+        __hip_atomic_load(&signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (val - shadow >= least) {
+      signalShadows[signalId] = shadow + least;  // consume
+      break;
+    }
+    if (polls % 256 == 0 && failed()) {
+      result = 2;
+      break;
+    }
+    if constexpr (kTimeout) {
+      if (clk.expired(timeoutCycles)) {
+        result = failed() ? 2 : 1;
+        break;
+      }
+    }
+    asm volatile("" ::: "memory");
+  }
+  // Data the signal covers is read after it (system scope: the NIC wrote it).
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  return result;
+}
+
+template <typename Queue>
+template <typename Coop>
+__device__ inline int ccoProxy<Queue>::waitSignal(ccoGdaSignal_t signalId, uint64_t least,
+                                                  Coop coop, uint64_t timeoutCycles) {
+  checkWaitCoop<Coop>();
+  syncGroup(coop);
+  int result = 0;
+  if (groupLeader(coop))
+    result = waitSignalLeader</*kTimeout=*/true>(signalId, least, timeoutCycles);
+  syncGroup(coop);
+  return groupResult<Coop>(result);
+}
+
+#undef CCO_PROXY_TRAP
+
+#endif  // defined(__HIPCC__)
 
 }  // namespace cco
 }  // namespace mori

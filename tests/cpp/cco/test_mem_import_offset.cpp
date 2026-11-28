@@ -29,6 +29,8 @@
 //   2. LSA: every peer's alias (ccoGetPeerPtr) reads that peer's data;
 //   3. GDA: an all-to-all put between two imported windows lands at the data, canary intact. The
 //      send window's MR is back-filled by ccoDevCommCreate, the recv window's is registered after.
+//   4. ccoProxy (gfx942/gfx950 proxy builds): the same all-to-all plus WindowSignalSet/putValue
+//      into a third imported window.
 // Then rank 0 imports at a different offset than the others: register must fail on every rank.
 
 #include "cco_test_harness.hpp"
@@ -56,6 +58,36 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindow_t sendWin, mori::cco::cco
     gda.waitSignal(static_cast<ccoGdaSignal_t>(threadIdx.x), 1);
   }
 }
+
+#ifdef MORI_CCO_PROXY
+// put carrying WindowSignalSet (sigWin offset me*16), then putValue (offset me*16 + 8) carrying
+// SignalSet{me}; one queue, so the SignalSet lands last.
+__global__ void ProxyAlltoAllKernel(mori::cco::ccoWindow_t sendWin, mori::cco::ccoWindow_t recvWin,
+                                    mori::cco::ccoWindow_t sigWin, size_t perPairBytes,
+                                    mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoProxy<> proxy{devComm, 0};
+  const int me = devComm.rank;
+  const int n = devComm.worldSize;
+  for (int r = 0; r < n; r++) {
+    if (r == me) continue;
+    proxy.put(r, recvWin, me * perPairBytes, sendWin, r * perPairBytes, perPairBytes,
+              ccoGda_WindowSignalSet{sigWin, static_cast<size_t>(me) * 16, 1}, ccoCoopWarp{});
+    proxy.putValue(r, sigWin, static_cast<size_t>(me) * 16 + 8, uint64_t{0xabc00000ull + me},
+                   ccoGda_SignalSet{static_cast<ccoGdaSignal_t>(me), 1}, ccoCoopWarp{});
+  }
+  proxy.flush(ccoCoopWarp{});
+  for (int src = 0; src < n; src++) {
+    if (src != me) proxy.waitSignal(static_cast<ccoGdaSignal_t>(src), 1, ccoCoopWarp{});
+  }
+}
+
+static bool ProxyArchOk(int dev) {
+  hipDeviceProp_t prop;
+  if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
+  return strncmp(prop.gcnArchName, "gfx942", 6) == 0 || strncmp(prop.gcnArchName, "gfx950", 6) == 0;
+}
+#endif
 
 // An external VMM allocation mapped at its own VA, rounded to the recommended granularity like
 // torch's symm_mem allocator.
@@ -187,6 +219,11 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     ok = CheckFloats("LSA peer read", got, want) && ok;
   }
 
+  // What an all-to-all (steps 3 and 4) leaves in this rank's recv window.
+  std::vector<float> recvWant(COUNT * nranks);
+  for (int src = 0; src < nranks; src++)
+    for (size_t i = 0; i < COUNT; i++) recvWant[src * COUNT + i] = SendVal(src, rank, i);
+
   // 3. GDA all-to-all between imported windows (FULL needs intranode cross-rail RDMA)
   const bool skipGda = getenv("MORI_CCO_SKIP_GDA_FULL") != nullptr;
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
@@ -221,13 +258,66 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     ccoBarrierAll(comm);
 
     HIP_CHECK(hipMemcpy(got.data(), recvData, bufBytes, hipMemcpyDeviceToHost));
-    std::vector<float> want(COUNT * nranks);
-    for (int src = 0; src < nranks; src++)
-      for (size_t i = 0; i < COUNT; i++) want[src * COUNT + i] = SendVal(src, rank, i);
-    ok = CheckFloats("GDA recv", got, want, /*skipSlot=*/rank) && ok;
+    ok = CheckFloats("GDA recv", got, recvWant, /*skipSlot=*/rank) && ok;
     ok = CheckCanary("GDA recv", recvExt, offset) && ok;
   }
   ok = CheckCanary("send", sendExt, offset) && ok;
+
+#ifdef MORI_CCO_PROXY
+  // 4. ccoProxy between the same imported windows (same FULL connectivity as step 3).
+  if (!skipGda && devComm.gdaConnType != CCO_GDA_CONNECTION_NONE && ProxyArchOk(dev)) {
+    ExtBuf sigExt;
+    const size_t sigBytes = 16 * nranks;
+    ExtAlloc(dev, offset + sigBytes, &sigExt);
+    char* sigData = static_cast<char*>(sigExt.base) + offset;
+    HIP_CHECK(hipMemset(sigExt.base, CANARY, sigExt.size));
+    HIP_CHECK(hipMemset(sigData, 0, sigBytes));
+    HIP_CHECK(hipMemset(recvData, 0xff, bufBytes));
+    bool proxyOk = true;
+    ccoWindow_t sigWin = nullptr;
+    void* sigAlias = nullptr;
+    ccoDevCommRequirements preqs = reqs;
+    preqs.proxySpscQueueCount = 1;
+    ccoDevComm pdc{};
+    const bool registered = ccoWindowRegister(comm, sigData, sigBytes, &sigWin, &sigAlias) == 0;
+    if (!registered || ccoDevCommCreate(comm, &preqs, &pdc) != 0) {
+      fprintf(stderr, "[rank %d] offset 0x%zx: proxy setup failed\n", rank, offset);
+      proxyOk = false;
+    } else {
+      ccoBarrierAll(comm);
+      hipStream_t stream;
+      HIP_CHECK(hipStreamCreate(&stream));
+      ProxyAlltoAllKernel<<<1, 64, 0, stream>>>(sendWin, recvWin, sigWin, COUNT * sizeof(float),
+                                                pdc);
+      HIP_CHECK(hipStreamSynchronize(stream));
+      HIP_CHECK(hipStreamDestroy(stream));
+      ccoBarrierAll(comm);
+      HIP_CHECK(hipMemcpy(got.data(), recvData, bufBytes, hipMemcpyDeviceToHost));
+      proxyOk = CheckFloats("proxy recv", got, recvWant, /*skipSlot=*/rank) && proxyOk;
+      proxyOk = CheckCanary("proxy recv", recvExt, offset) && proxyOk;
+      std::vector<uint64_t> slots(2 * nranks);
+      HIP_CHECK(hipMemcpy(slots.data(), sigData, sigBytes, hipMemcpyDeviceToHost));
+      for (int src = 0; src < nranks; src++) {
+        if (src == rank) continue;
+        if (slots[2 * src] != 1 || slots[2 * src + 1] != 0xabc00000ull + src) {
+          fprintf(stderr, "[rank %d] offset 0x%zx: proxy slots from %d: %llu 0x%llx\n", rank,
+                  offset, src, (unsigned long long)slots[2 * src],
+                  (unsigned long long)slots[2 * src + 1]);
+          proxyOk = false;
+        }
+      }
+      proxyOk = CheckCanary("proxy sig", sigExt, offset) && proxyOk;
+      ccoDevCommDestroy(comm, &pdc);
+    }
+    if (registered) {
+      ccoWindowDeregister(comm, sigWin);
+      ccoMemFree(comm, sigAlias);
+    }
+    ExtFree(&sigExt);
+    printf("[rank %d] offset 0x%zx: proxy put %s\n", rank, offset, proxyOk ? "ok" : "FAILED");
+    ok = ok && proxyOk;
+  }
+#endif
 
   if (!skipGda) ccoDevCommDestroy(comm, &devComm);
   ccoWindowDeregister(comm, recvWin);

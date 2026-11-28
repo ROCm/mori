@@ -513,7 +513,8 @@ jobs:
   intranode-test-mi300x:
     name: mori intranode test (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mi300x == 'true'
+    # Not cco: the lane carries it for the internode job's ccoProxy step only.
+    if: needs.scope.outputs.mi300x == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'kiwi') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io') || contains(fromJSON(needs.scope.outputs.groups), 'ras') || contains(fromJSON(needs.scope.outputs.groups), 'shmem'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -1464,6 +1465,13 @@ jobs:
             PORT=$((PORT + 1))
           done
 
+      - name: ccoProxy across nodes (1+1)
+        # MI355X runs this in ci_cco.yml's CCO internode job. Runs even if an
+        # earlier step failed.
+        if: ${{ !cancelled() && matrix.cco_proxy_cases != '' && contains(fromJSON(needs.scope.outputs.groups), 'cco') }}
+        timeout-minutes: 20
+        run: bash tools/run_cco_proxy_internode.sh --cases ${{ matrix.cco_proxy_cases }}
+
       - name: Cleanup node1
         if: always()
         run: |
@@ -1489,7 +1497,7 @@ jobs:
   internode-test-mi300x:
     name: mori internode test (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.mi300x == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'kiwi') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io'))
+    if: needs.scope.outputs.mi300x == 'true' && (contains(fromJSON(needs.scope.outputs.groups), 'ep') || contains(fromJSON(needs.scope.outputs.groups), 'kiwi') || contains(fromJSON(needs.scope.outputs.groups), 'ccl') || contains(fromJSON(needs.scope.outputs.groups), 'io') || contains(fromJSON(needs.scope.outputs.groups), 'cco'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -1513,6 +1521,8 @@ jobs:
             ct: docker
             timeout_minutes: 90
             build_ops_kiwi: "ON"
+            # Every case: CX7 takes RDMA atomics into GPU memory.
+            cco_proxy_cases: all
     env: *internode-env
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps: *internode-steps

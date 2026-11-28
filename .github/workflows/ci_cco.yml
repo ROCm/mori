@@ -793,7 +793,7 @@ jobs:
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
       HSA_USE_SVM: ${{ matrix.hsa_use_svm }}
       ENTRY: tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - *cco-fix-perms
 
@@ -1000,6 +1000,13 @@ jobs:
             --ifname $NODE1_IFNAME --entry $ENTRY \
             --cmd stress --rounds 2000 --kernel-type auto --dtype bf16 --max-tokens 4096 --num-qp 8
           wait "$NODE2_PID"
+
+      - name: ccoProxy across nodes (1+1, atomic-free and negative cases)
+        # The unit job's fork mode SKIPs test_proxy_put (MORI_CCO_SKIP_GDA_FULL).
+        # Runs even if an earlier step failed.
+        if: ${{ !cancelled() && contains(fromJSON(inputs.groups), 'cco') }}
+        timeout-minutes: 20
+        run: bash tools/run_cco_proxy_internode.sh --cases atomic_free
 
       - name: Cleanup node1
         if: always()
