@@ -615,7 +615,9 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  CAS-max rather than a plain store: with a shared lock two
   // readers can renew the same key at once, and neither may shorten it.
-  RenewLeaseAtomic(it->second, SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_));
+  // Counted like any remote reader, so another reader's report cannot end
+  // this lease; nothing reports for a single-key resolve, so the timer does.
+  AddRemoteReader(it->second, SteadyNs(std::chrono::steady_clock::now() + read_lease_ttl_));
   TouchLru(key, it->second);
   return r;
 }
@@ -654,7 +656,8 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     if (reader == ResolveReader::kLocal) {
       entry.hold = it->second.hold;
     } else {
-      RenewLeaseAtomic(it->second, lease_deadline);
+      // One per answer: a key asked twice in a batch is reported twice.
+      AddRemoteReader(it->second, lease_deadline);
     }
     if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }
@@ -711,6 +714,51 @@ std::vector<bool> PageBackend::BatchStillHolds(const std::vector<std::string>& k
     }
     const auto it = owned_.find(keys[i]);
     out[i] = it != owned_.end() && it->second.generation == generations[i];
+  }
+  return out;
+}
+
+// The lease is a timer only because a one-sided read never says when it is
+// done.  Here the reader says so, and the lease ends with the last reader
+// counted on it.  The pages are not freed: the key stays where it is, at the
+// hot end of the eviction order, and is merely evictable again.  A local
+// reader's hold still keeps it, exactly as for a lease whose timer ran out.
+//
+// Nothing here guards the bytes.  A reader counted out too early can only lose
+// its pages to eviction, and its own BatchStillHolds answer then turns that
+// read into a miss.
+std::vector<bool> PageBackend::BatchFinishReads(const std::vector<std::string>& keys,
+                                                const std::vector<uint64_t>& generations) {
+  std::vector<bool> out(keys.size(), false);
+  const int64_t now_ns = SteadyNs(std::chrono::steady_clock::now());
+  uint64_t released = 0;
+  // Shared, like the resolves it pairs with: only the slot's atomics change.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size() && i < generations.size(); ++i) {
+    if (generations[i] == 0) {
+      out[i] = true;
+      continue;
+    }
+    // The same check as BatchStillHolds; a later copy has readers of its own.
+    const auto it = owned_.find(keys[i]);
+    if (it == owned_.end() || it->second.generation != generations[i]) continue;
+    out[i] = true;
+    if (RemoveRemoteReader(it->second) && EndLeaseIfUnread(it->second, now_ns)) ++released;
+  }
+  if (released != 0) lease_reader_releases_.fetch_add(released, std::memory_order_relaxed);
+  return out;
+}
+
+std::vector<MetricSample> PageBackend::SampleMetrics() const {
+  std::vector<MetricSample> out;
+  // Read leases ended by their readers (ValidateReads with release) ahead of
+  // the timer.  Flat while remote reads flow means the readers are not
+  // reporting: an older build, or UMBP_REMOTE_READ_VALIDATE=0.
+  if (const uint64_t v = lease_reader_releases_.load(std::memory_order_relaxed); v != 0) {
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
+                               {{"event", "read_lease_reader_release"}},
+                               v});
   }
   return out;
 }

@@ -204,7 +204,8 @@ between it and your device **inside** the backend:
   **read lease**; a reaper reclaims the page when the lease expires. Override
   `BatchFinishReads` to end the lease as soon as the remote readers that were
   given the page report back, the way `SsdBackend` does; without it every read
-  holds its page for the full lease.
+  holds its page for the full lease. (`PageBackend` does the same for the key's
+  own pages, so a `PageMemorySource` medium gets it for free.)
 
 The cost is one host copy per side. The benefit is that your medium reaches the
 data plane with **zero new transfer-layer concepts** — no new `TransferRef`
