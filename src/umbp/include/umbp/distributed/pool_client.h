@@ -274,6 +274,11 @@ class PoolClient {
   enum class PutEntryOutcome { kFailed, kSucceeded, kAlreadyExists };
 
  private:
+  std::optional<bool> TryPagedGather(
+      const std::vector<size_t>& candidates, const std::vector<MediumBackend*>& holders,
+      const std::vector<ResolvedEntry>& resolved, const std::vector<std::vector<void*>>& dsts,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& offsets);
   PoolClientConfig config_;
   std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};

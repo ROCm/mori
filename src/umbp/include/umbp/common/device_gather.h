@@ -34,6 +34,20 @@ struct DeviceGatherFragment {
   size_t bytes;
 };
 
+// Requested ranges, not expanded page fragments.
+struct DeviceGatherRange {
+  void* dst;
+  size_t object;
+  size_t offset;
+  size_t bytes;
+};
+
+// object_page_offsets indexes each object's first entry in pages.
+bool LaunchDevicePagedGather(const size_t* object_page_offsets, size_t object_count, size_t page_size,
+                            const void* const* pages, size_t page_count,
+                            const DeviceGatherRange* ranges, size_t range_count,
+                            int device_id, hipStream_t stream);
+
 // Copies `count` independent fragments between a HostTierRegistration-covered
 // region and one GPU in a single kernel launch, in either direction, or between
 // two GPU buffers: on that GPU, or one of them on a GPU it has peer access to.

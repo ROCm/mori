@@ -202,6 +202,30 @@ owned by MORI-IO (`src/io/rdma/common.cpp`).
 
 ---
 
+## Fused paged gather
+
+`UMBP_FUSED_PAGED_GATHER=1` enables a local DRAM-to-GPU restore path that
+passes resolved pages and requested ranges directly to a HIP kernel. The
+kernel computes page fragments while copying, bypassing CPU transfer-item
+and transfer-plan construction. Default: off; cached on first ranged restore.
+For standalone mode set it on the UMBP server, not just the Python client.
+
+The kernel requires one DRAM backend, a common page size, complete local
+hits, registered destinations on one GPU, and kernel-addressable host pages.
+With `UMBP_HBM_RESTORE_SCHEDULER=round_robin`, the existing helper scheduler splits
+logical ranges into chunks and launches the paged kernel on peer GPUs, all
+writing directly to the destination. Otherwise the destination GPU runs the
+kernel itself. Unsupported batches use the existing path. Failed striped
+attempts are drained before falling back, matching the existing scheduler;
+a direct kernel execution failure is reported as a failed restore.
+CPU validation, object resolution, and
+source-page lifetime holds remain in place through kernel completion.
+
+If direct-path stream synchronization fails, the failed stream is discarded and the same
+process-wide failure latch used by the existing gather kernel is set. Subsequent
+restores skip both gather kernels and use the existing copy fallback.
+
+
 ## Testing
 
 - `tests/cpp/umbp/distributed/test_env_time.cpp` covers the parser

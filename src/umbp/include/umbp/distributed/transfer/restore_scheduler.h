@@ -27,6 +27,7 @@
 
 namespace mori::umbp {
 struct TransferPlan;
+struct DeviceGatherRange;
 
 // Split a restore across peer GPUs, all writing to one destination GPU.
 // Completes synchronously. On failure, all submitted chunks are drained before
@@ -37,4 +38,11 @@ struct TransferPlan;
 bool TryStripedRestore(const std::vector<TransferPlan>& plans,
                        const std::function<void*(const void*, size_t, int)>& host_device_address,
                        size_t chunk_bytes);
+
+// Same scheduler, but preserve logical ranges until the paged gather kernel.
+bool TryStripedRestore(
+    const std::vector<size_t>& object_page_offsets, size_t page_size,
+    const std::vector<const void*>& pages, const std::vector<DeviceGatherRange>& ranges,
+    int destination, const std::function<void*(const void*, size_t, int)>& host_device_address,
+    size_t chunk_bytes);
 }  // namespace mori::umbp

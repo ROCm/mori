@@ -147,6 +147,49 @@ TEST(RestoreScheduler, RestoresHostDataIntoDestinationGpu) {
   EXPECT_EQ(std::memcmp(copied.data() + kHalf, source.data(), kHalf), 0);
 }
 
+TEST(RestoreScheduler, PagedRestorePreservesShuffledPagesAndGaps) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  constexpr size_t kPage = 128 << 10, kBytes = 4 * kPage;
+  AlignedBuffer host(kBytes);
+  for (size_t i = 0; i < kBytes; ++i)
+    host.data()[i] = static_cast<char>((i * 37 + i / kPage) % 251);
+  HostTierRegistration registration(host.data(), host.size());
+  if (!registration.GatherableOn(0)) GTEST_SKIP() << "host region not gatherable";
+  void* ptr = nullptr;
+  ASSERT_EQ(hipMalloc(&ptr, kBytes), hipSuccess);
+  std::unique_ptr<void, decltype(&hipFree)> destination(ptr, hipFree);
+  ASSERT_EQ(hipMemset(ptr, 0x5a, kBytes), hipSuccess);
+  auto* dst = static_cast<char*>(ptr);
+  const std::vector<const void*> pages{host.data() + 2 * kPage, host.data(),
+                                      host.data() + 3 * kPage, host.data() + kPage};
+  const std::vector<DeviceGatherRange> ranges{
+      {dst + 7, 0, kPage - 17, kPage + 17},
+      {dst + 2 * kPage + 65, 1, kPage - 13, 77}, {dst, 0, 0, 0}};
+  std::set<int> helpers;
+  auto map_host = [&](const void* host_ptr, size_t bytes, int device) {
+    helpers.insert(device);
+    return registration.DeviceAddress(host_ptr, bytes, device);
+  };
+  const auto before = DeviceGatherLaunchCount();
+  // Deliberately split inside pages and logical ranges; no fallback is available here.
+  ASSERT_TRUE(TryStripedRestore({0, 2}, kPage, pages, ranges, 0, map_host, 1000));
+  EXPECT_GT(DeviceGatherLaunchCount(), before + 1);
+  if (devices > 1) EXPECT_GT(helpers.size(), 1u);
+  std::vector<char> expected(kBytes, 0x5a), actual(kBytes);
+  std::memcpy(expected.data() + 7, host.data() + 3 * kPage - 17, 17);
+  std::memcpy(expected.data() + 24, host.data(), kPage);
+  std::memcpy(expected.data() + 2 * kPage + 65, host.data() + 4 * kPage - 13, 13);
+  std::memcpy(expected.data() + 2 * kPage + 78, host.data() + kPage, 64);
+  ASSERT_EQ(hipMemcpy(actual.data(), ptr, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(actual, expected);
+  EXPECT_FALSE(TryStripedRestore({0, 2}, kPage, pages, ranges, 0,
+                                      [](const void*, size_t, int) -> void* { return nullptr; },
+                                      1000));
+}
+
 TEST(RestoreScheduler, ConcurrentRestoresReachTheirOwnDestinations) {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices < 2) GTEST_SKIP() << "needs two GPUs";
