@@ -60,6 +60,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/prefetch_service.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/distributed/tier_proto.h"
@@ -664,6 +665,36 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
 
     chmod(grpc_path.c_str(), 0600);
+    // Normally the Router uses the peer port. Keep an explicit legacy endpoint
+    // for deployments without a peer service, serving only the prefetch RPCs.
+    if (const char* address = std::getenv("UMBP_PREFETCH_CONTROL_ADDRESS");
+        address != nullptr && *address != '\0') {
+      control_service_ = std::make_unique<PrefetchService>(
+          [this](const auto& keys, auto options, auto id) {
+            std::shared_lock<std::shared_mutex> lock(client_mu_);
+            if (shutdown_.load())
+              return PrefetchSubmitResult{false, std::move(id), "server is stopping"};
+            return client_->SubmitPrefetch(keys, options, std::move(id));
+          },
+          [this](const auto& id) {
+            std::shared_lock<std::shared_mutex> lock(client_mu_);
+            return shutdown_.load() ? PrefetchStatus{} : client_->GetPrefetchStatus(id);
+          });
+      grpc::ServerBuilder control_builder;
+      ApplyGrpcLimits(&control_builder);
+      control_builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+      int port = 0;
+      control_builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &port);
+      control_builder.RegisterService(control_service_.get());
+      control_server_ = control_builder.BuildAndStart();
+      if (!control_server_ || port == 0) {
+        MORI_UMBP_ERROR("[StandaloneServer] failed to start prefetch control server on {}",
+                        address);
+        Shutdown();
+        return false;
+      }
+      MORI_UMBP_INFO("[StandaloneServer] prefetch control listening on {}", address);
+    }
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
     if (concurrent_backend_) {
       MORI_UMBP_INFO(
@@ -695,6 +726,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (server_) {
       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
     }
+    if (control_server_) {
+      control_server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
+      control_server_->Wait();
+    }
     UnregisterAllExternalIdentities();
     {
       std::unique_lock<std::shared_mutex> lock(client_mu_);
@@ -717,6 +752,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // extra ssd.enabled veto here would keep refusing a backend that can.
     response->set_supports_ranged_io(client_->SupportsRangedIO());
     response->set_simulation(backend_config_.sim.enabled);
+    response->set_supports_async_prefetch(client_->SupportsAsyncPrefetch());
+    response->set_prefetch_hint_version(1);
     return grpc::Status::OK;
   }
 
@@ -1042,8 +1079,35 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
   }
 
+  grpc::Status SubmitPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
+                              ::umbp::PrefetchSubmitResponse* response) override {
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
+    return PrefetchService::SubmitRequest(
+        *request, response, [this](const auto& keys, auto options, auto id) {
+          return client_->SubmitPrefetch(keys, options, std::move(id));
+        });
+  }
+
+  grpc::Status GetPrefetchStatus(grpc::ServerContext*, const ::umbp::PrefetchStatusRequest* request,
+                                 ::umbp::PrefetchStatusResponse* response) override {
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
+    PrefetchService::FillStatus(client_->GetPrefetchStatus(request->request_id()), response);
+    return grpc::Status::OK;
+  }
+
   grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                              ::umbp::CountResponse* response) override {
+    // The experimental synchronous API used fields 2..4 for lease, deadline
+    // and request_id but expected BatchBoolResponse. Reject that identifiable
+    // wire shape rather than returning a count it could misinterpret as bools.
+    const auto& unknown = request->GetReflection()->GetUnknownFields(*request);
+    for (int i = 0; i < unknown.field_count(); ++i) {
+      if (unknown.field(i).number() >= 2 && unknown.field(i).number() <= 4)
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "BatchPrefetch is a count hint; use SubmitPrefetch/GetPrefetchStatus");
+    }
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     DataPathLock lock(client_mu_, LookupLocking());
     response->set_count(shutdown_.load() ? 0 : client_->BatchPrefetch(keys));
@@ -1883,6 +1947,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::shared_ptr<l1::PoolManager> l1_manager_;
   std::unique_ptr<grpc::Service> l1_service_;
   std::unique_ptr<grpc::Server> server_;
+  std::unique_ptr<PrefetchService> control_service_;
+  std::unique_ptr<grpc::Server> control_server_;
   std::atomic<bool> shutdown_{false};
 
   // Data operations acquire client_mu_ before memory_mu_ and keep the client

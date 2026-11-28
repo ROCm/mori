@@ -33,6 +33,7 @@
 
 #include "mori/io/enum.hpp"
 #include "umbp/common/config.h"
+#include "umbp/common/prefetch.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -134,8 +135,19 @@ class IUMBPClient {
 
   /// Hint that these keys are about to be read: copy this node's SSD-resident
   /// ones into DRAM and pull other nodes' into this node's DRAM in the
-  /// background. Returns the keys copied or queued; 0 where unsupported.
+  /// background. Skips invalid/duplicate/pending keys and splits large hints.
+  /// Returns unique keys admitted, not completed; 0 where unsupported or full.
   virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
+
+  /// Tracked prefetch to local DRAM. Submission only acknowledges admission;
+  /// query until terminal for per-input results.
+  virtual PrefetchSubmitResult SubmitPrefetch(const std::vector<std::string>& keys,
+                                              PrefetchOptions options = {},
+                                              std::string request_id = {}) {
+    return {false, std::move(request_id), "async prefetch is unsupported"};
+  }
+  virtual PrefetchStatus GetPrefetchStatus(const std::string& request_id) { return {}; }
+  virtual bool SupportsAsyncPrefetch() const { return false; }
 
   /// Recency hint for objects the caller served from a faster cache of its
   /// own, so never read here: counted as just used, as a read would be, but

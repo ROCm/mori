@@ -337,6 +337,26 @@ size_t DistributedClient::BatchPrefetch(const std::vector<std::string>& keys) {
   return pool_client_->BatchPrefetch(keys);
 }
 
+PrefetchSubmitResult DistributedClient::SubmitPrefetch(const std::vector<std::string>& keys,
+                                                       PrefetchOptions options, std::string id) {
+  if (closing_) return {false, std::move(id), "client is closing"};
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return {false, std::move(id), "client is closed"};
+  return pool_client_->SubmitPrefetch(keys, options, std::move(id));
+}
+
+PrefetchStatus DistributedClient::GetPrefetchStatus(const std::string& id) {
+  if (closing_) return {};
+  std::shared_lock lk(op_mutex_);
+  return closed_ ? PrefetchStatus{} : pool_client_->GetPrefetchStatus(id);
+}
+
+bool DistributedClient::SupportsAsyncPrefetch() const {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  return !closed_ && pool_client_->SupportsAsyncPrefetch();
+}
+
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
   SimCall call(sim_trace_.get(), "batch_exists_consecutive", keys.size(), 0);
   if (closing_) return 0;

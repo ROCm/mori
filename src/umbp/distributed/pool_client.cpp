@@ -49,6 +49,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/common/prefetch_service.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
@@ -1123,9 +1124,24 @@ bool PoolClient::Init() {
   std::vector<uint8_t> engine_desc_bytes;
   if (peer_directory_ != nullptr) engine_desc_bytes = peer_directory_->PackedLocalEngineDesc();
 
+  if (config_.prefetch_budget_bytes > 0 || config_.ranged_locality_prefetch) {
+    prefetch_queue_ =
+        std::make_unique<PrefetchQueue>([this](const auto& keys, auto options, auto deadline) {
+          return ExecutePrefetch(keys, options, deadline);
+        });
+  }
+
   if (config_.peer_service_port > 0 || config_.auto_peer_service_port) {
     peer_service_ =
         std::make_unique<PeerServiceServer>(*default_pool_, engine_desc_bytes, metric_sink_);
+    if (config_.prefetch_budget_bytes > 0) {
+      prefetch_service_ = std::make_unique<PrefetchService>(
+          [this](const auto& keys, auto options, auto id) {
+            return SubmitPrefetch(keys, options, std::move(id));
+          },
+          [this](const auto& id) { return GetPrefetchStatus(id); });
+      peer_service_->SetPrefetchService(*prefetch_service_);
+    }
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -1191,16 +1207,12 @@ bool PoolClient::Init() {
     }
   }
 
-  // Start the async re-cache worker only when something can feed it and this
-  // node has an exportable local medium to install into.  Three independent
-  // producers share it: cache_remote_fetches (whole-object BatchGet),
-  // ranged_locality_prefetch (remote ranged reads) and BatchPrefetch.
-  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch ||
-       config_.prefetch_budget_bytes > 0) &&
-      registry_.Get(medium_) != nullptr) {
+  // Whole-object reads that already own the bytes only need a local install.
+  if (config_.cache_remote_fetches && registry_.Get(medium_) != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
       recache_stop_ = false;
+      recache_paused_ = false;
     }
     recache_worker_ = std::thread([this] { ReCacheWorkerLoop(); });
   }
@@ -1229,6 +1241,10 @@ bool PoolClient::Init() {
 void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
+  // Drain control RPCs before stopping their shared task queue.
+  peer_service_.reset();
+  prefetch_service_.reset();
+  if (prefetch_queue_) prefetch_queue_->Stop();
 
   if (kv_indexer_) {
     for (auto* backend : registry_.All()) backend->SetChangeHook({});
@@ -1243,7 +1259,6 @@ void PoolClient::Shutdown() {
     std::lock_guard<std::mutex> lk(recache_mutex_);
     recache_stop_ = true;
     recache_queue_.clear();
-    prefetch_inflight_.clear();
   }
   recache_cv_.notify_all();
   if (recache_worker_.joinable()) recache_worker_.join();
@@ -1278,8 +1293,6 @@ void PoolClient::Shutdown() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peers_.clear();
   }
-
-  peer_service_.reset();
 
   // hipHostUnregister the gather regions before their backing memory goes
   // away: the medium's buffers die with the registry below, and the scratch
@@ -1348,10 +1361,18 @@ KvMetadataPin PoolClient::RegisterKvBlock(const KvBlockMetadata& block) {
 bool PoolClient::FlushKvIndexer() { return !kv_indexer_ || kv_indexer_->Sync(); }
 
 bool PoolClient::Clear() {
+  std::lock_guard<std::mutex> clear_lock(clear_mutex_);
   // Vacuously done: nothing has been initialized so there is no state to
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
+  if (prefetch_queue_) prefetch_queue_->PauseAndDrain();
+  {
+    std::unique_lock<std::mutex> lock(recache_mutex_);
+    recache_paused_ = true;
+    recache_queue_.clear();
+    recache_cv_.wait(lock, [this] { return !recache_active_; });
+  }
   // Clear physical state and the default Pool's logical placement index before
   // the full-sync empty snapshot goes out.
   if (default_pool_ != nullptr) default_pool_->ClearLocal();
@@ -1364,6 +1385,12 @@ bool PoolClient::Clear() {
     // No master holds stale placements, so local clear needs no remote ack.
     for (auto* backend : registry_.All()) backend->ClearFullSyncAcked();
   }
+  {
+    std::lock_guard<std::mutex> lock(recache_mutex_);
+    recache_paused_ = false;
+    recache_cv_.notify_all();
+  }
+  if (prefetch_queue_) prefetch_queue_->Resume();
   return ok;
 }
 
@@ -2172,7 +2199,7 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // drop-on-full keeps best-effort semantics.
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
-    if (recache_stop_) return;
+    if (recache_stop_ || recache_paused_) return;
     if (recache_queue_.size() >= recache_queue_max_) {
       recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -2183,25 +2210,18 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   recache_cv_.notify_one();
 }
 
-// How many whole-object prefetches one worker pass may take at once.  Large
-// enough that the per-batch resolve RPC is amortised over a realistic page
-// batch, small enough that one batch's slot allocations and wire time stay
-// bounded when objects are multi-MiB.
-constexpr size_t kPrefetchBatchMax = 256;
+// Keep the deployed Router's GET wait knob. Waiting is bounded across the
+// whole batch and never affects unrelated keys.
+static std::chrono::milliseconds ExplicitPrefetchWaitTimeout() {
+  static const auto timeout = std::min(GetEnvMilliseconds("UMBP_EXPLICIT_PREFETCH_WAIT_TIMEOUT_MS",
+                                                          std::chrono::milliseconds(5000), 0),
+                                       std::chrono::milliseconds(300000));
+  return timeout;
+}
 
 bool PoolClient::CanInstallLocally() const {
   auto* local = registry_.Get(medium_);
   return local != nullptr && local->BufferCount() != 0;
-}
-
-bool PoolClient::LocalityPrefetchAdmits(size_t object_size) const {
-  if (!config_.ranged_locality_prefetch) return false;
-  if (!CanInstallLocally()) return false;
-  // Same admission policy as the non-ranged re-cache, minus its enable flag:
-  // ranged_locality_prefetch is this path's switch and was checked above, so
-  // the predicate is asked only about the policy and the block size.
-  return ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
-                            config_.admission_max_block_bytes, object_size);
 }
 
 void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const void* arena_slice,
@@ -2219,36 +2239,27 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
   }
 }
 
-void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
-                                          const RouteGetResult& route) {
-  if (LocalityPrefetchAdmits(object_size)) QueueWholeObjectPull(key, object_size, route);
+void PoolClient::WaitForPrefetch(const std::vector<std::string>& keys) {
+  const auto timeout = ExplicitPrefetchWaitTimeout();
+  if (!prefetch_queue_ || timeout.count() == 0 || !prefetch_queue_->HasRunningKeys(keys)) return;
+  const auto local = default_pool_->BatchContains(keys);
+  std::vector<std::string> missing;
+  for (size_t i = 0; i < keys.size(); ++i)
+    if (i >= local.size() || !local[i]) missing.push_back(keys[i]);
+  if (!missing.empty()) prefetch_queue_->WaitForKeys(missing, timeout);
 }
 
-bool PoolClient::QueueWholeObjectPull(const std::string& key, size_t object_size,
-                                      const RouteGetResult& route) {
-  ReCacheJob job;
-  job.key = key;
-  job.size = object_size;
-  job.route = route;  // bytes stays null: the worker pulls them itself
-
-  {
-    std::lock_guard<std::mutex> lk(recache_mutex_);
-    if (recache_stop_) return false;
-    if (recache_queue_.size() >= recache_queue_max_) {
-      recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-    if (!prefetch_inflight_.insert(key).second) return false;  // already queued or running
-    recache_queue_.push_back(std::move(job));
-  }
-  recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
-  recache_cv_.notify_one();
-  return true;
+void PoolClient::MaybePrefetchWholeObjects(const std::vector<std::string>& keys) {
+  if (!prefetch_queue_ || !config_.ranged_locality_prefetch || !CanInstallLocally()) return;
+  // Routes are resolved at execution; repeated cold reads share pending hints.
+  recache_stats_.admitted.fetch_add(prefetch_queue_->SubmitHint(keys), std::memory_order_relaxed);
 }
 
 void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   auto* backend = registry_.Get(medium_);
-  if (backend == nullptr || backend->BufferCount() == 0 || jobs.empty()) return;
+  if (backend == nullptr || backend->Tier() != TierType::DRAM || backend->BufferCount() == 0 ||
+      jobs.empty())
+    return;
 
   // Drop anything that landed while it waited in the queue — a concurrent
   // request, or the offload path writing it back.  One batched resolve, before
@@ -2271,6 +2282,16 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   if (requests.empty()) return;
 
   auto allocs = backend->BatchAllocate(requests);
+  // A request deadline never releases a destination before synchronous I/O finishes.
+  struct PendingSlots {
+    MediumBackend* backend;
+    std::vector<uint64_t> slots;
+    ~PendingSlots() {
+      if (!slots.empty()) backend->BatchAbort(slots);
+    }
+  } pending{backend, {}};
+  for (const auto& alloc : allocs)
+    if (alloc.outcome == AllocateOutcome::kSuccessAllocated) pending.slots.push_back(alloc.slot_id);
 
   // Peer pages and medium pages are both registered host memory, so the objects
   // move peer -> medium as plain RDMA: no arena, no bounce buffer, no memcpy,
@@ -2290,7 +2311,7 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   slot_refs.reserve(wanted.size());
   planned.reserve(wanted.size());
 
-  for (size_t w = 0; w < wanted.size(); ++w) {
+  for (size_t w = 0; w < wanted.size() && w < allocs.size(); ++w) {
     auto& alloc = allocs[w];
     if (alloc.outcome != AllocateOutcome::kSuccessAllocated) continue;
     const auto& job = jobs[wanted[w]];
@@ -2304,9 +2325,6 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
         contiguous ? backend->BufferRef(alloc.pages.front().buffer_index) : TransferRef{};
     if (!contiguous || !slot_buffer.Valid()) {
       recache_stats_.fragmented.fetch_add(1, std::memory_order_relaxed);
-      // Aborted here and never revisited: the commit/abort pass below walks
-      // `planned`, which this key does not enter.
-      backend->BatchAbort({alloc.slot_id});
       continue;
     }
 
@@ -2328,10 +2346,19 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   if (planned.empty()) return;
 
   std::vector<bool> fetched(planned.size(), false);
-  ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
+  try {
+#ifdef MORI_UMBP_TESTING
+    if (prefetch_transport_for_test_)
+      prefetch_transport_for_test_(plan, &fetched);
+    else
+#endif
+      ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
+  } catch (...) {
+    NoteRangedInstallFailure(wanted.size());
+    return;
+  }
 
   std::vector<CommitRequest> commits;
-  std::vector<uint64_t> aborts;
   commits.reserve(planned.size());
   // Everything this pass wanted but could not plan -- no slot, or a slot that
   // is not one addressable run -- already failed to become local.
@@ -2339,7 +2366,6 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   for (size_t i = 0; i < planned.size(); ++i) {
     auto& alloc = allocs[planned[i]];
     if (!fetched[i]) {
-      aborts.push_back(alloc.slot_id);
       ++not_installed;
       continue;
     }
@@ -2347,14 +2373,11 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   }
   if (!commits.empty()) {
     const auto results = backend->BatchCommit(commits);
-    for (size_t c = 0; c < results.size(); ++c) {
-      if (!results[c].success) {
-        aborts.push_back(commits[c].slot_id);
-        ++not_installed;
-      }
-    }
+    const size_t installed =
+        std::count_if(results.begin(), results.end(), [](const auto& r) { return r.success; });
+    recache_stats_.prefetched.fetch_add(installed, std::memory_order_relaxed);
+    not_installed += commits.size() - installed;
   }
-  if (!aborts.empty()) backend->BatchAbort(aborts);
   // Reported in one go rather than per key: this is a background pass, and the
   // counter is there to say how much locality is being lost, not to trace it.
   NoteRangedInstallFailure(not_installed);
@@ -2368,63 +2391,42 @@ void PoolClient::ReCacheWorkerLoop() {
   // by construction.
   MarkThreadBackgroundCopies();
 
-  // Reused across iterations so a steady stream of prefetches does not
-  // reallocate this vector on every batch.
-  std::vector<ReCacheJob> prefetch_batch;
   for (;;) {
     ReCacheJob job;
     {
       std::unique_lock<std::mutex> lk(recache_mutex_);
-      recache_cv_.wait(lk, [this] { return recache_stop_ || !recache_queue_.empty(); });
+      recache_cv_.wait(
+          lk, [this] { return recache_stop_ || (!recache_paused_ && !recache_queue_.empty()); });
       if (recache_stop_ && recache_queue_.empty()) return;
       job = std::move(recache_queue_.front());
       recache_queue_.pop_front();
-      // A prefetch is worth batching: its cost per key is a peer resolve RPC
-      // plus an RDMA round trip, and this is the only thread paying it.  Take
-      // every prefetch already waiting, up to a cap that keeps one batch's
-      // allocation and wire time bounded.
-      if (job.bytes == nullptr) {
-        prefetch_batch.clear();
-        prefetch_batch.push_back(std::move(job));
-        for (auto it = recache_queue_.begin();
-             it != recache_queue_.end() && prefetch_batch.size() < kPrefetchBatchMax;) {
-          if (it->bytes != nullptr) {
-            ++it;  // an install job; leave it in order
-            continue;
-          }
-          prefetch_batch.push_back(std::move(*it));
-          it = recache_queue_.erase(it);
-        }
-      }
-    }
-    if (!prefetch_batch.empty()) {
-      // Whole-object locality prefetch.  The dedup slots are released
-      // afterwards, so a later miss can try again for whatever did not land.
-      FetchWholeObjectsIntoMedium(prefetch_batch);
-      {
-        std::lock_guard<std::mutex> lk(recache_mutex_);
-        for (const auto& done : prefetch_batch) prefetch_inflight_.erase(done.key);
-      }
-      recache_stats_.prefetched.fetch_add(prefetch_batch.size(), std::memory_order_relaxed);
-      prefetch_batch.clear();
-      continue;
+      recache_active_ = true;
     }
     // Install into this node's medium. ExecuteLocalPut allocates a slot on that
     // backend, copies the bytes, and Commit queues a KvEvent::ADD that reaches
     // the master via heartbeat — mirroring the local Put publish path.
     // kSuccessAlreadyExists makes this idempotent for a repeat remote read of
     // the same key.
-    switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, medium_)) {
-      case PutAttemptOutcome::kSuccess:
-        recache_stats_.installed.fetch_add(1, std::memory_order_relaxed);
-        break;
-      case PutAttemptOutcome::kSuccessAlreadyExists:
-        recache_stats_.already_present.fetch_add(1, std::memory_order_relaxed);
-        break;
-      case PutAttemptOutcome::kRetry:
-      case PutAttemptOutcome::kFatal:
-        recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
-        break;
+    try {
+      switch (ExecuteLocalPut(job.key, job.bytes.get(), job.size, medium_)) {
+        case PutAttemptOutcome::kSuccess:
+          recache_stats_.installed.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case PutAttemptOutcome::kSuccessAlreadyExists:
+          recache_stats_.already_present.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case PutAttemptOutcome::kRetry:
+        case PutAttemptOutcome::kFatal:
+          recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
+          break;
+      }
+    } catch (...) {
+      recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> lock(recache_mutex_);
+      recache_active_ = false;
+      recache_cv_.notify_all();
     }
   }
 }
@@ -3258,6 +3260,7 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
     return results;
   }
+  WaitForPrefetch(keys);
 
   // Both arms are route-then-partition; they differ only in WHICH keys reach
   // the master and whether an unroutable key may still fall back to a local
@@ -3534,6 +3537,8 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   if (!initialized_ || n == 0 || !RangeBatchShapeValid(n, dsts, sizes, src_offsets)) {
     return results;
   }
+
+  WaitForPrefetch(keys);
 
   // Observed at scope exit for whichever phases ran; see ScopedBatchBandwidth.
   double local_bytes = 0.0;
@@ -3964,6 +3969,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
   size_t pos = 0;
+  std::vector<std::string> cold_keys;
   while (pos < units.size()) {
     std::vector<size_t> scratch_offsets;
     size_t cursor = 0;
@@ -4010,7 +4016,7 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
     sub_timer.Stop();
     // recache_remote=false: a ranged entry never holds the whole object, so
     // there is nothing the generic re-cache could legally install.  Locality is
-    // restored by MaybePrefetchWholeObject below instead.
+    // restored by MaybePrefetchWholeObjects below instead.
     ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
 
     // Scatter EVERY fetched unit out of the arena with ONE transfer, for the
@@ -4078,12 +4084,15 @@ std::vector<bool> PoolClient::BatchGetRangesImpl(
       PhaseTimer install_timer(dbg ? &dbg->rmt_install : nullptr);
       if (unit.holds_whole_object) {
         MaybeInstallCompleteArenaObject(sub_keys[j], sub_dsts[j], unit.object_size);
-      } else {
-        MaybePrefetchWholeObject(sub_keys[j], unit.object_size, *unit.route);
+      } else if (config_.ranged_locality_prefetch &&
+                 ShouldAdmitReCache(true, config_.cache_remote_admission,
+                                    config_.admission_max_block_bytes, unit.object_size)) {
+        cold_keys.push_back(sub_keys[j]);
       }
     }
     pos = end;
   }
+  MaybePrefetchWholeObjects(cold_keys);
 
   for (const auto& [original, ok] : unit_ok) results[original] = ok;
   return results;
@@ -5164,7 +5173,7 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
     // Never for a ranged entry: the destination holds only the requested spans,
     // and a medium slot is whole-object, so installing it would publish a key
     // whose remaining bytes are undefined.  The ranged path schedules its own
-    // whole-object prefetch instead (MaybePrefetchWholeObject).
+    // whole-object prefetch instead (MaybePrefetchWholeObjects).
     if (recache_remote && entry.item && !entry.item->Ranged()) {
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
@@ -5246,33 +5255,76 @@ bool PoolClient::Exists(const std::string& key) {
 }
 
 size_t PoolClient::BatchPrefetch(const std::vector<std::string>& keys) {
-  if (!initialized_ || default_pool_ == nullptr || config_.prefetch_budget_bytes == 0) return 0;
-  const auto here = default_pool_->BatchContains(keys);
-  std::vector<std::string> local;
-  std::vector<size_t> elsewhere;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (i < here.size() && here[i]) {
-      local.push_back(keys[i]);
-    } else {
-      elsewhere.push_back(i);
-    }
-  }
-  size_t started = default_pool_->Prefetch(local, config_.prefetch_budget_bytes);
-  if (elsewhere.empty() || !CanInstallLocally()) return started;
+  if (!initialized_ || !prefetch_queue_ || config_.prefetch_budget_bytes == 0) return 0;
+  return prefetch_queue_->SubmitHint(keys);
+}
 
-  // Pulled from their owners into this node's medium, so the read is local.
-  std::vector<std::optional<RouteGetResult>> routes(keys.size());
-  if (!RouteGetsInto(keys, elsewhere, /*exclude_self=*/true, &routes)) return started;
-  for (size_t i : elsewhere) {
-    const auto& route = routes[i];
-    if (route.has_value() &&
-        ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
-                           config_.admission_max_block_bytes, route->size) &&
-        QueueWholeObjectPull(keys[i], route->size, *route)) {
-      ++started;
+PrefetchSubmitResult PoolClient::SubmitPrefetch(const std::vector<std::string>& keys,
+                                                PrefetchOptions options, std::string id) {
+  if (!initialized_ || !prefetch_queue_ || config_.prefetch_budget_bytes == 0)
+    return {false, std::move(id), "prefetch is disabled"};
+  return prefetch_queue_->Submit(keys, options, std::move(id));
+}
+
+PrefetchStatus PoolClient::GetPrefetchStatus(const std::string& id) {
+  return prefetch_queue_ ? prefetch_queue_->Status(id) : PrefetchStatus{};
+}
+
+std::vector<bool> PoolClient::ExecutePrefetch(const std::vector<std::string>& keys,
+                                              PrefetchOptions options,
+                                              PrefetchQueue::Clock::time_point deadline) {
+  MarkThreadBackgroundCopies();
+  using Clock = PrefetchQueue::Clock;
+  std::unordered_set<std::string> seen;
+  std::vector<std::string> unique;
+  for (const auto& key : keys)
+    if (seen.insert(key).second) unique.push_back(key);
+  constexpr size_t kBatchKeys = 128;
+  constexpr uint64_t kBatchBytes = 128ULL << 20;
+  for (size_t first = 0; first < unique.size() && Clock::now() < deadline; first += kBatchKeys) {
+    const auto last = std::min(first + kBatchKeys, unique.size());
+    const std::vector<std::string> batch(unique.begin() + first, unique.begin() + last);
+    try {
+      default_pool_->Prefetch(batch, config_.prefetch_budget_bytes);
+      if (!HasMaster() || Clock::now() >= deadline) continue;
+      const auto local = default_pool_->BatchContains(batch);
+      std::vector<size_t> remote;
+      for (size_t i = 0; i < batch.size(); ++i)
+        if (i >= local.size() || !local[i]) remote.push_back(i);
+      if (remote.empty()) continue;
+      std::vector<std::optional<RouteGetResult>> routes(batch.size());
+      if (!RouteGetsInto(batch, remote, /*exclude_self=*/true, &routes)) continue;
+      std::vector<ReCacheJob> jobs;
+      uint64_t bytes = 0;
+      auto flush = [&] {
+        if (!jobs.empty() && Clock::now() < deadline) {
+          std::vector<std::string> copying;
+          for (const auto& job : jobs) copying.push_back(job.key);
+          prefetch_queue_->BeginKeys(copying);
+          ScopeExit finish_batch{[this] { prefetch_queue_->EndKeys(); }};
+          FetchWholeObjectsIntoMedium(jobs);
+        }
+        jobs.clear();
+        bytes = 0;
+      };
+      for (auto i : remote) {
+        if (!routes[i] || routes[i]->size > kBatchBytes ||
+            !ShouldAdmitReCache(true, config_.cache_remote_admission,
+                                config_.admission_max_block_bytes, routes[i]->size))
+          continue;
+        if (bytes + routes[i]->size > kBatchBytes) flush();
+        bytes += routes[i]->size;
+        jobs.push_back(ReCacheJob{batch[i], nullptr, routes[i]->size, routes[i]});
+      }
+      flush();
+    } catch (...) { /* Keep earlier committed copies; later batches can still succeed. */
     }
   }
-  return started;
+  // Residency is checked after all copies: SSD budget eviction may remove an early copy.
+  const auto lease_until = Clock::now() + options.lease_ttl;
+  auto ready = default_pool_->LeasePrefetched(keys, options.lease_ttl);
+  if (Clock::now() >= lease_until) std::fill(ready.begin(), ready.end(), false);
+  return ready;
 }
 
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {

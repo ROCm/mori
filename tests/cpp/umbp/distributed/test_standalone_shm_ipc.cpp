@@ -32,22 +32,45 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "umbp/common/prefetch_queue.h"
+#include "umbp/common/prefetch_service.h"
+#include "umbp/distributed/peer/peer_service.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
+#include "umbp_peer.grpc.pb.h"
 #include "umbp_standalone.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
+
+class ScopedPrefetchControlAddress {
+ public:
+  explicit ScopedPrefetchControlAddress(const std::string& address) {
+    if (const char* value = std::getenv("UMBP_PREFETCH_CONTROL_ADDRESS")) previous_ = value;
+    setenv("UMBP_PREFETCH_CONTROL_ADDRESS", address.c_str(), 1);
+  }
+  ~ScopedPrefetchControlAddress() {
+    if (previous_)
+      setenv("UMBP_PREFETCH_CONTROL_ADDRESS", previous_->c_str(), 1);
+    else
+      unsetenv("UMBP_PREFETCH_CONTROL_ADDRESS");
+  }
+
+ private:
+  std::optional<std::string> previous_;
+};
 
 TEST(StandaloneShmIpcTest, AnonymousShmRegistryLookupMapsSameMemory) {
   HostMemAllocator allocator;
@@ -1139,6 +1162,127 @@ TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
   server_thread.join();
   unlink(grpc_path.c_str());
   unlink(fd_path.c_str());
+}
+
+TEST(StandaloneShmIpcTest, AsyncPrefetchPreservesRouterWireAndEngineIo) {
+  const std::string address = "unix:///tmp/umbp_prefetch_" + std::to_string(getpid()) + ".sock";
+  PeerServiceServer temporary_peer(static_cast<BackendRegistry*>(nullptr));
+  ASSERT_TRUE(temporary_peer.Start(0));
+  const std::string control_address = "127.0.0.1:" + std::to_string(temporary_peer.BoundPort());
+  temporary_peer.Stop();
+  ScopedPrefetchControlAddress control_env(control_address);
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4 << 20;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  config.standalone_process = standalone_config;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  auto client = CreateUMBPClient(config);
+  ASSERT_TRUE(client->SupportsAsyncPrefetch());
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  auto memory = allocator.Alloc(4096, options);
+  ASSERT_TRUE(memory.valid());
+  const auto ptr = reinterpret_cast<uintptr_t>(memory.ptr);
+  ASSERT_TRUE(client->RegisterMemory(ptr, memory.mapped_size));
+  std::memset(memory.ptr, 0x6b, 4096);
+  ASSERT_TRUE(client->Put("resident", ptr, 4096));
+
+  auto stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(control_address, grpc::InsecureChannelCredentials()));
+  // Hand-encoded bytes from the deployed Router's fields: key=resident,
+  // key=missing, key=resident, lease=1000, timeout=2000, request_id=router.
+  const unsigned char wire[] = {0x0a, 8,    'r',  'e', 's', 'i', 'd', 'e',  'n',  't',  0x0a,
+                                7,    'm',  'i',  's', 's', 'i', 'n', 'g',  0x0a, 8,    'r',
+                                'e',  's',  'i',  'd', 'e', 'n', 't', 0x10, 0xe8, 0x07, 0x18,
+                                0xd0, 0x0f, 0x22, 6,   'r', 'o', 'u', 't',  'e',  'r'};
+  ::umbp::PrefetchRequest request;
+  ASSERT_TRUE(request.ParseFromArray(wire, sizeof(wire)));
+  grpc::ClientContext submit_context;
+  ::umbp::PrefetchSubmitResponse submitted;
+  ASSERT_TRUE(stub->SubmitPrefetch(&submit_context, request, &submitted).ok());
+  ASSERT_TRUE(submitted.accepted()) << submitted.error();
+  EXPECT_EQ(submitted.request_id(), "router");
+  PrefetchStatus status;
+  for (int i = 0; i < 200; ++i) {
+    status = client->GetPrefetchStatus("router");
+    if (PrefetchTerminal(status.state)) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(status.state, PrefetchState::kPartial);
+  EXPECT_EQ(status.ok, (std::vector<bool>{true, false, true}));
+  EXPECT_EQ(status.completed_keys, 2u);
+  EXPECT_TRUE(client
+                  ->SubmitPrefetch(
+                      {"resident", "missing", "resident"},
+                      {std::chrono::milliseconds(1000), std::chrono::milliseconds(2000)}, "router")
+                  .accepted);
+  EXPECT_FALSE(client->SubmitPrefetch({"different"}, {}, "router").accepted);
+  EXPECT_EQ(client->BatchPrefetch({"resident"}), 1u);
+  std::memset(memory.ptr, 0, 4096);
+  EXPECT_EQ(client->BatchGetRanges({"resident"}, {{ptr}}, {{4096}}, {{0}}),
+            std::vector<bool>{true});
+  EXPECT_EQ(static_cast<unsigned char*>(memory.ptr)[2048], 0x6b);
+  ::umbp::Empty empty;
+  ::umbp::BoolResponse admin_response;
+  grpc::ClientContext clear_context;
+  EXPECT_EQ(stub->Clear(&clear_context, empty, &admin_response).error_code(),
+            grpc::StatusCode::UNIMPLEMENTED);
+  grpc::ClientContext flush_context;
+  EXPECT_EQ(stub->Flush(&flush_context, empty, &admin_response).error_code(),
+            grpc::StatusCode::UNIMPLEMENTED);
+  EXPECT_TRUE(client->Flush());
+  EXPECT_TRUE(client->Clear());
+  EXPECT_EQ(client->GetPrefetchStatus("router").state, PrefetchState::kFailed);
+  client->DeregisterMemory(ptr);
+  client->Close();
+  allocator.Free(memory);
+  server.Shutdown();
+}
+
+TEST(StandaloneShmIpcTest, PeerPortSharesPrefetchQueueWithoutStandaloneAdminRpcs) {
+  PrefetchQueue queue(
+      [](const auto& keys, auto, auto) { return std::vector<bool>(keys.size(), true); });
+  PrefetchService service([&](const auto& keys, auto options,
+                              auto id) { return queue.Submit(keys, options, std::move(id)); },
+                          [&](const auto& id) { return queue.Status(id); });
+  PeerServiceServer peer(static_cast<BackendRegistry*>(nullptr));
+  peer.SetPrefetchService(service);
+  ASSERT_TRUE(peer.Start(0));
+  const auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(peer.BoundPort()),
+                                           grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPStandalone::NewStub(channel);
+  ::umbp::PrefetchRequest request;
+  request.add_keys("resident");
+  request.set_request_id("peer");
+  grpc::ClientContext submit_context;
+  ::umbp::PrefetchSubmitResponse submitted;
+  ASSERT_TRUE(stub->SubmitPrefetch(&submit_context, request, &submitted).ok());
+  ASSERT_TRUE(submitted.accepted());
+  EXPECT_FALSE(queue.Submit({"different"}, {}, "peer").accepted);
+  ::umbp::PrefetchStatusRequest lookup;
+  lookup.set_request_id("peer");
+  ::umbp::PrefetchStatusResponse status;
+  grpc::ClientContext status_context;
+  ASSERT_TRUE(stub->GetPrefetchStatus(&status_context, lookup, &status).ok());
+  EXPECT_EQ(status.total_keys(), 1u);
+  ::umbp::Empty empty;
+  ::umbp::BoolResponse response;
+  grpc::ClientContext clear_context;
+  EXPECT_EQ(stub->Clear(&clear_context, empty, &response).error_code(),
+            grpc::StatusCode::UNIMPLEMENTED);
+  grpc::ClientContext flush_context;
+  EXPECT_EQ(stub->Flush(&flush_context, empty, &response).error_code(),
+            grpc::StatusCode::UNIMPLEMENTED);
+  auto peer_stub = ::umbp::UMBPPeer::NewStub(channel);
+  ::umbp::GetPeerInfoRequest peer_request;
+  ::umbp::GetPeerInfoResponse peer_response;
+  grpc::ClientContext peer_context;
+  EXPECT_TRUE(peer_stub->GetPeerInfo(&peer_context, peer_request, &peer_response).ok());
+  peer.Stop();
 }
 
 // The recency hint crosses the process boundary and reaches the server's
