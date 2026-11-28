@@ -1425,12 +1425,12 @@ constexpr bool CCO_SDMA_BREAK_ON_RETRIES = true;
 constexpr bool CCO_SDMA_BREAK_ON_RETRIES = false;
 #endif
 
-// Wait for this lane's ring stores to land before the doorbell. gfx12 dropped the
-// s_waitcnt intrinsic; gfx9 keeps it because a release fence there also writes
-// back L2, which the uncached ring does not need.
+// Wait for this lane's ring stores to land before the doorbell. The ring is uncached, so a
+// store wait is all it needs; a release fence would also write back L2 (gfx9) or the device
+// scope (gfx12.5, global_wb). gfx12 has no waitcnt intrinsic, hence the asm.
 __device__ __forceinline__ void ccoSdmaPublishStores() {
 #if defined(CCO_GFX125X)
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
 #else
   __builtin_amdgcn_s_waitcnt(0);
 #endif
