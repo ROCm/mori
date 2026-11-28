@@ -84,6 +84,25 @@ transfer stops fitting under the GEMM.
 
 The plan kernel rendezvouses across its grid, so that grid must be fully resident
 (one block per CU is). The combine has no grid-wide rendezvous and is not resident.
+
+Plan-free (``MegaMoESdma(plan_free=True)``, the default; ``gemm2="8wave"`` only): no plan
+kernel. aiter's compact dispatch lays out every local expert as [fanout-pair group section |
+normal section], each ordered by source rank and SBM-padded, with every count in ``bigcnt``, so the
+8wave GEMM2 computes the plan's outputs in closed form (section table in LDS per workgroup,
+``out_row`` in the epilogue, offsets / chunk bounds / inv entries in the comm workgroup) and checks
+the peers' "consumed" flags before its first write of ``S``.
+
+``inv_pipe`` (``MegaMoESdma(inv_pipe=True)``, ``main.py --inv-pipe``; plan-free only, off by
+default): the comm waves push the peers' inv entries between the puts instead of all before the
+first one, so the first put leaves when chunk 0 is ready. The entries still complete before the
+signal-carrying put (the put waits for all of the wave's stores before its doorbell) and before the
+flag (a release). It pays only where the transfer bounds the call; where the GEMM does, the longer
+overlap slows the slowest rank's GEMM.
+
+``combine_opt`` (``MegaMoESdma(combine_opt=True)``, the default): the combine without its per-block
+release before the counter atomic (the inv resets are write-through stores, waited for before the
+atomic), with the block's inv slots loaded once and reset in one batch after the token loop, and
+with the last block's done stores relaxed after its one system release.
 """
 from dataclasses import dataclass
 
@@ -1545,7 +1564,7 @@ def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
 # --- Kernel 3: combine --------------------------------------------------------
 
 def build_combine(
-    *, layout, rank, hidden, topk, quant="none", signal_mode="remote", p2p_fallback=False
+    *, layout, rank, hidden, topk, quant="none", signal_mode="remote", p2p_fallback=False, opt=False,
 ):
     """Kernel 3: finish the transfer and reduce.
 
@@ -1559,9 +1578,15 @@ def build_combine(
 
     ``p2p_fallback``: a slot whose ``inv`` is ``INV_P2P`` is read from this rank's
     ``comb_inp[slot]`` (``arg_comb_inp``), where GEMM2 put a row past the end of ``S``.
+    ``opt`` (``MegaMoESdma(combine_opt=True)``; at most ``2 * WAVE`` inv slots per block): load the
+    block's inv slots once (lane j holds slot j, read back per token) and reset them after one barrier
+    at the end with write-through stores, so no inv line is dirty in L2 and no per-block release is
+    needed before the counter atomic; the last block computes the peers' done addresses once and
+    stores them relaxed after its one system release.
     """
     import mori.cco.device.flydsl as cco
 
+    P6S = bool(opt)
     if hidden % 8:
         raise ValueError(f"hidden must be a multiple of 8, got {hidden}")
     quant_fp8 = quant == "fp8_blockwise_1x32"
@@ -1578,7 +1603,8 @@ def build_combine(
 
     # fmt: off
     @flyc.kernel(name=f"mega_combine_p{npes}_s{layout.send_rows}r{layout.recv_rows}_h{hidden}_k{topk}_{quant}_{signal_mode}"
-                 f"_f{int(p2p_fallback)}_r{rank}", known_block_size=[BLOCK, 1, 1])
+                 f"_f{int(p2p_fallback)}_r{rank}{'_p6s' if P6S else ''}",
+                 known_block_size=[BLOCK, 1, 1])
     def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64, arg_comb_inp: fx.Int64,
         arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
         i32_nblocks: fx.Int32, i32_tokens: fx.Int32):
@@ -1612,6 +1638,23 @@ def build_combine(
         fx.barrier()
 
         inv_buf = ptr_buf_tensor(arg_inv, fx.Int32)
+        if const_expr(P6S):
+            # Every inv slot of this block's tokens, slot j in lane j % 64 of pv[j // 64] (<= 128 slots, checked on
+            # the host); a token reads its slots back with readlane instead of loading them.
+            inv_rsrc = create_buffer_resource_from_addr(_uniform_i64(arg_inv))
+            lane = fx.Int32(tid) % fx.Int32(WAVE)
+            ntok = (i32_tokens - fx.Int32(bid) + i32_nblocks - fx.Int32(1)) // i32_nblocks
+            nslot = (ntok > fx.Int32(0)).select(ntok, fx.Int32(0)) * fx.Int32(topk)
+
+            def slot_index(j):
+                i = j // fx.Int32(topk)
+                return (fx.Int32(bid) + i * i32_nblocks) * fx.Int32(topk) + (j - i * fx.Int32(topk))
+
+            pv = []
+            for h in range_constexpr(2):
+                j = lane + fx.Int32(h * WAVE)
+                ok = j < nslot
+                pv.append(ok.select(fx.Int32(inv_buf[slot_index(ok.select(j, fx.Int32(0)))]), fx.Int32(-1)))
 
         # B. top-k reduce
         s_base = _uniform_i64(w.lsa_ptr(rank, layout.off_s))
@@ -1655,8 +1698,16 @@ def build_combine(
             return fx.Vector(vals), scale
         for tok in range(bid, i32_tokens, i32_nblocks):
             slots = []
-            for k in range_constexpr(topk):
-                slots.append(inv_buf[tok * fx.Int32(topk) + fx.Int32(k)])
+            if const_expr(P6S):
+                it = (tok - fx.Int32(bid)) // i32_nblocks
+                for k in range_constexpr(topk):
+                    idx = it * fx.Int32(topk) + fx.Int32(k)
+                    vlo = fx.Int32(rocdl.readlane(T.i32, pv[0], idx & fx.Int32(WAVE - 1)))
+                    vhi = fx.Int32(rocdl.readlane(T.i32, pv[1], idx & fx.Int32(WAVE - 1)))
+                    slots.append((idx < fx.Int32(WAVE)).select(vlo, vhi))
+            else:
+                for k in range_constexpr(topk):
+                    slots.append(inv_buf[tok * fx.Int32(topk) + fx.Int32(k)])
             for chunk in range_constexpr(chunks):
                 u = fx.Int32(chunk * BLOCK) + tid
                 if u < fx.Int32(units):
@@ -1691,26 +1742,44 @@ def build_combine(
                     buf_copy_store(
                         out, tok * fx.Int32(units) + u, acc.to(fx.BFloat16), fx.BFloat16, unit_elems=8
                     )
-            # Every thread has the slots in registers; only then may they be reset.
+            if const_expr(not P6S):
+                # Every thread has the slots in registers; only then may they be reset.
+                fx.barrier()
+                if tid < fx.Int32(topk):
+                    inv_buf[tok * fx.Int32(topk) + tid] = fx.Int32(-1)
+        if const_expr(P6S):
+            # Every slot of the block was read; reset them all, written through to memory so no inv line is dirty
+            # in L2 when done goes out (the s_waitcnt below retires them before the counter atomic).
             fx.barrier()
-            if tid < fx.Int32(topk):
-                inv_buf[tok * fx.Int32(topk) + tid] = fx.Int32(-1)
+            if fx.Int32(tid) < nslot:
+                buffer_store(fx.Int32(-1), inv_rsrc, slot_index(fx.Int32(tid)), cache_modifier=1 | 16)  # sc0 sc1
 
         # C. the last block out tells the peers this call's data has been consumed
         rocdl.s_waitcnt(0)
         fx.barrier()
         if tid == fx.Int32(0):
-            comm_ops.fence_agent_release()
+            if const_expr(not P6S):
+                comm_ops.fence_agent_release()
             old = fx.Int32(comm_ops.atomic_add_agent(arg_fin, fx.Int32(1)))
             if (old + fx.Int32(1)) % i32_nblocks == fx.Int32(0):
+                if const_expr(P6S):
+                    # One read of the window, before the fences: the stores below then go out back to back.
+                    done_addr = {}
+                    for peer in range_constexpr(npes):
+                        if peer != rank:
+                            done_addr[peer] = fx.Int64(w.lsa_ptr(peer, layout.off_done)) + fx.Int64(rank * 4)
                 comm_ops.fence_agent_acquire()
                 buffer_store(phase, rsrc_counter, 0)
                 comm_ops.fence_system_release()
                 for peer in range_constexpr(npes):
                     if peer != rank:
-                        comm_ops.store_i32_global_system_release(
-                            fx.Int64(w.lsa_ptr(peer, layout.off_done)) + fx.Int64(rank * 4), phase
-                        )
+                        if const_expr(P6S):
+                            # The system release above already orders everything before these stores.
+                            comm_ops.store_i32_global_system_monotonic(done_addr[peer], phase)
+                        else:
+                            comm_ops.store_i32_global_system_release(
+                                fx.Int64(w.lsa_ptr(peer, layout.off_done)) + fx.Int64(rank * 4), phase
+                            )
 
     # fmt: off
     @flyc.jit
@@ -1760,6 +1829,22 @@ class MegaMoESdma:
     persistent GEMM2 of ``gemm2_8wave.py`` (workgroup 0 is the comm workgroup), which
     needs fp8 transport, ``remote`` signalling and one queue. Switch with ``set_gemm2``.
 
+    ``plan_free`` (``"8wave"`` only; the aiter GEMM2 always runs the plan): no plan kernel.
+    aiter's compact dispatch lays every local expert out as [fanout-pair group section |
+    normal section], each ordered by source rank and SBM-padded, with all counts in its
+    gathered ``bigcnt``; so GEMM2 places every row in closed form (its epilogue computes
+    ``out_row``, its comm workgroup the offsets, chunk bounds, inv entries, overflow count and
+    the cdone reset), and waits for the peers' "consumed" flags before its first write of
+    ``S`` instead of before the plan. On by default; switch with ``set_plan_free``.
+
+    ``inv_pipe`` (plan-free only): ``False`` (default) pushes the peers' ``inv`` entries before
+    the first put; ``True`` pushes the next chunk's entries after each put, so the first put
+    leaves as soon as chunk 0 is ready. Every entry is still complete before the peer's signal
+    and flag. It pays only where the transfer bounds the call. Switch with ``set_inv_pipe``.
+
+    ``combine_opt`` (default on): the combine of ``build_combine(opt=True)``, where the block's
+    inv slots fit in two waves' lanes; otherwise the plain one. Switch with ``set_combine_opt``.
+
     The send/landing layout is exact (from aiter's gathered route counts); ``S`` is
     ``send_slack`` times ``max_tok * topk`` rows, capped by the 32-bit buffer-resource
     range. With fp8 transport (and aiter's comb_inp in the same fp8 format) a row past
@@ -1780,6 +1865,9 @@ class MegaMoESdma:
         signal_mode="quiet",
         quant="none",
         gemm2="aiter",
+        plan_free=True,
+        inv_pipe=False,
+        combine_opt=True,
     ):
         import torch
         import torch.distributed as dist
@@ -1885,6 +1973,8 @@ class MegaMoESdma:
         )
         # Rows past the end of S (sent through the fallback, or dropped without it).
         self.overflow = torch.zeros(1, **i32)
+        # Plan-free GEMM2: [rows past the end of S, rows outside their closed-form run].
+        self.pf_counters = torch.zeros(4, **i32)
         self.combine_fin = torch.zeros(1, **i32)
         # In the window, so a sender can fill it: -1 means "no row for this slot"; the
         # combine kernel puts it back after reading. Set before the barrier below, so
@@ -1923,16 +2013,15 @@ class MegaMoESdma:
         )
         self._plans = {}
         self._gemm2_8w = {}
-        self._combine = build_combine(
-            layout=lay,
-            rank=self.rank,
-            hidden=self.hidden,
-            topk=self.topk,
-            quant=quant,
-            signal_mode=signal_mode,
-            p2p_fallback=self.p2p_fallback,
-        )
+        self.plan_free = False
+        self.inv_pipe = False
+        self._combines = {}
+        self.combine_opt = False
+        self.set_combine_opt(combine_opt)
+        self.gemm2 = None
         self.set_gemm2(gemm2)
+        self.set_plan_free(plan_free)
+        self.set_inv_pipe(inv_pipe)
 
     def _plan_for(self, sbm):
         if sbm < MIN_SBM:
@@ -1954,6 +2043,49 @@ class MegaMoESdma:
             )
         return self._plans[sbm]
 
+
+    def _pf_active(self):
+        return bool(self.plan_free) and self.gemm2 == "8wave"
+
+    def _pf_enter(self, was_active):
+        """A plan-path call leaves the chunk counters at their targets (the plan zeroes them at
+        the start of a call); the plan-free GEMM2 resets them at the end of its call instead,
+        so they must be zero when a plan-free call follows a plan-path one."""
+        if self._pf_active() and not was_active:
+            self.cdone.zero_()
+
+    def set_plan_free(self, on):
+        """``True`` (default): with ``gemm2="8wave"``, no plan kernel (see the class docstring).
+        ``False``: the plan kernel places every row."""
+        was = self._pf_active()
+        self.plan_free = bool(on)
+        self._pf_enter(was)
+
+
+    def set_inv_pipe(self, on):
+        """When the plan-free comm waves push the peers' inv entries (see the class docstring); no
+        effect off the plan-free 8wave path."""
+        self.inv_pipe = bool(on)
+
+    def set_combine_opt(self, on):
+        """``True`` (default): ``build_combine(opt=True)`` where a block's inv slots fit in two waves'
+        lanes, else the plain combine. ``False``: the plain combine."""
+        mode = bool(on) and -(-self.max_tok // self.comb_blocks) * self.topk <= 2 * WAVE
+        if mode not in self._combines:
+            self._combines[mode] = build_combine(
+                layout=self.layout,
+                rank=self.rank,
+                hidden=self.hidden,
+                topk=self.topk,
+                quant=self.quant,
+                signal_mode=self.signal_mode,
+                p2p_fallback=self.p2p_fallback,
+                opt=mode,
+            )
+        self._combine = self._combines[mode]
+        self.combine_opt = mode
+
+
     def set_gemm2(self, gemm2):
         """Pick the GEMM2 kernel, ``"aiter"`` or ``"8wave"`` (see the class docstring)."""
         if gemm2 not in ("aiter", "8wave"):
@@ -1973,7 +2105,10 @@ class MegaMoESdma:
                 why.append("S+R under 2 GiB (lower send_slack)")
             if why:
                 raise ValueError("gemm2='8wave' needs " + ", ".join(why))
+        was = self.gemm2 is not None and self._pf_active()
         self.gemm2 = gemm2
+        if self.gemm2 is not None and hasattr(self, "plan_free"):
+            self._pf_enter(was)
 
     def set_chunk_tiles(self, chunk_tiles):
         """Change the shipped chunk size; only the gemm2 kernel is (re)compiled."""
@@ -2087,7 +2222,9 @@ class MegaMoESdma:
         moe, op, lay = self.moe, self.moe._s1_op, self.layout
         sbm = int(config.stage1.sort_block_m)
         ct = self.comm_spec.chunk_tiles
-        key = (sbm, ct)
+        pf = self._pf_active()
+        ip = self.inv_pipe and pf
+        key = (sbm, ct, pf, ip)
         if key not in self._gemm2_8w:
             self._gemm2_8w[key] = compile_gemm2_8wave_sdma(
                 K=moe.inter_dim,
@@ -2103,6 +2240,24 @@ class MegaMoESdma:
                 chunk_tiles=ct,
                 grid_ctas=self.nblocks,
                 comb_bytes=self.comb_bytes,
+                plan_free=pf,
+                total_segments=self.total_segments,
+                inv_pipe=ip,
+            )
+        if pf:
+            # The plan's outputs are not read: their slots carry the plan-free inputs.
+            slots = (
+                fx.Int64(self.bigcnt.data_ptr()),
+                fx.Int64(self.pair_cfg.data_ptr()),
+                fx.Int64(moe._s1_epoch_parity.data_ptr()),
+                fx.Int64(self.pf_counters.data_ptr()),
+            )
+        else:
+            slots = (
+                fx.Int64(self.out_row.data_ptr()),
+                fx.Int64(self.tile_base.data_ptr()),
+                fx.Int64(self.cursor.data_ptr()),
+                fx.Int64(self.idx_send.data_ptr()),
             )
         nvm = int(moe._s1_nvm)
         _run_compiled(
@@ -2118,14 +2273,14 @@ class MegaMoESdma:
             fx.Int64(op.tile_row_base.data_ptr()),
             moe.comb_op._fx_p2p_comb_inp,
             fx.Int64(op.num_valid.data_ptr()),
-            fx.Int64(self.out_row.data_ptr()),
+            slots[0],
             fx.Int64(self.mem.ptr + lay.off_s),
             fx.Int64(self.dev_comm.ptr),
             fx.Int64(self.win.handle),
             fx.Int64(self.cdone.data_ptr()),
-            fx.Int64(self.tile_base.data_ptr()),
-            fx.Int64(self.cursor.data_ptr()),
-            fx.Int64(self.idx_send.data_ptr()),
+            slots[1],
+            slots[2],
+            slots[3],
             s_fx,
         )
 
@@ -2146,7 +2301,8 @@ class MegaMoESdma:
                 profile.append((stage, ev))
 
         mark("start")
-        self._launch_plan(config, s_fx)
+        if not self._pf_active():
+            self._launch_plan(config, s_fx)
         mark("plan")
         if self.gemm2 == "8wave":
             self._launch_gemm2_8wave(config, s_fx)
@@ -2175,12 +2331,19 @@ class MegaMoESdma:
         import torch
 
         torch.cuda.synchronize()
-        rows = int(self.overflow.item())
+        rows = int(self.overflow.item()) + int(self.pf_counters[0].item())
         self.overflow.zero_()
         bad = int(self.cursor[4 * self.npes].item())
         if bad:
             raise RuntimeError(
                 f"rank {self.rank}: {bad} per-rank row counts differ from the gathered route counts"
+            )
+        bad = int(self.pf_counters[1].item())
+        self.pf_counters.zero_()
+        if bad:
+            raise RuntimeError(
+                f"rank {self.rank}: {bad} rows lie outside their closed-form run (plan_free): "
+                "the sorted layout is not aiter's compact one"
             )
         return rows
 
