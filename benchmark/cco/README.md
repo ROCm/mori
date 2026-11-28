@@ -50,19 +50,24 @@ mpirun -np 2 ./build/benchmark/cco_p2p_put_bw -t lsa -b 1M -e 1G -f 4 -n 20 -w 5
 
 ## ccoProxy vs ccoGda
 
-`-t proxy` runs the ibgda kernels through `ccoProxy` on a proxy-only DevComm
-(proxy QPs to ibgda's peers, no GDA QPs).
+`-t proxy` runs ccoProxy kernels with the ibgda kernels' split, on a proxy-only
+DevComm (proxy QPs to ibgda's peers, no GDA QPs). Options that a binary does
+not take are rejected rather than ignored.
 
-- `cco_p2p_put_latency -t proxy`: one put + flush per iteration.
+- `cco_p2p_put_latency -t proxy` (`-s warp` or `-s block`): one put + flush per
+  iteration.
   - `-P` switches ibgda or proxy to a ping-pong: put + SignalInc, PE 1 echoes,
     and the reported value is round trip / 2.
   - `-S` is the same ping-pong with bare signals.
 - `cco_p2p_put_bw -t proxy`: ibgda's split. Each unit (block, wavefront with
-  `-s warp`, or thread with `-s thread`, `-s thread_agg` or `-s lane`) puts its
-  slice every iteration, then one flush per launch.
-  - `-s thread` and `-s thread_agg` need `-q mpsc`; `-s lane`
-    (`ccoCoopLaneMasked`) needs `-T` in whole wavefronts.
-  - `-h` lists `-q`, `-Q` and `-K`.
+  `-s warp`, or thread with `-s thread` or `-s lane`) puts its slice every
+  iteration, then one flush per launch.
+  - `-s thread` needs `-q mpsc`; `-s lane` (`ccoCoopLaneMasked`) needs `-T` in
+    whole wavefronts. `-s thread_agg` is rejected: `ccoGdaThreadAggregate` only
+    changes a put carrying a signal.
+  - `-Q` and `-K` set the proxy threads and the QPs per (thread, peer); 0, the
+    default, takes the engine's. The banner prints the requested values; the
+    engine caps them by the queue count.
 - Message rate: run small sizes with `-s warp`, `-s lane` or `-s thread` and
   many wavefronts. The `Mpps` column gives the per-message issue rate.
 

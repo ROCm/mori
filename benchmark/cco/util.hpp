@@ -71,8 +71,6 @@ enum class Transport { kLsa, kIbgda, kSdma, kProxy };
 
 // GDA/proxy signal slot used by the ping-pong latency kernels.
 inline constexpr uint32_t kSlotPing = 0;
-inline constexpr int kBenchSignalCount = 4;
-inline constexpr int kDefaultProxyThreads = 4;
 
 inline constexpr std::size_t kDefaultMinSize = 8;
 inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
@@ -120,10 +118,18 @@ struct PerfArgs {
   // -P / -S (latency): ping-pong, both PEs run.
   bool pingpong = false;
   bool signal_only = false;
-  // proxy: -Q threads, -q mpsc, -K QPs per peer (0 = engine default).
-  int proxy_threads = kDefaultProxyThreads;
+  // proxy: -Q threads and -K QPs per peer (0 = the engine's default), -q mpsc.
+  int proxy_threads = 0;
   bool proxy_mpsc = false;
   int proxy_qps_per_peer = 0;
+};
+
+// The options a benchmark takes beyond the common ones; PerfInit rejects the
+// others, so no option is silently ignored.
+struct PerfFeatures {
+  bool proxy = false;             // -t proxy, -Q, -K
+  bool proxy_per_thread = false;  // with -t proxy: -q, -s lane, -s thread (put_bw)
+  bool pingpong = false;          // -P, -S
 };
 
 // SPSC queues per block: one per wavefront for -s warp|lane, else one.
@@ -161,11 +167,8 @@ struct PerfContext {
 
 // Returns 0 on success, 1 on bad args / setup failure, 2 when help was shown
 // (caller should exit 0 without calling PerfFinalize).
-int PerfInit(int argc, char** argv, PerfContext* ctx);
+int PerfInit(int argc, char** argv, PerfContext* ctx, const PerfFeatures& features = {});
 void PerfFinalize(PerfContext* ctx);
-// Rejects the options after PerfInit: PE 0 prints `msg`, then PerfFinalize.
-// Returns 1, main's exit code.
-int PerfReject(PerfContext* ctx, const char* msg);
 
 using LaunchFn = std::function<void(int /*count*/)>;
 

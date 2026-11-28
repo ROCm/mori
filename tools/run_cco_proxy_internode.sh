@@ -3,7 +3,7 @@
 # a CI internode job. Builds the test in its own cmake tree in node1's container
 # (the wheel's tree was configured by pip's isolated cmake), copies the binary
 # and the libraries it links from that tree to the same path on node2, and fails
-# unless both ranks print PASSED; a SKIP fails too.
+# unless both ranks print PASSED.
 #
 # Usage: run_cco_proxy_internode.sh [--cases LIST] [--negative LIST]
 #   --cases     positive cases (MORI_CCO_PROXY_TEST_CASES); default "all",
@@ -51,7 +51,6 @@ wait "$NODE2_PID" || RC=1
 for LOG in "$LOG1" "$LOG2"; do
   echo "=== $LOG ==="
   cat "$LOG"
-  if grep -q SKIP "$LOG"; then echo "test_proxy_put SKIPped"; RC=1; fi
   grep -q '\] PASSED' "$LOG" || RC=1
 done
 exit $RC

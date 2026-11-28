@@ -229,26 +229,16 @@ int main(int argc, char** argv) {
   using namespace mori::cco::benchmark;
 
   PerfContext ctx{};
-  const int init_rc = PerfInit(argc, argv, &ctx);
+  PerfFeatures features;
+  features.proxy = true;
+  features.pingpong = true;
+  const int init_rc = PerfInit(argc, argv, &ctx, features);
   if (init_rc != 0) {
     return init_rc == 2 ? 0 : 1;
   }
 
   PerfArgs& args = ctx.args;
-  if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
-    return PerfReject(&ctx, "-s lane is for cco_p2p_put_bw -t proxy");
-  }
   const int my_pe = ctx.my_pe;
-
-  const bool proxy = args.transport == Transport::kProxy;
-  const bool rdma = proxy || args.transport == Transport::kIbgda;
-  const bool warp_or_block =
-      args.put_scope == PutScope::kWarp || args.put_scope == PutScope::kBlock;
-  if (proxy && !warp_or_block) return PerfReject(&ctx, "-t proxy needs -s warp|block");
-  if (args.proxy_mpsc) return PerfReject(&ctx, "-q mpsc is cco_p2p_put_bw only");
-  if (args.pingpong && (!rdma || !warp_or_block)) {
-    return PerfReject(&ctx, "ping-pong (-P / -S) needs -t ibgda|proxy and -s warp|block");
-  }
   if (args.pingpong && args.signal_only) args.max_size = args.min_size;  // no payload: one row
   // Ping-pong needs both PEs in the kernel; otherwise PE 0 issues alone.
   const bool run_kernels = (my_pe == 0) || args.pingpong;

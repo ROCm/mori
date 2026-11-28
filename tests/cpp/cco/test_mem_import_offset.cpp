@@ -273,15 +273,16 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
     HIP_CHECK(hipMemset(sigExt.base, CANARY, sigExt.size));
     HIP_CHECK(hipMemset(sigData, 0, sigBytes));
     HIP_CHECK(hipMemset(recvData, 0xff, bufBytes));
+    bool proxyOk = true;
     ccoWindow_t sigWin = nullptr;
     void* sigAlias = nullptr;
     ccoDevCommRequirements preqs = reqs;
     preqs.proxySpscQueueCount = 1;
     ccoDevComm pdc{};
-    if (ccoWindowRegister(comm, sigData, sigBytes, &sigWin, &sigAlias) != 0 ||
-        ccoDevCommCreate(comm, &preqs, &pdc) != 0) {
+    const bool registered = ccoWindowRegister(comm, sigData, sigBytes, &sigWin, &sigAlias) == 0;
+    if (!registered || ccoDevCommCreate(comm, &preqs, &pdc) != 0) {
       fprintf(stderr, "[rank %d] offset 0x%zx: proxy setup failed\n", rank, offset);
-      ok = false;
+      proxyOk = false;
     } else {
       ccoBarrierAll(comm);
       hipStream_t stream;
@@ -292,8 +293,8 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
       HIP_CHECK(hipStreamDestroy(stream));
       ccoBarrierAll(comm);
       HIP_CHECK(hipMemcpy(got.data(), recvData, bufBytes, hipMemcpyDeviceToHost));
-      ok = CheckFloats("proxy recv", got, recvWant, /*skipSlot=*/rank) && ok;
-      ok = CheckCanary("proxy recv", recvExt, offset) && ok;
+      proxyOk = CheckFloats("proxy recv", got, recvWant, /*skipSlot=*/rank) && proxyOk;
+      proxyOk = CheckCanary("proxy recv", recvExt, offset) && proxyOk;
       std::vector<uint64_t> slots(2 * nranks);
       HIP_CHECK(hipMemcpy(slots.data(), sigData, sigBytes, hipMemcpyDeviceToHost));
       for (int src = 0; src < nranks; src++) {
@@ -302,16 +303,19 @@ static bool RunOffset(mori::cco::ccoComm* comm, int dev, int rank, int nranks, s
           fprintf(stderr, "[rank %d] offset 0x%zx: proxy slots from %d: %llu 0x%llx\n", rank,
                   offset, src, (unsigned long long)slots[2 * src],
                   (unsigned long long)slots[2 * src + 1]);
-          ok = false;
+          proxyOk = false;
         }
       }
-      ok = CheckCanary("proxy sig", sigExt, offset) && ok;
+      proxyOk = CheckCanary("proxy sig", sigExt, offset) && proxyOk;
       ccoDevCommDestroy(comm, &pdc);
+    }
+    if (registered) {
       ccoWindowDeregister(comm, sigWin);
       ccoMemFree(comm, sigAlias);
     }
     ExtFree(&sigExt);
-    printf("[rank %d] offset 0x%zx: proxy put %s\n", rank, offset, ok ? "ok" : "FAILED");
+    printf("[rank %d] offset 0x%zx: proxy put %s\n", rank, offset, proxyOk ? "ok" : "FAILED");
+    ok = ok && proxyOk;
   }
 #endif
 

@@ -68,8 +68,6 @@ static constexpr size_t PER_RANK_VMM = 256ULL * 1024 * 1024;
 // clock64 cycles; long enough for any proxy answer.
 static constexpr uint64_t TIMEOUT_CYCLES = 40ULL * 1000 * 1000 * 1000;
 
-#ifdef MORI_CCO_PROXY
-
 // Rank 0: status[b] = flush's result (0 done, 1 timed out, 2 DevComm failed).
 __global__ void ProxyPutKernel(ccoDevComm devComm, ccoWindow_t sendWin, ccoWindow_t recvWin,
                                int* status) {
@@ -140,7 +138,10 @@ int main(int argc, char** argv) {
   reqs.gdaSignalCount = BLOCKS;  // the proxy's signal slots
   ccoDevComm devComm{};
   if (ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
-    fprintf(stderr, "[rank %d] ccoDevCommCreate failed for a proxy-only DevComm\n", rank);
+    fprintf(stderr,
+            "[rank %d] ccoDevCommCreate failed for a proxy-only DevComm (needs mori built with "
+            "BUILD_CCO_PROXY and a gfx942 / gfx950 GPU)\n",
+            rank);
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 
@@ -201,16 +202,3 @@ int main(int argc, char** argv) {
   MPI_Finalize();
   return total == 0 ? 0 : 1;
 }
-
-#else  // !MORI_CCO_PROXY
-
-int main(int argc, char** argv) {
-  MPI_Init(&argc, &argv);
-  int rank = 0;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  if (rank == 0) fprintf(stderr, "This build has no ccoProxy engine (BUILD_CCO_PROXY).\n");
-  MPI_Finalize();
-  return 1;
-}
-
-#endif  // MORI_CCO_PROXY

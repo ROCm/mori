@@ -1466,7 +1466,8 @@ jobs:
           done
 
       - name: ccoProxy across nodes (1+1)
-        # MI355X runs this in ci_cco.yml's CCO internode job.
+        # MI355X runs this in ci_cco.yml's CCO internode job. Runs even if an
+        # earlier step failed.
         if: ${{ !cancelled() && matrix.cco_proxy_cases != '' && contains(fromJSON(needs.scope.outputs.groups), 'cco') }}
         timeout-minutes: 20
         run: bash tools/run_cco_proxy_internode.sh --cases ${{ matrix.cco_proxy_cases }}

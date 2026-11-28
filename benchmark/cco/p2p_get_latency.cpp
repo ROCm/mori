@@ -116,10 +116,6 @@ int main(int argc, char** argv) {
   }
 
   PerfArgs& args = ctx.args;
-  if (args.put_scope == PutScope::kLane) {  // ccoCoopLaneMasked: proxy put_bw only
-    return PerfReject(&ctx, "-s lane is for cco_p2p_put_bw -t proxy");
-  }
-  if (args.transport == Transport::kProxy) return PerfReject(&ctx, "-t proxy: ccoProxy has no get");
   const int my_pe = ctx.my_pe;
 
   // SDMA keeps its historical thread-scope default; -s selects warp/block.

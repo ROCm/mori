@@ -130,8 +130,6 @@ target_include_directories(intra_node_benchmark
 # tests/cpp/cco/test_cco_lsa_*.cpp (auto-discovery harness). The C++ examples
 # below are HIP, MPI-bootstrapped, and link mori_cco. LSA uses only cco.hpp; GDA
 # uses only cco_scale_out.hpp and needs the NIC define for provider dispatch.
-# The ccoProxy one compiles its kernels only when mori_cco has the engine
-# (MORI_CCO_PROXY).
 add_executable(cco_lsa_put cco/cpp/01_lsa_put.cpp)
 set_source_files_properties(cco/cpp/01_lsa_put.cpp PROPERTIES LANGUAGE HIP)
 target_include_directories(cco_lsa_put PRIVATE ${CMAKE_SOURCE_DIR}/include)
