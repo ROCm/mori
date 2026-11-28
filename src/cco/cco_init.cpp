@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,7 +52,7 @@
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
-// Declarations and defaults only; the engine is linked in when MORI_CCO_PROXY is set.
+// ccoProxy host engine, or its stub in builds without it.
 #include "cco_proxy_engine.hpp"
 
 namespace mori {
@@ -784,17 +783,19 @@ int ccoCommDestroy(ccoComm* comm) {
   MORI_SHMEM_TRACE("ccoCommDestroy: rank={}", comm->rank);
 
   // Stop engines of DevComms never destroyed: their threads post against the
-  // windows, QPs and bootstrap freed below. ccoDevCommDestroy(nullptr, &dc) frees
-  // the rest.
-#ifdef MORI_CCO_PROXY
-  for (void* engine : comm->proxyEngines) {
+  // window MRs and the PD (comm->ctx) freed below. ccoDevCommDestroy(nullptr, &dc)
+  // frees the rest.
+  std::vector<std::pair<uint64_t, ccoProxyEngine*>> proxyEngines;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    proxyEngines.swap(comm->proxyEngines);
+  }
+  for (const auto& entry : proxyEngines) {
     MORI_SHMEM_WARN(
         "ccoCommDestroy: a DevComm with ccoProxy queues was not destroyed; "
         "stopping its proxy engine");
-    ccoProxyEngineDestroy(static_cast<ccoProxyEngine*>(engine));
+    ccoProxyEngineDestroy(entry.second);
   }
-#endif
-  comm->proxyEngines.clear();
 
   // Safety net for callers that didn't pair every WindowRegister with a
   // matching Deregister: walk and properly deregister each straggler so
@@ -1748,6 +1749,157 @@ static const char* CcoConnectionName(int type) {
   }
 }
 
+// ccoProxy defaults for the 0 fields of ccoDevCommRequirements.
+constexpr int kDefaultProxyThreads = 4;
+constexpr int kDefaultProxyQpsPerPeer = 4;
+constexpr int kDefaultProxyQueueCapacity = 4096;  // lines (256 KiB ring per queue)
+
+// The ccoProxy fields of ccoDevCommRequirements, defaults and caps applied.
+struct CcoProxyRequest {
+  bool negative = false;  // a negative count or capacity, or proxyConnectionType < -1
+  int spsc = 0;
+  int mpsc = 0;
+  int64_t queues = 0;  // spsc + mpsc; above INT_MAX fails the agreement
+  int threads = 0;     // 1 .. queues
+  int qpsPerPeer = 0;  // at most the largest queue count of one thread
+  int queueCapacity = 0;
+  int connType = CCO_GDA_CONNECTION_NONE;  // requested; FOLLOW_GDA gives gdaConnectionType
+};
+
+static CcoProxyRequest CcoParseProxyRequest(const ccoDevCommRequirements* reqs) {
+  CcoProxyRequest req;
+  if (reqs->size < sizeof(ccoDevCommRequirements)) return req;  // older callers: no proxy fields
+  req.negative = reqs->proxySpscQueueCount < 0 || reqs->proxyMpscQueueCount < 0 ||
+                 reqs->proxyThreadCount < 0 || reqs->proxyQpsPerPeer < 0 ||
+                 reqs->proxyQueueCapacity < 0 ||
+                 reqs->proxyConnectionType < CCO_PROXY_CONNECTION_FOLLOW_GDA;
+  if (req.negative) return req;
+  req.spsc = reqs->proxySpscQueueCount;
+  req.mpsc = reqs->proxyMpscQueueCount;
+  req.queues = int64_t{req.spsc} + req.mpsc;
+  if (req.queues == 0) return req;
+  // A thread without a queue would only spin, a QP without one would idle.
+  const int64_t threads =
+      reqs->proxyThreadCount > 0 ? reqs->proxyThreadCount : kDefaultProxyThreads;
+  req.threads = static_cast<int>(std::min(threads, req.queues));
+  const int64_t maxQueuesPerThread = (req.queues + req.threads - 1) / req.threads;
+  const int64_t qps = reqs->proxyQpsPerPeer > 0 ? reqs->proxyQpsPerPeer : kDefaultProxyQpsPerPeer;
+  req.qpsPerPeer = static_cast<int>(std::min(qps, maxQueuesPerThread));
+  req.queueCapacity =
+      reqs->proxyQueueCapacity > 0 ? reqs->proxyQueueCapacity : kDefaultProxyQueueCapacity;
+  req.connType = reqs->proxyConnectionType == CCO_PROXY_CONNECTION_FOLLOW_GDA
+                     ? static_cast<int>(reqs->gdaConnectionType)
+                     : reqs->proxyConnectionType;
+  return req;
+}
+
+// Agrees on the ccoProxy request; returns the error every rank reports, or "" to
+// go on. Collective whatever this rank requested, and ahead of the other
+// collectives in ccoDevCommCreate, so ranks that disagree all fail here instead
+// of some waiting in the MR back-fill or the engine's QP exchange.
+// resolvedConn: the resolved proxy connection type, -1 for an invalid request.
+static std::string CcoProxyAgree(ccoComm* comm, const CcoProxyRequest& req, int resolvedConn,
+                                 int signalCount) {
+  struct ProxyReq {
+    int32_t negative, spsc, mpsc, threads, qpsPerPeer, connType, signalCount, builtIn, targetOk,
+        disabled;
+  };
+  // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
+  bool targetOk = true;
+  if (req.queues > 0) {
+    hipDeviceProp_t prop;
+    const hipError_t err = hipGetDeviceProperties(&prop, comm->hipDev);
+    if (err != hipSuccess) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: hipGetDeviceProperties failed: {}",
+                       hipGetErrorString(err));
+      targetOk = false;
+    } else {
+      const std::string arch(prop.gcnArchName, std::strcspn(prop.gcnArchName, ":"));
+      targetOk = arch == "gfx942" || arch == "gfx950";
+      if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
+    }
+  }
+  ProxyReq mine{};
+  mine.negative = req.negative;
+  mine.spsc = req.spsc;
+  mine.mpsc = req.mpsc;
+  mine.threads = req.threads;
+  mine.qpsPerPeer = req.qpsPerPeer;
+  mine.connType = resolvedConn;
+  mine.signalCount = signalCount;
+  mine.builtIn = ccoProxyEngineBuiltIn();
+  mine.targetOk = targetOk;
+  mine.disabled = env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY");
+  std::vector<ProxyReq> all(comm->worldSize);
+  comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
+
+  const ProxyReq& r0 = all[0];
+  for (int r = 0; r < comm->worldSize; r++) {
+    if (all[r].negative) {
+      return "negative ccoProxy count or capacity, or proxyConnectionType < -1, on rank " +
+             std::to_string(r);
+    }
+  }
+  auto describe = [](const ProxyReq& q) {
+    return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
+           std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
+           " QPs per peer";
+  };
+  for (int r = 1; r < comm->worldSize; r++) {
+    const ProxyReq& q = all[r];
+    if (q.spsc != r0.spsc || q.mpsc != r0.mpsc || q.threads != r0.threads ||
+        q.qpsPerPeer != r0.qpsPerPeer) {
+      return "ranks disagree on the ccoProxy requirements (defaults and caps applied): rank 0 "
+             "asks for " +
+             describe(r0) + ", rank " + std::to_string(r) + " for " + describe(q);
+    }
+  }
+  const int64_t queues = int64_t{r0.spsc} + r0.mpsc;
+  if (queues == 0) return "";
+  if (queues > std::numeric_limits<int>::max()) {
+    return "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
+  }
+  for (int r = 0; r < comm->worldSize; r++) {
+    const ProxyReq& q = all[r];
+    const std::string rank = std::to_string(r);
+    if (!q.builtIn) {
+      return "ccoProxy queues requested but mori on rank " + rank +
+             " was built without the ccoProxy host engine (BUILD_CCO_PROXY=OFF, or no "
+             "gfx942/gfx950 in GPU_TARGETS)";
+    }
+    if (q.signalCount < 0) {
+      return "gdaSignalCount " + std::to_string(q.signalCount) +
+             " is negative with ccoProxy queues (rank " + rank + ")";
+    }
+    if (q.signalCount != r0.signalCount) {
+      return "ranks disagree on gdaSignalCount with ccoProxy queues: rank 0 has " +
+             std::to_string(r0.signalCount) + ", rank " + rank + " " +
+             std::to_string(q.signalCount);
+    }
+    if (q.connType < 0) {
+      return "invalid proxyConnectionType on rank " + rank + " (-1 or a ccoGdaConnectionType)";
+    }
+    if (q.connType != r0.connType) {
+      return "ranks disagree on the ccoProxy connection type: rank 0 resolves it to " +
+             std::string(CcoConnectionName(r0.connType)) + ", rank " + rank + " to " +
+             CcoConnectionName(q.connType);
+    }
+    if (!q.targetOk) {
+      return "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " + rank +
+             " has another (or its device query failed)";
+    }
+    if (q.disabled) {
+      return "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " + rank;
+    }
+    if (q.connType == CCO_GDA_CONNECTION_NONE) {
+      return "ccoProxy queues need RDMA and a proxyConnectionType (or, at -1, gdaConnectionType) "
+             "that resolves to non-NONE on every rank; rank " +
+             rank + " resolves it to NONE";
+    }
+  }
+  return "";
+}
+
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm) {
   MORI_SHMEM_TRACE("ccoDevCommCreate: rank={}", comm->rank);
 
@@ -1794,108 +1946,24 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   core::RdmaEndpointDevice* epsGpu = nullptr;
 
-  // Read the proxy fields only if reqs has them (proxyConnectionType sits in tail
-  // padding, so this only rejects callers that predate all of them).
-  const bool reqsHaveProxy =
-      reqs->size >= offsetof(ccoDevCommRequirements, proxyConnectionType) + sizeof(int);
-  const int proxySpsc = reqsHaveProxy ? std::max(reqs->proxySpscQueueCount, 0) : 0;
-  const int proxyMpsc = reqsHaveProxy ? std::max(reqs->proxyMpscQueueCount, 0) : 0;
-  const int proxyThreads = reqsHaveProxy ? std::max(reqs->proxyThreadCount, 0) : 0;
-  const int proxyQpsPerPeer = (reqsHaveProxy && reqs->proxyQpsPerPeer > 0)
-                                  ? reqs->proxyQpsPerPeer
-                                  : kDefaultProxyQpsPerPeer;
-  const int64_t proxyQueues = int64_t{proxySpsc} + int64_t{proxyMpsc};  // may exceed INT_MAX
-  // Requested proxy connection type: -1 follows gdaConnectionType; NONE without queues.
-  int proxyConnReq = CCO_GDA_CONNECTION_NONE;
-  if (proxyQueues > 0) {
-    proxyConnReq = reqs->proxyConnectionType < 0 ? static_cast<int>(reqs->gdaConnectionType)
-                                                 : reqs->proxyConnectionType;
-  }
+  // ccoProxy: resolve its connection like GDA's, then agree across ranks.
+  const CcoProxyRequest proxyReq = CcoParseProxyRequest(reqs);
   const bool proxyConnValid =
-      proxyConnReq >= CCO_GDA_CONNECTION_NONE && proxyConnReq <= CCO_GDA_CONNECTION_RAIL;
+      proxyReq.connType >= CCO_GDA_CONNECTION_NONE && proxyReq.connType <= CCO_GDA_CONNECTION_RAIL;
   // As for GDA: a FULL proxy connection reaches LSA peers by NIC loopback.
-  if (proxyConnReq == CCO_GDA_CONNECTION_FULL) comm->ctx->EnsureRdmaTransport();
+  if (proxyReq.connType == CCO_GDA_CONNECTION_FULL) comm->ctx->EnsureRdmaTransport();
   std::vector<bool> proxyPeerMask;
-  const ccoGdaConnectionType proxyConnType =
-      CcoResolveConnection(comm, proxyConnValid ? proxyConnReq : 0, &proxyPeerMask);
-  std::string proxyError;
-#ifdef MORI_CCO_PROXY
+  const ccoGdaConnectionType proxyConnType = CcoResolveConnection(
+      comm, proxyConnValid ? proxyReq.connType : CCO_GDA_CONNECTION_NONE, &proxyPeerMask);
   {
-    // Collective in every proxy build, whatever this rank requested, and ahead
-    // of the other collectives here, so ranks that disagree all fail here
-    // instead of some waiting in the MR back-fill or the engine's QP exchange.
-    struct ProxyReq {
-      int32_t spsc, mpsc, threads, connType, disabled, qpsPerPeer, targetOk, signalCount;
-    };
-    // Pushes only run on wave64 gfx942/gfx950; a multi-arch build reaches here on others too.
-    bool targetOk = true;
-    if (proxyQueues > 0) {
-      hipDeviceProp_t prop;
-      HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, comm->hipDev));
-      const std::string arch(prop.gcnArchName, std::strcspn(prop.gcnArchName, ":"));
-      targetOk = arch == "gfx942" || arch == "gfx950";
-      if (!targetOk) MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy does not support {}", arch);
+    // The engine checks slot signals against the sender's gdaSignalCount.
+    const std::string error =
+        CcoProxyAgree(comm, proxyReq, proxyConnValid ? static_cast<int>(proxyConnType) : -1,
+                      proxyReq.queues > 0 ? reqs->gdaSignalCount : 0);
+    if (!error.empty()) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: {}", error);
+      return -1;
     }
-    ProxyReq mine{proxySpsc, proxyMpsc, proxyThreads,
-                  proxyConnValid ? static_cast<int32_t>(proxyConnType) : -1,  // -1 = invalid
-                  env::IsEnvVarEnabled("MORI_CCO_DISABLE_PROXY"),
-                  proxyQueues > 0 ? proxyQpsPerPeer : 0,  // no QPs, nothing to agree on
-                  targetOk,
-                  // The engine checks slot signals against the sender's count.
-                  proxyQueues > 0 ? reqs->gdaSignalCount : 0};
-    std::vector<ProxyReq> all(comm->worldSize);
-    comm->bootNet->Allgather(&mine, all.data(), sizeof(ProxyReq));
-    for (int r = 0; r < comm->worldSize && proxyError.empty(); r++) {
-      if (all[r].spsc != all[0].spsc || all[r].mpsc != all[0].mpsc ||
-          all[r].threads != all[0].threads || all[r].qpsPerPeer != all[0].qpsPerPeer) {
-        auto describe = [](const ProxyReq& q) {
-          return std::to_string(q.spsc) + " SPSC + " + std::to_string(q.mpsc) + " MPSC queues, " +
-                 std::to_string(q.threads) + " threads and " + std::to_string(q.qpsPerPeer) +
-                 " QPs per peer";
-        };
-        proxyError = "ranks disagree on the ccoProxy requirements: rank 0 asks for " +
-                     describe(all[0]) + ", rank " + std::to_string(r) + " for " + describe(all[r]);
-      } else if (all[r].signalCount < 0) {
-        proxyError = "gdaSignalCount " + std::to_string(all[r].signalCount) +
-                     " is negative with ccoProxy queues (rank " + std::to_string(r) + ")";
-      } else if (all[r].signalCount != all[0].signalCount) {
-        proxyError = "ranks disagree on gdaSignalCount with ccoProxy queues: rank 0 has " +
-                     std::to_string(all[0].signalCount) + ", rank " + std::to_string(r) + " " +
-                     std::to_string(all[r].signalCount);
-      } else if (all[r].connType < 0) {
-        proxyError = "invalid proxyConnectionType on rank " + std::to_string(r) +
-                     " (-1 or a ccoGdaConnectionType)";
-      } else if (all[r].connType != all[0].connType) {
-        proxyError = "ranks disagree on the ccoProxy connection type: rank 0 resolves it to " +
-                     std::string(CcoConnectionName(all[0].connType)) + ", rank " +
-                     std::to_string(r) + " to " + CcoConnectionName(all[r].connType);
-      } else if (proxyQueues > 0 && !all[r].targetOk) {
-        proxyError = "ccoProxy queues need a gfx942/gfx950 GPU on every rank; rank " +
-                     std::to_string(r) + " has another";
-      } else if (proxyQueues > 0 && all[r].disabled) {
-        proxyError = "ccoProxy queues requested but MORI_CCO_DISABLE_PROXY is set on rank " +
-                     std::to_string(r);
-      } else if (proxyQueues > 0 && all[r].connType == CCO_GDA_CONNECTION_NONE) {
-        proxyError =
-            "ccoProxy queues need RDMA and a proxyConnectionType (or, at -1, "
-            "gdaConnectionType) that resolves to non-NONE on every rank; rank " +
-            std::to_string(r) + " resolves it to NONE";
-      }
-    }
-    if (proxyError.empty() && proxyQueues > std::numeric_limits<int>::max()) {
-      proxyError = "proxySpscQueueCount + proxyMpscQueueCount exceeds INT_MAX";
-    }
-  }
-#else
-  if (proxyQueues > 0) {
-    proxyError =
-        "ccoProxy queues requested but mori was built without the ccoProxy host engine "
-        "(BUILD_CCO_PROXY=OFF, or no gfx942/gfx950 in GPU_TARGETS)";
-  }
-#endif
-  if (!proxyError.empty()) {
-    MORI_SHMEM_ERROR("ccoDevCommCreate: {}", proxyError);
-    return -1;
   }
 
   // First FULL DevComm on a single-node comm: back-fill MRs for windows registered without one.
@@ -1977,12 +2045,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   int nNodes = comm->worldSize / comm->lsaSize;
   bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
 
-  // User signal and counter slots exist when GDA or ccoProxy connects; ccoProxy
-  // signals use the signal slots.
+  // User signal slots exist when GDA or ccoProxy connects (ccoProxy signals use
+  // them); GDA counter slots only when GDA connects.
   const bool anyRdma =
       connType != CCO_GDA_CONNECTION_NONE || proxyConnType != CCO_GDA_CONNECTION_NONE;
   int signalCountUser = anyRdma ? reqs->gdaSignalCount : 0;
-  int counterCount = anyRdma ? reqs->gdaCounterCount : 0;
+  int counterCount = (connType != CCO_GDA_CONNECTION_NONE) ? reqs->gdaCounterCount : 0;
   int lsaBarrierCount = reqs->lsaBarrierCount;
   int railGdaBarrierCount = gdaRailUsable ? reqs->railGdaBarrierCount : 0;
   int hybridBarrierCount = reqs->barrierCount;
@@ -2091,47 +2159,30 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   hostShadow.resourceWindow = resourceWindow;
 
   // ccoProxy engine: agreed on above, so every rank with queues gets here.
-#ifdef MORI_CCO_PROXY
-  if (proxyQueues > 0) {
+  if (proxyReq.queues > 0) {
     ccoProxyEngineConfig proxyConfig;
-    proxyConfig.numSpscQueues = proxySpsc;
-    proxyConfig.numMpscQueues = proxyMpsc;
-    proxyConfig.numThreads = proxyThreads;
-    proxyConfig.queueCapacity =
-        reqs->proxyQueueCapacity > 0 ? static_cast<size_t>(reqs->proxyQueueCapacity) : 0;
-    proxyConfig.qpsPerPeer = proxyQpsPerPeer;
+    proxyConfig.numSpscQueues = proxyReq.spsc;
+    proxyConfig.numMpscQueues = proxyReq.mpsc;
+    proxyConfig.numThreads = proxyReq.threads;
+    proxyConfig.qpsPerPeer = proxyReq.qpsPerPeer;
+    proxyConfig.queueCapacity = static_cast<size_t>(proxyReq.queueCapacity);
     proxyConfig.signalCount = signalCountUser;
     proxyConfig.peerMask = proxyPeerMask;
     ccoProxyEngine* engine =
         ccoProxyEngineCreate(comm->ctx, comm->bootNet, proxyConfig, &hostShadow.proxy);
     if (engine == nullptr) {
-      proxyError = "ccoProxy engine creation failed";
-    } else {
-      hostShadow.proxy.connType = proxyConnType;
-      std::lock_guard<std::mutex> lock(comm->allocMutex);
-      comm->proxyEngines.push_back(engine);
+      MORI_SHMEM_ERROR("ccoDevCommCreate: ccoProxy engine creation failed");
+      if (resourceWindow) {
+        (void)ccoWindowDeregister(comm, resourceWindow);
+        (void)ccoMemFree(comm, resourceWindowPtr);
+      }
+      if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
+      return -1;
     }
-    // Ask the MR flag helper, not the env: a build may ignore the env.
-    static std::once_flag relaxedWarned;
-    if (engine != nullptr && application::MaybeAddRelaxedOrderingFlag(0) != 0) {
-      std::call_once(relaxedWarned, [] {
-        std::fprintf(stderr,
-                     "[mori cco] WARNING: ccoProxy: MORI_IB_ENABLE_RELAXED_ORDERING=1 registers "
-                     "the windows with relaxed ordering, so a SignalSet / WindowSignalSet or a "
-                     "putValue used as a flag may land before the data it follows; signal "
-                     "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
-      });
-    }
-  }
-#endif
-  if (!proxyError.empty()) {
-    MORI_SHMEM_ERROR("ccoDevCommCreate: {}", proxyError);
-    if (resourceWindow) {
-      (void)ccoWindowDeregister(comm, resourceWindow);
-      (void)ccoMemFree(comm, resourceWindowPtr);
-    }
-    if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
-    return -1;
+    hostShadow.proxy.connType = proxyConnType;
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    hostShadow.proxy.engineId = comm->nextProxyEngineId++;
+    comm->proxyEngines.emplace_back(hostShadow.proxy.engineId, engine);
   }
 
   // GDA barrier handles point into ibgda.signalBuf; no resource-window bytes
@@ -2341,26 +2392,21 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 /*                           ccoDevCommGetError                            */
 /* ========================================================================== */
 
-#ifdef MORI_CCO_PROXY
-// Only an engine still listed on comm is alive (a destroyed DevComm's copy
-// points at a freed one). Caller holds comm->allocMutex.
-static std::vector<void*>::iterator FindProxyEngine(ccoComm* comm, const void* engine) {
-  return std::find(comm->proxyEngines.begin(), comm->proxyEngines.end(), engine);
+// The live engine with this id, or end(). Ids are never reused, so a destroyed
+// DevComm (or a copy of one) finds nothing. Caller holds comm->allocMutex.
+static auto FindProxyEngine(ccoComm* comm, uint64_t engineId) {
+  return std::find_if(comm->proxyEngines.begin(), comm->proxyEngines.end(),
+                      [engineId](const auto& entry) { return entry.first == engineId; });
 }
-#endif
 
 int ccoDevCommGetError(ccoComm* comm, const ccoDevComm* devComm, ccoDevCommError* err) {
   if (comm == nullptr || devComm == nullptr || err == nullptr) return -1;
   *err = ccoDevCommError{};
-#ifdef MORI_CCO_PROXY
-  if (devComm->proxy.engine != nullptr) {
-    // The lock keeps a concurrent destroy from freeing the engine.
-    std::lock_guard<std::mutex> lock(comm->allocMutex);
-    if (FindProxyEngine(comm, devComm->proxy.engine) == comm->proxyEngines.end()) return 0;
-    return ccoProxyEngineGetError(static_cast<const ccoProxyEngine*>(devComm->proxy.engine), err);
-  }
-#endif
-  return 0;
+  if (devComm->proxy.engineId == 0) return 0;
+  // The lock keeps a concurrent destroy from freeing the engine.
+  std::lock_guard<std::mutex> lock(comm->allocMutex);
+  auto it = FindProxyEngine(comm, devComm->proxy.engineId);
+  return it == comm->proxyEngines.end() ? 0 : ccoProxyEngineGetError(it->second, err);
 }
 
 /* ========================================================================== */
@@ -2374,22 +2420,20 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   // device-pointer fields directly to release the resources they reference.
   ccoDevComm& hostShadow = *devComm;
 
-  // ccoProxy first: its threads post against the windows, MRs and QPs freed below.
-  // With comm == nullptr, ccoCommDestroy already freed it.
-#ifdef MORI_CCO_PROXY
-  if (hostShadow.proxy.engine && comm) {
-    bool owned = false;
+  // ccoProxy first, so no proxy thread runs while the rest is torn down. With
+  // comm == nullptr, ccoCommDestroy already stopped it.
+  if (hostShadow.proxy.engineId != 0 && comm != nullptr) {
+    ccoProxyEngine* engine = nullptr;
     {
       std::lock_guard<std::mutex> lock(comm->allocMutex);
-      auto it = FindProxyEngine(comm, hostShadow.proxy.engine);
+      auto it = FindProxyEngine(comm, hostShadow.proxy.engineId);
       if (it != comm->proxyEngines.end()) {
+        engine = it->second;
         comm->proxyEngines.erase(it);
-        owned = true;
       }
     }
-    if (owned) ccoProxyEngineDestroy(static_cast<ccoProxyEngine*>(hostShadow.proxy.engine));
+    ccoProxyEngineDestroy(engine);  // null: not live on comm
   }
-#endif
   hostShadow.proxy = {};
 
   auto& ibgda = hostShadow.ibgda;

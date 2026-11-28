@@ -22,7 +22,6 @@
 #pragma once
 
 #include <cstdint>
-#include <type_traits>
 
 #include "internal/serializer.hip.hpp"
 #include "mori/cco/proxy/queue/queue.hpp"
@@ -108,17 +107,6 @@ class DeviceContext {
         internal::ArgumentSerializer<Args...>::serialize(payload.bytes, args...);
         return queue.push_lane_masked(payload, arg_bytes, callback_id, active);
       }
-    }
-
-    // invoke_lane_masked() over the executing lanes, from divergent code too (MPSC only). Sends
-    // the first `arg_bytes` bytes of `args`, the callback's argument size, so callbacks whose
-    // arguments are prefixes of T can share one T. Always returns true.
-    template <typename T>
-    __device__ bool invoke_active_lanes(uint8_t callback_id, const T& args, uint32_t arg_bytes) {
-      static_assert(std::is_trivially_copyable_v<T>, "invoke arguments are copied bytewise");
-      static_assert(sizeof(T) <= mori::cco::proxy::queue::kMaxMessageBytes,
-                    "invoke arguments exceed mori::cco::proxy::queue::kMaxMessageBytes");
-      return queue.push_active_lanes(args, arg_bytes, callback_id);
     }
   };
 

@@ -26,9 +26,11 @@
 //   KIWI_QUEUE_VERSION_* dropped; license header, include paths and formatting follow mori.
 // - Only the device-to-host SPSC/MPSC queues and invoke; no host-to-device queues, slot.hip.hpp
 //   or upstream CMake.
-// - Pushes compile only for gfx942/gfx950; elsewhere they trap (MORI_CCO_PROXY_PUSH_UNSUPPORTED).
+// - Upstream #errors on non-GFX9 device targets; here only gfx942/gfx950 compile the push
+//   bodies, and other device targets (gfx90a included) get a __builtin_trap() push
+//   (MORI_CCO_PROXY_PUSH_UNSUPPORTED, also read by cco_scale_out.hpp).
 // - Added MPSC push_active_lanes(), beside upstream's push_lane_masked(), with its own cache
-//   (divergent_consumer_index_cached); invoke_active_lanes() in device_context.hip.hpp.
+//   (divergent_consumer_index_cached, seeded by device_handle()).
 
 /**
  * @file queue.hpp
@@ -44,7 +46,8 @@
  *   messages of up to 512 bytes plus 32-bit metadata, and one push API
  *   (push_reg, push_shared, push_global, push_lanes, and push_lane_masked,
  *   where each active lane pushes its own message)
- * - Full-wavefront (64 threads) cooperative device-side operations
+ * - Full-wavefront (64 threads) cooperative device-side operations (MPSC
+ *   push_active_lanes() excepted)
  * - Lap epochs instead of clearing; cached producer/consumer progress to
  *   reduce PCIe traffic
  *

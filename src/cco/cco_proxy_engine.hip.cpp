@@ -69,6 +69,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -490,7 +491,9 @@ class ProxyWorker {
     if (err_->state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
       err_->info = e;
       err_->state.store(2, std::memory_order_release);
-      const bool destroying = stop_ != nullptr && stop_->load(std::memory_order_acquire);
+      // While destroying, a WR fails when its peer destroyed first.
+      const bool destroying = stop_ != nullptr && stop_->load(std::memory_order_acquire) &&
+                              (e.code == CCO_PROXY_ERR_COMPLETION || e.code == CCO_PROXY_ERR_POST);
       std::fprintf(
           stderr, "%s\n",
           DescribeError(e, destroying
@@ -525,8 +528,8 @@ class ProxyWorker {
     Poison();
   }
 
-  // Sets ccoProxyFailedBit in every owned queue's flushDone.
-  void Poison() { PublishFlushDone(queues, ccoProxyFailedBit); }
+  // Sets impl::ccoProxyFailedBit in every owned queue's flushDone.
+  void Poison() { PublishFlushDone(queues, impl::ccoProxyFailedBit); }
 
   // Release-stores flushed | bits into each queue's flushDone (this worker is its
   // only writer), then one sfence for the batch.
@@ -556,7 +559,7 @@ class ProxyWorker {
   // A signal targets an 8-byte aligned word and, for a slot, one below
   // gdaSignalCount: past it lie the peer's consumed counts, counters and barrier
   // state, which the NIC would write without complaint. Raises BAD_REQUEST otherwise.
-  bool SignalValid(const ccoProxySignalDesc& d, ccoProxyOp op) {
+  bool SignalValid(const impl::ccoProxySignalDesc& d, ccoProxyOp op) {
     const bool aligned = (d.raddr & 7) == 0;
     const uint64_t slot = d.raddr / sizeof(uint64_t);
     if (aligned && (d.slot == 0 || slot < static_cast<uint64_t>(signalCount_))) return true;
@@ -571,14 +574,14 @@ class ProxyWorker {
     return false;
   }
 
-  void OnPut(const ccoProxyPutDesc& d) {
+  void OnPut(const impl::ccoProxyPutDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpPut);
     if (qp == nullptr || !Reserve(*qp, 1)) return;
     cur_->lastSeq[d.peer] = AddWrite(*qp, d);
   }
 
-  void OnPutSignal(const ccoProxyPutSignalDesc& d) {
+  void OnPutSignal(const impl::ccoProxyPutSignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutSignal);
     if (qp == nullptr || !SignalValid(d.signal, ccoProxyOpPutSignal) || !Reserve(*qp, 2)) {
@@ -588,21 +591,21 @@ class ProxyWorker {
     cur_->lastSeq[d.put.peer] = AddSignal(*qp, d.signal);
   }
 
-  void OnSignal(const ccoProxySignalDesc& d) {
+  void OnSignal(const impl::ccoProxySignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpSignal);
     if (qp == nullptr || !SignalValid(d, ccoProxyOpSignal) || !Reserve(*qp, 1)) return;
     cur_->lastSeq[d.peer] = AddSignal(*qp, d);
   }
 
-  void OnPutValue(const ccoProxyPutValueDesc& d) {
+  void OnPutValue(const impl::ccoProxyPutValueDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.peer, ccoProxyOpPutValue);
     if (qp == nullptr || !Reserve(*qp, 1)) return;
     cur_->lastSeq[d.peer] = AddInline(*qp, d.raddr, d.rkey, d.value, d.bytes);
   }
 
-  void OnPutValueSignal(const ccoProxyPutValueSignalDesc& d) {
+  void OnPutValueSignal(const impl::ccoProxyPutValueSignalDesc& d) {
     if (failed_) return;
     ProxyQp* qp = PeerQp(d.put.peer, ccoProxyOpPutValueSignal);
     if (qp == nullptr || !SignalValid(d.signal, ccoProxyOpPutValueSignal) || !Reserve(*qp, 2)) {
@@ -707,7 +710,7 @@ class ProxyWorker {
     return e;
   }
 
-  uint64_t AddWrite(ProxyQp& qp, const ccoProxyPutDesc& d) {
+  uint64_t AddWrite(ProxyQp& qp, const impl::ccoProxyPutDesc& d) {
     ibv_send_wr wr{};
     ibv_sge sge{};
     sge.addr = d.laddr;  // MR address (window offset + iovaBias)
@@ -734,12 +737,12 @@ class ProxyWorker {
   }
 
   // A signal: an 8-byte inline write (set) or an atomic fetch-add.
-  uint64_t AddSignal(ProxyQp& qp, const ccoProxySignalDesc& d) {
+  uint64_t AddSignal(ProxyQp& qp, const impl::ccoProxySignalDesc& d) {
     if (d.set) return AddInline(qp, d.raddr, d.rkey, d.value, sizeof(uint64_t));
     return AddAtomic(qp, d);
   }
 
-  uint64_t AddAtomic(ProxyQp& qp, const ccoProxySignalDesc& d) {
+  uint64_t AddAtomic(ProxyQp& qp, const impl::ccoProxySignalDesc& d) {
     ibv_send_wr wr{};
     ibv_sge sge{};
     sge.addr = scratchAddr;
@@ -848,18 +851,12 @@ class ccoProxyEngine {
  public:
   ~ccoProxyEngine() {
     StopAndJoin();
-    if (ibv) {
-      for (auto& w : workers) {
-        for (auto& qp : w->qps) {
-          if (qp.active) ibv->DestroyRdmaEndpointNoThrow(qp.ep);
-        }
-      }
-    }
     workers.clear();
     queues.clear();
     spsc.reset();  // frees the KIWI queues
     mpsc.reset();
-    ibv.reset();  // deregisters the scratch MR; leaves the borrowed PD alone
+    ibv.reset();  // destroys the QPs and CQs; leaves the borrowed PD alone
+    if (scratchMr) (void)ibv_dereg_mr(scratchMr);
     free(scratch);
     if (flushDone) (void)hipFree(flushDone);
     if (flushTicket) (void)hipFree(flushTicket);
@@ -880,6 +877,7 @@ class ccoProxyEngine {
   ProxyErrorState err;
   int rank{0};
   void* scratch{nullptr};
+  ibv_mr* scratchMr{nullptr};      // on the borrowed PD
   uint64_t* flushDone{nullptr};    // [numSpsc + numMpsc]
   uint64_t* flushTicket{nullptr};  // [numSpsc + numMpsc]
   std::atomic<bool> stop{false};
@@ -901,13 +899,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   };
   const int numSpsc = config.numSpscQueues;
   const int numMpsc = config.numMpscQueues;
-  // Summed in 64 bits and validated below before any use as an int.
-  const int64_t numQueues64 = int64_t{numSpsc} + int64_t{numMpsc};
-  const int numQueues =
-      static_cast<int>(std::clamp<int64_t>(numQueues64, 0, std::numeric_limits<int>::max()));
-  // Never more threads than queues: a thread without a queue would only spin.
-  const int numThreads =
-      std::min(config.numThreads > 0 ? config.numThreads : kDefaultProxyThreads, numQueues);
+  const int numQueues = numSpsc + numMpsc;  // ccoDevCommCreate keeps it within int
+  const int numThreads = config.numThreads;
   // QPs per peer of thread t: threadQps[t] = min(config.qpsPerPeer, t's queue
   // count), so no QP lacks a queue. Handle (peer, t, slot) sits at
   // local[peer * qpsPerRank + qpBase[t] + slot]; every rank computes the same
@@ -923,17 +916,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   try {
     application::RdmaDeviceContext* devCtx = ctx->GetRdmaDeviceContext();
     if (devCtx == nullptr) throw std::runtime_error("no RDMA device context");
-    if (numSpsc < 0 || numMpsc < 0 || numQueues64 <= 0 ||
-        numQueues64 > std::numeric_limits<int>::max()) {
-      throw std::runtime_error("bad queue counts: " + std::to_string(numSpsc) + " SPSC + " +
-                               std::to_string(numMpsc) + " MPSC");
-    }
-    if (static_cast<int>(config.peerMask.size()) != worldSize) {
-      throw std::runtime_error("peerMask size != worldSize");
-    }
-    if (config.qpsPerPeer < 1) {
-      throw std::runtime_error("bad qpsPerPeer " + std::to_string(config.qpsPerPeer));
-    }
     for (int t = 0; t < numThreads; t++) {
       const int owned = numQueues / numThreads + (t < numQueues % numThreads ? 1 : 0);
       threadQps.push_back(std::min(config.qpsPerPeer, owned));
@@ -941,10 +923,9 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       qpsPerRank += threadQps.back();
     }
     local.resize(static_cast<size_t>(worldSize) * qpsPerRank);
-    const size_t capacity =
-        config.queueCapacity ? config.queueCapacity : kDefaultProxyQueueCapacity;
+    const size_t capacity = config.queueCapacity;
     if ((capacity & (capacity - 1)) != 0 ||
-        capacity < mori::cco::proxy::queue::message_lines(sizeof(ccoProxyPutSignalDesc))) {
+        capacity < mori::cco::proxy::queue::message_lines(sizeof(impl::ccoProxyPutSignalDesc))) {
       throw std::runtime_error("queue capacity must be a power of two >= the largest descriptor");
     }
     int dev = -1, largeBar = 0;
@@ -967,9 +948,6 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
     epConfig.maxCqeNum = kSqDepth;
     epConfig.maxRecvWr = 1;
     epConfig.maxInlineData = kInlineBytes;
-    epConfig.onGpu = false;
-    epConfig.withCompChannel = false;
-    epConfig.enableSrq = false;
     epConfig.atomicIbufSlots = 0;
     const ibv_port_attr* portAttr = devCtx->GetRdmaDevice()->GetPortAttr(epConfig.portId);
     if (portAttr == nullptr || portAttr->max_msg_sz == 0) {
@@ -981,14 +959,19 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       throw std::runtime_error("scratch allocation failed");
     }
     std::memset(engine->scratch, 0, kScratchStride * numThreads);
-    application::RdmaMemoryRegion scratchMr =
-        engine->ibv->RegisterRdmaMemoryRegion(engine->scratch, kScratchStride * numThreads);
+    // ibv_reg_mr directly: RegisterRdmaMemoryRegion aborts, and every rank must fail together.
+    engine->scratchMr =
+        ibv_reg_mr(devCtx->GetIbvPd(), engine->scratch, kScratchStride * numThreads,
+                   application::MaybeAddRelaxedOrderingFlag(MR_DEFAULT_ACCESS_FLAG));
+    if (engine->scratchMr == nullptr) {
+      throw std::runtime_error(std::string("scratch MR registration failed: ") + strerror(errno));
+    }
 
     for (int t = 0; t < numThreads; t++) {
       auto w = std::make_unique<ProxyWorker>(t, worldSize, threadQps[t], config.signalCount, rank,
                                              &engine->err);
       w->scratchAddr = reinterpret_cast<uint64_t>(engine->scratch) + t * kScratchStride;
-      w->scratchLkey = scratchMr.lkey;
+      w->scratchLkey = engine->scratchMr->lkey;
       engine->workers.push_back(std::move(w));
     }
 
@@ -1000,7 +983,8 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
         hipMalloc(reinterpret_cast<void**>(&engine->flushTicket), sizeof(uint64_t) * numQueues),
         "hipMalloc");
     HipOrThrow(hipMemset(engine->flushTicket, 0, sizeof(uint64_t) * numQueues), "hipMemset");
-    HipOrThrow(hipDeviceSynchronize(), "hipDeviceSynchronize");
+    // The memsets land before any host write to flushDone.
+    HipOrThrow(hipStreamSynchronize(nullptr), "hipStreamSynchronize");
 
     // One invoke context per pool. Queues: SPSC pool [0, numSpsc), MPSC pool
     // [numSpsc, numQueues); queue g is consumed by thread g % numThreads.
@@ -1053,7 +1037,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
       AgreeOk(bootNet, mine, "failed to set up its proxy engine", &error);
   if (!error.empty()) return fail(error);
   // One RDMA write must fit every port.
-  uint64_t maxMsgBytes = ccoProxyMaxPutBytes;
+  uint64_t maxMsgBytes = impl::ccoProxyMaxPutBytes;
   for (const ProxyCreateInfo& info : all) maxMsgBytes = std::min(maxMsgBytes, info.maxMsgBytes);
 
   // Exchange QP handles the way Context does. A broken bootstrap leaves nothing
@@ -1070,7 +1054,7 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   // would hang in later collectives or fail its first put.
   try {
     if (env::GetInt("MORI_CCO_PROXY_TEST_FAIL_CONNECT") == rank) {
-      throw std::runtime_error("MORI_CCO_PROXY_TEST_FAIL_CONNECT");  // test hook
+      throw std::runtime_error("MORI_CCO_PROXY_TEST_FAIL_CONNECT");  // test-only hook
     }
     for (int peer = 0; peer < worldSize; peer++) {
       if (peer == rank || !config.peerMask[peer]) continue;
@@ -1112,23 +1096,34 @@ ccoProxyEngine* ccoProxyEngineCreate(application::Context* ctx,
   if (!error.empty()) return fail(error);
 
   const int numPeers =
-      static_cast<int>(std::count(config.peerMask.begin(), config.peerMask.end(), true)) -
-      (config.peerMask[rank] ? 1 : 0);
+      static_cast<int>(std::count(config.peerMask.begin(), config.peerMask.end(), true));
   MORI_SHMEM_INFO(
-      "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} qpsPerPeer={} "
-      "(requested {}) peers={} QPs={} sqDepth={} maxPutBytes={}",
-      rank, numSpsc, numMpsc, numThreads, threadQps[0], config.qpsPerPeer, numPeers,
+      "ccoProxyEngineCreate: rank={} spscQueues={} mpscQueues={} threads={} qpsPerPeer={} (all "
+      "threads, <= {} per thread) peers={} QPs={} sqDepth={} maxPutBytes={}",
+      rank, numSpsc, numMpsc, numThreads, qpsPerRank, config.qpsPerPeer, numPeers,
       qpsPerRank * numPeers, kSqDepth, maxMsgBytes);
+  // Same check the window MR registrations use.
+  static std::once_flag relaxedWarned;
+  if (application::MaybeAddRelaxedOrderingFlag(0) != 0) {
+    std::call_once(relaxedWarned, [] {
+      std::fprintf(stderr,
+                   "[mori cco] WARNING: ccoProxy: MORI_IB_ENABLE_RELAXED_ORDERING=1 registers "
+                   "the windows with relaxed ordering, so a SignalSet / WindowSignalSet or a "
+                   "putValue used as a flag may land before the data it follows; signal "
+                   "with SignalInc / SignalAdd instead, or turn relaxed ordering off\n");
+    });
+  }
   out->numSpscQueues = numSpsc;
   out->numMpscQueues = numMpsc;
   out->spscContext = engine->spsc ? engine->spsc->device_context() : nullptr;
   out->mpscContext = engine->mpsc ? engine->mpsc->device_context() : nullptr;
   out->flushDone = engine->flushDone;
   out->flushTicket = engine->flushTicket;
-  out->maxPutBytes = static_cast<uint32_t>(maxMsgBytes);  // <= ccoProxyMaxPutBytes
-  out->engine = engine.get();
+  out->maxPutBytes = static_cast<uint32_t>(maxMsgBytes);  // <= impl::ccoProxyMaxPutBytes
   return engine.release();
 }
+
+bool ccoProxyEngineBuiltIn() { return true; }
 
 int ccoProxyEngineGetError(const ccoProxyEngine* engine, ccoDevCommError* err) {
   if (engine == nullptr || engine->err.state.load(std::memory_order_acquire) != 2) return 0;

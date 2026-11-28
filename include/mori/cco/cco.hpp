@@ -59,6 +59,7 @@
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #endif
 
@@ -205,17 +206,19 @@ __device__ inline void syncThreads() {
 }
 // HIP __threadfence_system (amd_device_functions.h)
 __device__ inline void threadFenceSystem() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, ""); }
-// HIP clock64 (amd_device_functions.h): cycle counter for the barrier timeout.
+// HIP clock64 (amd_device_functions.h): cycle counter for the timeouts below.
 __device__ inline long long clock64() { return (long long)__builtin_readcyclecounter(); }
-// Timeout in clock64 cycles. s_memtime can jump ~10^8 cycles either way within a
-// wave (gfx942/gfx950), so `now - start` may underflow; count forward steps only.
+// Timeout in clock64 cycles (LSA barrier, ccoProxy). s_memtime can jump ~10^8
+// cycles either way within a wave (seen on gfx942), so count only forward steps
+// short enough to be one poll; a skipped step makes the timeout late, not early.
 struct TimeoutClock {
+  static constexpr uint64_t kMaxStep = uint64_t{1} << 24;  // ~8 ms at 2 GHz
   uint64_t last = 0;
   uint64_t elapsed = 0;
   __device__ inline void start() { last = static_cast<uint64_t>(clock64()); }
   __device__ inline bool expired(uint64_t timeoutCycles) {
     const uint64_t now = static_cast<uint64_t>(clock64());
-    if (now > last) elapsed += now - last;
+    if (now > last && now - last < kMaxStep) elapsed += now - last;
     last = now;
     return elapsed >= timeoutCycles;
   }
@@ -397,19 +400,19 @@ struct ccoSdmaContext {
 struct ccoProxyContext {
   int numSpscQueues;
   int numMpscQueues;
-  void* spscContext;  // DeviceContext<SPSCD2HQueue>* (device); null without SPSC queues
-  void* mpscContext;  // DeviceContext<MPSCD2HQueue>* (device); null without MPSC queues
+  void* spscContext;  // DeviceContext<ccoProxySpsc>* (device); null without SPSC queues
+  void* mpscContext;  // DeviceContext<ccoProxyMpsc>* (device); null without MPSC queues
   // [SPSC pool, then MPSC pool] FLUSHes satisfied, written by the proxy
-  // (fine-grained device memory); bit 63 = ccoProxyFailedBit.
+  // (fine-grained device memory); bit 63 = impl::ccoProxyFailedBit.
   uint64_t* flushDone;
   uint64_t* flushTicket;  // [as flushDone] flush tickets taken (kernel fetch-adds)
-  // Largest single RDMA write: ccoProxyMaxPutBytes capped at the smallest
+  // Largest single RDMA write: impl::ccoProxyMaxPutBytes capped at the smallest
   // max_msg_sz of any rank's port. put() splits larger transfers.
   uint32_t maxPutBytes;
   // Resolved proxy connection type (ccoGdaConnectionType): the peers with proxy
   // QPs and the team CCO_TEAM_GDA peers index. NONE when no proxy queues.
   int32_t connType;
-  void* engine;  // host-only ccoProxyEngine*, opaque to kernels
+  uint64_t engineId;  // host-only: comm->proxyEngines key, 0 = none
 };
 
 struct ccoDevComm {
@@ -436,7 +439,7 @@ struct ccoDevComm {
   ccoWindowDevice resourceWindow_inlined;  // inlined snapshot; kernels read from cmem directly
 
   // IBGDA context (QP + signal + counter). No QPs when gdaConnType==NONE;
-  // signal/counter slots also exist when proxy.connType != NONE.
+  // signal slots also exist when proxy.connType != NONE.
   ccoIbgdaContext ibgda;
   // Standalone barriers:
   //   * lsaBarrier            — intra-node, driven by reqs.lsaBarrierCount
@@ -458,15 +461,9 @@ struct ccoDevComm {
 typedef ccoDevComm* ccoDevComm_t;
 static_assert(std::is_trivially_copyable<ccoDevComm>::value,
               "ccoDevComm must be trivially copyable for hipMemcpy");
-// Kernels and the JIT bitcode snapshot this layout.
-static_assert(sizeof(ccoProxyContext) == 56 && offsetof(ccoProxyContext, flushDone) == 24 &&
-                  offsetof(ccoProxyContext, flushTicket) == 32 &&
-                  offsetof(ccoProxyContext, maxPutBytes) == 40 &&
-                  offsetof(ccoProxyContext, connType) == 44 &&
-                  offsetof(ccoProxyContext, engine) == 48,
-              "ccoProxyContext layout is ABI");
+// Pinned so layout changes are deliberate (rebuild JIT bitcode).
 static_assert(sizeof(ccoDevComm) == 256 && offsetof(ccoDevComm, proxy) == 200,
-              "ccoDevComm layout is ABI");
+              "ccoDevComm layout changed: rebuild the JIT bitcode");
 
 // Look up a registered window by a local pointer that lies within it. Backend-
 // agnostic accessor over the window table built into ccoDevComm above.
@@ -621,23 +618,25 @@ struct ccoCoopBlock {
   __device__ void sync() { impl::syncThreads(); }
 };
 
-// ccoProxy only (ccoGda rejects it): all 64 lanes call from converged code and
-// each lane with `active` issues its own op. As a group it is one thread.
-struct ccoCoopLaneMasked {
+// ccoProxy put / putValue / signal only: all 64 lanes call from converged code
+// and each lane with `active` issues its own op. kGroup: a put / putValue
+// carrying a signal signals once per group of active lanes with the same peer,
+// as ccoCoopThread does. thread_rank() / size() count per lane; there is no
+// sync(), so APIs that need a group barrier do not compile with it.
+template <bool kGroup>
+struct ccoCoopLaneMaskedT {
   bool active = true;
   __device__ int thread_rank() const { return 0; }
   __device__ int size() const { return 1; }
-  __device__ void sync() {}
 };
+using ccoCoopLaneMasked = ccoCoopLaneMaskedT<false>;
+using ccoCoopLaneMaskedGroup = ccoCoopLaneMaskedT<true>;
 
-// ccoCoopLaneMasked, but a put / putValue carrying a signal signals once per
-// group of active lanes with the same peer, as ccoCoopThread does.
-struct ccoCoopLaneMaskedGroup {
-  bool active = true;
-  __device__ int thread_rank() const { return 0; }
-  __device__ int size() const { return 1; }
-  __device__ void sync() {}
-};
+namespace impl {
+template <typename Coop>
+inline constexpr bool kLaneMaskedCoop =
+    std::is_same_v<Coop, ccoCoopLaneMasked> || std::is_same_v<Coop, ccoCoopLaneMaskedGroup>;
+}  // namespace impl
 
 /* ════════════════════════════════════════════════════════════════════════════
  *  3. Teams — logical rank-subset descriptors used by per-backend sessions
@@ -911,6 +910,8 @@ __device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop coop, uint64_t timeo
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
+class ccoProxyEngine;  // src/cco/cco_proxy_engine.hpp
+
 struct ccoWindowHost {
   void* localPtr;
   size_t size;
@@ -1001,9 +1002,11 @@ struct ccoComm {
 
   std::vector<ccoWindowHost*> windows;
 
-  // Live ccoProxy engines (ccoProxyEngine*, one per DevComm with proxy queues),
-  // so ccoCommDestroy can stop any whose DevComm was never destroyed.
-  std::vector<void*> proxyEngines;
+  // Live ccoProxy engines by ccoProxyContext::engineId (one per DevComm with
+  // proxy queues), so ccoCommDestroy can stop any whose DevComm was never
+  // destroyed. allocMutex protects them too.
+  std::vector<std::pair<uint64_t, ccoProxyEngine*>> proxyEngines;
+  uint64_t nextProxyEngineId = 1;
 
   struct WindowTableEntry {
     uintptr_t base;
@@ -1094,6 +1097,8 @@ void* ccoGetPeerPtr(ccoComm* comm, void* localPtr, int pe);
 // it references are released by ccoDevCommDestroy(comm, &devComm), once, on
 // this struct (not a copy). Destroy is local; with ccoProxy, quiesce peers
 // first (MORI-CCO-GUIDE.md §10).
+//
+// Collective: every rank calls it, in the same order.
 int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
@@ -1118,7 +1123,7 @@ struct ccoDevCommError {
   uint32_t vendorErr;  // COMPLETION: ibv_wc::vendor_err
   int sysErrno;        // POST / INTERNAL: errno, or 0
   uint64_t wrId;       // per-QP WR sequence number, or 0
-  uint64_t raddr;      // remote window offset of the failed WR
+  uint64_t raddr;      // remote MR address of the failed WR (window offset + iovaBias; slot id * 8)
   uint32_t rkey;
   uint32_t len;
   uint64_t suppressed;  // later errors, not reported

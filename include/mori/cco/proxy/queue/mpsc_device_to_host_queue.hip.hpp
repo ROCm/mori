@@ -39,8 +39,7 @@
  * their lines with one fetch-add, and each lane stores all of its own
  * message's chunks.
  * push_active_lanes() is push_lane_masked() over the executing lanes, from divergent code
- * too; its first executing lane takes lane 0's role, and it waits for each claim's result
- * before returning, so its claims also follow the wavefront's program order.
+ * too; its first executing lane takes lane 0's role.
  *
  * Consumer. pop() is the SPSC pop: it keeps its position privately, consumes
  * a message only when every chunk of its lines carries the lap of its own
@@ -66,6 +65,9 @@
  * therefore popped in program order, and the active lanes of one
  * push_lane_masked() call in lane order; messages of different wavefronts
  * interleave.
+ * push_active_lanes() claims from its first executing lane, which can change between calls;
+ * its order rests instead on every push waiting for its claim's result, so the wavefront's
+ * next claim, from any lane, is issued after the previous one is performed.
  */
 
 #pragma once
@@ -212,11 +214,8 @@ class Queue<Direction::DeviceToHost, Concurrency::MPSC> {
       __builtin_trap();
       return false;
 #else
-      const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, true, log2_capacity);
-      if (c.total == 0) {
-        return true;  // no active lane: claim nothing
-      }
       // With a partial exec, broadcast_lane0() and lane_masked_claim() see only executing lanes.
+      const detail::LaneClaim c = detail::lane_masked_claim<T>(bytes, true, log2_capacity);
       const uint32_t leader = __builtin_ctzll(__builtin_amdgcn_read_exec());
       uint64_t base = 0;
       if (__lane_id() == leader) {

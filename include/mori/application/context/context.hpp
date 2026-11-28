@@ -88,8 +88,8 @@ class Context {
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
   int GetNumQpPerPe() const { return numQpPerPe; }
-  // Endpoint config (port, GID index, ...) Context uses for its own QPs; valid once a
-  // peer with RDMA capability was seen.
+  // Endpoint config (port, GID index, ...) Context uses for its own QPs; valid once
+  // RdmaTransportEnabled().
   const RdmaEndpointConfig& GetRdmaEndpointConfig() const { return savedEpConfig; }
 
   // Capability-level query: reveals all transports physically available to
