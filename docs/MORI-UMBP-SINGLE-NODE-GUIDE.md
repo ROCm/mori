@@ -121,6 +121,24 @@ ulimit -c unlimited
 ```
 Make sure the directory exists and has enough space.
 
+## Borrowed NumPy restore descriptors
+
+`client.batch_get_ranges_from_arrays(keys, pointers, sizes, offsets)` reads
+native-endian `np.uint64` descriptor arrays directly, without Python-element
+conversion. `pointers` has shape
+`(len(keys), ranges_per_object)`; `sizes` and `offsets` either have that same
+shape or are shared one-dimensional rows of length `ranges_per_object`.
+Arrays must be aligned and C-contiguous. Other dtypes/layouts are rejected,
+not force-cast. Keep them unchanged until the synchronous call returns.
+
+The existing `batch_get_ranges_into_ptr` sequence API is unchanged and still
+supports ragged rows. The array entry point supports standalone-process and
+embedded clients. Standalone builds its RPC directly from the borrowed arrays;
+embedded reads them directly through the existing restore implementation,
+without constructing descriptor vectors. This removes
+Python lists and per-element binding conversion, not native planning,
+standalone RPC serialization, or KV data transfer.
+
 ## Troubleshooting
 
 - **Container launch**: `docker ps` should show `umbp-single-node`. If it exits immediately, check `docker logs`.

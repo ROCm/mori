@@ -63,6 +63,10 @@ class StandaloneProcessClient : public IUMBPClient {
                                    const std::vector<std::vector<uintptr_t>>& dsts,
                                    const std::vector<std::vector<size_t>>& sizes,
                                    const std::vector<std::vector<size_t>>& src_offsets) override;
+  std::vector<bool> BatchGetRanges(
+      const std::vector<std::string>& keys, const uintptr_t* dsts, const size_t* sizes,
+      const size_t* src_offsets, size_t ranges_per_key, size_t size_stride,
+      size_t offset_stride) override;
   std::vector<bool> BatchPutRanges(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& object_sizes,
                                    const std::vector<std::vector<uintptr_t>>& srcs,
@@ -102,6 +106,9 @@ class StandaloneProcessClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
+  template <typename ReadRow>
+  std::vector<bool> BatchGetRangesImpl(const std::vector<std::string>& keys,
+                                     ReadRow read_row);
   std::vector<bool> BatchPutImpl(const std::vector<std::string>& keys,
                                  const std::vector<uintptr_t>& srcs,
                                  const std::vector<size_t>& sizes);
